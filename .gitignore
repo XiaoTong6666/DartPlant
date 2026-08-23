@@ -1,0 +1,15 @@
+/build/
+/.lcm/
+third_party/*/target/
+/tests/flutter_fixture/build/
+/tests/flutter_fixture/.dart_tool/
+/tests/flutter_fixture/android/.gradle/
+/tests/flutter_fixture/android/local.properties
+/tests/flutter_fixture/android/app/.cxx/
+/tests/flutter_fixture/**/*.iml
+__pycache__/
+*.py[cod]
+/.dart_tool/
+/tests/dart/.dart_tool/
+/tests/dart/.packages
+/tests/dart/pubspec.lock

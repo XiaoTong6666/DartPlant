@@ -1,0 +1,277 @@
+// Copyright (C) 2026 XiaoTong6666
+// SPDX-License-Identifier: Apache-2.0
+
+#include <dlfcn.h>
+#include <dobby.h>
+
+#include <cstdio>
+#include <string>
+
+#include "core/internal.h"
+#include "dartplant/invocation.h"
+#include "dartplant/runtime.h"
+#include "dartplant/runtime_profile.h"
+#include "runtime/runtime_internal.h"
+
+namespace {
+
+using Add = int (*)(int, int);
+
+Add g_original_add = nullptr;
+int g_enter_calls = 0;
+int g_leave_calls = 0;
+int g_listener_calls = 0;
+bool g_null_semantic_callback_ok = false;
+
+void OnEnter(DartPlantInvocation* invocation, void*) {
+    ++g_enter_calls;
+    DartPlantValue value{};
+    if (dartplant_invocation_get_argument(invocation, 0, &value) == DARTPLANT_OK) {
+        value.raw += 10;
+        dartplant_invocation_set_argument(invocation, 0, &value);
+    }
+}
+
+void OnLeave(DartPlantInvocation* invocation, void*) {
+    ++g_leave_calls;
+    DartPlantValue value{};
+    if (dartplant_invocation_get_result(invocation, &value) == DARTPLANT_OK) {
+        value.raw += 100;
+        dartplant_invocation_set_result(invocation, &value);
+    }
+}
+
+void SkipWithResult(DartPlantInvocation* invocation, void*) {
+    const DartPlantValue value = {DARTPLANT_VALUE_RAW_WORD, 0, 77};
+    dartplant_invocation_set_result(invocation, &value);
+}
+
+void SkipWithValidatedNull(DartPlantInvocation* invocation, void*) {
+    const DartPlantValue null_value = {DARTPLANT_VALUE_NULL, 0, 0};
+    DartPlantValue argument{};
+    const DartPlantStatus set_argument =
+        dartplant_invocation_set_argument(invocation, 0, &null_value);
+    const DartPlantStatus get_argument =
+        dartplant_invocation_get_argument(invocation, 0, &argument);
+    const DartPlantStatus set_result = dartplant_invocation_set_result(invocation, &null_value);
+    g_null_semantic_callback_ok = set_argument == DARTPLANT_OK && get_argument == DARTPLANT_OK &&
+                                  argument.kind == DARTPLANT_VALUE_NULL &&
+                                  set_result == DARTPLANT_OK;
+}
+
+void ObserveEnter(DartPlantInvocation*, void*) { ++g_listener_calls; }
+
+extern "C" int DartPlantFixtureAdd(int left, int right);
+
+__attribute__((noinline)) int HookedAdd(int left, int right) {
+    return g_original_add(left, right) + 100;
+}
+
+int HostHook(void* target, void* replacement, void** backup) {
+    return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replacement),
+                     reinterpret_cast<dobby_dummy_func_t*>(backup));
+}
+
+int HostUnhook(void* target) { return DobbyDestroy(target); }
+
+int Fail(const char* message) {
+    std::fprintf(stderr, "[FAIL] %s: %s\n", message, dartplant_last_error());
+    return 1;
+}
+
+int ExerciseListenerChain(const DartPlantMethod* method,
+                          const DartPlantHookOptions& callback_options) {
+    DartPlantHookOptions listener_options = callback_options;
+    listener_options.on_enter = ObserveEnter;
+    listener_options.on_leave = nullptr;
+    DartPlantListener* listener = nullptr;
+    if (dartplant::AddCallbackListenerForMethod(method, listener_options, 100, &listener) !=
+        DARTPLANT_OK) {
+        return Fail("public listener chain add");
+    }
+    if (!dartplant_listener_is_active(listener)) {
+        return Fail("public listener chain active");
+    }
+    if (DartPlantFixtureAdd(2, 3) != 115) {
+        return Fail("public listener chain call");
+    }
+    if (g_listener_calls != 1) {
+        return Fail("public listener chain");
+    }
+    if (dartplant_remove_listener(listener) != DARTPLANT_OK ||
+        dartplant_listener_is_active(listener) || !dartplant_listener_is_idle(listener)) {
+        return Fail("listener removal and idle state");
+    }
+    dartplant_release_listener(listener);
+    return 0;
+}
+
+}  // namespace
+
+int main() {
+#if !defined(__aarch64__)
+    std::fprintf(stderr, "[FAIL] device test requires ARM64\n");
+    return 1;
+#endif
+
+    const DartPlantNativeApiEntries entries = {2, HostHook, HostUnhook};
+    dartplant::InstallHostApi(&entries);
+    dartplant::RefreshModules();
+
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(DartPlantFixtureAdd), &info) == 0 ||
+        info.dli_fname == nullptr) {
+        return Fail("dladdr fixture");
+    }
+    const std::string path(info.dli_fname);
+    const size_t slash = path.find_last_of('/');
+    const std::string module_name = slash == std::string::npos ? path : path.substr(slash + 1);
+
+    Dl_info runtime_info{};
+    if (dladdr(reinterpret_cast<void*>(dartplant_last_error), &runtime_info) == 0 ||
+        runtime_info.dli_fname == nullptr) {
+        return Fail("dladdr runtime");
+    }
+    const std::string runtime_path(runtime_info.dli_fname);
+    const size_t runtime_slash = runtime_path.find_last_of('/');
+    const std::string runtime_module_name =
+        runtime_slash == std::string::npos ? runtime_path : runtime_path.substr(runtime_slash + 1);
+
+    DartPlantAddressQuery query = {
+        .struct_size = sizeof(query),
+        .module_name = module_name.c_str(),
+        .address = reinterpret_cast<uint64_t>(DartPlantFixtureAdd),
+        .address_kind = DARTPLANT_ADDRESS_RUNTIME,
+        .code_size = 4,
+        .expected_build_id = nullptr,
+        .expected_fingerprint = nullptr,
+    };
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    if (dartplant_hook_address(&query, reinterpret_cast<void*>(HookedAdd), &backup, &hook) !=
+        DARTPLANT_OK) {
+        return Fail("install address hook");
+    }
+    g_original_add = reinterpret_cast<Add>(backup);
+    if (g_original_add == nullptr || DartPlantFixtureAdd(2, 3) != 105) {
+        return Fail("replacement and original call");
+    }
+
+    DartPlantHook* duplicate = nullptr;
+    void* duplicate_backup = nullptr;
+    if (dartplant_hook_address(&query, reinterpret_cast<void*>(HookedAdd), &duplicate_backup,
+                               &duplicate) != DARTPLANT_ALREADY_HOOKED) {
+        return Fail("duplicate hook rejection");
+    }
+
+    if (dartplant_unhook(hook) != DARTPLANT_OK || DartPlantFixtureAdd(2, 3) != 5) {
+        return Fail("unhook and restore");
+    }
+    dartplant_release_hook(hook);
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.argument_count = 2;
+    profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+    profile.argument_locations[1] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    // This executable is intentionally not a Dart VM. Build a synthetic method
+    // only to validate the ARM64 callback/trampoline backend; runtime Function
+    // discovery is tested by the real Flutter fixture below this test layer.
+    dartplant::DartCodeTargetRegistry code_targets;
+    auto code_target =
+        code_targets.GetOrCreate(reinterpret_cast<uintptr_t>(DartPlantFixtureAdd), 4, 0, 1);
+    auto function = std::make_shared<dartplant::DartFunctionHandle>();
+    function->identity = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    function->source = dartplant::DartFunctionSource::kSynthetic;
+    function->code_target = code_target;
+    code_target->AddAlias(function->identity);
+    DartPlantMethod method{};
+    method.record.library_uri = function->identity.library_uri;
+    method.record.class_name = function->identity.class_name;
+    method.record.function_name = function->identity.function_name;
+    method.record.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    method.record.address_kind = DARTPLANT_ADDRESS_RUNTIME;
+    method.record.address = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
+    method.record.code_size = 4;
+    method.function = function;
+
+    DartPlantHookOptions callback_options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = OnLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    g_enter_calls = 0;
+    g_leave_calls = 0;
+    g_listener_calls = 0;
+    DartPlantHook* callback_hook = nullptr;
+    if (dartplant::InstallCallbackHook(&method, profile, callback_options, 0, &callback_hook,
+                                       nullptr) != DARTPLANT_OK) {
+        return Fail("callback hook install");
+    }
+    if (g_listener_calls != 0 || DartPlantFixtureAdd(2, 3) != 115 || g_enter_calls != 1 ||
+        g_leave_calls != 1) {
+        return Fail("callback enter/leave hook");
+    }
+    if (ExerciseListenerChain(&method, callback_options) != 0) return 1;
+    if (dartplant_unhook(callback_hook) != DARTPLANT_OK) {
+        return Fail("callback unhook");
+    }
+    dartplant_release_hook(callback_hook);
+
+    constexpr uint64_t kCanonicalNull = 0x100000001;
+    DartPlantRuntimeProfile null_profile = profile;
+    null_profile.flags |=
+        DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+    callback_options.on_enter = SkipWithValidatedNull;
+    callback_options.on_leave = nullptr;
+    callback_hook = nullptr;
+    g_null_semantic_callback_ok = false;
+    if (dartplant::InstallCallbackHook(&method, null_profile, callback_options, 0, &callback_hook,
+                                       nullptr, kCanonicalNull) != DARTPLANT_OK ||
+        DartPlantFixtureAdd(2, 3) != 1 || !g_null_semantic_callback_ok) {
+        return Fail("callback validated null semantic hook");
+    }
+    if (dartplant_unhook(callback_hook) != DARTPLANT_OK) {
+        return Fail("validated null callback unhook");
+    }
+    dartplant_release_hook(callback_hook);
+
+    callback_options.on_enter = SkipWithResult;
+    callback_options.on_leave = nullptr;
+    callback_hook = nullptr;
+    if (dartplant::InstallCallbackHook(&method, profile, callback_options, 0, &callback_hook,
+                                       nullptr) != DARTPLANT_OK ||
+        DartPlantFixtureAdd(2, 3) != 77) {
+        return Fail("callback skip-original hook");
+    }
+    if (dartplant_unhook(callback_hook) != DARTPLANT_OK) {
+        return Fail("skip callback unhook");
+    }
+    dartplant_release_hook(callback_hook);
+
+    query.address = reinterpret_cast<uint64_t>(&query);
+    if (dartplant_hook_address(&query, reinterpret_cast<void*>(HookedAdd), &backup, &hook) !=
+        DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE) {
+        return Fail("non-executable address rejection");
+    }
+
+    std::printf("[PASS] ARM64 Dobby hook/original/unhook\n");
+    std::printf("[PASS] ARM64 callback enter/leave/result mutation\n");
+    std::printf("[PASS] ARM64 callback skip-original\n");
+    std::printf("[PASS] ARM64 validated null callback semantic\n");
+    std::printf("[PASS] duplicate hook rejection\n");
+    std::printf("[PASS] executable range validation\n");
+    return 0;
+}

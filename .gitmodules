@@ -1,0 +1,15 @@
+[submodule "third_party/flutterdec"]
+	path = third_party/flutterdec
+	url = https://github.com/caverav/flutterdec.git
+	branch = main
+[submodule "third_party/blutter"]
+	path = third_party/blutter
+	url = https://github.com/worawit/blutter.git
+	branch = main
+[submodule "third_party/capstone"]
+	path = third_party/capstone
+	url = https://github.com/capstone-engine/capstone.git
+[submodule "third_party/dobby"]
+	path = third_party/dobby
+	url = https://github.com/XiaoTong6666/Dobby.git
+	branch = master

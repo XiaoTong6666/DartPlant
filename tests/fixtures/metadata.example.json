@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "producer": "dartplant-indexer",
+  "architecture": "arm64",
+  "snapshot_kind": "full-aot",
+  "module": {
+    "soname": "libapp.so",
+    "build_id": ""
+  },
+  "methods": [
+    {
+      "library_uri": "package:dartplant_fixture/fixture.dart",
+      "class": "DartPlantFixture",
+      "name": "add",
+      "signature": "(int, int) -> int",
+      "entry_kind": 0,
+      "address_kind": 3,
+      "code_section_va": 4096,
+      "code_offset": "0x20",
+      "entry_va": "0x1020",
+      "code_size": 64,
+      "fingerprint": "0123456789abcdef0123456789abcdef",
+      "fingerprint_algo": "fnv1a64"
+    }
+  ]
+}

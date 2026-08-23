@@ -1,0 +1,7 @@
+{
+  "projectName": "DartPlant",
+  "platform": "android-31",
+  "ndkVer": "30.0.15729638",
+  "abi": "arm64-v8a",
+  "deviceDirectory": "/data/local/tmp/dartplant"
+}

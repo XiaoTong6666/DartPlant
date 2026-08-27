@@ -48,7 +48,7 @@ IGNORED_PARTS = {
 def is_ignored(path: Path) -> bool:
     relative_path = path.relative_to(ROOT_DIR)
     relative = relative_path.as_posix()
-    if ".cxx" in relative_path.parts:
+    if ".cxx" in relative_path.parts or ".dart_tool" in relative_path.parts:
         return True
     if relative in IGNORED_PARTS:
         return True

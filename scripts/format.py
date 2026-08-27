@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess as sp
 from pathlib import Path
@@ -43,8 +44,43 @@ def resolve_rustfmt() -> str:
     raise FileNotFoundError("rustfmt not found")
 
 
-def run(cmd: list[str]) -> None:
-    result = sp.run(cmd, check=False)
+def resolve_dart() -> str:
+    dart = shutil.which("dart")
+    if dart:
+        return dart
+    raise FileNotFoundError("dart not found")
+
+
+def resolve_flutter_dart() -> str:
+    flutter_root = os.getenv("FLUTTER_ROOT")
+    if flutter_root:
+        candidate = Path(flutter_root) / "bin" / "dart"
+        if candidate.is_file():
+            return str(candidate)
+
+    flutter = shutil.which("flutter")
+    if flutter:
+        candidate = Path(flutter).resolve().parent / "dart"
+        if candidate.is_file():
+            return str(candidate)
+
+    raise FileNotFoundError("Flutter-bundled dart not found")
+
+
+def iter_dart_files(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    files: list[Path] = []
+    for path in root.rglob("*.dart"):
+        relative = path.relative_to(root)
+        if ".dart_tool" in relative.parts or "build" in relative.parts:
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def run(cmd: list[str], *, cwd: Path | None = None) -> None:
+    result = sp.run(cmd, cwd=cwd, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"command failed with exit code {result.returncode}: {cmd}")
 
@@ -74,17 +110,40 @@ def format_rust(files: list[Path], *, check: bool) -> None:
     run(cmd)
 
 
+def format_dart(
+    files: list[Path], *, dart: str, check: bool, cwd: Path
+) -> None:
+    if not files:
+        return
+    cmd = [dart, "format"]
+    if check:
+        cmd.extend(["--output=none", "--set-exit-if-changed"])
+    cmd.extend(str(path) for path in files)
+    run(cmd, cwd=cwd)
+
+
 def run_format(*, check: bool, list_only: bool, ndk: str | None) -> None:
     rust_files = iter_files(RUST_EXTENSIONS)
     cpp_files = iter_files(CPP_EXTENSIONS)
+    dart_root = ROOT_DIR / "tests" / "dart"
+    flutter_root = ROOT_DIR / "tests" / "flutter_fixture"
+    dart_files = iter_dart_files(dart_root)
+    flutter_dart_files = iter_dart_files(flutter_root)
 
     if list_only:
-        for path in rust_files + cpp_files:
+        for path in rust_files + cpp_files + dart_files + flutter_dart_files:
             print(path.relative_to(ROOT_DIR).as_posix())
         return
 
     format_rust(rust_files, check=check)
     format_cpp(cpp_files, check=check, ndk=ndk)
+    format_dart(dart_files, dart=resolve_dart(), check=check, cwd=dart_root)
+    format_dart(
+        flutter_dart_files,
+        dart=resolve_flutter_dart(),
+        check=check,
+        cwd=flutter_root,
+    )
 
 
 def main() -> None:

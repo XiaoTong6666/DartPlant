@@ -1,0 +1,276 @@
+# Copyright (C) 2026 XiaoTong6666
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: DartPlant CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Audit and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read project configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+          echo "platform=$(python3 -c 'import json; print(json.load(open("project-config.json"))["platform"])')" >> "$GITHUB_OUTPUT"
+          echo "abi=$(python3 -c 'import json; print(json.load(open("project-config.json"))["abi"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Use NDK LLVM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm_bin="$(find "$ANDROID_HOME/ndk/${{ steps.config.outputs.ndk }}/toolchains/llvm/prebuilt" -mindepth 2 -maxdepth 2 -type d -name bin -print -quit)"
+          test -n "$llvm_bin"
+          echo "$llvm_bin" >> "$GITHUB_PATH"
+
+      - name: Doctor
+        run: python3 scripts/main.py doctor
+
+      - name: Resolve Dart formatting dependencies
+        working-directory: tests/dart
+        run: dart pub get
+
+      - name: Resolve Flutter formatting dependencies
+        working-directory: tests/flutter_fixture
+        run: flutter pub get
+
+      - name: Check formatting
+        run: python3 scripts/main.py format --check
+
+      - name: Audit source tree
+        run: python3 scripts/main.py audit
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Lint source tree
+        run: python3 scripts/main.py lint
+
+  host-tests:
+    name: Host C++ and Rust tests (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [debug, release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/tools
+          key: cargo-${{ runner.os }}-${{ hashFiles('tools/dartplant-indexer/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read NDK version
+        id: config
+        shell: bash
+        run: echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Run host tests
+        run: python3 scripts/main.py test host --force --build-type "${{ matrix.build_type }}"
+
+  dart-tests:
+    name: Dart fixture tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('tests/dart/pubspec.yaml') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Resolve Dart dependencies
+        working-directory: tests/dart
+        run: dart pub get
+
+      - name: Analyze Dart fixture
+        working-directory: tests/dart
+        run: dart analyze
+
+      - name: Run Dart fixture tests
+        working-directory: tests/dart
+        run: dart test
+
+  flutter-tests:
+    name: Flutter fixture analyze and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Resolve Flutter dependencies
+        working-directory: tests/flutter_fixture
+        run: flutter pub get
+
+      - name: Analyze Flutter fixture
+        working-directory: tests/flutter_fixture
+        run: flutter analyze
+
+      - name: Run Flutter fixture tests
+        working-directory: tests/flutter_fixture
+        run: flutter test
+
+  android-build:
+    name: Android arm64 ${{ matrix.build_type }} build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [debug, release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read project configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+          echo "abi=$(python3 -c 'import json; print(json.load(open("project-config.json"))["abi"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Build Android standalone targets
+        run: python3 scripts/main.py build android --force --build-type "${{ matrix.build_type }}"
+
+      - name: Upload Android test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dartplant-android-arm64-${{ matrix.build_type }}
+          path: |
+            build/android-arm64/dartplant_device_tests
+            build/android-arm64/libdartplant_device_fixture.so
+          if-no-files-found: error
+          retention-days: 7

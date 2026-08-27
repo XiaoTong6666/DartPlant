@@ -6,7 +6,8 @@ void main() {
   test('fixture methods have stable baseline behavior', () {
     expect(fixture.addInt(7, 5), 12);
     expect(fixture.negateBool(true), isFalse);
-    expect(fixture.echoObject(const FixtureObject(9)).toString(), 'FixtureObject(9)');
+    expect(fixture.echoObject(const FixtureObject(9)).toString(),
+        'FixtureObject(9)');
     expect(fixture.addDouble(1.25, 2.5), 3.75);
   });
 

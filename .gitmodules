@@ -9,6 +9,7 @@
 [submodule "third_party/capstone"]
 	path = third_party/capstone
 	url = https://github.com/capstone-engine/capstone.git
+        branch = next
 [submodule "third_party/dobby"]
 	path = third_party/dobby
 	url = https://github.com/XiaoTong6666/Dobby.git

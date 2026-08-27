@@ -61,7 +61,7 @@ final class DartPlantNative {
       .lookup<NativeFunction<_InstrumentedAddProbeNative>>(
         'dartplant_fixture_instrumented_add_probe',
       )
-           .asFunction();
+      .asFunction();
   static final _ResetNullSemanticProbeDart _resetNullSemanticProbe = _library
       .lookup<NativeFunction<_ResetNullSemanticProbeNative>>(
         'dartplant_fixture_reset_null_semantic_probe',

@@ -45,7 +45,7 @@ Future<void> main() async {
     debugPrint('DartPlant initialize status: $initializeStatus');
     DartPlantNative.resetNullSemanticProbe();
     final canonicalNull = nullableEchoObject(null);
-    final rewrittenToNull = nullableEchoObject(FixtureObject(11));
+    final rewrittenToNull = nullableEchoObject(const FixtureObject(11));
     final nullProbe = DartPlantNative.nullSemanticProbe();
     debugPrint(
       'DartPlant null semantic probe: $nullProbe values=$canonicalNull/$rewrittenToNull',
@@ -122,7 +122,7 @@ final class FixtureScreen extends StatefulWidget {
 final class _FixtureScreenState extends State<FixtureScreen> {
   String _result = 'ready';
   int _left = 7;
-  int _right = 5;
+  final int _right = 5;
   bool _flag = true;
   double _doubleLeft = 1.25;
   double _doubleRight = 2.5;
@@ -142,7 +142,7 @@ final class _FixtureScreenState extends State<FixtureScreen> {
 
   Future<void> _runObjectProbe() async {
     if (Platform.isAndroid) DartPlantNative.beginObjectProbe();
-    final first = 'object:${fixture.echoObject(FixtureObject(9))}';
+    final first = 'object:${fixture.echoObject(const FixtureObject(9))}';
     _show(first);
     // The native callback has returned, so this root can no longer protect
     // the object while the allocation-pressure phase runs. Host widget tests
@@ -155,7 +155,7 @@ final class _FixtureScreenState extends State<FixtureScreen> {
     }
     pressure.clear();
     await Future<void>.delayed(const Duration(milliseconds: 300));
-    final second = fixture.echoObject(FixtureObject(10));
+    final second = fixture.echoObject(const FixtureObject(10));
     _show('object:$second');
   }
 

@@ -63,9 +63,15 @@ struct MetadataIndex {
     std::vector<MethodRecord> methods;
 };
 
-struct HostApi {
+struct HostApiBinding {
     DartPlantHostHook hook = nullptr;
     DartPlantHostUnhook unhook = nullptr;
+};
+
+struct HostApi {
+    // Bindings are immutable and process-lifetime. This supports callbacks that
+    // outlive a host backend replacement without requiring shared_ptr atomics.
+    std::atomic<const HostApiBinding*> binding{nullptr};
 };
 
 enum class HookRecordState {
@@ -112,6 +118,7 @@ std::string FingerprintCode(const void* address, size_t size);
 
 void InstallHostApi(const DartPlantNativeApiEntries* entries);
 void RefreshModules();
+void ReplaceModules(std::vector<ModuleImage> modules);
 DartPlantStatus InvalidateRuntimeHooks(
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
@@ -204,6 +211,7 @@ struct DartPlantHook {
     DartPlantHookOptions options{};
     DartPlantVmAdapter* vm_adapter = nullptr;
     uint64_t validated_null_value = 0;
+    const dartplant::HostApiBinding* host_binding = nullptr;
     std::shared_ptr<std::atomic_uint64_t> runtime_generation;
     uint64_t expected_runtime_generation = 0;
     void* replacement_entry = nullptr;

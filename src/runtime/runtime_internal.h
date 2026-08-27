@@ -37,6 +37,8 @@ struct RuntimeProfileStorage {
 
 struct RuntimeRegistration;
 
+using RuntimeModuleRefreshReporter = void (*)(DartPlantStatus status, const char* error);
+
 struct RuntimeOperationLease {
     std::shared_ptr<RuntimeRegistration> registration;
 
@@ -55,7 +57,9 @@ bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMeth
 RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime);
 DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                                       const std::vector<ModuleImage>& modules);
-DartPlantStatus NotifyRuntimeModuleLoaded(const char* module_name, void* module_handle);
+void StartRuntimeModuleRefreshWorker(RuntimeModuleRefreshReporter reporter);
+uint64_t ScheduleRuntimeModuleRefresh();
+DartPlantStatus WaitForRuntimeModuleRefresh(uint64_t epoch);
 
 }  // namespace dartplant
 

@@ -39,6 +39,9 @@ std::vector<std::vector<std::string>> g_known_alias_functions;
 DartPlantListener* g_self_removing_listener = nullptr;
 int g_self_remove_leave_calls = 0;
 int g_fake_unhook_calls = 0;
+bool g_fake_fail_unhook_enabled = true;
+int g_backend_a_unhook_calls = 0;
+int g_backend_b_unhook_calls = 0;
 DartPlantObjectHandle* g_object_argument_handle = nullptr;
 
 struct FakeVmObject {
@@ -195,7 +198,17 @@ int FakeUnhook(void*) {
 
 int FakeFailUnhook(void*) {
     ++g_fake_unhook_calls;
-    return -1;
+    return g_fake_fail_unhook_enabled ? -1 : 0;
+}
+
+int BackendAUnhook(void*) {
+    ++g_backend_a_unhook_calls;
+    return 0;
+}
+
+int BackendBUnhook(void*) {
+    ++g_backend_b_unhook_calls;
+    return 0;
 }
 
 void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
@@ -619,6 +632,7 @@ TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
     const DartPlantNativeApiEntries failing_entries = {2, FakeHook, FakeFailUnhook};
     dartplant::InstallHostApi(&failing_entries);
     g_fake_unhook_calls = 0;
+    g_fake_fail_unhook_enabled = true;
 
     auto generation = std::make_shared<std::atomic_uint64_t>(1);
     DartPlantHook* hook = nullptr;
@@ -640,7 +654,29 @@ TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
 
     const DartPlantNativeApiEntries working_entries = {2, FakeHook, FakeUnhook};
     dartplant::InstallHostApi(&working_entries);
+    EXPECT_EQ(DARTPLANT_UNHOOK_FAILED, dartplant_unhook(hook));
+    EXPECT_EQ(2, g_fake_unhook_calls);
+    g_fake_fail_unhook_enabled = false;
     EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
+    dartplant_release_hook(hook);
+}
+
+TEST_CASE(HookUnhooksWithItsInstallingBackend) {
+    const DartPlantNativeApiEntries backend_a = {2, FakeHook, BackendAUnhook};
+    const DartPlantNativeApiEntries backend_b = {2, FakeHook, BackendBUnhook};
+    dartplant::InstallHostApi(&backend_a);
+    g_backend_a_unhook_calls = 0;
+    g_backend_b_unhook_calls = 0;
+
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(Replacement),
+                                     reinterpret_cast<void*>(Replacement), &backup, &hook));
+    dartplant::InstallHostApi(&backend_b);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
+    EXPECT_EQ(1, g_backend_a_unhook_calls);
+    EXPECT_EQ(0, g_backend_b_unhook_calls);
     dartplant_release_hook(hook);
 }
 
@@ -758,7 +794,21 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
               dartplant_method_runtime_address(duplicate_safe_method));
     dartplant_release_method(duplicate_safe_method);
 
-    dartplant::NotifyRuntimeModuleLoaded("libunrelated.so", nullptr);
+    dartplant::StartRuntimeModuleRefreshWorker(nullptr);
+    uint64_t refresh_epoch = 0;
+    uint64_t first_refresh_epoch = 0;
+    {
+        std::lock_guard lock(runtime->mutex);
+        for (int event = 0; event < 32; ++event) {
+            (void) event;
+            refresh_epoch = dartplant::ScheduleRuntimeModuleRefresh();
+            if (first_refresh_epoch == 0) first_refresh_epoch = refresh_epoch;
+        }
+    }
+    EXPECT_TRUE(first_refresh_epoch != 0);
+    EXPECT_TRUE(refresh_epoch != 0);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::WaitForRuntimeModuleRefresh(refresh_epoch));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::WaitForRuntimeModuleRefresh(first_refresh_epoch));
     EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
     EXPECT_EQ(DARTPLANT_RUNTIME_READY, runtime->state);
     EXPECT_TRUE(runtime->live_snapshot_index.has_value());
@@ -821,7 +871,9 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_TRUE(destroy_method->function->code_target->HookRecord() == nullptr);
     dartplant_release_hook(destroy_hook);
     dartplant_release_method(destroy_method);
-    dartplant::NotifyRuntimeModuleLoaded("libafter-runtime-destroy.so", nullptr);
+    const uint64_t after_destroy_epoch = dartplant::ScheduleRuntimeModuleRefresh();
+    EXPECT_TRUE(after_destroy_epoch != 0);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::WaitForRuntimeModuleRefresh(after_destroy_epoch));
     dartplant_reset();
     dlclose(fixture);
 }

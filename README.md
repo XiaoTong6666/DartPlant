@@ -53,6 +53,18 @@ The current implementation provides:
   dependency-load refresh, module identity selection, and runtime-generation
   fail-closed invalidation.
 
+LSPosed invokes native module callbacks while holding its module-registry mutex.
+The adapter callback therefore only increments an atomic refresh epoch and wakes
+a process-lifetime worker. ELF enumeration, snapshot discovery, runtime locking,
+hook invalidation, and host `unhook_func` calls all run on that worker after the
+LSPosed callback returns. Every successful loader callback schedules a full scan;
+events are coalesced by epoch rather than filtered by the top-level `dlopen` name.
+The worker and callback code are process-lifetime state; the Android module is
+linked `NODELETE` because the host ABI has no callback-unregister operation.
+This release supports process-lifetime Flutter app/runtime images. Arbitrary
+concurrent `dlclose` of an image with installed hooks is unsupported until a
+host supplies a pre-unload synchronization callback or a backend-safe retire API.
+
 The runtime API is intentionally separate from the legacy process-global API:
 
 ```cpp
@@ -155,7 +167,7 @@ Dart/Flutter ARM64 AOT raw-layout profile, while other profiles fail closed.
 The optional LSPosed adapter owns loader-facing lifecycle only: it validates and
 stores the host entries, refreshes the process module inventory on initialization
 and every module-loaded callback, and lets each runtime instance select its own
-app/runtime image incarnation. The core resolver remains independent of Vector's
+app/runtime image incarnation. The core resolver remains independent of LSPosed's
 Java/Kotlin APIs.
 
 The ARM64 device regression currently proves the public runtime method hook API

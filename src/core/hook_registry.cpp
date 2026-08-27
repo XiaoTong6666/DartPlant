@@ -102,8 +102,15 @@ bool ValidateProfile(const DartPlantRuntimeProfile& profile) {
 
 DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
     const uintptr_t target = HookTarget(hook);
-    if (target == 0 || State().host.unhook == nullptr ||
-        State().host.unhook(reinterpret_cast<void*>(target)) != 0) {
+    // Synthetic internal tests can construct a hook without the public
+    // installation path. Real installed hooks always retain their own binding.
+    const auto* host_binding = hook->host_binding == nullptr
+                                   ? State().host.binding.load(std::memory_order_acquire)
+                                   : hook->host_binding;
+    const DartPlantHostUnhook host_unhook =
+        host_binding == nullptr ? nullptr : host_binding->unhook;
+    if (target == 0 || host_unhook == nullptr ||
+        host_unhook(reinterpret_cast<void*>(target)) != 0) {
         std::lock_guard hook_lock(hook->mutex);
         hook->state = HookRecordState::kFailed;
         SetLastError("host unhook function failed");
@@ -150,20 +157,24 @@ RuntimeState& State() {
 }
 
 void InstallHostApi(const DartPlantNativeApiEntries* entries) {
-    std::lock_guard lock(State().mutex);
     if (entries == nullptr || entries->version < 2 || entries->hook_func == nullptr ||
         entries->unhook_func == nullptr) {
-        State().host = {};
+        State().host.binding.store(nullptr, std::memory_order_release);
         SetLastError("host API version or function pointers are invalid");
         return;
     }
-    State().host = {entries->hook_func, entries->unhook_func};
+    auto* binding = new HostApiBinding();
+    binding->hook = entries->hook_func;
+    binding->unhook = entries->unhook_func;
+    State().host.binding.store(binding, std::memory_order_release);
     ClearLastError();
 }
 
-void RefreshModules() {
+void RefreshModules() { ReplaceModules(EnumerateModules()); }
+
+void ReplaceModules(std::vector<ModuleImage> modules) {
     std::lock_guard lock(State().mutex);
-    State().modules = EnumerateModules();
+    State().modules = std::move(modules);
 }
 
 DartPlantStatus InvalidateRuntimeHooks(
@@ -212,7 +223,9 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
         return DARTPLANT_INVALID_ARGUMENT;
     }
     std::lock_guard lock(State().mutex);
-    if (State().host.hook == nullptr || State().host.unhook == nullptr) {
+    const auto* host_binding = State().host.binding.load(std::memory_order_acquire);
+    if (host_binding == nullptr || host_binding->hook == nullptr ||
+        host_binding->unhook == nullptr) {
         SetLastError("host hook API is not initialized");
         return DARTPLANT_HOST_API_UNAVAILABLE;
     }
@@ -221,7 +234,7 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
         return DARTPLANT_ALREADY_HOOKED;
     }
     void* original = nullptr;
-    if (State().host.hook(reinterpret_cast<void*>(target), replacement, &original) != 0 ||
+    if (host_binding->hook(reinterpret_cast<void*>(target), replacement, &original) != 0 ||
         original == nullptr) {
         SetLastError("host hook function failed");
         return DARTPLANT_HOOK_FAILED;
@@ -229,6 +242,7 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
     auto hook = std::make_unique<DartPlantHook>();
     hook->code_target = code_target;
     hook->backup = original;
+    hook->host_binding = host_binding;
     hook->active.store(true, std::memory_order_release);
     hook->state = HookRecordState::kInstalled;
     hook->code_target->BindHookRecord(hook.get());
@@ -354,7 +368,9 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
     }
 
     std::lock_guard lock(State().mutex);
-    if (State().host.hook == nullptr || State().host.unhook == nullptr) {
+    const auto* host_binding = State().host.binding.load(std::memory_order_acquire);
+    if (host_binding == nullptr || host_binding->hook == nullptr ||
+        host_binding->unhook == nullptr) {
         SetLastError("host hook API is not initialized");
         return DARTPLANT_HOST_API_UNAVAILABLE;
     }
@@ -372,6 +388,7 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
     hook->options = options;
     hook->vm_adapter = options.vm_adapter;
     hook->validated_null_value = validated_null_value;
+    hook->host_binding = host_binding;
     hook->runtime_generation = std::move(runtime_generation);
     hook->expected_runtime_generation = expected_runtime_generation;
     hook->state = HookRecordState::kInstalling;
@@ -384,7 +401,7 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
     }
 
     void* original = nullptr;
-    if (State().host.hook(reinterpret_cast<void*>(target), hook->replacement_entry, &original) !=
+    if (host_binding->hook(reinterpret_cast<void*>(target), hook->replacement_entry, &original) !=
             0 ||
         original == nullptr) {
         DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);

@@ -36,6 +36,11 @@ def run_lint(*, build_type: str, ndk: str | None) -> None:
                     clang_tidy,
                     "-p",
                     str(context.host_build_dir),
+                    # GCC may omit an explicit -std flag from compile_commands.json
+                    # when its default already satisfies CMake's cxx_std_20 feature.
+                    # clang-tidy can use a different frontend/default, so keep the
+                    # lint language mode aligned with the project contract.
+                    "--extra-arg=-std=gnu++20",
                     *[str(path) for path in sources],
                 ],
                 cwd=context.host_build_dir,

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <deque>
+#include <thread>
 
 #include "runtime/dart_vm_abi.h"
 #include "runtime/runtime_internal.h"
@@ -12,8 +14,10 @@ namespace dartplant {
 
 struct RuntimeRegistration {
     DartPlantRuntime* runtime = nullptr;
+    std::string app_module_name;
+    std::string runtime_module_name;
+    std::atomic_bool closing{false};
     size_t active_operations = 0;
-    bool closing = false;
     std::condition_variable idle;
 };
 
@@ -131,10 +135,32 @@ std::vector<std::shared_ptr<RuntimeRegistration>>& RuntimeRegistry() {
     return runtimes;
 }
 
+struct RuntimeRefreshWorkerState {
+    std::mutex mutex;
+    std::condition_variable completed;
+    std::atomic_uint64_t requested_epoch{0};
+    uint64_t completed_epoch = 0;
+    struct RefreshResult {
+        uint64_t first_epoch = 0;
+        uint64_t last_epoch = 0;
+        DartPlantStatus status = DARTPLANT_OK;
+    };
+    std::deque<RefreshResult> results;
+    std::atomic<RuntimeModuleRefreshReporter> reporter{nullptr};
+    std::atomic_bool started{false};
+};
+
+RuntimeRefreshWorkerState& RuntimeRefreshWorker() {
+    static auto* state = new RuntimeRefreshWorkerState;
+    return *state;
+}
+
 void RegisterRuntime(DartPlantRuntime* runtime) {
     std::lock_guard lock(RuntimeRegistryMutex());
     auto registration = std::make_shared<RuntimeRegistration>();
     registration->runtime = runtime;
+    registration->app_module_name = runtime->profile.app_module_name;
+    registration->runtime_module_name = runtime->profile.runtime_module_name;
     RuntimeRegistry().push_back(std::move(registration));
 }
 
@@ -145,10 +171,23 @@ std::shared_ptr<RuntimeRegistration> CloseRuntime(DartPlantRuntime* runtime) {
         [runtime](const auto& registration) { return registration->runtime == runtime; });
     if (found == RuntimeRegistry().end()) return nullptr;
     auto registration = *found;
-    registration->closing = true;
+    registration->closing.store(true, std::memory_order_release);
     RuntimeRegistry().erase(found);
     registration->idle.wait(lock, [&registration] { return registration->active_operations == 0; });
     return registration;
+}
+
+std::vector<RuntimeOperationLease> PinRuntimeRefreshes() {
+    std::vector<RuntimeOperationLease> operations;
+    std::lock_guard lock(RuntimeRegistryMutex());
+    for (const auto& registration : RuntimeRegistry()) {
+        if (registration->closing.load(std::memory_order_acquire)) continue;
+        ++registration->active_operations;
+        RuntimeOperationLease lease;
+        lease.registration = registration;
+        operations.push_back(std::move(lease));
+    }
+    return operations;
 }
 
 void ReleaseRuntimeOperation(std::shared_ptr<RuntimeRegistration>* registration) {
@@ -259,7 +298,8 @@ RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime) {
     std::lock_guard lock(RuntimeRegistryMutex());
     const auto found = std::find_if(
         RuntimeRegistry().begin(), RuntimeRegistry().end(), [runtime](const auto& registration) {
-            return registration->runtime == runtime && !registration->closing;
+            return registration->runtime == runtime &&
+                   !registration->closing.load(std::memory_order_acquire);
         });
     if (found == RuntimeRegistry().end()) return lease;
     ++(*found)->active_operations;
@@ -365,37 +405,73 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     return DARTPLANT_OK;
 }
 
-DartPlantStatus NotifyRuntimeModuleLoaded(const char*, void*) {
-    std::vector<RuntimeOperationLease> operations;
-    {
-        std::lock_guard lock(RuntimeRegistryMutex());
-        for (const auto& registration : RuntimeRegistry()) {
-            if (registration->closing) continue;
-            ++registration->active_operations;
-            RuntimeOperationLease lease;
-            lease.registration = registration;
-            operations.push_back(std::move(lease));
-        }
-    }
-    if (operations.empty()) return DARTPLANT_OK;
+void StartRuntimeModuleRefreshWorker(RuntimeModuleRefreshReporter reporter) {
+    auto& worker = RuntimeRefreshWorker();
+    if (reporter != nullptr) worker.reporter.store(reporter, std::memory_order_release);
+    bool expected = false;
+    if (!worker.started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    std::thread([] {
+        auto& state = RuntimeRefreshWorker();
+        uint64_t processed_epoch = 0;
+        for (;;) {
+            state.requested_epoch.wait(processed_epoch, std::memory_order_acquire);
+            const uint64_t epoch = state.requested_epoch.load(std::memory_order_acquire);
 
-    const auto modules = EnumerateModules();
-    DartPlantStatus status = DARTPLANT_OK;
-    std::string error;
-    for (const auto& operation : operations) {
-        const DartPlantStatus refresh_status =
-            RefreshRuntimeModules(operation.registration->runtime, modules);
-        if (refresh_status != DARTPLANT_OK && status == DARTPLANT_OK) {
-            status = refresh_status;
-            error = LastError();
+            auto operations = PinRuntimeRefreshes();
+            auto modules = EnumerateModules();
+            ReplaceModules(modules);
+
+            DartPlantStatus status = DARTPLANT_OK;
+            std::string error;
+            for (const auto& operation : operations) {
+                const DartPlantStatus refresh_status =
+                    RefreshRuntimeModules(operation.registration->runtime, modules);
+                if (refresh_status != DARTPLANT_OK && status == DARTPLANT_OK) {
+                    status = refresh_status;
+                    error = LastError();
+                }
+            }
+
+            RuntimeModuleRefreshReporter reporter = nullptr;
+            {
+                std::lock_guard lock(state.mutex);
+                state.completed_epoch = epoch;
+                state.results.push_back(
+                    {.first_epoch = processed_epoch + 1, .last_epoch = epoch, .status = status});
+                if (state.results.size() > 64) state.results.pop_front();
+                reporter = state.reporter.load(std::memory_order_acquire);
+            }
+            processed_epoch = epoch;
+            state.completed.notify_all();
+            operations.clear();
+            if (status != DARTPLANT_OK && reporter != nullptr) {
+                reporter(status, error.empty() ? "runtime module refresh failed" : error.c_str());
+            }
         }
+    }).detach();
+}
+
+uint64_t ScheduleRuntimeModuleRefresh() {
+    auto& worker = RuntimeRefreshWorker();
+    if (!worker.started.load(std::memory_order_acquire)) return 0;
+    const uint64_t epoch = worker.requested_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    worker.requested_epoch.notify_one();
+    return epoch;
+}
+
+DartPlantStatus WaitForRuntimeModuleRefresh(uint64_t epoch) {
+    if (epoch == 0) return DARTPLANT_OK;
+    auto& worker = RuntimeRefreshWorker();
+    std::unique_lock lock(worker.mutex);
+    worker.completed.wait(lock, [&worker, epoch] { return worker.completed_epoch >= epoch; });
+    if (worker.results.empty() || epoch < worker.results.front().first_epoch) {
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
-    if (status != DARTPLANT_OK) {
-        SetLastError(error.empty() ? "runtime module refresh failed" : error);
-        return status;
-    }
-    ClearLastError();
-    return DARTPLANT_OK;
+    const auto found = std::lower_bound(
+        worker.results.begin(), worker.results.end(), epoch,
+        [](const auto& result, uint64_t requested) { return result.last_epoch < requested; });
+    return found == worker.results.end() || epoch < found->first_epoch ? DARTPLANT_RUNTIME_NOT_READY
+                                                                       : found->status;
 }
 
 DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,

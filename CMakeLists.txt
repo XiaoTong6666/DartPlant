@@ -96,7 +96,9 @@ if(ANDROID)
             log
             dl
         )
-        target_link_options(dartplant PRIVATE -Wl,-z,max-page-size=16384)
+        # Vector stores NativeOnModuleLoaded without an unregister API. Keep the
+        # callback and its refresh worker code resident for process lifetime.
+        target_link_options(dartplant PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,nodelete)
     endif()
 
     if(DARTPLANT_BUILD_ANDROID_TESTS)

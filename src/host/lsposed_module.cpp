@@ -13,16 +13,22 @@ namespace {
 constexpr char kLogTag[] = "DartPlant";
 std::atomic_bool g_initialized{false};
 
-void OnModuleLoaded(const char* name, void* handle) {
-    dartplant::RefreshModules();
-    const DartPlantStatus status = dartplant::NotifyRuntimeModuleLoaded(name, handle);
-    if (status != DARTPLANT_OK) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "runtime module refresh failed: %s",
-                            dartplant::LastError());
-    }
-    if (name != nullptr) {
-        __android_log_print(ANDROID_LOG_DEBUG, kLogTag, "module loaded: %s", name);
-    }
+__attribute__((constructor)) void InitializeRuntimeRefreshWorker() {
+    // Constructors run during do_dlopen before Vector acquires its module
+    // registry mutex and invokes native_init.
+    dartplant::StartRuntimeModuleRefreshWorker(nullptr);
+}
+
+void ReportRuntimeRefresh(DartPlantStatus status, const char* error) {
+    __android_log_print(ANDROID_LOG_ERROR, kLogTag, "runtime module refresh failed (%d): %s",
+                        static_cast<int>(status), error == nullptr ? "unknown error" : error);
+}
+
+void OnModuleLoaded(const char* name, void*) {
+    // Vector invokes this while holding g_module_registry_mutex. Keep this path
+    // to atomic filtering/coalescing only; the worker performs every heavy step.
+    (void) name;
+    dartplant::ScheduleRuntimeModuleRefresh();
 }
 
 }  // namespace
@@ -31,24 +37,15 @@ extern "C" __attribute__((visibility("default"))) DartPlantNativeOnModuleLoaded
 native_init(const DartPlantNativeApiEntries* entries) {
     if (entries == nullptr || entries->version < 2 || entries->hook_func == nullptr ||
         entries->unhook_func == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "invalid LSPosed Native API entries");
         return nullptr;
     }
     if (g_initialized.exchange(true, std::memory_order_acq_rel)) {
-        __android_log_print(ANDROID_LOG_DEBUG, kLogTag,
-                            "ignored duplicate LSPosed native_init invocation");
         return nullptr;
     }
     dartplant::InstallHostApi(entries);
-    dartplant::RefreshModules();
-    // LSPosed reports only future successful dlopen calls, so cover images that
-    // were already mapped before this native module was initialized.
-    const DartPlantStatus status = dartplant::NotifyRuntimeModuleLoaded(nullptr, nullptr);
-    if (status != DARTPLANT_OK) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "initial runtime refresh failed: %s",
-                            dartplant::LastError());
-    }
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "initialized LSPosed Native API version %u",
-                        entries->version);
+    dartplant::StartRuntimeModuleRefreshWorker(ReportRuntimeRefresh);
+    // Vector reports only future successful dlopen calls. Queue the existing
+    // mapping scan instead of running it under Vector's registry mutex.
+    dartplant::ScheduleRuntimeModuleRefresh();
     return OnModuleLoaded;
 }

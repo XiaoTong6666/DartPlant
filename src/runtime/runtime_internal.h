@@ -5,6 +5,7 @@
 #define DARTPLANT_RUNTIME_RUNTIME_INTERNAL_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,8 +35,27 @@ struct RuntimeProfileStorage {
     void Assign(const DartPlantRuntimeProfile& source);
 };
 
+struct RuntimeRegistration;
+
+struct RuntimeOperationLease {
+    std::shared_ptr<RuntimeRegistration> registration;
+
+    RuntimeOperationLease() = default;
+    RuntimeOperationLease(const RuntimeOperationLease&) = delete;
+    RuntimeOperationLease& operator=(const RuntimeOperationLease&) = delete;
+    RuntimeOperationLease(RuntimeOperationLease&& other) noexcept;
+    RuntimeOperationLease& operator=(RuntimeOperationLease&& other) noexcept;
+    ~RuntimeOperationLease();
+
+    explicit operator bool() const { return registration != nullptr; }
+};
+
 bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right);
-void NotifyRuntimeModuleLoaded(const char* module_name, void* module_handle);
+bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMethod* method);
+RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime);
+DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
+                                      const std::vector<ModuleImage>& modules);
+DartPlantStatus NotifyRuntimeModuleLoaded(const char* module_name, void* module_handle);
 
 }  // namespace dartplant
 
@@ -53,6 +73,8 @@ struct DartPlantRuntime {
     mutable std::recursive_mutex mutex;
     dartplant::RuntimeProfileStorage profile;
     std::vector<dartplant::ModuleImage> modules;
+    std::optional<dartplant::ModuleImage> selected_app_module;
+    std::optional<dartplant::ModuleImage> selected_runtime_module;
     std::optional<dartplant::FlutterSnapshotSource> snapshot;
     // Built automatically from live Class.functions/Library.toplevel_class.
     // Runtime method resolution never consumes a precomputed metadata/index file.

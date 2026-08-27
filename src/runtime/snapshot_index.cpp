@@ -132,6 +132,7 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
                                                     std::string* error) {
     SnapshotIndex index;
     index.module_name = snapshot.module_name == nullptr ? "" : snapshot.module_name;
+    index.module_path = snapshot.module_path == nullptr ? "" : snapshot.module_path;
     index.build_id = snapshot.module_build_id == nullptr ? "" : snapshot.module_build_id;
     index.snapshot_hash = snapshot.snapshot_hash == nullptr ? "" : snapshot.snapshot_hash;
     DartPlantLiveVmProfile profile{};

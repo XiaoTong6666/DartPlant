@@ -20,6 +20,10 @@ namespace {
 
 int Replacement(int left, int right) { return left + right + 10; }
 
+int RetiredReplacement(int left, int right) { return left + right + 20; }
+
+int RetiredReplacementLater(int left, int right) { return left + right + 30; }
+
 int g_enter_calls = 0;
 int g_leave_calls = 0;
 uint32_t g_enter_depth = 0;
@@ -189,10 +193,17 @@ int FakeUnhook(void*) {
     return 0;
 }
 
+int FakeFailUnhook(void*) {
+    ++g_fake_unhook_calls;
+    return -1;
+}
+
 void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
                                     void* target) {
     EXPECT_TRUE(runtime != nullptr);
     runtime->modules = dartplant::EnumerateModules();
+    runtime->selected_app_module = module;
+    runtime->selected_runtime_module = module;
     runtime->profile_matched = true;
 
     dartplant::FlutterSnapshotSource snapshot;
@@ -210,6 +221,7 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
 
     dartplant::SnapshotIndex index;
     index.module_name = module.name;
+    index.module_path = module.path;
     index.build_id = module.build_id;
     index.snapshot_hash = "synthetic-live-index";
     index.dart_version = "test";
@@ -573,6 +585,118 @@ TEST_CASE(RuntimeRequiresMatchingAotModules) {
     dartplant_runtime_destroy(runtime);
 }
 
+TEST_CASE(RuntimeDestroyWaitsForPinnedOperations) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    EXPECT_TRUE(static_cast<bool>(operation));
+    std::atomic_bool destroyed{false};
+    std::thread destroyer([&] {
+        dartplant_runtime_destroy(runtime);
+        destroyed.store(true, std::memory_order_release);
+    });
+
+    bool closing = false;
+    for (int attempt = 0; attempt < 100000; ++attempt) {
+        auto probe = dartplant::AcquireRuntimeOperation(runtime);
+        if (!probe) {
+            closing = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(closing);
+    EXPECT_TRUE(!destroyed.load(std::memory_order_acquire));
+    operation = {};
+    destroyer.join();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+}
+
+TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
+    const DartPlantNativeApiEntries failing_entries = {2, FakeHook, FakeFailUnhook};
+    dartplant::InstallHostApi(&failing_entries);
+    g_fake_unhook_calls = 0;
+
+    auto generation = std::make_shared<std::atomic_uint64_t>(1);
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(Replacement),
+                                     reinterpret_cast<void*>(Replacement), &backup, &hook));
+    hook->runtime_generation = generation;
+    hook->expected_runtime_generation = 1;
+    EXPECT_EQ(DARTPLANT_UNHOOK_FAILED, dartplant::InvalidateRuntimeHooks(generation));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+
+    DartPlantHook* duplicate = nullptr;
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_ALREADY_HOOKED,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(Replacement),
+                                     reinterpret_cast<void*>(Replacement), &backup, &duplicate));
+    EXPECT_TRUE(duplicate == nullptr);
+
+    const DartPlantNativeApiEntries working_entries = {2, FakeHook, FakeUnhook};
+    dartplant::InstallHostApi(&working_entries);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
+    dartplant_release_hook(hook);
+}
+
+TEST_CASE(RetiredRuntimeHookRetainsBackendOwnership) {
+    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
+    dartplant::InstallHostApi(&entries);
+    g_fake_unhook_calls = 0;
+
+    auto generation = std::make_shared<std::atomic_uint64_t>(1);
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(RetiredReplacement),
+                                     reinterpret_cast<void*>(Replacement), &backup, &hook));
+    hook->runtime_generation = generation;
+    hook->expected_runtime_generation = 1;
+
+    dartplant::RetireRuntimeHooks(generation);
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_EQ(DARTPLANT_UNHOOK_FAILED, dartplant_unhook(hook));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+
+    DartPlantHook* duplicate = nullptr;
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_ALREADY_HOOKED,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(RetiredReplacement),
+                                     reinterpret_cast<void*>(Replacement), &backup, &duplicate));
+    EXPECT_TRUE(duplicate == nullptr);
+    dartplant_release_hook(hook);
+    dartplant_reset();
+    EXPECT_EQ(0, g_fake_unhook_calls);
+}
+
+TEST_CASE(RetiredRuntimeHookDoesNotBlockLaterGenerationInvalidation) {
+    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
+    dartplant::InstallHostApi(&entries);
+    g_fake_unhook_calls = 0;
+
+    auto generation = std::make_shared<std::atomic_uint64_t>(1);
+    DartPlantHook* retired = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(RetiredReplacementLater),
+                                     reinterpret_cast<void*>(Replacement), &backup, &retired));
+    retired->runtime_generation = generation;
+    retired->expected_runtime_generation = 1;
+    dartplant::RetireRuntimeHooks(generation);
+
+    generation->store(2, std::memory_order_release);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InvalidateRuntimeHooks(generation));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    dartplant_release_hook(retired);
+    dartplant_reset();
+}
+
 TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
     dartplant::InstallHostApi(&entries);
@@ -625,6 +749,15 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_TRUE(hook->code_target == method->function->code_target);
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
 
+    auto resolver_duplicate = *module;
+    resolver_duplicate.path += ".resolver-copy";
+    runtime->modules.push_back(std::move(resolver_duplicate));
+    DartPlantMethod* duplicate_safe_method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &duplicate_safe_method));
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(target),
+              dartplant_method_runtime_address(duplicate_safe_method));
+    dartplant_release_method(duplicate_safe_method);
+
     dartplant::NotifyRuntimeModuleLoaded("libunrelated.so", nullptr);
     EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
     EXPECT_EQ(DARTPLANT_RUNTIME_READY, runtime->state);
@@ -632,24 +765,48 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
     EXPECT_EQ(0, g_fake_unhook_calls);
 
-    for (auto& loaded_module : runtime->modules) {
-        if (loaded_module.name == "libdartplant_fixture.so") {
-            loaded_module.load_bias += 0x1000;
-            break;
-        }
-    }
+    auto ambiguous_modules = modules;
+    auto duplicate_module = *module;
+    duplicate_module.path += ".namespace-copy";
+    ambiguous_modules.push_back(std::move(duplicate_module));
     EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
-              dartplant_runtime_on_module_loaded(runtime, "libdartplant_fixture.so", fixture));
+              dartplant::RefreshRuntimeModules(runtime, ambiguous_modules));
     EXPECT_EQ(generation + 1, runtime->generation->load(std::memory_order_acquire));
+    EXPECT_EQ(DARTPLANT_RUNTIME_FAILED, runtime->state);
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_TRUE(!runtime->selected_app_module.has_value());
+    EXPECT_TRUE(!runtime->selected_runtime_module.has_value());
+    DartPlantHook* duplicate_hook = nullptr;
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallHook(reinterpret_cast<uintptr_t>(target),
+                                                   reinterpret_cast<void*>(Replacement), &backup,
+                                                   &duplicate_hook));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(duplicate_hook));
+    dartplant_release_hook(duplicate_hook);
+
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+    std::vector<dartplant::ModuleImage> missing_modules;
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant::RefreshRuntimeModules(runtime, missing_modules));
+    EXPECT_EQ(generation + 2, runtime->generation->load(std::memory_order_acquire));
     EXPECT_TRUE(!runtime->live_snapshot_index.has_value());
     EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
-    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_EQ(2, g_fake_unhook_calls);
     EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
     EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
     dartplant_release_hook(hook);
-    dartplant_release_method(method);
 
     SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+    DartPlantHook* stale_hook = nullptr;
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant_runtime_hook_method_raw(
+                  runtime, method, reinterpret_cast<void*>(Replacement), &backup, &stale_hook));
+    EXPECT_TRUE(stale_hook == nullptr);
+    dartplant_release_method(method);
+
     DartPlantMethod* destroy_method = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &destroy_method));
     DartPlantHook* destroy_hook = nullptr;
@@ -660,13 +817,46 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_TRUE(destroy_hook->active.load(std::memory_order_acquire));
     dartplant_runtime_destroy(runtime);
     EXPECT_TRUE(!destroy_hook->active.load(std::memory_order_acquire));
-    EXPECT_EQ(2, g_fake_unhook_calls);
+    EXPECT_EQ(3, g_fake_unhook_calls);
     EXPECT_TRUE(destroy_method->function->code_target->HookRecord() == nullptr);
     dartplant_release_hook(destroy_hook);
     dartplant_release_method(destroy_method);
     dartplant::NotifyRuntimeModuleLoaded("libafter-runtime-destroy.so", nullptr);
     dartplant_reset();
     dlclose(fixture);
+}
+
+TEST_CASE(RuntimeLiveVmCaptureRejectsForeignAndStaleInvocation) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    DartPlantRuntime* first = nullptr;
+    DartPlantRuntime* second = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &first));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &second));
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = "libapp.so";
+    snapshot.module_path = "/data/app/libapp.so";
+    snapshot.snapshot_hash = "capture-generation-test";
+    first->snapshot = snapshot;
+    second->snapshot = snapshot;
+
+    DartPlantMethod method{};
+    method.runtime_generation = first->generation;
+    method.expected_runtime_generation = first->generation->load(std::memory_order_acquire);
+    DartPlantHook hook{};
+    hook.runtime_generation = first->generation;
+    hook.expected_runtime_generation = method.expected_runtime_generation;
+    DartPlantInvocation invocation{};
+    invocation.requested_method = &method;
+    invocation.hook = &hook;
+
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, dartplant_runtime_capture_live_vm(second, &invocation));
+    first->generation->fetch_add(1, std::memory_order_acq_rel);
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, dartplant_runtime_capture_live_vm(first, &invocation));
+
+    dartplant_runtime_destroy(second);
+    dartplant_runtime_destroy(first);
 }
 
 TEST_CASE(RuntimeMethodResolutionRequiresAutomaticLiveFunctionIndex) {

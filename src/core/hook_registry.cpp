@@ -67,7 +67,8 @@ uintptr_t HookTarget(const DartPlantHook* hook) {
 
 DartPlantHook* FindHookLocked(uintptr_t target) {
     const auto found = std::find_if(Hooks().begin(), Hooks().end(), [target](const auto& hook) {
-        return HookTarget(hook.get()) == target && hook->active.load(std::memory_order_acquire);
+        std::lock_guard hook_lock(hook->mutex);
+        return HookTarget(hook.get()) == target && hook->state != HookRecordState::kUnhooked;
     });
     return found == Hooks().end() ? nullptr : found->get();
 }
@@ -118,6 +119,10 @@ DartPlantStatus UnhookRecordLocked(DartPlantHook* hook) {
     {
         std::lock_guard hook_lock(hook->mutex);
         if (hook->state == HookRecordState::kUnhooked) return DARTPLANT_OK;
+        if (hook->state == HookRecordState::kRetired) {
+            SetLastError("hook target mapping is retired and cannot be safely unhooked");
+            return DARTPLANT_UNHOOK_FAILED;
+        }
         if (hook->state == HookRecordState::kUnhooking) {
             return DARTPLANT_OK;
         }
@@ -161,17 +166,43 @@ void RefreshModules() {
     State().modules = EnumerateModules();
 }
 
-void InvalidateRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation) {
+DartPlantStatus InvalidateRuntimeHooks(
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation) {
+    if (runtime_generation == nullptr) return DARTPLANT_OK;
+    std::lock_guard lock(State().mutex);
+    DartPlantStatus status = DARTPLANT_OK;
+    for (const auto& hook : Hooks()) {
+        if (hook->runtime_generation != runtime_generation) continue;
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            if (hook->state == HookRecordState::kRetired) continue;
+        }
+        const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
+        if (unhook_status != DARTPLANT_OK) status = unhook_status;
+    }
+    return status;
+}
+
+void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation) {
     if (runtime_generation == nullptr) return;
     std::lock_guard lock(State().mutex);
     for (const auto& hook : Hooks()) {
-        if (hook->runtime_generation == runtime_generation) {
-            UnhookRecordLocked(hook.get());
+        if (hook->runtime_generation != runtime_generation) continue;
+        std::lock_guard hook_lock(hook->mutex);
+        if (hook->state == HookRecordState::kUnhooked) continue;
+        hook->active.store(false, std::memory_order_release);
+        for (const auto& listener : hook->listeners) {
+            listener->active.store(false, std::memory_order_release);
         }
+        hook->listeners.clear();
+        hook->state = HookRecordState::kRetired;
     }
 }
 
-bool IsTargetHooked(uintptr_t target) { return FindHookLocked(target) != nullptr; }
+bool IsTargetHooked(uintptr_t target) {
+    DartPlantHook* hook = FindHookLocked(target);
+    return hook != nullptr && hook->active.load(std::memory_order_acquire);
+}
 
 DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, void* replacement,
                             void** backup, DartPlantHook** out_hook) {
@@ -261,7 +292,10 @@ bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners) {
     if (hook == nullptr || listeners == nullptr) return false;
     std::lock_guard lock(hook->mutex);
-    if (!hook->has_method || hook->state == HookRecordState::kFailed) return false;
+    if (!hook->has_method || hook->state == HookRecordState::kFailed ||
+        hook->state == HookRecordState::kRetired) {
+        return false;
+    }
     if (hook->runtime_generation != nullptr &&
         hook->runtime_generation->load(std::memory_order_acquire) !=
             hook->expected_runtime_generation) {
@@ -289,7 +323,12 @@ void InvocationExited(DartPlantHook* hook) {
     }
     if (finish_unhook) {
         std::lock_guard state_lock(State().mutex);
-        FinishUnhookLocked(hook);
+        bool still_unhooking = false;
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            still_unhooking = hook->state == HookRecordState::kUnhooking;
+        }
+        if (still_unhooking) FinishUnhookLocked(hook);
     }
 }
 

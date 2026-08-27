@@ -14,6 +14,11 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* r
         dartplant::SetLastError("runtime method has no code target");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError("runtime is not ready for method hooks");
@@ -22,6 +27,10 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* r
     if (!runtime->profile_matched) {
         dartplant::SetLastError("runtime app image is not matched");
         return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
+        dartplant::SetLastError("method belongs to a stale or different runtime generation");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     const DartPlantStatus status =
         dartplant::InstallHook(method->function->code_target, replacement, backup, out_hook);
@@ -41,6 +50,11 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
         dartplant::SetLastError("runtime callback hook arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError("runtime is not ready for method hooks");
@@ -49,6 +63,10 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
     if (!runtime->profile_matched) {
         dartplant::SetLastError("runtime app image is not matched");
         return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
+        dartplant::SetLastError("method belongs to a stale or different runtime generation");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     return dartplant::InstallCallbackHook(method, runtime->profile.profile, *options, 0, out_hook,
@@ -65,6 +83,11 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
         dartplant::SetLastError("runtime profile hook arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError("runtime is not ready for method hooks");
@@ -73,6 +96,10 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
     if (!runtime->profile_matched) {
         dartplant::SetLastError("runtime app image is not matched");
         return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
+        dartplant::SetLastError("method belongs to a stale or different runtime generation");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     return dartplant::InstallCallbackHook(method, *profile, *options, 0, out_hook, nullptr,
@@ -89,6 +116,11 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
         dartplant::SetLastError("runtime listener arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
 
     std::lock_guard lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
@@ -98,6 +130,10 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
     if (!runtime->profile_matched) {
         dartplant::SetLastError("runtime app image is not matched");
         return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
+        dartplant::SetLastError("method belongs to a stale or different runtime generation");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
 

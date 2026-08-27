@@ -41,6 +41,7 @@ struct SnapshotFunction {
 
 struct SnapshotIndex {
     std::string module_name;
+    std::string module_path;
     std::string snapshot_hash;
     std::string build_id;
     std::string dart_version;

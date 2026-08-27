@@ -9,19 +9,43 @@
 #include "runtime/runtime_internal.h"
 
 namespace dartplant {
+
+struct RuntimeRegistration {
+    DartPlantRuntime* runtime = nullptr;
+    size_t active_operations = 0;
+    bool closing = false;
+    std::condition_variable idle;
+};
+
 namespace {
 
 bool BuildIdMatches(const ModuleImage& module, const std::string& expected) {
     return expected.empty() || EqualsIgnoreCaseAscii(module.build_id, expected);
 }
 
-std::optional<ModuleImage> ProfileModule(const std::vector<ModuleImage>& modules,
-                                         const std::string& name, const std::string& build_id) {
-    const auto module = FindModule(modules, name);
-    if (!module.has_value() || !BuildIdMatches(*module, build_id)) {
-        return std::nullopt;
+enum class ModuleSelectionState { kMissing, kUnique, kAmbiguous };
+
+struct ModuleSelection {
+    ModuleSelectionState state = ModuleSelectionState::kMissing;
+    std::optional<ModuleImage> module;
+};
+
+ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
+                                    const std::string& name, const std::string& build_id) {
+    const bool exact_path = name.find('/') != std::string::npos;
+    ModuleSelection selection;
+    for (const auto& module : modules) {
+        const bool name_matches = exact_path ? module.path == name : module.name == name;
+        if (!name_matches || !BuildIdMatches(module, build_id)) continue;
+        if (selection.module.has_value()) {
+            selection.state = ModuleSelectionState::kAmbiguous;
+            selection.module.reset();
+            return selection;
+        }
+        selection.state = ModuleSelectionState::kUnique;
+        selection.module = module;
     }
-    return module;
+    return selection;
 }
 
 void FillSnapshotInfo(const FlutterSnapshotSource& snapshot, DartPlantFlutterSnapshotInfo* info) {
@@ -64,6 +88,14 @@ bool SameModuleIdentity(const std::optional<ModuleImage>& left,
                       right->executable_ranges.begin(), SameExecutableRange);
 }
 
+bool ContainsModuleIdentity(const std::vector<ModuleImage>& modules,
+                            const std::optional<ModuleImage>& expected) {
+    if (!expected.has_value()) return false;
+    return std::any_of(modules.begin(), modules.end(), [&expected](const ModuleImage& module) {
+        return SameModuleIdentity(expected, std::optional<ModuleImage>(module));
+    });
+}
+
 bool SameSnapshotIdentity(const std::optional<FlutterSnapshotSource>& left,
                           const std::optional<FlutterSnapshotSource>& right) {
     if (left.has_value() != right.has_value()) return false;
@@ -94,26 +126,44 @@ std::mutex& RuntimeRegistryMutex() {
     return mutex;
 }
 
-std::vector<DartPlantRuntime*>& RuntimeRegistry() {
-    static std::vector<DartPlantRuntime*> runtimes;
+std::vector<std::shared_ptr<RuntimeRegistration>>& RuntimeRegistry() {
+    static std::vector<std::shared_ptr<RuntimeRegistration>> runtimes;
     return runtimes;
 }
 
 void RegisterRuntime(DartPlantRuntime* runtime) {
     std::lock_guard lock(RuntimeRegistryMutex());
-    RuntimeRegistry().push_back(runtime);
+    auto registration = std::make_shared<RuntimeRegistration>();
+    registration->runtime = runtime;
+    RuntimeRegistry().push_back(std::move(registration));
 }
 
-void UnregisterRuntime(DartPlantRuntime* runtime) {
+std::shared_ptr<RuntimeRegistration> CloseRuntime(DartPlantRuntime* runtime) {
+    std::unique_lock lock(RuntimeRegistryMutex());
+    const auto found = std::find_if(
+        RuntimeRegistry().begin(), RuntimeRegistry().end(),
+        [runtime](const auto& registration) { return registration->runtime == runtime; });
+    if (found == RuntimeRegistry().end()) return nullptr;
+    auto registration = *found;
+    registration->closing = true;
+    RuntimeRegistry().erase(found);
+    registration->idle.wait(lock, [&registration] { return registration->active_operations == 0; });
+    return registration;
+}
+
+void ReleaseRuntimeOperation(std::shared_ptr<RuntimeRegistration>* registration) {
+    if (registration == nullptr || *registration == nullptr) return;
     std::lock_guard lock(RuntimeRegistryMutex());
-    std::erase(RuntimeRegistry(), runtime);
+    auto current = std::move(*registration);
+    --current->active_operations;
+    if (current->closing && current->active_operations == 0) current->idle.notify_all();
 }
 
-DartPlantStatus ResolveLiveIndexedRuntimeMethod(const SnapshotIndex& index,
-                                                const std::vector<ModuleImage>& modules,
-                                                DartCodeTargetRegistry& code_targets,
-                                                const DartPlantMethodQuery& query,
-                                                DartPlantMethod** out_method) {
+DartPlantStatus ResolveLiveIndexedRuntimeMethod(
+    const SnapshotIndex& index, const ModuleImage& module, DartCodeTargetRegistry& code_targets,
+    const DartPlantMethodQuery& query,
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
+    uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
     bool ambiguous = false;
     const SnapshotFunction* record = index.FindSnapshotFunction(
         query.library_uri, query.class_name == nullptr ? "" : query.class_name, query.function_name,
@@ -127,9 +177,13 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(const SnapshotIndex& index,
         SetLastError("Dart method was not found in the live Function index");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
-    const auto module = FindModule(modules, index.module_name);
-    if (!module.has_value() ||
-        !module->ContainsExecutable(record->runtime_entry, record->code_size)) {
+    if (module.name != index.module_name ||
+        (!index.module_path.empty() && module.path != index.module_path) ||
+        !BuildIdMatches(module, index.build_id)) {
+        SetLastError("live Function index module identity does not match the selected app image");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!module.ContainsExecutable(record->runtime_entry, record->code_size)) {
         SetLastError("live Function index entry is outside executable module ranges");
         return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
     }
@@ -161,8 +215,10 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(const SnapshotIndex& index,
 
     auto* method = new DartPlantMethod;
     method->record = std::move(method_record);
-    method->module = *module;
+    method->module = module;
     method->function = std::move(function);
+    method->runtime_generation = runtime_generation;
+    method->expected_runtime_generation = expected_runtime_generation;
     *out_method = method;
     ClearLastError();
     return DARTPLANT_OK;
@@ -177,18 +233,81 @@ bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right) {
                                                      });
 }
 
+bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMethod* method) {
+    return runtime != nullptr && method != nullptr &&
+           method->runtime_generation == runtime->generation &&
+           method->expected_runtime_generation ==
+               runtime->generation->load(std::memory_order_acquire);
+}
+
+RuntimeOperationLease::RuntimeOperationLease(RuntimeOperationLease&& other) noexcept
+    : registration(std::move(other.registration)) {}
+
+RuntimeOperationLease& RuntimeOperationLease::operator=(RuntimeOperationLease&& other) noexcept {
+    if (this != &other) {
+        ReleaseRuntimeOperation(&registration);
+        registration = std::move(other.registration);
+    }
+    return *this;
+}
+
+RuntimeOperationLease::~RuntimeOperationLease() { ReleaseRuntimeOperation(&registration); }
+
+RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime) {
+    RuntimeOperationLease lease;
+    if (runtime == nullptr) return lease;
+    std::lock_guard lock(RuntimeRegistryMutex());
+    const auto found = std::find_if(
+        RuntimeRegistry().begin(), RuntimeRegistry().end(), [runtime](const auto& registration) {
+            return registration->runtime == runtime && !registration->closing;
+        });
+    if (found == RuntimeRegistry().end()) return lease;
+    ++(*found)->active_operations;
+    lease.registration = *found;
+    return lease;
+}
+
 DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                                       const std::vector<ModuleImage>& modules) {
     if (runtime == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     std::lock_guard lock(runtime->mutex);
 
-    const auto old_app = FindModule(runtime->modules, runtime->profile.app_module_name);
-    const auto old_dart_runtime =
-        FindModule(runtime->modules, runtime->profile.runtime_module_name);
-    const auto new_app = FindModule(modules, runtime->profile.app_module_name);
-    const auto new_dart_runtime = FindModule(modules, runtime->profile.runtime_module_name);
+    const auto old_app = runtime->selected_app_module;
+    const auto old_dart_runtime = runtime->selected_runtime_module;
+    const ModuleSelection app_selection = SelectProfileModule(
+        modules, runtime->profile.app_module_name, runtime->profile.app_build_id);
+    const ModuleSelection dart_runtime_selection = SelectProfileModule(
+        modules, runtime->profile.runtime_module_name, runtime->profile.runtime_build_id);
+    if (app_selection.state == ModuleSelectionState::kAmbiguous ||
+        dart_runtime_selection.state == ModuleSelectionState::kAmbiguous) {
+        const bool old_app_mapping_present = ContainsModuleIdentity(modules, old_app);
+        runtime->generation->fetch_add(1, std::memory_order_acq_rel);
+        DartPlantStatus invalidation_status = DARTPLANT_OK;
+        if (old_app.has_value() && !old_app_mapping_present) {
+            RetireRuntimeHooks(runtime->generation);
+        } else {
+            invalidation_status = InvalidateRuntimeHooks(runtime->generation);
+        }
+        runtime->code_targets.Clear();
+        runtime->snapshot.reset();
+        runtime->live_vm_context.reset();
+        runtime->live_vm_null_value = 0;
+        runtime->live_snapshot_index.reset();
+        runtime->live_function_index_info = {};
+        runtime->modules = modules;
+        runtime->selected_app_module.reset();
+        runtime->selected_runtime_module.reset();
+        runtime->profile_matched = false;
+        runtime->state = DARTPLANT_RUNTIME_FAILED;
+        if (invalidation_status != DARTPLANT_OK) return invalidation_status;
+        SetLastError("runtime profile module identity is ambiguous");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    const auto& new_app = app_selection.module;
+    const auto& new_dart_runtime = dart_runtime_selection.module;
     const bool app_changed = !SameModuleIdentity(old_app, new_app);
     const bool dart_runtime_changed = !SameModuleIdentity(old_dart_runtime, new_dart_runtime);
+    const bool old_app_mapping_present = ContainsModuleIdentity(modules, old_app);
 
     std::optional<FlutterSnapshotSource> snapshot;
     if (!app_changed && runtime->snapshot.has_value()) {
@@ -201,9 +320,20 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     const bool relevant_identity_changed = app_changed || dart_runtime_changed || snapshot_changed;
 
     runtime->modules = modules;
+    // Publish the selected current incarnations before invalidation can fail,
+    // so FAILED state reporting never describes an unloaded dependency.
+    runtime->selected_app_module = new_app;
+    runtime->selected_runtime_module = new_dart_runtime;
+    DartPlantStatus hook_invalidation_status = DARTPLANT_OK;
     if (relevant_identity_changed) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
-        InvalidateRuntimeHooks(runtime->generation);
+        if (app_changed && old_app.has_value() && !old_app_mapping_present) {
+            // The old app incarnation is confirmed absent. Its target address
+            // may be unmapped or reused, so only retire registry ownership.
+            RetireRuntimeHooks(runtime->generation);
+        } else {
+            hook_invalidation_status = InvalidateRuntimeHooks(runtime->generation);
+        }
         runtime->code_targets.Clear();
         runtime->snapshot = std::move(snapshot);
         runtime->live_vm_context.reset();
@@ -212,11 +342,12 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->live_function_index_info = {};
     }
 
-    const auto app = ProfileModule(runtime->modules, runtime->profile.app_module_name,
-                                   runtime->profile.app_build_id);
-    const auto dart_runtime = ProfileModule(runtime->modules, runtime->profile.runtime_module_name,
-                                            runtime->profile.runtime_build_id);
-    runtime->profile_matched = app.has_value() && dart_runtime.has_value();
+    if (hook_invalidation_status != DARTPLANT_OK) {
+        runtime->state = DARTPLANT_RUNTIME_FAILED;
+        return hook_invalidation_status;
+    }
+
+    runtime->profile_matched = new_app.has_value() && new_dart_runtime.has_value();
     if (!runtime->profile_matched) {
         runtime->state = DARTPLANT_RUNTIME_CREATED;
         SetLastError("runtime profile modules are not loaded or mismatch");
@@ -234,13 +365,37 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     return DARTPLANT_OK;
 }
 
-void NotifyRuntimeModuleLoaded(const char*, void*) {
+DartPlantStatus NotifyRuntimeModuleLoaded(const char*, void*) {
+    std::vector<RuntimeOperationLease> operations;
+    {
+        std::lock_guard lock(RuntimeRegistryMutex());
+        for (const auto& registration : RuntimeRegistry()) {
+            if (registration->closing) continue;
+            ++registration->active_operations;
+            RuntimeOperationLease lease;
+            lease.registration = registration;
+            operations.push_back(std::move(lease));
+        }
+    }
+    if (operations.empty()) return DARTPLANT_OK;
+
     const auto modules = EnumerateModules();
-    std::lock_guard lock(RuntimeRegistryMutex());
-    for (DartPlantRuntime* runtime : RuntimeRegistry()) {
-        RefreshRuntimeModules(runtime, modules);
+    DartPlantStatus status = DARTPLANT_OK;
+    std::string error;
+    for (const auto& operation : operations) {
+        const DartPlantStatus refresh_status =
+            RefreshRuntimeModules(operation.registration->runtime, modules);
+        if (refresh_status != DARTPLANT_OK && status == DARTPLANT_OK) {
+            status = refresh_status;
+            error = LastError();
+        }
+    }
+    if (status != DARTPLANT_OK) {
+        SetLastError(error.empty() ? "runtime module refresh failed" : error);
+        return status;
     }
     ClearLastError();
+    return DARTPLANT_OK;
 }
 
 DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
@@ -268,8 +423,12 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         !SameSemanticContext(*runtime->live_vm_context, runtime->live_vm_null_value, context,
                              validated_null_value)) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
-        InvalidateRuntimeHooks(runtime->generation);
+        const DartPlantStatus invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         runtime->code_targets.Clear();
+        if (invalidation_status != DARTPLANT_OK) {
+            runtime->state = DARTPLANT_RUNTIME_FAILED;
+            return invalidation_status;
+        }
     }
     runtime->live_vm_context = context;
     runtime->live_vm_null_value = validated_null_value;
@@ -309,9 +468,20 @@ DartPlantStatus dartplant_runtime_create(const DartPlantRuntimeProfile* profile,
 
 void dartplant_runtime_destroy(DartPlantRuntime* runtime) {
     if (runtime == nullptr) return;
-    dartplant::UnregisterRuntime(runtime);
+    if (dartplant::CloseRuntime(runtime) == nullptr) return;
+    const auto modules = dartplant::EnumerateModules();
+    bool app_mapping_is_current = false;
+    {
+        std::lock_guard lock(runtime->mutex);
+        app_mapping_is_current =
+            dartplant::ContainsModuleIdentity(modules, runtime->selected_app_module);
+    }
     runtime->generation->fetch_add(1, std::memory_order_acq_rel);
-    dartplant::InvalidateRuntimeHooks(runtime->generation);
+    if (app_mapping_is_current) {
+        dartplant::InvalidateRuntimeHooks(runtime->generation);
+    } else {
+        dartplant::RetireRuntimeHooks(runtime->generation);
+    }
     delete runtime;
 }
 
@@ -319,6 +489,11 @@ DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, co
     if (runtime == nullptr) {
         dartplant::SetLastError("runtime is null");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     auto modules = dartplant::EnumerateModules();
     return dartplant::RefreshRuntimeModules(runtime, modules);
@@ -331,16 +506,16 @@ DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime info arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     out_info->state = runtime->state;
     out_info->loaded_module_count = static_cast<uint32_t>(runtime->modules.size());
-    out_info->app_module_loaded =
-        dartplant::FindModule(runtime->modules, runtime->profile.app_module_name).has_value() ? 1
-                                                                                              : 0;
-    out_info->runtime_module_loaded =
-        dartplant::FindModule(runtime->modules, runtime->profile.runtime_module_name).has_value()
-            ? 1
-            : 0;
+    out_info->app_module_loaded = runtime->selected_app_module.has_value() ? 1 : 0;
+    out_info->runtime_module_loaded = runtime->selected_runtime_module.has_value() ? 1 : 0;
     out_info->live_function_index_ready = runtime->live_snapshot_index.has_value() ? 1 : 0;
     out_info->profile_matched = runtime->profile_matched ? 1 : 0;
     return DARTPLANT_OK;
@@ -351,6 +526,11 @@ DartPlantStatus dartplant_runtime_get_flutter_snapshot(const DartPlantRuntime* r
     if (runtime == nullptr || out_info == nullptr || out_info->struct_size < sizeof(*out_info)) {
         dartplant::SetLastError("runtime snapshot info arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->snapshot.has_value()) {
@@ -369,9 +549,25 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime live VM capture arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->snapshot.has_value()) {
         dartplant::SetLastError("Flutter snapshot source is not available for live VM capture");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    if (invocation->requested_method == nullptr ||
+        !dartplant::IsCurrentRuntimeMethod(runtime, invocation->requested_method) ||
+        invocation->hook == nullptr ||
+        invocation->hook->runtime_generation != runtime->generation ||
+        invocation->hook->expected_runtime_generation !=
+            runtime->generation->load(std::memory_order_acquire) ||
+        invocation->context == nullptr) {
+        dartplant::SetLastError(
+            "live VM capture invocation belongs to a stale or different runtime generation");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
 
@@ -436,15 +632,25 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime cold-bootstrap arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
 
     dartplant::FlutterSnapshotSource snapshot;
+    std::optional<dartplant::ModuleImage> app_module;
+    uint64_t generation = 0;
     {
         std::lock_guard lock(runtime->mutex);
-        if (!runtime->profile_matched || !runtime->snapshot.has_value()) {
+        if (!runtime->profile_matched || !runtime->snapshot.has_value() ||
+            !runtime->selected_app_module.has_value()) {
             dartplant::SetLastError("runtime images/snapshot are not ready for cold bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         snapshot = *runtime->snapshot;
+        app_module = runtime->selected_app_module;
+        generation = runtime->generation->load(std::memory_order_acquire);
     }
 
     DartPlantFlutterSnapshotInfo snapshot_info{};
@@ -461,10 +667,10 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
 
     {
         std::lock_guard lock(runtime->mutex);
-        if (!runtime->snapshot.has_value() ||
-            runtime->snapshot->snapshot_hash != snapshot.snapshot_hash ||
-            runtime->snapshot->module_build_id != snapshot.module_build_id) {
-            dartplant::SetLastError("runtime snapshot changed during cold bootstrap");
+        if (runtime->generation->load(std::memory_order_acquire) != generation ||
+            !dartplant::SameModuleIdentity(runtime->selected_app_module, app_module) ||
+            !dartplant::SameSnapshotIdentity(runtime->snapshot, snapshot)) {
+            dartplant::SetLastError("runtime incarnation changed during cold bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         const DartPlantStatus index_status = dartplant::BuildLiveIndexForContext(
@@ -484,15 +690,25 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
         dartplant::SetLastError("runtime register-bootstrap arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
 
     dartplant::FlutterSnapshotSource snapshot;
+    std::optional<dartplant::ModuleImage> app_module;
+    uint64_t generation = 0;
     {
         std::lock_guard lock(runtime->mutex);
-        if (!runtime->profile_matched || !runtime->snapshot.has_value()) {
+        if (!runtime->profile_matched || !runtime->snapshot.has_value() ||
+            !runtime->selected_app_module.has_value()) {
             dartplant::SetLastError("runtime images/snapshot are not ready for register bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         snapshot = *runtime->snapshot;
+        app_module = runtime->selected_app_module;
+        generation = runtime->generation->load(std::memory_order_acquire);
     }
 
     DartPlantFlutterSnapshotInfo snapshot_info{};
@@ -506,10 +722,10 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
 
     {
         std::lock_guard lock(runtime->mutex);
-        if (!runtime->snapshot.has_value() ||
-            runtime->snapshot->snapshot_hash != snapshot.snapshot_hash ||
-            runtime->snapshot->module_build_id != snapshot.module_build_id) {
-            dartplant::SetLastError("runtime snapshot changed during register bootstrap");
+        if (runtime->generation->load(std::memory_order_acquire) != generation ||
+            !dartplant::SameModuleIdentity(runtime->selected_app_module, app_module) ||
+            !dartplant::SameSnapshotIdentity(runtime->snapshot, snapshot)) {
+            dartplant::SetLastError("runtime incarnation changed during register bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         const DartPlantStatus index_status =
@@ -546,6 +762,11 @@ DartPlantStatus dartplant_runtime_get_function_index_info(
         dartplant::SetLastError("runtime Function index info arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->live_snapshot_index.has_value()) {
         dartplant::SetLastError("runtime live Function index is not available");
@@ -562,6 +783,11 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
         out_info->struct_size < sizeof(DartPlantLiveVmFunctionInfo)) {
         dartplant::SetLastError("runtime Function info arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->live_snapshot_index.has_value() ||
@@ -603,6 +829,11 @@ DartPlantStatus dartplant_runtime_read_global_object_pool_entry(
         dartplant::SetLastError("runtime ObjectPool entry arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->live_vm_context.has_value() || !runtime->snapshot.has_value()) {
         dartplant::SetLastError("runtime LiveVmContext is not available for ObjectPool lookup");
@@ -625,6 +856,11 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime method query is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     std::lock_guard lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError("runtime is not ready for method resolution");
@@ -640,8 +876,13 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
             "method query is outside the supported live Function-index identity domain");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
+    if (!runtime->selected_app_module.has_value()) {
+        dartplant::SetLastError("runtime app module identity is not selected");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     return dartplant::ResolveLiveIndexedRuntimeMethod(
-        *runtime->live_snapshot_index, runtime->modules, runtime->code_targets, *query, out_method);
+        *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->code_targets, *query,
+        runtime->generation, runtime->generation->load(std::memory_order_acquire), out_method);
 }
 
 }  // extern "C"

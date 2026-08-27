@@ -49,6 +49,9 @@ The current implementation provides:
 - Per-thread invocation depth and nested call tracking.
 - Shared HookChain listeners with priority ordering and safe removal snapshots.
 - Host unit tests and standalone ARM64 Android Dobby integration tests.
+- LSPosed `native_init` lifecycle adapter with already-loaded image rescan,
+  dependency-load refresh, module identity selection, and runtime-generation
+  fail-closed invalidation.
 
 The runtime API is intentionally separate from the legacy process-global API:
 
@@ -149,7 +152,11 @@ process-wide signal sampler remains a fallback for hosts without such a mutator
 entry. Current production limitations are profile coverage and ABI scope, not
 metadata availability: live VM resolver v1 is currently tied to its validated
 Dart/Flutter ARM64 AOT raw-layout profile, while other profiles fail closed.
-LSPosed lifecycle integration remains a separate host concern.
+The optional LSPosed adapter owns loader-facing lifecycle only: it validates and
+stores the host entries, refreshes the process module inventory on initialization
+and every module-loaded callback, and lets each runtime instance select its own
+app/runtime image incarnation. The core resolver remains independent of Vector's
+Java/Kotlin APIs.
 
 The ARM64 device regression currently proves the public runtime method hook API
 with a standalone Dobby host backend, including enter, original call, leave,

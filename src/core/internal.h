@@ -75,6 +75,9 @@ enum class HookRecordState {
     kUnhooking,
     kUnhooked,
     kFailed,
+    // The target mapping disappeared before the backend could safely restore
+    // its bytes. Keep ownership and executable stubs for process lifetime.
+    kRetired,
 };
 
 struct DartPlantListenerRecord {
@@ -109,7 +112,9 @@ std::string FingerprintCode(const void* address, size_t size);
 
 void InstallHostApi(const DartPlantNativeApiEntries* entries);
 void RefreshModules();
-void InvalidateRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
+DartPlantStatus InvalidateRuntimeHooks(
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
+void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 
 DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, void* replacement,
                             void** backup, DartPlantHook** out_hook);
@@ -148,6 +153,8 @@ struct DartPlantMethod {
     dartplant::MethodRecord record;
     dartplant::ModuleImage module;
     std::shared_ptr<dartplant::DartFunctionHandle> function;
+    std::shared_ptr<std::atomic_uint64_t> runtime_generation;
+    uint64_t expected_runtime_generation = 0;
 };
 
 namespace dartplant {

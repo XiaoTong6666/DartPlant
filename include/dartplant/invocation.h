@@ -46,7 +46,9 @@ typedef enum DartPlantValueKind {
 typedef struct DartPlantValue {
     DartPlantValueKind kind;
     uint32_t reserved;
-    uint64_t raw;  // Opaque raw bits: tagged word or IEEE-754 payload.
+    // Kind-dependent payload. RAW_WORD/SMI/HEAP_OBJECT keep the VM word,
+    // DOUBLE keeps the IEEE-754 bits, and BOOL uses the semantic value 0 or 1.
+    uint64_t raw;
 } DartPlantValue;
 
 typedef struct DartPlantArm64Context {

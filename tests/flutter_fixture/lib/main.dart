@@ -20,6 +20,14 @@ Object? nullableEchoObject(Object? value) {
   return value;
 }
 
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+bool negateBool(bool value) => !value;
+
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final initializeStartStatus = DartPlantNative.startInitialize();
@@ -41,6 +49,13 @@ Future<void> main() async {
     final nullProbe = DartPlantNative.nullSemanticProbe();
     debugPrint(
       'DartPlant null semantic probe: $nullProbe values=$canonicalNull/$rewrittenToNull',
+    );
+    DartPlantNative.resetBoolSemanticProbe();
+    final boolTrue = negateBool(false);
+    final boolFalse = negateBool(true);
+    final boolProbe = DartPlantNative.boolSemanticProbe();
+    debugPrint(
+      'DartPlant bool semantic probe: $boolProbe values=$boolTrue/$boolFalse',
     );
     DartPlantNative.resetInstrumentedAddProbe();
     for (var index = 0; index < 5; ++index) {

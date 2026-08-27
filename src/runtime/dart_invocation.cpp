@@ -42,6 +42,67 @@ uint64_t ActiveValidatedNullValue(const DartPlantInvocation* invocation) {
                : 0;
 }
 
+bool ActiveValidatedBoolValues(const DartPlantInvocation* invocation, uint64_t* out_true,
+                               uint64_t* out_false) {
+    if (invocation == nullptr || out_true == nullptr || out_false == nullptr) return false;
+    if (invocation->hook != nullptr && invocation->hook->runtime_generation != nullptr &&
+        invocation->hook->runtime_generation->load(std::memory_order_acquire) !=
+            invocation->hook->expected_runtime_generation) {
+        return false;
+    }
+    const uint64_t bool_true = invocation->validated_bool_true_value;
+    const uint64_t bool_false = invocation->validated_bool_false_value;
+    if (bool_true == 0 || bool_false == 0 || bool_true == bool_false) return false;
+    *out_true = bool_true;
+    *out_false = bool_false;
+    return true;
+}
+
+DartPlantValue RefineTaggedSemanticValue(const DartPlantInvocation* invocation,
+                                         DartPlantValue value) {
+    if (value.kind != DARTPLANT_VALUE_HEAP_OBJECT) return value;
+    uint64_t bool_true = 0;
+    uint64_t bool_false = 0;
+    if (!ActiveValidatedBoolValues(invocation, &bool_true, &bool_false)) return value;
+    if (value.raw == bool_true) return {DARTPLANT_VALUE_BOOL, 0, 1};
+    if (value.raw == bool_false) return {DARTPLANT_VALUE_BOOL, 0, 0};
+    return value;
+}
+
+DartPlantStatus EncodeGpSemanticValue(const DartPlantInvocation* invocation,
+                                      const DartPlantValue* value, bool is_tagged,
+                                      uint64_t* out_raw) {
+    if (value == nullptr || out_raw == nullptr) {
+        dartplant::SetLastError("GP semantic value encoding arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (value->kind != DARTPLANT_VALUE_BOOL) {
+        return dartplant::dartplant_vm_abi_encode_gp_word(
+            value, is_tagged, ActiveValidatedNullValue(invocation), out_raw);
+    }
+    if (!is_tagged) {
+        dartplant::SetLastError("Bool value encoding requires a tagged GP location");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (value->raw > 1) {
+        dartplant::SetLastError("Bool semantic values must use raw=0 or raw=1");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    uint64_t bool_true = 0;
+    uint64_t bool_false = 0;
+    if (!ActiveValidatedBoolValues(invocation, &bool_true, &bool_false)) {
+        dartplant::SetLastError("Bool value encoding requires validated canonical Bool roots");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    const DartPlantValue heap_value = {
+        DARTPLANT_VALUE_HEAP_OBJECT,
+        0,
+        value->raw != 0 ? bool_true : bool_false,
+    };
+    return dartplant::dartplant_vm_abi_encode_gp_word(
+        &heap_value, true, ActiveValidatedNullValue(invocation), out_raw);
+}
+
 bool ReadLocation(const DartPlantInvocation* invocation, const DartPlantAbiLocation& location,
                   uint64_t* out_value) {
     if (location.kind == DARTPLANT_ABI_FP_REGISTER) {
@@ -192,9 +253,10 @@ DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* inv
     }
     *out_value = location.kind == DARTPLANT_ABI_FP_REGISTER
                      ? dartplant::dartplant_vm_abi_decode_fp_word(raw)
-                     : dartplant::dartplant_vm_abi_decode_gp_word(
-                           raw, TaggedArgumentAccessEnabled(invocation),
-                           ActiveValidatedNullValue(invocation));
+                     : RefineTaggedSemanticValue(invocation,
+                                                 dartplant::dartplant_vm_abi_decode_gp_word(
+                                                     raw, TaggedArgumentAccessEnabled(invocation),
+                                                     ActiveValidatedNullValue(invocation)));
     return DARTPLANT_OK;
 }
 
@@ -211,11 +273,11 @@ DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocatio
     }
     const auto& location = invocation->profile->argument_locations[index];
     uint64_t raw = 0;
-    const DartPlantStatus status = location.kind == DARTPLANT_ABI_FP_REGISTER
-                                       ? dartplant::dartplant_vm_abi_encode_fp_word(value, &raw)
-                                       : dartplant::dartplant_vm_abi_encode_gp_word(
-                                             value, TaggedArgumentAccessEnabled(invocation),
-                                             ActiveValidatedNullValue(invocation), &raw);
+    const DartPlantStatus status =
+        location.kind == DARTPLANT_ABI_FP_REGISTER
+            ? dartplant::dartplant_vm_abi_encode_fp_word(value, &raw)
+            : EncodeGpSemanticValue(invocation, value, TaggedArgumentAccessEnabled(invocation),
+                                    &raw);
     if (status != DARTPLANT_OK) {
         return status;
     }
@@ -304,8 +366,9 @@ DartPlantStatus dartplant_invocation_get_result(const DartPlantInvocation* invoc
     *out_value =
         invocation->profile->result_location.kind == DARTPLANT_ABI_FP_REGISTER
             ? dartplant::dartplant_vm_abi_decode_fp_word(raw)
-            : dartplant::dartplant_vm_abi_decode_gp_word(raw, TaggedResultAccessEnabled(invocation),
-                                                         ActiveValidatedNullValue(invocation));
+            : RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                        raw, TaggedResultAccessEnabled(invocation),
+                                                        ActiveValidatedNullValue(invocation)));
     return DARTPLANT_OK;
 }
 
@@ -319,9 +382,7 @@ DartPlantStatus dartplant_invocation_set_result(DartPlantInvocation* invocation,
     const DartPlantStatus status =
         invocation->profile->result_location.kind == DARTPLANT_ABI_FP_REGISTER
             ? dartplant::dartplant_vm_abi_encode_fp_word(value, &raw)
-            : dartplant::dartplant_vm_abi_encode_gp_word(
-                  value, TaggedResultAccessEnabled(invocation),
-                  ActiveValidatedNullValue(invocation), &raw);
+            : EncodeGpSemanticValue(invocation, value, TaggedResultAccessEnabled(invocation), &raw);
     if (status != DARTPLANT_OK) {
         return status;
     }

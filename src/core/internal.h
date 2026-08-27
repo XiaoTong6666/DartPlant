@@ -133,7 +133,9 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
                                     DartPlantHook** out_hook, DartPlantListener** out_listener,
                                     uint64_t validated_null_value = 0,
                                     std::shared_ptr<std::atomic_uint64_t> runtime_generation = {},
-                                    uint64_t expected_runtime_generation = 0);
+                                    uint64_t expected_runtime_generation = 0,
+                                    uint64_t validated_bool_true_value = 0,
+                                    uint64_t validated_bool_false_value = 0);
 DartPlantStatus AddCallbackListener(
     DartPlantHook* hook, const DartPlantMethod* requested_method,
     const DartPlantHookOptions& options, int32_t priority, DartPlantListener** out_listener,
@@ -211,6 +213,8 @@ struct DartPlantHook {
     DartPlantHookOptions options{};
     DartPlantVmAdapter* vm_adapter = nullptr;
     uint64_t validated_null_value = 0;
+    uint64_t validated_bool_true_value = 0;
+    uint64_t validated_bool_false_value = 0;
     const dartplant::HostApiBinding* host_binding = nullptr;
     std::shared_ptr<std::atomic_uint64_t> runtime_generation;
     uint64_t expected_runtime_generation = 0;

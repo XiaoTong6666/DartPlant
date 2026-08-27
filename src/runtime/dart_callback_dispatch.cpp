@@ -109,6 +109,8 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     frame.invocation.depth = g_depth;
     frame.invocation.vm_adapter = hook->vm_adapter;
     frame.invocation.validated_null_value = hook->validated_null_value;
+    frame.invocation.validated_bool_true_value = hook->validated_bool_true_value;
+    frame.invocation.validated_bool_false_value = hook->validated_bool_false_value;
 
     if (frame.invocation.vm_adapter != nullptr) {
         if (dartplant_vm_enter_scope(frame.invocation.vm_adapter) != DARTPLANT_OK) {

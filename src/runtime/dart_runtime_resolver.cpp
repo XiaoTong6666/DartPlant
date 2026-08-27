@@ -116,13 +116,16 @@ bool SameSnapshotIdentity(const std::optional<FlutterSnapshotSource>& left,
 }
 
 bool SameSemanticContext(const DartPlantLiveVmContext& left, uint64_t left_null,
-                         const DartPlantLiveVmContext& right, uint64_t right_null) {
+                         uint64_t left_bool_true, uint64_t left_bool_false,
+                         const DartPlantLiveVmContext& right, uint64_t right_null,
+                         uint64_t right_bool_true, uint64_t right_bool_false) {
     return left.profile_version == right.profile_version && left.isolate == right.isolate &&
            left.isolate_group == right.isolate_group && left.class_table == right.class_table &&
            left.cached_class_table_table == right.cached_class_table_table &&
            left.object_store == right.object_store && left.heap_base == right.heap_base &&
            left.pp == right.pp && left.global_object_pool == right.global_object_pool &&
-           left.object_pool_length == right.object_pool_length && left_null == right_null;
+           left.object_pool_length == right.object_pool_length && left_null == right_null &&
+           left_bool_true == right_bool_true && left_bool_false == right_bool_false;
 }
 
 std::mutex& RuntimeRegistryMutex() {
@@ -332,6 +335,8 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->snapshot.reset();
         runtime->live_vm_context.reset();
         runtime->live_vm_null_value = 0;
+        runtime->live_vm_bool_true_value = 0;
+        runtime->live_vm_bool_false_value = 0;
         runtime->live_snapshot_index.reset();
         runtime->live_function_index_info = {};
         runtime->modules = modules;
@@ -378,6 +383,8 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->snapshot = std::move(snapshot);
         runtime->live_vm_context.reset();
         runtime->live_vm_null_value = 0;
+        runtime->live_vm_bool_true_value = 0;
+        runtime->live_vm_bool_false_value = 0;
         runtime->live_snapshot_index.reset();
         runtime->live_function_index_info = {};
     }
@@ -487,6 +494,15 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     DartPlantFlutterSnapshotInfo snapshot_info{};
     snapshot_info.struct_size = sizeof(snapshot_info);
     FillSnapshotInfo(snapshot, &snapshot_info);
+    DartPlantLiveVmProfile profile{};
+    profile.struct_size = sizeof(profile);
+    DartPlantStatus status = dartplant_live_vm_select_profile(&snapshot_info, &profile);
+    if (status != DARTPLANT_OK) return status;
+    uint64_t bool_true_value = 0;
+    uint64_t bool_false_value = 0;
+    status = ResolveLiveVmCanonicalBoolRoots(context, profile, &bool_true_value, &bool_false_value);
+    if (status != DARTPLANT_OK) return status;
+
     DartPlantLiveVmFunctionIndexInfo index_info{};
     index_info.struct_size = sizeof(index_info);
     std::string error;
@@ -496,8 +512,9 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     if (runtime->live_vm_context.has_value() &&
-        !SameSemanticContext(*runtime->live_vm_context, runtime->live_vm_null_value, context,
-                             validated_null_value)) {
+        !SameSemanticContext(*runtime->live_vm_context, runtime->live_vm_null_value,
+                             runtime->live_vm_bool_true_value, runtime->live_vm_bool_false_value,
+                             context, validated_null_value, bool_true_value, bool_false_value)) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
         const DartPlantStatus invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         runtime->code_targets.Clear();
@@ -508,6 +525,8 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     }
     runtime->live_vm_context = context;
     runtime->live_vm_null_value = validated_null_value;
+    runtime->live_vm_bool_true_value = bool_true_value;
+    runtime->live_vm_bool_false_value = bool_false_value;
     runtime->live_snapshot_index = std::move(index);
     runtime->live_function_index_info = index_info;
     runtime->state = DARTPLANT_RUNTIME_READY;
@@ -896,6 +915,73 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
     *out_info = info;
     dartplant::ClearLastError();
     return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_runtime_get_method_signature(
+    const DartPlantRuntime* runtime, const DartPlantMethod* method,
+    DartPlantDartFunctionSignatureInfo* out_signature) {
+    if (runtime == nullptr || method == nullptr || out_signature == nullptr ||
+        out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo)) {
+        dartplant::SetLastError("runtime method signature arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    std::lock_guard lock(runtime->mutex);
+    if (runtime->state != DARTPLANT_RUNTIME_READY || !runtime->live_vm_context.has_value() ||
+        !runtime->snapshot.has_value()) {
+        dartplant::SetLastError("runtime LiveVmContext is not available for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method) || method->function == nullptr ||
+        method->function->source != dartplant::DartFunctionSource::kLiveVm ||
+        method->function->function_object == 0) {
+        dartplant::SetLastError("method is stale or has no live Function object");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    DartPlantFlutterSnapshotInfo snapshot_info{};
+    snapshot_info.struct_size = sizeof(snapshot_info);
+    dartplant::FillSnapshotInfo(*runtime->snapshot, &snapshot_info);
+    return dartplant_live_vm_read_function_signature(&*runtime->live_vm_context, &snapshot_info,
+                                                     method->function->function_object,
+                                                     out_signature);
+}
+
+DartPlantStatus dartplant_runtime_get_method_parameter(const DartPlantRuntime* runtime,
+                                                       const DartPlantMethod* method,
+                                                       uint32_t index,
+                                                       DartPlantDartParameterInfo* out_parameter) {
+    if (runtime == nullptr || method == nullptr || out_parameter == nullptr ||
+        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo)) {
+        dartplant::SetLastError("runtime method parameter arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    std::lock_guard lock(runtime->mutex);
+    if (runtime->state != DARTPLANT_RUNTIME_READY || !runtime->live_vm_context.has_value() ||
+        !runtime->snapshot.has_value()) {
+        dartplant::SetLastError("runtime LiveVmContext is not available for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    if (!dartplant::IsCurrentRuntimeMethod(runtime, method) || method->function == nullptr ||
+        method->function->source != dartplant::DartFunctionSource::kLiveVm ||
+        method->function->function_object == 0) {
+        dartplant::SetLastError("method is stale or has no live Function object");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    DartPlantFlutterSnapshotInfo snapshot_info{};
+    snapshot_info.struct_size = sizeof(snapshot_info);
+    dartplant::FillSnapshotInfo(*runtime->snapshot, &snapshot_info);
+    return dartplant_live_vm_read_function_parameter(&*runtime->live_vm_context, &snapshot_info,
+                                                     method->function->function_object, index,
+                                                     out_parameter);
 }
 
 DartPlantStatus dartplant_runtime_read_global_object_pool_entry(

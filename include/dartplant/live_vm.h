@@ -9,6 +9,7 @@
 #include "dartplant/dartplant.h"
 #include "dartplant/flutter_snapshot.h"
 #include "dartplant/invocation.h"
+#include "dartplant/signature.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -325,6 +326,16 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_live_vm_find_method(
     const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
     const char* library_uri, const char* class_name, const char* function_name,
     DartPlantLiveVmMethodInfo* out_method);
+
+// Parses the retained Function.signature FunctionType directly from the live VM.
+// AOT may drop signatures that are not required by entry-point or dynamic-call
+// semantics; such functions fail closed instead of reconstructing types from code.
+DARTPLANT_EXPORT DartPlantStatus dartplant_live_vm_read_function_signature(
+    const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
+    uint64_t function, DartPlantDartFunctionSignatureInfo* out_signature);
+DARTPLANT_EXPORT DartPlantStatus dartplant_live_vm_read_function_parameter(
+    const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
+    uint64_t function, uint32_t index, DartPlantDartParameterInfo* out_parameter);
 
 // Enumerates the runtime Function graph reconstructed from Class.functions and
 // Library.toplevel_class. This is the production replacement for precomputed

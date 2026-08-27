@@ -11,6 +11,7 @@
 #include "dartplant/invocation.h"
 #include "dartplant/live_vm.h"
 #include "dartplant/runtime_profile.h"
+#include "dartplant/signature.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +82,16 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_index_info(
     const DartPlantRuntime* runtime, DartPlantLiveVmFunctionIndexInfo* out_info);
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_info(
     const DartPlantRuntime* runtime, uint32_t index, DartPlantLiveVmFunctionInfo* out_info);
+
+// Reads the retained Dart FunctionType for a live runtime method. A stale method
+// or an AOT-dropped Function.signature fails closed; no ABI is inferred here.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_method_signature(
+    const DartPlantRuntime* runtime, const DartPlantMethod* method,
+    DartPlantDartFunctionSignatureInfo* out_signature);
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_method_parameter(
+    const DartPlantRuntime* runtime, const DartPlantMethod* method, uint32_t index,
+    DartPlantDartParameterInfo* out_parameter);
+
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_read_global_object_pool_entry(
     const DartPlantRuntime* runtime, uint32_t index, DartPlantObjectPoolEntryInfo* out_entry);
 

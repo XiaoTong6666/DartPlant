@@ -115,6 +115,9 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
         if (
             "cold bootstrap status=" in latest
             and "DartPlant initialize status:" in latest
+            and "DartPlant FunctionType semantic probe:" in latest
+            and "DartPlant FunctionType named semantic probe:" in latest
+            and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
         ):
             return latest
@@ -153,6 +156,14 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(f"cold start {round_index}: hook probe did not return 115\n{logs}")
     if "DartPlant null semantic probe: 1 values=null/null" not in logs:
         raise RuntimeError(f"cold start {round_index}: null semantic probe failed\n{logs}")
+    if "DartPlant FunctionType semantic probe: 1" not in logs:
+        raise RuntimeError(f"cold start {round_index}: FunctionType semantic probe failed\n{logs}")
+    if "DartPlant FunctionType named semantic probe: 1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: generic/named FunctionType semantic probe failed\n{logs}"
+        )
+    if "DartPlant bool semantic probe: 1 values=false/true" not in logs:
+        raise RuntimeError(f"cold start {round_index}: bool semantic probe failed\n{logs}")
     if "runtime live-vm lookup addInt ok" not in logs or "model_ok=1" not in logs:
         raise RuntimeError(f"cold start {round_index}: live model regression failed\n{logs}")
     required_shared_markers = (

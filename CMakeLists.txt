@@ -184,6 +184,7 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         tests/metadata_test.cc
         tests/hook_registry_test.cc
         tests/runtime_test.cc
+        tests/live_vm_signature_test.cc
         tests/snapshot_index_test.cc
         tests/flutter_snapshot_test.cc
     )

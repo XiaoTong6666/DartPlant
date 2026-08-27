@@ -981,7 +981,7 @@ TEST_CASE(InvocationDecodesAndEncodesValidatedDartNull) {
               dartplant_invocation_set_argument(&raw_invocation, 0, &null_value));
     EXPECT_EQ(kCanonicalNull, raw_context.x[1]);
 
-    const DartPlantValue bool_value = {DARTPLANT_VALUE_BOOL, 0, kCanonicalNull};
+    const DartPlantValue bool_value = {DARTPLANT_VALUE_BOOL, 0, 1};
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant_invocation_set_argument(&invocation, 0, &bool_value));
 
@@ -995,6 +995,82 @@ TEST_CASE(InvocationDecodesAndEncodesValidatedDartNull) {
     EXPECT_EQ(DARTPLANT_VALUE_RAW_WORD, value.kind);
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant_invocation_set_argument(&untagged_invocation, 0, &null_value));
+}
+
+TEST_CASE(InvocationDecodesAndEncodesValidatedCanonicalDartBool) {
+    constexpr uint64_t kCanonicalTrue = 0x7300000011;
+    constexpr uint64_t kCanonicalFalse = 0x7300000021;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
+                    DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+    profile.argument_count = 1;
+    profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    DartPlantArm64Context context{};
+    context.x[0] = kCanonicalFalse;
+    context.x[1] = kCanonicalTrue;
+    DartPlantInvocation invocation{};
+    invocation.profile = &profile;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_LEAVE;
+    invocation.validated_bool_true_value = kCanonicalTrue;
+    invocation.validated_bool_false_value = kCanonicalFalse;
+
+    DartPlantValue value{};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_BOOL, value.kind);
+    EXPECT_EQ(1ULL, value.raw);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_result(&invocation, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_BOOL, value.kind);
+    EXPECT_EQ(0ULL, value.raw);
+
+    const DartPlantValue semantic_true = {DARTPLANT_VALUE_BOOL, 0, 1};
+    const DartPlantValue semantic_false = {DARTPLANT_VALUE_BOOL, 0, 0};
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_set_argument(&invocation, 0, &semantic_true));
+    EXPECT_EQ(kCanonicalTrue, context.x[1]);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_set_argument(&invocation, 0, &semantic_false));
+    EXPECT_EQ(kCanonicalFalse, context.x[1]);
+
+    invocation.phase = DARTPLANT_INVOCATION_LEAVE;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_set_result(&invocation, &semantic_true));
+    EXPECT_EQ(kCanonicalTrue, context.x[0]);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_result(&invocation, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_BOOL, value.kind);
+    EXPECT_EQ(1ULL, value.raw);
+
+    const DartPlantValue invalid_bool = {DARTPLANT_VALUE_BOOL, 0, 2};
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant_invocation_set_result(&invocation, &invalid_bool));
+    EXPECT_EQ(kCanonicalTrue, context.x[0]);
+
+    DartPlantRuntimeProfile raw_profile = profile;
+    raw_profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    invocation.profile = &raw_profile;
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_RAW_WORD, value.kind);
+    EXPECT_EQ(kCanonicalFalse, value.raw);
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant_invocation_set_argument(&invocation, 0, &semantic_true));
+    EXPECT_EQ(kCanonicalFalse, context.x[1]);
+
+    auto generation = std::make_shared<std::atomic_uint64_t>(7);
+    DartPlantHook hook{};
+    hook.runtime_generation = generation;
+    hook.expected_runtime_generation = 7;
+    invocation.profile = &profile;
+    invocation.hook = &hook;
+    context.x[1] = kCanonicalTrue;
+    generation->store(8, std::memory_order_release);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_HEAP_OBJECT, value.kind);
+    EXPECT_EQ(kCanonicalTrue, value.raw);
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant_invocation_set_argument(&invocation, 0, &semantic_false));
+    EXPECT_EQ(kCanonicalTrue, context.x[1]);
 }
 
 TEST_CASE(InvocationRejectsUntypedProfile) {

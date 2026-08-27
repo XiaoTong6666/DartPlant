@@ -346,13 +346,12 @@ void InvocationExited(DartPlantHook* hook) {
     }
 }
 
-DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
-                                    const DartPlantRuntimeProfile& profile,
-                                    const DartPlantHookOptions& options, int32_t priority,
-                                    DartPlantHook** out_hook, DartPlantListener** out_listener,
-                                    uint64_t validated_null_value,
-                                    std::shared_ptr<std::atomic_uint64_t> runtime_generation,
-                                    uint64_t expected_runtime_generation) {
+DartPlantStatus InstallCallbackHook(
+    const DartPlantMethod* method, const DartPlantRuntimeProfile& profile,
+    const DartPlantHookOptions& options, int32_t priority, DartPlantHook** out_hook,
+    DartPlantListener** out_listener, uint64_t validated_null_value,
+    std::shared_ptr<std::atomic_uint64_t> runtime_generation, uint64_t expected_runtime_generation,
+    uint64_t validated_bool_true_value, uint64_t validated_bool_false_value) {
     const uintptr_t target = MethodTarget(method);
     if (target == 0 || method == nullptr || method->function == nullptr ||
         method->function->code_target == nullptr ||
@@ -388,6 +387,8 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
     hook->options = options;
     hook->vm_adapter = options.vm_adapter;
     hook->validated_null_value = validated_null_value;
+    hook->validated_bool_true_value = validated_bool_true_value;
+    hook->validated_bool_false_value = validated_bool_false_value;
     hook->host_binding = host_binding;
     hook->runtime_generation = std::move(runtime_generation);
     hook->expected_runtime_generation = expected_runtime_generation;

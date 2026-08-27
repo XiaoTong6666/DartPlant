@@ -22,8 +22,11 @@ DartPlantRuntime* g_runtime = nullptr;
 DartPlantMethod* g_instrumented_add = nullptr;
 DartPlantMethod* g_add_int = nullptr;
 DartPlantMethod* g_echo_object = nullptr;
+DartPlantMethod* g_negate_bool = nullptr;
+DartPlantMethod* g_signature_probe = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
+DartPlantHook* g_negate_bool_hook = nullptr;
 DartPlantListener* g_add_int_listener = nullptr;
 DartPlantFlutterSnapshotInfo g_snapshot_info{};
 std::atomic_flag g_object_bridge_probe = ATOMIC_FLAG_INIT;
@@ -44,6 +47,9 @@ std::atomic<uint64_t> g_null_passthrough_count = 0;
 std::atomic<uint64_t> g_null_result_overrides = 0;
 std::atomic<uint64_t> g_null_result_count = 0;
 std::atomic<uint64_t> g_null_semantic_failures = 0;
+std::atomic<uint64_t> g_bool_true_results = 0;
+std::atomic<uint64_t> g_bool_false_results = 0;
+std::atomic<uint64_t> g_bool_semantic_failures = 0;
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -257,13 +263,24 @@ void OnEchoObjectLeave(DartPlantInvocation* invocation, void*) {
     g_null_result_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-[[maybe_unused]] void OnBoolLeave(DartPlantInvocation* invocation, void*) {
+void OnBoolLeave(DartPlantInvocation* invocation, void*) {
     DartPlantValue value{};
-    if (dartplant_invocation_get_result(invocation, &value) == DARTPLANT_OK) {
-        __android_log_print(ANDROID_LOG_INFO, kTag, "bool result raw=0x%llx",
-                            static_cast<unsigned long long>(value.raw));
-        // Observation only. Native code must not write a Dart heap reference
-        // without a VM-managed handle.
+    if (dartplant_invocation_get_result(invocation, &value) != DARTPLANT_OK ||
+        value.kind != DARTPLANT_VALUE_BOOL || value.raw > 1) {
+        LogFailure("bool result semantic decode");
+        g_bool_semantic_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (value.raw != 0) {
+        g_bool_true_results.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_bool_false_results.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const DartPlantValue replacement = {DARTPLANT_VALUE_BOOL, 0, value.raw == 0 ? 1ULL : 0ULL};
+    if (dartplant_invocation_set_result(invocation, &replacement) != DARTPLANT_OK) {
+        LogFailure("bool result semantic encode");
+        g_bool_semantic_failures.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -565,6 +582,146 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         return;
     }
 
+    if (!FindLiveTopLevelMethod("negateBool", &g_negate_bool)) {
+        LogFailure("bool live resolution");
+        g_cold_bootstrap_status.store(DARTPLANT_METHOD_NOT_FOUND, std::memory_order_release);
+        return;
+    }
+
+    DartPlantDartFunctionSignatureInfo bool_signature{};
+    bool_signature.struct_size = sizeof(bool_signature);
+    DartPlantDartParameterInfo bool_parameter{};
+    bool_parameter.struct_size = sizeof(bool_parameter);
+    DartPlantLiveVmProfile live_profile{};
+    live_profile.struct_size = sizeof(live_profile);
+    const DartPlantStatus signature_status =
+        dartplant_runtime_get_method_signature(g_runtime, g_negate_bool, &bool_signature);
+    const DartPlantStatus parameter_status =
+        dartplant_runtime_get_method_parameter(g_runtime, g_negate_bool, 0, &bool_parameter);
+    const DartPlantStatus profile_status =
+        dartplant_live_vm_select_profile(&g_snapshot_info, &live_profile);
+    const uint32_t expected_bool_cid = live_profile.profile_version == 3 ? 63U : 62U;
+    const bool signature_ok =
+        signature_status == DARTPLANT_OK && parameter_status == DARTPLANT_OK &&
+        profile_status == DARTPLANT_OK && bool_signature.parameter_count == 1 &&
+        bool_signature.implicit_parameter_count == 0 && bool_signature.fixed_parameter_count == 1 &&
+        bool_signature.optional_parameter_count == 0 && bool_signature.type_parameter_count == 0 &&
+        bool_signature.parent_type_argument_count == 0 &&
+        !bool_signature.has_named_optional_parameters &&
+        bool_signature.result_type.kind == DARTPLANT_DART_TYPE_INTERFACE &&
+        bool_signature.result_type.nullability == DARTPLANT_DART_NULLABILITY_NON_NULLABLE &&
+        bool_signature.result_type.type_class_id == expected_bool_cid &&
+        bool_parameter.kind == DARTPLANT_DART_PARAMETER_REQUIRED_POSITIONAL &&
+        bool_parameter.is_required && bool_parameter.type.kind == DARTPLANT_DART_TYPE_INTERFACE &&
+        bool_parameter.type.nullability == DARTPLANT_DART_NULLABILITY_NON_NULLABLE &&
+        bool_parameter.type.type_class_id == expected_bool_cid;
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "FunctionType semantic probe status=%d parameter_status=%d profile=%u params=%u implicit=%u fixed=%u optional=%u result_cid=%u parameter_cid=%u passed=%u",
+        signature_status, parameter_status, live_profile.profile_version,
+        bool_signature.parameter_count, bool_signature.implicit_parameter_count,
+        bool_signature.fixed_parameter_count, bool_signature.optional_parameter_count,
+        bool_signature.result_type.type_class_id, bool_parameter.type.type_class_id,
+        static_cast<unsigned>(signature_ok));
+    __android_log_print(ANDROID_LOG_INFO, kTag, "DartPlant FunctionType semantic probe: %u",
+                        static_cast<unsigned>(signature_ok));
+    if (!signature_ok) {
+        LogFailure("FunctionType semantic parser");
+        g_cold_bootstrap_status.store(
+            signature_status != DARTPLANT_OK ? signature_status : DARTPLANT_PROFILE_MISMATCH,
+            std::memory_order_release);
+        return;
+    }
+
+    if (!FindLiveTopLevelMethod("signatureProbe", &g_signature_probe)) {
+        LogFailure("generic FunctionType live resolution");
+        g_cold_bootstrap_status.store(DARTPLANT_METHOD_NOT_FOUND, std::memory_order_release);
+        return;
+    }
+    DartPlantDartFunctionSignatureInfo generic_signature{};
+    generic_signature.struct_size = sizeof(generic_signature);
+    DartPlantDartParameterInfo generic_parameters[3] = {};
+    for (auto& parameter : generic_parameters) parameter.struct_size = sizeof(parameter);
+    const DartPlantStatus generic_signature_status =
+        dartplant_runtime_get_method_signature(g_runtime, g_signature_probe, &generic_signature);
+    DartPlantStatus generic_parameter_status = DARTPLANT_OK;
+    for (uint32_t index = 0; index < 3 && generic_parameter_status == DARTPLANT_OK; ++index) {
+        generic_parameter_status = dartplant_runtime_get_method_parameter(
+            g_runtime, g_signature_probe, index, &generic_parameters[index]);
+    }
+    const auto& generic_value = generic_parameters[0];
+    const bool type_parameter_matches =
+        generic_signature.result_type.kind == DARTPLANT_DART_TYPE_PARAMETER &&
+        generic_value.type.kind == DARTPLANT_DART_TYPE_PARAMETER &&
+        generic_signature.result_type.is_function_type_parameter &&
+        generic_value.type.is_function_type_parameter &&
+        generic_signature.result_type.type_parameter_base ==
+            generic_value.type.type_parameter_base &&
+        generic_signature.result_type.type_parameter_index ==
+            generic_value.type.type_parameter_index;
+    bool enabled_ok = false;
+    bool count_ok = false;
+    for (uint32_t index = 1; index < 3; ++index) {
+        const auto& parameter = generic_parameters[index];
+        if (std::strcmp(parameter.name, "enabled") == 0) {
+            enabled_ok = parameter.kind == DARTPLANT_DART_PARAMETER_NAMED &&
+                         parameter.is_required &&
+                         parameter.type.kind == DARTPLANT_DART_TYPE_INTERFACE &&
+                         parameter.type.nullability == DARTPLANT_DART_NULLABILITY_NON_NULLABLE &&
+                         parameter.type.type_class_id == expected_bool_cid;
+        } else if (std::strcmp(parameter.name, "count") == 0) {
+            count_ok = parameter.kind == DARTPLANT_DART_PARAMETER_NAMED && !parameter.is_required &&
+                       parameter.type.kind == DARTPLANT_DART_TYPE_INTERFACE &&
+                       parameter.type.nullability == DARTPLANT_DART_NULLABILITY_NON_NULLABLE;
+        }
+    }
+    const bool generic_signature_ok =
+        generic_signature_status == DARTPLANT_OK && generic_parameter_status == DARTPLANT_OK &&
+        generic_signature.parameter_count == 3 && generic_signature.implicit_parameter_count == 0 &&
+        generic_signature.fixed_parameter_count == 1 &&
+        generic_signature.optional_parameter_count == 2 &&
+        generic_signature.type_parameter_count == 1 &&
+        generic_signature.parent_type_argument_count == 0 &&
+        generic_signature.has_named_optional_parameters &&
+        generic_value.kind == DARTPLANT_DART_PARAMETER_REQUIRED_POSITIONAL &&
+        generic_value.is_required && type_parameter_matches && enabled_ok && count_ok;
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "FunctionType named semantic probe signature_status=%d parameter_status=%d params=%u fixed=%u optional=%u type_params=%u names=%s/%s required=%u/%u passed=%u",
+        generic_signature_status, generic_parameter_status, generic_signature.parameter_count,
+        generic_signature.fixed_parameter_count, generic_signature.optional_parameter_count,
+        generic_signature.type_parameter_count, generic_parameters[1].name,
+        generic_parameters[2].name, static_cast<unsigned>(generic_parameters[1].is_required),
+        static_cast<unsigned>(generic_parameters[2].is_required),
+        static_cast<unsigned>(generic_signature_ok));
+    __android_log_print(ANDROID_LOG_INFO, kTag, "DartPlant FunctionType named semantic probe: %u",
+                        static_cast<unsigned>(generic_signature_ok));
+    if (!generic_signature_ok) {
+        LogFailure("generic/named FunctionType semantic parser");
+        g_cold_bootstrap_status.store(generic_signature_status != DARTPLANT_OK
+                                          ? generic_signature_status
+                                          : DARTPLANT_PROFILE_MISMATCH,
+                                      std::memory_order_release);
+        return;
+    }
+
+    DartPlantRuntimeProfile bool_profile{};
+    dartplant_runtime_profile_init_arm64_aot(&bool_profile);
+    bool_profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
+                         DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+    // This milestone proves result semantics only. Argument locations remain
+    // unavailable until typed Function/ABI metadata is implemented.
+    bool_profile.argument_count = 0;
+    bool_profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+    const DartPlantStatus bool_status =
+        InstallMethodHook(g_negate_bool, bool_profile, OnBoolLeave, &g_negate_bool_hook, nullptr,
+                          DARTPLANT_HOOK_ALLOW_SHARED_CODE);
+    if (bool_status != DARTPLANT_OK) {
+        LogFailure("bool semantic callback installation");
+        g_cold_bootstrap_status.store(bool_status, std::memory_order_release);
+        return;
+    }
+
     g_runtime_live_vm_ready.store(true, std::memory_order_release);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
@@ -638,6 +795,26 @@ extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_nul
         static_cast<unsigned long long>(result_overrides),
         static_cast<unsigned long long>(null_results), static_cast<unsigned long long>(failures),
         static_cast<unsigned>(passed));
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+dartplant_fixture_reset_bool_semantic_probe() {
+    g_bool_true_results.store(0, std::memory_order_relaxed);
+    g_bool_false_results.store(0, std::memory_order_relaxed);
+    g_bool_semantic_failures.store(0, std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_bool_semantic_probe() {
+    const uint64_t true_results = g_bool_true_results.load(std::memory_order_relaxed);
+    const uint64_t false_results = g_bool_false_results.load(std::memory_order_relaxed);
+    const uint64_t failures = g_bool_semantic_failures.load(std::memory_order_relaxed);
+    const bool passed = true_results == 1 && false_results == 1 && failures == 0;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "bool semantic probe true=%llu false=%llu failures=%llu passed=%u",
+                        static_cast<unsigned long long>(true_results),
+                        static_cast<unsigned long long>(false_results),
+                        static_cast<unsigned long long>(failures), static_cast<unsigned>(passed));
     return passed ? 1 : 0;
 }
 
@@ -786,6 +963,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     dartplant_fixture_reset_null_semantic_probe();
+    dartplant_fixture_reset_bool_semantic_probe();
 
     DartPlantLiveVmArm64Registers entry_registers{};
     entry_registers.struct_size = sizeof(entry_registers);
@@ -848,15 +1026,24 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
         dartplant_unhook(g_echo_object_hook);
         dartplant_release_hook(g_echo_object_hook);
     }
+    if (g_negate_bool_hook != nullptr) {
+        dartplant_unhook(g_negate_bool_hook);
+        dartplant_release_hook(g_negate_bool_hook);
+    }
     if (g_add_int != nullptr) dartplant_release_method(g_add_int);
     if (g_instrumented_add != nullptr) dartplant_release_method(g_instrumented_add);
     if (g_echo_object != nullptr) dartplant_release_method(g_echo_object);
+    if (g_negate_bool != nullptr) dartplant_release_method(g_negate_bool);
+    if (g_signature_probe != nullptr) dartplant_release_method(g_signature_probe);
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
     g_instrumented_add = nullptr;
     g_add_int = nullptr;
     g_echo_object = nullptr;
+    g_negate_bool = nullptr;
+    g_signature_probe = nullptr;
     g_instrumented_add_hook = nullptr;
     g_echo_object_hook = nullptr;
+    g_negate_bool_hook = nullptr;
     g_add_int_listener = nullptr;
     g_runtime = nullptr;
     g_snapshot_info = {};
@@ -867,4 +1054,5 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     dartplant_fixture_reset_null_semantic_probe();
+    dartplant_fixture_reset_bool_semantic_probe();
 }

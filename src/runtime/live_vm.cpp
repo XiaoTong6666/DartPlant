@@ -222,6 +222,81 @@ constexpr std::array<const DartPlantLiveVmProfile*, 3> kLiveVmProfiles = {
     &kDart3121Arm64ProductCompressed,
 };
 
+struct CanonicalBoolLayout {
+    uint32_t profile_version;
+    uint32_t thread_true_offset;
+    uint32_t thread_false_offset;
+    uint32_t value_offset;
+    uint32_t cid;
+};
+
+// Dart SDK runtime_offsets_extracted.h, PRODUCT + TARGET_ARCH_ARM64 +
+// DART_COMPRESSED_POINTERS, plus raw_object.h's UntaggedBool::value_ layout.
+constexpr std::array<CanonicalBoolLayout, 3> kCanonicalBoolLayouts = {{
+    {1, 0x78, 0x80, 0x8, 62},  // Dart 3.4.4.
+    {2, 0x80, 0x88, 0x8, 62},  // Dart 3.5.0.
+    {3, 0x98, 0xa0, 0x8, 63},  // Dart 3.12.1.
+}};
+
+const CanonicalBoolLayout* FindCanonicalBoolLayout(uint32_t profile_version) {
+    const auto found = std::find_if(kCanonicalBoolLayouts.begin(), kCanonicalBoolLayouts.end(),
+                                    [profile_version](const CanonicalBoolLayout& layout) {
+                                        return layout.profile_version == profile_version;
+                                    });
+    return found == kCanonicalBoolLayouts.end() ? nullptr : &*found;
+}
+
+struct FunctionTypeLayout {
+    uint32_t profile_version;
+    uint32_t function_signature_offset;
+    uint32_t abstract_type_flags_offset;
+    uint32_t type_parameters_offset;
+    uint32_t result_type_offset;
+    uint32_t parameter_types_offset;
+    uint32_t named_parameter_names_offset;
+    uint32_t packed_parameter_counts_offset;
+    uint32_t packed_type_parameter_counts_offset;
+    uint32_t cid_type;
+    uint32_t cid_function_type;
+    uint32_t cid_record_type;
+    uint32_t cid_type_parameter;
+    uint32_t cid_null;
+    uint32_t cid_dynamic;
+    uint32_t cid_void;
+    uint32_t cid_never;
+    uint32_t type_parameter_base_offset;
+    uint32_t type_parameter_index_offset;
+    uint8_t nullability_bits;
+    uint8_t type_class_id_shift;
+    uint8_t type_parameter_function_bit;
+};
+
+// Dart SDK raw_object.h + runtime_offsets_extracted.h for PRODUCT ARM64 with
+// compressed pointers. FunctionType.result_type is the compressed field between
+// type_parameters (0x20) and parameter_types (0x28); it is not emitted by the
+// compiler offset extractor because generated code does not address it directly.
+constexpr std::array<FunctionTypeLayout, 3> kFunctionTypeLayouts = {{
+    {1,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 48, 49,
+     50, 51,   170,  171,  172,  173,  0x24, 0x26, 2,    4,  4},  // Dart 3.4.4.
+    {2,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 48, 49,
+     50, 51,   170,  171,  172,  173,  0x24, 0x26, 1,    3,  3},  // Dart 3.5.0.
+    {3,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 49, 50, 51,
+     52, 171,  172,  173,  174,  0x24, 0x26, 1,    3,    3},  // Dart 3.12.1; Bytecode shifts later
+                                                              // predefined CIDs.
+}};
+
+const FunctionTypeLayout* FindFunctionTypeLayout(uint32_t profile_version) {
+    const auto found = std::find_if(kFunctionTypeLayouts.begin(), kFunctionTypeLayouts.end(),
+                                    [profile_version](const FunctionTypeLayout& layout) {
+                                        return layout.profile_version == profile_version;
+                                    });
+    return found == kFunctionTypeLayouts.end() ? nullptr : &*found;
+}
+
+// compiler::target::kNumParameterFlagsPerElement for ARM64. Each named parameter
+// currently contributes one flag bit, so one compressed Smi stores 16 entries.
+constexpr uint32_t kNamedParameterFlagsPerSmi = 16;
+
 struct MemoryRange {
     uintptr_t begin = 0;
     uintptr_t end = 0;
@@ -457,6 +532,25 @@ bool ReadArrayElement(const ProcessMemoryReader& reader, const DartPlantLiveVmPr
     }
     *out_tagged = DecompressObject(heap_base, compressed);
     return true;
+}
+
+bool ReadArrayLength(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                     uint64_t tagged_array, uint64_t* out_length) {
+    if (out_length == nullptr) return false;
+    uint32_t cid = 0;
+    return ReadCid(reader, tagged_array, &cid) &&
+           (cid == profile.cid_array || cid == profile.cid_immutable_array) &&
+           ReadPositiveCompressedSmi(reader, Untag(tagged_array) + profile.array_length_offset,
+                                     out_length);
+}
+
+bool ReadArrayRawElement(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                         uint64_t tagged_array, uint64_t index, uint32_t* out_raw) {
+    if (out_raw == nullptr) return false;
+    uint64_t length = 0;
+    if (!ReadArrayLength(reader, profile, tagged_array, &length) || index >= length) return false;
+    return reader.Read(
+        Untag(tagged_array) + profile.array_elements_offset + index * sizeof(uint32_t), out_raw);
 }
 
 bool ArrayContainsFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
@@ -1030,7 +1124,266 @@ DartPlantStatus SelectProfile(const DartPlantFlutterSnapshotInfo& snapshot,
     return DARTPLANT_OK;
 }
 
+struct ParsedFunctionSignature {
+    uint64_t signature = 0;
+    uint64_t parameter_types = 0;
+    uint64_t named_parameter_names = 0;
+    uint32_t parameter_count = 0;
+    uint32_t implicit_parameter_count = 0;
+    uint32_t fixed_parameter_count = 0;
+    uint32_t optional_parameter_count = 0;
+    uint32_t type_parameter_count = 0;
+    uint32_t parent_type_argument_count = 0;
+    bool has_named_optional_parameters = false;
+    DartPlantDartTypeInfo result_type{};
+};
+
+bool DecodeDartNullability(uint32_t flags, const FunctionTypeLayout& layout,
+                           DartPlantDartNullability* out_nullability) {
+    if (out_nullability == nullptr) return false;
+    const uint32_t encoded = flags & ((1U << layout.nullability_bits) - 1U);
+    if (layout.nullability_bits == 2) {
+        switch (encoded) {
+        case 0:
+            *out_nullability = DARTPLANT_DART_NULLABILITY_NULLABLE;
+            return true;
+        case 1:
+            *out_nullability = DARTPLANT_DART_NULLABILITY_NON_NULLABLE;
+            return true;
+        case 2:
+            *out_nullability = DARTPLANT_DART_NULLABILITY_LEGACY;
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (layout.nullability_bits == 1) {
+        *out_nullability = encoded == 0 ? DARTPLANT_DART_NULLABILITY_NULLABLE
+                                        : DARTPLANT_DART_NULLABILITY_NON_NULLABLE;
+        return true;
+    }
+    return false;
+}
+
+bool DecodeDartType(const ProcessMemoryReader& reader, const FunctionTypeLayout& layout,
+                    uint64_t tagged_type, DartPlantDartTypeInfo* out_type) {
+    if (out_type == nullptr || !IsHeapObject(tagged_type)) return false;
+    DartPlantDartTypeInfo type{};
+    type.struct_size = sizeof(type);
+    if (!ReadCid(reader, tagged_type, &type.object_cid)) return false;
+    if (type.object_cid != layout.cid_type && type.object_cid != layout.cid_function_type &&
+        type.object_cid != layout.cid_record_type && type.object_cid != layout.cid_type_parameter) {
+        return false;
+    }
+
+    uint32_t flags = 0;
+    if (!reader.Read(Untag(tagged_type) + layout.abstract_type_flags_offset, &flags) ||
+        !DecodeDartNullability(flags, layout, &type.nullability)) {
+        return false;
+    }
+
+    if (type.object_cid == layout.cid_type) {
+        const uint32_t represented_cid =
+            static_cast<uint32_t>((flags >> layout.type_class_id_shift) & kClassIdTagMask);
+        if (represented_cid == 0) return false;
+        if (represented_cid == layout.cid_null) {
+            type.kind = DARTPLANT_DART_TYPE_NULL;
+        } else if (represented_cid == layout.cid_dynamic) {
+            type.kind = DARTPLANT_DART_TYPE_DYNAMIC;
+        } else if (represented_cid == layout.cid_void) {
+            type.kind = DARTPLANT_DART_TYPE_VOID;
+        } else if (represented_cid == layout.cid_never) {
+            type.kind = DARTPLANT_DART_TYPE_NEVER;
+        } else {
+            type.kind = DARTPLANT_DART_TYPE_INTERFACE;
+            type.type_class_id = represented_cid;
+        }
+    } else if (type.object_cid == layout.cid_function_type) {
+        type.kind = DARTPLANT_DART_TYPE_FUNCTION;
+    } else if (type.object_cid == layout.cid_record_type) {
+        type.kind = DARTPLANT_DART_TYPE_RECORD;
+    } else {
+        type.kind = DARTPLANT_DART_TYPE_PARAMETER;
+        uint16_t base = 0;
+        uint16_t index = 0;
+        if (!reader.Read(Untag(tagged_type) + layout.type_parameter_base_offset, &base) ||
+            !reader.Read(Untag(tagged_type) + layout.type_parameter_index_offset, &index)) {
+            return false;
+        }
+        type.type_parameter_base = base;
+        type.type_parameter_index = index;
+        type.is_function_type_parameter =
+            static_cast<uint8_t>((flags >> layout.type_parameter_function_bit) & 0x1U);
+    }
+    *out_type = type;
+    return true;
+}
+
+DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader,
+                                               const DartPlantLiveVmProfile& profile,
+                                               const FunctionTypeLayout& layout, uint64_t heap_base,
+                                               uint64_t tagged_function,
+                                               ParsedFunctionSignature* out_signature) {
+    if (out_signature == nullptr || heap_base == 0 ||
+        !RequireCid(reader, tagged_function, profile.cid_function)) {
+        return FailProbe("live VM Function is stale or has an invalid CID for signature parsing");
+    }
+
+    uint64_t tagged_signature = 0;
+    if (!ReadCompressedObject(reader, Untag(tagged_function), layout.function_signature_offset,
+                              heap_base, &tagged_signature)) {
+        return FailProbe("live VM Function.signature is unreadable");
+    }
+    uint32_t signature_cid = 0;
+    if (!ReadCid(reader, tagged_signature, &signature_cid)) {
+        return FailProbe("live VM Function.signature is not a readable heap object");
+    }
+    if (signature_cid == layout.cid_null) {
+        SetLastError("AOT precompiler dropped Function.signature for this function");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    if (signature_cid != layout.cid_function_type) {
+        return FailProbe("live VM Function.signature has an unexpected CID");
+    }
+
+    const uintptr_t signature_address = Untag(tagged_signature);
+    uint32_t packed_counts = 0;
+    uint16_t packed_type_counts = 0;
+    uint64_t result_type = 0;
+    if (!reader.Read(signature_address + layout.packed_parameter_counts_offset, &packed_counts) ||
+        !reader.Read(signature_address + layout.packed_type_parameter_counts_offset,
+                     &packed_type_counts) ||
+        !ReadCompressedObject(reader, signature_address, layout.result_type_offset, heap_base,
+                              &result_type)) {
+        return FailProbe("live VM FunctionType fields are unreadable");
+    }
+
+    ParsedFunctionSignature parsed{};
+    parsed.signature = tagged_signature;
+    parsed.implicit_parameter_count = packed_counts & 0x1U;
+    parsed.has_named_optional_parameters = ((packed_counts >> 1) & 0x1U) != 0;
+    parsed.fixed_parameter_count = (packed_counts >> 2) & 0x3fffU;
+    parsed.optional_parameter_count = (packed_counts >> 16) & 0x3fffU;
+    parsed.parameter_count = parsed.fixed_parameter_count + parsed.optional_parameter_count;
+    parsed.parent_type_argument_count = packed_type_counts & 0xffU;
+    parsed.type_parameter_count = (packed_type_counts >> 8) & 0xffU;
+    if (parsed.implicit_parameter_count > parsed.fixed_parameter_count ||
+        (parsed.has_named_optional_parameters && parsed.optional_parameter_count == 0)) {
+        return FailProbe("live VM FunctionType parameter counts are inconsistent");
+    }
+    if (!DecodeDartType(reader, layout, result_type, &parsed.result_type)) {
+        return FailProbe("live VM FunctionType result type is invalid");
+    }
+
+    if (parsed.parameter_count != 0) {
+        if (!ReadCompressedObject(reader, signature_address, layout.parameter_types_offset,
+                                  heap_base, &parsed.parameter_types)) {
+            return FailProbe("live VM FunctionType parameter_types is unreadable");
+        }
+        uint64_t parameter_type_count = 0;
+        if (!ReadArrayLength(reader, profile, parsed.parameter_types, &parameter_type_count) ||
+            parameter_type_count != parsed.parameter_count) {
+            return FailProbe("live VM FunctionType parameter_types length does not match counts");
+        }
+    }
+
+    if (parsed.has_named_optional_parameters) {
+        if (!ReadCompressedObject(reader, signature_address, layout.named_parameter_names_offset,
+                                  heap_base, &parsed.named_parameter_names)) {
+            return FailProbe("live VM FunctionType named_parameter_names is unreadable");
+        }
+        uint64_t named_slot_count = 0;
+        const uint64_t flag_slot_count =
+            (parsed.optional_parameter_count + kNamedParameterFlagsPerSmi - 1) /
+            kNamedParameterFlagsPerSmi;
+        const uint64_t expected_named_slot_count =
+            static_cast<uint64_t>(parsed.optional_parameter_count) + flag_slot_count;
+        if (!ReadArrayLength(reader, profile, parsed.named_parameter_names, &named_slot_count) ||
+            named_slot_count != expected_named_slot_count) {
+            return FailProbe("live VM FunctionType named_parameter_names is inconsistent");
+        }
+    }
+
+    *out_signature = parsed;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus PrepareFunctionSignatureRead(const DartPlantLiveVmContext& context,
+                                             const DartPlantFlutterSnapshotInfo& snapshot,
+                                             uint64_t tagged_function,
+                                             DartPlantLiveVmProfile* out_profile,
+                                             const FunctionTypeLayout** out_layout,
+                                             ProcessMemoryReader* out_reader) {
+    if (out_profile == nullptr || out_layout == nullptr || out_reader == nullptr ||
+        tagged_function == 0) {
+        SetLastError("live VM signature parser arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    out_profile->struct_size = sizeof(*out_profile);
+    DartPlantStatus status = SelectProfile(snapshot, out_profile);
+    if (status != DARTPLANT_OK) return status;
+    if (context.profile_version != out_profile->profile_version ||
+        !SameString(context.profile_name, out_profile->name) || context.heap_base == 0) {
+        SetLastError("live VM context profile does not match FunctionType parser profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_layout = FindFunctionTypeLayout(out_profile->profile_version);
+    if (*out_layout == nullptr) {
+        SetLastError("no FunctionType layout for selected live VM profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!out_reader->Refresh()) {
+        SetLastError("cannot inspect process mappings for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    return DARTPLANT_OK;
+}
+
 }  // namespace
+
+DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& context,
+                                                const DartPlantLiveVmProfile& profile,
+                                                uint64_t* out_true, uint64_t* out_false) {
+    const CanonicalBoolLayout* layout = FindCanonicalBoolLayout(profile.profile_version);
+    if (out_true == nullptr || out_false == nullptr || context.thread == 0 || layout == nullptr) {
+        SetLastError("live VM Bool root arguments/profile are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (context.profile_version != profile.profile_version) {
+        SetLastError("live VM Bool root profile does not match the captured context");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    ProcessMemoryReader reader;
+    if (!reader.Refresh()) {
+        SetLastError("failed to inspect process mappings for Dart Bool roots");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    uint64_t bool_true = 0;
+    uint64_t bool_false = 0;
+    if (!reader.Read(static_cast<uintptr_t>(context.thread) + layout->thread_true_offset,
+                     &bool_true) ||
+        !reader.Read(static_cast<uintptr_t>(context.thread) + layout->thread_false_offset,
+                     &bool_false) ||
+        bool_true == 0 || bool_false == 0 || bool_true == bool_false ||
+        !RequireCid(reader, bool_true, layout->cid) ||
+        !RequireCid(reader, bool_false, layout->cid)) {
+        SetLastError("Dart canonical Bool roots failed CID validation");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    uint8_t true_value = 0;
+    uint8_t false_value = 0xff;
+    if (!reader.Read(Untag(bool_true) + layout->value_offset, &true_value) ||
+        !reader.Read(Untag(bool_false) + layout->value_offset, &false_value) || true_value != 1 ||
+        false_value != 0) {
+        SetLastError("Dart canonical Bool roots failed value validation");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_true = bool_true;
+    *out_false = bool_false;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
 }  // namespace dartplant
 
 extern "C" DartPlantStatus dartplant_live_vm_select_profile(
@@ -1612,6 +1965,129 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
     method.entry_is_shared = method.entry_alias_count > 1 ? 1 : 0;
 
     *out_method = method;
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
+extern "C" DartPlantStatus dartplant_live_vm_read_function_signature(
+    const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
+    uint64_t function, DartPlantDartFunctionSignatureInfo* out_signature) {
+    if (context == nullptr || snapshot == nullptr || out_signature == nullptr ||
+        context->struct_size < sizeof(DartPlantLiveVmContext) ||
+        snapshot->struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
+        out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo)) {
+        dartplant::SetLastError("live VM FunctionType signature arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    DartPlantLiveVmProfile profile{};
+    const dartplant::FunctionTypeLayout* layout = nullptr;
+    dartplant::ProcessMemoryReader reader;
+    DartPlantStatus status = dartplant::PrepareFunctionSignatureRead(*context, *snapshot, function,
+                                                                     &profile, &layout, &reader);
+    if (status != DARTPLANT_OK) return status;
+
+    dartplant::ParsedFunctionSignature parsed{};
+    status = dartplant::ParseRetainedFunctionSignature(reader, profile, *layout, context->heap_base,
+                                                       function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+
+    DartPlantDartFunctionSignatureInfo signature{};
+    signature.struct_size = sizeof(signature);
+    signature.parameter_count = parsed.parameter_count;
+    signature.implicit_parameter_count = parsed.implicit_parameter_count;
+    signature.fixed_parameter_count = parsed.fixed_parameter_count;
+    signature.optional_parameter_count = parsed.optional_parameter_count;
+    signature.type_parameter_count = parsed.type_parameter_count;
+    signature.parent_type_argument_count = parsed.parent_type_argument_count;
+    signature.has_named_optional_parameters = parsed.has_named_optional_parameters ? 1 : 0;
+    signature.result_type = parsed.result_type;
+    *out_signature = signature;
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
+extern "C" DartPlantStatus dartplant_live_vm_read_function_parameter(
+    const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
+    uint64_t function, uint32_t index, DartPlantDartParameterInfo* out_parameter) {
+    if (context == nullptr || snapshot == nullptr || out_parameter == nullptr ||
+        context->struct_size < sizeof(DartPlantLiveVmContext) ||
+        snapshot->struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
+        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo)) {
+        dartplant::SetLastError("live VM FunctionType parameter arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    DartPlantLiveVmProfile profile{};
+    const dartplant::FunctionTypeLayout* layout = nullptr;
+    dartplant::ProcessMemoryReader reader;
+    DartPlantStatus status = dartplant::PrepareFunctionSignatureRead(*context, *snapshot, function,
+                                                                     &profile, &layout, &reader);
+    if (status != DARTPLANT_OK) return status;
+
+    dartplant::ParsedFunctionSignature parsed{};
+    status = dartplant::ParseRetainedFunctionSignature(reader, profile, *layout, context->heap_base,
+                                                       function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+    if (index >= parsed.parameter_count) {
+        dartplant::SetLastError("FunctionType parameter index is out of range");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    uint64_t tagged_type = 0;
+    if (!dartplant::ReadArrayElement(reader, profile, context->heap_base, parsed.parameter_types,
+                                     index, &tagged_type)) {
+        return dartplant::FailProbe("FunctionType parameter type is unreadable");
+    }
+
+    DartPlantDartParameterInfo parameter{};
+    parameter.struct_size = sizeof(parameter);
+    parameter.index = index;
+    if (!dartplant::DecodeDartType(reader, *layout, tagged_type, &parameter.type)) {
+        return dartplant::FailProbe("FunctionType parameter type is invalid");
+    }
+
+    if (index < parsed.implicit_parameter_count) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_IMPLICIT;
+    } else if (index < parsed.fixed_parameter_count) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_REQUIRED_POSITIONAL;
+        parameter.is_required = 1;
+    } else if (!parsed.has_named_optional_parameters) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_OPTIONAL_POSITIONAL;
+    } else {
+        parameter.kind = DARTPLANT_DART_PARAMETER_NAMED;
+        const uint32_t named_index = index - parsed.fixed_parameter_count;
+        uint64_t tagged_name = 0;
+        if (!dartplant::ReadArrayElement(reader, profile, context->heap_base,
+                                         parsed.named_parameter_names, named_index, &tagged_name) ||
+            !dartplant::ReadDartString(reader, profile, tagged_name, parameter.name,
+                                       sizeof(parameter.name))) {
+            return dartplant::FailProbe("FunctionType named parameter name is invalid");
+        }
+
+        // FunctionType::GetRequiredFlagIndex(): required flags are appended to
+        // named_parameter_names as Smi bitmaps.
+        const uint32_t flag_index =
+            parsed.optional_parameter_count + named_index / dartplant::kNamedParameterFlagsPerSmi;
+        uint64_t named_slot_count = 0;
+        if (!dartplant::ReadArrayLength(reader, profile, parsed.named_parameter_names,
+                                        &named_slot_count)) {
+            return dartplant::FailProbe("FunctionType named parameter flags are unreadable");
+        }
+        if (flag_index < named_slot_count) {
+            uint32_t raw_flags = 0;
+            if (!dartplant::ReadArrayRawElement(reader, profile, parsed.named_parameter_names,
+                                                flag_index, &raw_flags) ||
+                (raw_flags & dartplant::kSmiTagMask) != 0) {
+                return dartplant::FailProbe("FunctionType required-named flags are not a Smi");
+            }
+            const uint32_t flags = raw_flags >> 1;
+            const uint32_t mask = 1U << (named_index % dartplant::kNamedParameterFlagsPerSmi);
+            parameter.is_required = (flags & mask) != 0 ? 1 : 0;
+        }
+    }
+
+    *out_parameter = parameter;
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }

@@ -60,6 +60,9 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
 void StartRuntimeModuleRefreshWorker(RuntimeModuleRefreshReporter reporter);
 uint64_t ScheduleRuntimeModuleRefresh();
 DartPlantStatus WaitForRuntimeModuleRefresh(uint64_t epoch);
+DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& context,
+                                                const DartPlantLiveVmProfile& profile,
+                                                uint64_t* out_true, uint64_t* out_false);
 
 }  // namespace dartplant
 
@@ -85,9 +88,11 @@ struct DartPlantRuntime {
     std::optional<dartplant::SnapshotIndex> live_snapshot_index;
     DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
     std::optional<DartPlantLiveVmContext> live_vm_context;
-    // The canonical null heap object is captured only from a semantically
-    // validated Dart NULL_REG sample. It never crosses the public C ABI.
+    // Canonical semantic roots are captured only from an exact, validated live
+    // VM profile and are scoped to this runtime generation.
     uint64_t live_vm_null_value = 0;
+    uint64_t live_vm_bool_true_value = 0;
+    uint64_t live_vm_bool_false_value = 0;
     std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
     dartplant::DartCodeTargetRegistry code_targets;
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
@@ -105,6 +110,8 @@ struct DartPlantInvocation {
     uint32_t depth = 0;
     DartPlantVmAdapter* vm_adapter = nullptr;
     uint64_t validated_null_value = 0;
+    uint64_t validated_bool_true_value = 0;
+    uint64_t validated_bool_false_value = 0;
     bool identity_ambiguous = false;
     bool vm_scope_entered = false;
     bool skip_original = false;

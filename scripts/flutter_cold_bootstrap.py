@@ -17,6 +17,7 @@ FIXTURE_DIR = ROOT_DIR / "tests" / "flutter_fixture"
 APK_PATH = FIXTURE_DIR / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk"
 GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
 SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
+ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
 PACKAGE = "dev.dartplant.dartplant_fixture"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 
@@ -108,6 +109,33 @@ def _build_fixture(flutter: str) -> None:
     )
     if not gen_snapshot.is_file():
         raise FileNotFoundError(f"Flutter ARM64 gen_snapshot not found: {gen_snapshot}")
+    dart = flutter_root / "bin" / "cache" / "dart-sdk" / "bin" / "dart"
+    if not dart.is_file():
+        raise FileNotFoundError(f"Flutter Dart executable not found: {dart}")
+    sdk_repo = ROOT_DIR.parent / "sdk"
+    if not (sdk_repo / ".git").exists():
+        raise FileNotFoundError(
+            "compiler ABI oracle requires the Dart SDK source checkout at "
+            f"{sdk_repo}"
+        )
+    run(
+        [
+            sys.executable,
+            str(ROOT_DIR / "tools" / "compiler-oracle" / "run_abi_oracle.py"),
+            "--dart",
+            str(dart),
+            "--sdk-repo",
+            str(sdk_repo),
+            "--app-package-config",
+            str(FIXTURE_DIR / ".dart_tool" / "package_config.json"),
+            "--dill",
+            str(dill),
+            "--output",
+            str(ABI_ORACLE_JSON),
+        ],
+        cwd=ROOT_DIR,
+        env=os.environ.copy(),
+    )
     run(
         [
             sys.executable,
@@ -124,6 +152,8 @@ def _build_fixture(flutter: str) -> None:
             "Global",
             "--function-name",
             "verifiedAbiDouble",
+            "--abi-oracle-json",
+            str(ABI_ORACLE_JSON),
             "--output-header",
             str(SIDECAR_HEADER),
         ],
@@ -186,6 +216,7 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
+            and "DartPlant late shared typed fail-close:" in latest
         ):
             return latest
         time.sleep(0.05)
@@ -251,9 +282,17 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT lookup did not use the artifact index\n{logs}"
         )
-    if "DartPlant ordinary AOT typed probe: 1 values=13.75/15.0" not in logs:
+    if "DartPlant ordinary AOT typed probe: 1 values=16.125/6.25" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT typed callback probe failed\n{logs}"
+        )
+    if "DartPlant late shared transition: 1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: late shared CodeTarget transition failed\n{logs}"
+        )
+    if "DartPlant late shared typed fail-close: 1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: late shared callback fail-close failed\n{logs}"
         )
     if "runtime live-vm lookup addInt ok" not in logs or "model_ok=1" not in logs:
         raise RuntimeError(f"cold start {round_index}: live model regression failed\n{logs}")

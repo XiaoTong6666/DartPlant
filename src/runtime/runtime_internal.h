@@ -43,6 +43,7 @@ struct RuntimeAbiEvidenceEntry {
     DartMethodIdentity identity;
     uintptr_t code_target = 0;
     uint64_t generation = 0;
+    uint32_t formal_parameter_count = 0;
     std::vector<abi::DartFunctionAbiEvidence> providers;
     abi::DartFunctionAbiResolution resolution;
     abi::DartCallLayoutStatus layout_status = abi::DartCallLayoutStatus::kIncompleteEvidence;

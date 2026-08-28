@@ -2,7 +2,14 @@
 
 `dump_abi_oracle.dart` exports normalized Function-slot ABI representations
 and register-CC facts from the Dart compiler's `vm.unboxing-info.metadata` and
-the matching transformed Kernel member shape.
+the matching transformed Kernel member shape. This JSON is the primary ABI
+truth consumed by `build_snapshot_sidecar.py`; optimized CFG/disassembly text
+is kept only as an independent cross-check and address/fingerprint source.
+
+`run_abi_oracle.py` runs that Dart producer with source packages materialized
+from the exact Dart SDK git tag matching the target Dart executable. It avoids
+resolving SDK-internal compiler packages from pub, so a newer local SDK working
+tree cannot silently change the oracle for an older Flutter artifact.
 
 The script must be run with the Dart executable and package configuration from
 the same Dart SDK checkout/compiler pipeline that produced the transformed DILL
@@ -21,17 +28,22 @@ If the matching transformed DILL/compiler metadata is unavailable, the caller
 must treat the ABI as unknown instead of substituting a guessed representation.
 
 This producer intentionally emits only **compiler truth**. A runtime-ready
-evidence record must additionally bind those facts to the exact target artifact:
+evidence record additionally binds those facts to the exact target artifact:
 
 - snapshot hash;
 - `libapp.so` build-id;
 - physical Dart Code fingerprint.
 
-Those identity fields come from the matching AOT artifact/indexing step (for
-example DartPlant's offline indexer), not from `FunctionType` and not from this
-Kernel metadata reader. `dartplant_runtime_register_compiler_abi_evidence()`
-requires all three and revalidates them against the live runtime before a
-`DartCallLayout` can become verified.
+Those identity fields come from the matching AOT artifact/indexing step, not
+from `FunctionType`. The sidecar builder also consumes a V8 snapshot profile
+from the same `gen_snapshot` run to prove physical Code identity multiplicity
+(`UNIQUE`/`SHARED`) across the whole compiler object graph. A single sidecar
+record is never treated as proof of uniqueness.
+
+`dartplant_runtime_register_compiler_abi_evidence()` revalidates snapshot hash,
+build-id, logical Function identity, entry VA, code size and code fingerprint
+against the live runtime. Typed `DartCallLayout` creation additionally requires
+a compiler-proven unique `CodeTarget`.
 
 For ordinary Kernel members, the producer mirrors the same rules used by
 `Function::MaxNumberOfParametersInRegisters()`: generic functions and

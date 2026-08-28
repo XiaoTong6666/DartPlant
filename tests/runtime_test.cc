@@ -47,6 +47,12 @@ int g_backend_b_unhook_calls = 0;
 DartPlantObjectHandle* g_object_argument_handle = nullptr;
 uint64_t g_leave_x1 = 0;
 uint64_t g_leave_v0 = 0;
+int g_late_shared_enter_calls = 0;
+int g_late_shared_leave_calls = 0;
+uint8_t g_late_shared_identity_ambiguous = 0;
+uint8_t g_late_shared_verified_abi = 0;
+DartPlantStatus g_late_shared_raw_status = DARTPLANT_NOT_INITIALIZED;
+DartPlantStatus g_late_shared_typed_status = DARTPLANT_NOT_INITIALIZED;
 
 struct FakeVmObject {
     uint64_t raw;
@@ -167,6 +173,18 @@ void OrderedEnter(DartPlantInvocation*, void* user_data) {
 void OrderedLeave(DartPlantInvocation*, void* user_data) {
     g_callback_order.push_back(-*static_cast<int*>(user_data));
 }
+
+void LateSharedEnter(DartPlantInvocation* invocation, void*) {
+    ++g_late_shared_enter_calls;
+    g_late_shared_identity_ambiguous = dartplant_invocation_identity_ambiguous(invocation);
+    g_late_shared_verified_abi = dartplant_invocation_has_verified_abi(invocation);
+    uint64_t raw = 0;
+    g_late_shared_raw_status = dartplant_invocation_get_gp_register(invocation, 1, &raw);
+    DartPlantValue value{};
+    g_late_shared_typed_status = dartplant_invocation_get_argument(invocation, 0, &value);
+}
+
+void LateSharedLeave(DartPlantInvocation*, void*) { ++g_late_shared_leave_calls; }
 
 void RecordRequestedIdentity(DartPlantInvocation* invocation, void*) {
     g_last_invocation = invocation;
@@ -920,6 +938,8 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     function.code_size = 1;
     function.code_section_va = 0x1000;
     function.fingerprint = fingerprint.c_str();
+    function.code_identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    function.physical_entry_alias_count = 1;
 
     DartPlantSnapshotIndexInfo source{};
     source.struct_size = sizeof(source);
@@ -942,6 +962,11 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     EXPECT_EQ(DARTPLANT_FINGERPRINT_MISMATCH,
               dartplant_runtime_register_snapshot_index(runtime, &source));
     function.fingerprint = saved_fingerprint;
+
+    function.physical_entry_alias_count = 0;
+    EXPECT_EQ(DARTPLANT_METADATA_INVALID,
+              dartplant_runtime_register_snapshot_index(runtime, &source));
+    function.physical_entry_alias_count = 1;
 
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_register_snapshot_index(runtime, &source));
     EXPECT_EQ(DARTPLANT_INVALID_ARGUMENT,
@@ -971,6 +996,23 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     dropped_evidence.parameter_count = 0;
     dropped_evidence.result_representation = DARTPLANT_ABI_REPRESENTATION_TAGGED;
     dropped_evidence.max_parameters_in_registers = 0;
+    dropped_evidence.library_uri = "package:fixture/main.dart";
+    dropped_evidence.class_name = "Fixture";
+    dropped_evidence.function_name = "dropped";
+    dropped_evidence.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    dropped_evidence.entry_va = 0x1000;
+    dropped_evidence.code_size = 1;
+
+    const char* saved_function_name = dropped_evidence.function_name;
+    dropped_evidence.function_name = "different";
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH, dartplant_runtime_register_compiler_abi_evidence(
+                                              runtime, dropped, &dropped_evidence));
+    dropped_evidence.function_name = saved_function_name;
+    const uint64_t saved_entry_va = dropped_evidence.entry_va;
+    dropped_evidence.entry_va = 0x1004;
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH, dartplant_runtime_register_compiler_abi_evidence(
+                                              runtime, dropped, &dropped_evidence));
+    dropped_evidence.entry_va = saved_entry_va;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_register_compiler_abi_evidence(runtime, dropped,
                                                                              &dropped_evidence));
     DartPlantMethodAbiInfo dropped_abi{};
@@ -979,7 +1021,7 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     EXPECT_EQ(DARTPLANT_METHOD_ABI_VERIFIED, dropped_abi.state);
     EXPECT_EQ(0U, dropped_abi.parameter_count);
     EXPECT_EQ(1U, static_cast<uint32_t>(dropped_abi.has_verified_call_layout));
-    dartplant_release_method(dropped);
+    EXPECT_TRUE(dropped->function->code_target->HasProvenUniqueIdentity());
 
     const DartPlantMethodQuery live_query = {
         .struct_size = sizeof(live_query),
@@ -994,7 +1036,36 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     EXPECT_TRUE(live != nullptr);
     EXPECT_TRUE(live->function != nullptr);
     EXPECT_TRUE(live->function->source == dartplant::DartFunctionSource::kLiveVm);
+    EXPECT_TRUE(dropped->function->code_target->IsShared());
+    dropped_abi = {};
+    dropped_abi.struct_size = sizeof(dropped_abi);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_method_abi_info(runtime, dropped, &dropped_abi));
+    EXPECT_EQ(DARTPLANT_METHOD_ABI_UNSUPPORTED, dropped_abi.state);
+    EXPECT_EQ(0U, static_cast<uint32_t>(dropped_abi.has_verified_call_layout));
+    EXPECT_TRUE(dartplant::FindRuntimeCallLayoutLocked(runtime, dropped) == nullptr);
     dartplant_release_method(live);
+
+    // Restore the test-only CodeTarget to its compiler-proven unique state so
+    // the next registration reaches the formal-shape consistency check. A
+    // later provider is not allowed to redefine the established dimension.
+    {
+        std::lock_guard target_lock(dropped->function->code_target->mutex);
+        dropped->function->code_target->aliases.resize(1);
+        dropped->function->code_target->reported_alias_count = 1;
+        dropped->function->code_target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    }
+    const DartPlantAbiRepresentation one_parameter[] = {DARTPLANT_ABI_REPRESENTATION_TAGGED};
+    dropped_evidence.parameter_representations = one_parameter;
+    dropped_evidence.parameter_count = 1;
+    dropped_evidence.max_parameters_in_registers = 1;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI, dartplant_runtime_register_compiler_abi_evidence(
+                                             runtime, dropped, &dropped_evidence));
+    dropped_abi = {};
+    dropped_abi.struct_size = sizeof(dropped_abi);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_method_abi_info(runtime, dropped, &dropped_abi));
+    EXPECT_EQ(DARTPLANT_METHOD_ABI_CONFLICTING, dropped_abi.state);
+    EXPECT_EQ(0U, static_cast<uint32_t>(dropped_abi.has_verified_call_layout));
+    dartplant_release_method(dropped);
 
     EXPECT_TRUE(runtime->artifact_snapshot_index.has_value());
     runtime->artifact_snapshot_index->functions[0].fingerprint = "ffffffffffffffff";
@@ -1314,6 +1385,8 @@ TEST_CASE(RuntimeAbiEvidenceBindingRequiresIdentityTargetGenerationAndUniqueCode
     evidence_entry.call_layout = layout;
     runtime.abi_evidence.push_back(std::move(evidence_entry));
 
+    EXPECT_TRUE(dartplant::FindRuntimeCallLayoutLocked(&runtime, &method) == nullptr);
+    method.function->code_target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
     EXPECT_EQ(layout.get(), dartplant::FindRuntimeCallLayoutLocked(&runtime, &method).get());
     runtime.generation->store(2, std::memory_order_release);
     EXPECT_TRUE(dartplant::FindRuntimeCallLayoutLocked(&runtime, &method) == nullptr);
@@ -1592,6 +1665,156 @@ TEST_CASE(HookChainUsesPrioritySnapshotAndPairedLeaveOrder) {
     dartplant_release_listener(low_listener);
     EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(high_listener));
     dartplant_release_listener(high_listener);
+}
+
+TEST_CASE(LateSharedCodeWithoutOptInBypassesCallbacksAndVerifiedAbi) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->id = reinterpret_cast<uintptr_t>(Replacement);
+    target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    const dartplant::DartMethodIdentity first_identity = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "first",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    target->AddAlias(first_identity);
+
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->identity = first_identity;
+    method.function->code_target = target;
+
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(method);
+    hook.profile = profile;
+    hook.backup = reinterpret_cast<void*>(Replacement);
+    hook.shared_code_opt_in = false;
+    auto layout = std::make_shared<dartplant::abi::DartCallLayout>();
+    layout->dart_sp_register = 15;
+    hook.call_layout = layout;
+
+    DartPlantHookOptions options = {
+        .struct_size = sizeof(options),
+        .flags = 0,
+        .on_enter = LateSharedEnter,
+        .on_leave = LateSharedLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* listener = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&hook, &method, options, 0, &listener));
+
+    const dartplant::DartMethodIdentity late_alias = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "second",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    target->AddAlias(late_alias);
+    EXPECT_TRUE(target->IsShared());
+
+    g_late_shared_enter_calls = 0;
+    g_late_shared_leave_calls = 0;
+    DartPlantArm64Context context{};
+    const auto enter = dartplant_arm64_dispatch_enter(&context, &hook);
+    EXPECT_EQ(reinterpret_cast<void*>(Replacement), enter.original);
+    EXPECT_EQ(0, g_late_shared_enter_calls);
+    EXPECT_EQ(0, g_late_shared_leave_calls);
+    dartplant_arm64_dispatch_leave_from_tls(9, 0, 0);
+    EXPECT_EQ(0, g_late_shared_enter_calls);
+    EXPECT_EQ(0, g_late_shared_leave_calls);
+    EXPECT_EQ(0ULL, hook.in_flight);
+    EXPECT_TRUE(dartplant_listener_is_idle(listener));
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
+    dartplant_release_listener(listener);
+}
+
+TEST_CASE(LateSharedCodeWithOptInKeepsRawCallbackButDropsVerifiedAbi) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->id = reinterpret_cast<uintptr_t>(Replacement);
+    target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    const dartplant::DartMethodIdentity first_identity = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "first",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    target->AddAlias(first_identity);
+
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->identity = first_identity;
+    method.function->code_target = target;
+
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(method);
+    hook.profile = profile;
+    hook.backup = reinterpret_cast<void*>(Replacement);
+    hook.shared_code_opt_in = true;
+    auto layout = std::make_shared<dartplant::abi::DartCallLayout>();
+    layout->dart_sp_register = 15;
+    hook.call_layout = layout;
+
+    DartPlantHookOptions options = {
+        .struct_size = sizeof(options),
+        .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
+        .on_enter = LateSharedEnter,
+        .on_leave = LateSharedLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* listener = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&hook, &method, options, 0, &listener));
+
+    const dartplant::DartMethodIdentity late_alias = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "second",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    target->AddAlias(late_alias);
+
+    g_late_shared_enter_calls = 0;
+    g_late_shared_leave_calls = 0;
+    g_late_shared_identity_ambiguous = 0;
+    g_late_shared_verified_abi = 1;
+    g_late_shared_raw_status = DARTPLANT_NOT_INITIALIZED;
+    g_late_shared_typed_status = DARTPLANT_NOT_INITIALIZED;
+    DartPlantArm64Context context{};
+    context.x[1] = 0x44;
+    const auto enter = dartplant_arm64_dispatch_enter(&context, &hook);
+    EXPECT_EQ(reinterpret_cast<void*>(Replacement), enter.original);
+    EXPECT_EQ(1, g_late_shared_enter_calls);
+    EXPECT_EQ(1, static_cast<int>(g_late_shared_identity_ambiguous));
+    EXPECT_EQ(0, static_cast<int>(g_late_shared_verified_abi));
+    EXPECT_EQ(DARTPLANT_OK, g_late_shared_raw_status);
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI, g_late_shared_typed_status);
+    dartplant_arm64_dispatch_leave_from_tls(9, 0, 0);
+    EXPECT_EQ(1, g_late_shared_leave_calls);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
+    dartplant_release_listener(listener);
 }
 
 TEST_CASE(LiveVmProfilesRequireExactSnapshotIdentity) {

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "dartplant/dartplant.h"
+#include "dartplant/flutter_snapshot.h"
 
 namespace dartplant {
 
@@ -52,20 +53,33 @@ struct DartCodeTarget {
     uint32_t code_size = 0;
     uint64_t code_object = 0;
     uint32_t reported_alias_count = 1;
+    DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
     std::vector<DartMethodIdentity> aliases;
     DartPlantHook* hook_record = nullptr;
 
-    void Update(uint32_t new_code_size, uint64_t new_code_object, uint32_t alias_count) {
+    void Update(uint32_t new_code_size, uint64_t new_code_object, uint32_t alias_count,
+                DartPlantCodeIdentityProof new_identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN) {
         std::lock_guard lock(mutex);
         if (new_code_size != 0) code_size = new_code_size;
         if (new_code_object != 0) code_object = new_code_object;
         if (alias_count > reported_alias_count) reported_alias_count = alias_count;
+        if (new_identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1) {
+            identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
+        } else if (new_identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE &&
+                   identity_proof == DARTPLANT_CODE_IDENTITY_UNKNOWN) {
+            identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+        }
     }
 
     void AddAlias(const DartMethodIdentity& identity) {
         std::lock_guard lock(mutex);
         const auto found = std::find(aliases.begin(), aliases.end(), identity);
         if (found == aliases.end()) aliases.push_back(identity);
+        if (aliases.size() > 1) {
+            reported_alias_count =
+                std::max<uint32_t>(reported_alias_count, static_cast<uint32_t>(aliases.size()));
+            identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
+        }
     }
 
     uint32_t KnownAliasCount() const {
@@ -105,7 +119,14 @@ struct DartCodeTarget {
 
     bool IsShared() const {
         std::lock_guard lock(mutex);
-        return reported_alias_count > 1 || aliases.size() > 1;
+        return identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1 ||
+               aliases.size() > 1;
+    }
+
+    bool HasProvenUniqueIdentity() const {
+        std::lock_guard lock(mutex);
+        return identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE && reported_alias_count <= 1 &&
+               aliases.size() <= 1;
     }
 };
 
@@ -121,15 +142,16 @@ struct DartFunctionHandle {
 
 class DartCodeTargetRegistry final {
 public:
-    std::shared_ptr<DartCodeTarget> GetOrCreate(uintptr_t entry, uint32_t code_size,
-                                                uint64_t code_object = 0,
-                                                uint32_t reported_alias_count = 1) {
+    std::shared_ptr<DartCodeTarget> GetOrCreate(
+        uintptr_t entry, uint32_t code_size, uint64_t code_object = 0,
+        uint32_t reported_alias_count = 1,
+        DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN) {
         if (entry == 0) return nullptr;
         std::lock_guard lock(mutex_);
         auto found = targets_.find(entry);
         if (found != targets_.end()) {
             if (auto existing = found->second.lock(); existing != nullptr) {
-                existing->Update(code_size, code_object, reported_alias_count);
+                existing->Update(code_size, code_object, reported_alias_count, identity_proof);
                 return existing;
             }
         }
@@ -139,6 +161,8 @@ public:
         target->code_size = code_size;
         target->code_object = code_object;
         target->reported_alias_count = std::max<uint32_t>(1, reported_alias_count);
+        target->identity_proof =
+            target->reported_alias_count > 1 ? DARTPLANT_CODE_IDENTITY_SHARED : identity_proof;
         targets_[entry] = target;
         return target;
     }

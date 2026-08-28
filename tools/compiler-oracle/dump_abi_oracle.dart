@@ -112,33 +112,32 @@ void main(List<String> arguments) {
   }
 
   final input = File(arguments[0]);
-  if (!input.isFileSync()) {
+  if (!input.existsSync()) {
     stderr.writeln('compiler oracle input not found: ${input.path}');
     exitCode = 66;
     return;
   }
 
   final component = Component();
-  final repository = UnboxingInfoMetadataRepository();
-  component.addMetadataRepository(repository);
+  final repo = UnboxingInfoMetadataRepository();
+  component.addMetadataRepository(repo);
   BinaryBuilderWithMetadata(Uint8List.fromList(input.readAsBytesSync()))
       .readComponent(component);
 
   final functions = <Map<String, Object?>>[];
   for (final library in component.libraries) {
     for (final procedure in library.procedures) {
-      final encoded = encodeMember(library, '', procedure, repository);
+      final encoded = encodeMember(library, '', procedure, repo);
       if (encoded != null) functions.add(encoded);
     }
     for (final clazz in library.classes) {
+      final className = clazz.name;
       for (final constructor in clazz.constructors) {
-        final encoded =
-            encodeMember(library, clazz.name, constructor, repository);
+        final encoded = encodeMember(library, className, constructor, repo);
         if (encoded != null) functions.add(encoded);
       }
       for (final procedure in clazz.procedures) {
-        final encoded =
-            encodeMember(library, clazz.name, procedure, repository);
+        final encoded = encodeMember(library, className, procedure, repo);
         if (encoded != null) functions.add(encoded);
       }
     }
@@ -150,7 +149,6 @@ void main(List<String> arguments) {
     'input_dill': input.path,
     'functions': functions,
   };
-  File(arguments[1]).writeAsStringSync(
-    const JsonEncoder.withIndent('  ').convert(output),
-  );
+  final encodedOutput = const JsonEncoder.withIndent('  ').convert(output);
+  File(arguments[1]).writeAsStringSync(encodedOutput);
 }

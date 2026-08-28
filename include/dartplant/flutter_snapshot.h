@@ -20,6 +20,16 @@ struct DartPlantFlutterSnapshotInfo {
     uint8_t compressed_pointers;
 };
 
+// Compiler-side proof about the logical identity multiplicity of one physical
+// Dart Code entry. UNKNOWN is deliberately not equivalent to UNIQUE: an
+// artifact index that only contains one logical record cannot by itself prove
+// that the precompiler did not deduplicate another Function onto the same Code.
+typedef enum DartPlantCodeIdentityProof {
+    DARTPLANT_CODE_IDENTITY_UNKNOWN = 0,
+    DARTPLANT_CODE_IDENTITY_UNIQUE,
+    DARTPLANT_CODE_IDENTITY_SHARED,
+} DartPlantCodeIdentityProof;
+
 typedef struct DartPlantSnapshotFunctionInfo {
     uint32_t struct_size;
     const char* library_uri;
@@ -31,6 +41,8 @@ typedef struct DartPlantSnapshotFunctionInfo {
     uint64_t code_size;
     uint64_t code_section_va;
     const char* fingerprint;
+    DartPlantCodeIdentityProof code_identity_proof;
+    uint32_t physical_entry_alias_count;
 } DartPlantSnapshotFunctionInfo;
 
 typedef struct DartPlantSnapshotIndexInfo {

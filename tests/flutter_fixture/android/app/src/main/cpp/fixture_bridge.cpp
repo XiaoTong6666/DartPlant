@@ -13,7 +13,11 @@
 #include "dartplant/native_api.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
+#if __has_include("ordinary_aot_sidecar.h")
 #include "ordinary_aot_sidecar.h"
+#else
+#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 0
+#endif
 #include "standalone_dobby_host.h"
 
 namespace {
@@ -370,11 +374,17 @@ void OnVerifiedAbiDoubleEnter(DartPlantInvocation* invocation, void*) {
                        dartplant_invocation_argument_count(invocation) == 2 &&
                        dartplant_invocation_get_argument(invocation, 0, &left) == DARTPLANT_OK &&
                        dartplant_invocation_get_argument(invocation, 1, &right) == DARTPLANT_OK &&
-                       left.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
-                       right.kind == DARTPLANT_VALUE_HEAP_OBJECT;
+                       left.kind == DARTPLANT_VALUE_DOUBLE && right.kind == DARTPLANT_VALUE_DOUBLE;
     if (!valid) {
         g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
         LogFailure("verified ordinary AOT double enter ABI");
+        return;
+    }
+    double rewritten_left = std::bit_cast<double>(left.raw) + 1.0;
+    left.raw = std::bit_cast<uint64_t>(rewritten_left);
+    if (dartplant_invocation_set_argument(invocation, 0, &left) != DARTPLANT_OK) {
+        g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("verified ordinary AOT double argument rewrite");
         return;
     }
     g_verified_abi_double_enter.fetch_add(1, std::memory_order_relaxed);
@@ -946,11 +956,51 @@ dartplant_fixture_reset_verified_abi_double_probe() {
 }
 
 extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_mark_verified_abi_double_shared() {
+    if (g_runtime == nullptr || g_verified_abi_double == nullptr ||
+        g_verified_abi_double->function == nullptr ||
+        g_verified_abi_double->function->code_target == nullptr ||
+        g_verified_abi_double_hook == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag, "late shared fixture marker unavailable");
+        return 0;
+    }
+
+    const dartplant::DartMethodIdentity late_alias = {
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "verifiedAbiDoubleLateAlias",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    g_verified_abi_double->function->code_target->AddAlias(late_alias);
+
+    DartPlantMethodAbiInfo abi_info{};
+    abi_info.struct_size = sizeof(abi_info);
+    const DartPlantStatus info_status =
+        dartplant_runtime_get_method_abi_info(g_runtime, g_verified_abi_double, &abi_info);
+    const bool passed =
+        g_verified_abi_double->function->code_target->IsShared() && info_status == DARTPLANT_OK &&
+        abi_info.state == DARTPLANT_METHOD_ABI_UNSUPPORTED &&
+        abi_info.has_verified_call_layout == 0 && !g_verified_abi_double_hook->shared_code_opt_in;
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DartPlant late shared transition: %u info_status=%d abi_state=%u verified_layout=%u aliases=%u opt_in=%u",
+        static_cast<unsigned>(passed), info_status, static_cast<unsigned>(abi_info.state),
+        static_cast<unsigned>(abi_info.has_verified_call_layout),
+        g_verified_abi_double->function->code_target->AliasCount(),
+        static_cast<unsigned>(g_verified_abi_double_hook->shared_code_opt_in));
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
 dartplant_fixture_verified_abi_double_probe() {
     const uint64_t enter = g_verified_abi_double_enter.load(std::memory_order_relaxed);
     const uint64_t leave = g_verified_abi_double_leave.load(std::memory_order_relaxed);
     const uint64_t failures = g_verified_abi_double_failures.load(std::memory_order_relaxed);
-    const bool passed = enter == 2 && leave == 2 && failures == 0;
+    // The second call occurs after the fixture marks this physical target as
+    // shared. The hook has no shared-code opt-in, so only the first invocation
+    // is allowed to reach the typed callbacks.
+    const bool passed = enter == 1 && leave == 1 && failures == 0;
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
         "verified ordinary AOT double probe enter=%llu leave=%llu failures=%llu passed=%u",

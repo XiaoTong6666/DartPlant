@@ -26,6 +26,8 @@ typedef _ResetVerifiedAbiDoubleProbeNative = Void Function();
 typedef _ResetVerifiedAbiDoubleProbeDart = void Function();
 typedef _VerifiedAbiDoubleProbeNative = Uint64 Function();
 typedef _VerifiedAbiDoubleProbeDart = int Function();
+typedef _MarkVerifiedAbiDoubleSharedNative = Uint64 Function();
+typedef _MarkVerifiedAbiDoubleSharedDart = int Function();
 
 final class DartPlantNative {
   DartPlantNative._();
@@ -97,6 +99,12 @@ final class DartPlantNative {
         'dartplant_fixture_verified_abi_double_probe',
       )
       .asFunction();
+  static final _MarkVerifiedAbiDoubleSharedDart _markVerifiedAbiDoubleShared =
+      _library
+          .lookup<NativeFunction<_MarkVerifiedAbiDoubleSharedNative>>(
+            'dartplant_fixture_mark_verified_abi_double_shared',
+          )
+          .asFunction();
 
   static int startInitialize() => _initialize(NativeApi.initializeApiDLData);
 
@@ -151,4 +159,6 @@ final class DartPlantNative {
   static void resetVerifiedAbiDoubleProbe() => _resetVerifiedAbiDoubleProbe();
 
   static int verifiedAbiDoubleProbe() => _verifiedAbiDoubleProbe();
+
+  static int markVerifiedAbiDoubleShared() => _markVerifiedAbiDoubleShared();
 }

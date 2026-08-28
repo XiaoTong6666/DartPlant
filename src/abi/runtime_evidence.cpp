@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <cstddef>
 #include <iterator>
+#include <string_view>
 
 #include "abi/calling_convention.h"
 #include "abi/evidence_solver.h"
@@ -73,7 +75,8 @@ DartPlantMethodAbiState PublicAbiState(const RuntimeAbiEvidenceEntry& entry) {
 std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
     const DartPlantRuntime* runtime, const DartPlantMethod* method) {
     if (runtime == nullptr || method == nullptr || method->function == nullptr ||
-        method->function->code_target == nullptr || method->function->code_target->IsShared()) {
+        method->function->code_target == nullptr ||
+        !method->function->code_target->HasProvenUniqueIdentity()) {
         return nullptr;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
@@ -89,11 +92,13 @@ std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
 extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     DartPlantRuntime* runtime, const DartPlantMethod* method,
     const DartPlantCompilerAbiEvidence* evidence) {
+    constexpr size_t kCompilerAbiEvidenceV1Size =
+        offsetof(DartPlantCompilerAbiEvidence, library_uri);
     if (runtime == nullptr || method == nullptr || evidence == nullptr ||
-        evidence->struct_size < sizeof(DartPlantCompilerAbiEvidence) ||
-        evidence->snapshot_hash == nullptr || evidence->snapshot_hash[0] == '\0' ||
-        evidence->app_build_id == nullptr || evidence->app_build_id[0] == '\0' ||
-        evidence->code_fingerprint == nullptr || evidence->code_fingerprint[0] == '\0' ||
+        evidence->struct_size < kCompilerAbiEvidenceV1Size || evidence->snapshot_hash == nullptr ||
+        evidence->snapshot_hash[0] == '\0' || evidence->app_build_id == nullptr ||
+        evidence->app_build_id[0] == '\0' || evidence->code_fingerprint == nullptr ||
+        evidence->code_fingerprint[0] == '\0' ||
         (evidence->parameter_count != 0 && evidence->parameter_representations == nullptr)) {
         dartplant::SetLastError("compiler ABI evidence arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -151,6 +156,37 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         dartplant::SetLastError(
             "compiler ABI evidence code fingerprint does not match the CodeTarget");
         return DARTPLANT_FINGERPRINT_MISMATCH;
+    }
+    const bool has_function_binding = evidence->struct_size >= sizeof(*evidence);
+    if (method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+        !has_function_binding) {
+        dartplant::SetLastError(
+            "artifact compiler ABI evidence requires an exact Function identity/address binding");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (has_function_binding) {
+        const std::string_view evidence_library =
+            evidence->library_uri == nullptr ? "" : evidence->library_uri;
+        const std::string_view evidence_class =
+            evidence->class_name == nullptr ? "" : evidence->class_name;
+        const std::string_view evidence_function =
+            evidence->function_name == nullptr ? "" : evidence->function_name;
+        if (evidence_library != method->function->identity.library_uri ||
+            evidence_class != method->function->identity.class_name ||
+            evidence_function != method->function->identity.function_name ||
+            evidence->entry_kind != method->function->identity.entry_kind ||
+            evidence->entry_va == 0 || evidence->code_size != code_size) {
+            dartplant::SetLastError(
+                "compiler ABI evidence Function identity does not match the runtime method");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const auto evidence_target = runtime->snapshot->ResolveInstructionVa(
+            *runtime->selected_app_module, evidence->entry_va);
+        if (!evidence_target.has_value() || *evidence_target != target) {
+            dartplant::SetLastError(
+                "compiler ABI evidence entry VA does not resolve to the runtime CodeTarget");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
     }
     if (evidence->must_use_stack_calling_convention != 0 &&
         evidence->max_parameters_in_registers != 0) {
@@ -246,18 +282,28 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         entry.identity = method->function->identity;
         entry.code_target = dartplant::MethodTarget(method);
         entry.generation = generation;
+        entry.formal_parameter_count = evidence->parameter_count;
         runtime->abi_evidence.push_back(std::move(entry));
         existing = std::prev(runtime->abi_evidence.end());
+    } else if (existing->formal_parameter_count != evidence->parameter_count) {
+        existing->resolution.conflicting = true;
+        existing->layout_status = dartplant::abi::DartCallLayoutStatus::kConflictingEvidence;
+        existing->call_layout.reset();
+        dartplant::SetLastError(
+            "compiler ABI evidence changes the established formal parameter count");
+        return DARTPLANT_UNSUPPORTED_ABI;
     }
 
     existing->providers.push_back(std::move(provider));
-    existing->resolution =
-        dartplant::abi::ResolveFunctionAbiEvidence(existing->providers, evidence->parameter_count);
+    existing->resolution = dartplant::abi::ResolveFunctionAbiEvidence(
+        existing->providers, existing->formal_parameter_count);
     auto layout = std::make_shared<dartplant::abi::DartCallLayout>();
     existing->layout_status = dartplant::abi::ComputeDartCallLayout(
         existing->resolution, dartplant::abi::Arm64AotCallingConventionProfile(), layout.get());
-    existing->call_layout =
-        existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk ? layout : nullptr;
+    existing->call_layout = existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
+                                    method->function->code_target->HasProvenUniqueIdentity()
+                                ? layout
+                                : nullptr;
 
     if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kConflictingEvidence ||
         existing->resolution.conflicting) {
@@ -296,13 +342,6 @@ extern "C" DartPlantStatus dartplant_runtime_get_method_abi_info(const DartPlant
 
     DartPlantMethodAbiInfo info{};
     info.struct_size = sizeof(info);
-    if (method->function != nullptr && method->function->code_target != nullptr &&
-        method->function->code_target->IsShared()) {
-        info.state = DARTPLANT_METHOD_ABI_UNSUPPORTED;
-        *out_info = info;
-        dartplant::ClearLastError();
-        return DARTPLANT_OK;
-    }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     const auto found =
         std::find_if(runtime->abi_evidence.begin(), runtime->abi_evidence.end(),
@@ -312,10 +351,18 @@ extern "C" DartPlantStatus dartplant_runtime_get_method_abi_info(const DartPlant
     if (found == runtime->abi_evidence.end()) {
         info.state = DARTPLANT_METHOD_ABI_NONE;
     } else {
-        info.state = dartplant::PublicAbiState(*found);
         info.parameter_count = static_cast<uint32_t>(found->resolution.parameters.size());
-        info.has_verified_call_layout = found->call_layout != nullptr ? 1 : 0;
-        info.stack_words = found->call_layout == nullptr ? 0 : found->call_layout->stack_words;
+        if (method->function != nullptr && method->function->code_target != nullptr &&
+            method->function->code_target->IsShared()) {
+            info.state = DARTPLANT_METHOD_ABI_UNSUPPORTED;
+        } else if (method->function != nullptr && method->function->code_target != nullptr &&
+                   !method->function->code_target->HasProvenUniqueIdentity()) {
+            info.state = DARTPLANT_METHOD_ABI_INCOMPLETE;
+        } else {
+            info.state = dartplant::PublicAbiState(*found);
+            info.has_verified_call_layout = found->call_layout != nullptr ? 1 : 0;
+            info.stack_words = found->call_layout == nullptr ? 0 : found->call_layout->stack_words;
+        }
     }
     *out_info = info;
     dartplant::ClearLastError();

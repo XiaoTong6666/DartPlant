@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(dartplant LANGUAGES CXX)
 
-option(DARTPLANT_BUILD_TESTS "Build DartPlant host tests" ON)
+option(DARTPLANT_BUILD_TESTS "Build DartPlant host tests" ${PROJECT_IS_TOP_LEVEL})
 option(DARTPLANT_BUILD_ANDROID_TESTS "Build DartPlant Android device tests" OFF)
 option(DARTPLANT_BUILD_ANDROID_MODULE "Build the optional LSPosed Native API shared module" OFF)
 set(
@@ -187,11 +187,14 @@ endif()
 
 if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
     enable_testing()
-    set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
-    set(CAPSTONE_AARCH64_SUPPORT ON CACHE BOOL "" FORCE)
-    set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
-    set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
+    # Keep bundled Capstone configuration local to this directory scope. With
+    # CMP0077 NEW (CMake >= 3.13), these normal variables seed Capstone's
+    # option() calls without rewriting a parent project's cache.
+    set(CAPSTONE_ARCHITECTURE_DEFAULT OFF)
+    set(CAPSTONE_AARCH64_SUPPORT ON)
+    set(CAPSTONE_BUILD_TESTS OFF)
+    set(CAPSTONE_BUILD_CSTOOL OFF)
+    set(CAPSTONE_INSTALL OFF)
     add_subdirectory(third_party/capstone EXCLUDE_FROM_ALL)
 
     add_library(

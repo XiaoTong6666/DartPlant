@@ -15,8 +15,11 @@ extern "C" {
 // Minimal host contract required by DartPlant core. The host owns the actual
 // inline-hook implementation (LSPosed Native API, Dobby, ShadowHook, etc.).
 // user_data lets a consumer bind a backend instance without process-global
-// state; DartPlant retains this binding for the lifetime of every installed
-// physical hook so backend replacement cannot redirect a later unhook.
+// state; DartPlant retains the pointer value together with the callback binding
+// for every installed physical hook so backend replacement cannot redirect a
+// later unhook. user_data is borrowed, not owned: the host must keep the
+// pointed-to backend instance alive until every hook created with this binding
+// has been unhooked and released.
 typedef int (*DartPlantHostHookCallback)(void* user_data, void* target, void* replacement,
                                          void** backup);
 typedef int (*DartPlantHostUnhookCallback)(void* user_data, void* target);

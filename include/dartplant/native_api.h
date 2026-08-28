@@ -14,6 +14,12 @@ typedef void (*DartPlantNativeOnModuleLoaded)(const char* name, void* handle);
 typedef int (*DartPlantNativeHook)(void* target, void* replacement, void** backup);
 typedef int (*DartPlantNativeUnhook)(void* target);
 
+// Source-compatibility aliases kept for consumers of the original public C
+// header. The native_init ABI is unchanged; new generic hosts should use
+// DartPlantHostApi from host_api.h.
+typedef DartPlantNativeHook DartPlantHostHook;
+typedef DartPlantNativeUnhook DartPlantHostUnhook;
+
 // Compatibility ABI used by LSPosed/Vector native_init hosts. DartPlant core
 // itself consumes DartPlantHostApi; this adapter type intentionally preserves
 // the established field names and version=2 contract.

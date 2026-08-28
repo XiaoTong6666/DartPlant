@@ -300,9 +300,9 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     method_record.code_size = static_cast<uint32_t>(record->code_size);
     method_record.fingerprint = record->fingerprint;
 
-    auto code_target =
-        code_targets.GetOrCreate(record->runtime_entry, static_cast<uint32_t>(record->code_size), 0,
-                                 std::max<uint32_t>(1, record->entry_alias_count));
+    auto code_target = code_targets.GetOrCreate(
+        record->runtime_entry, static_cast<uint32_t>(record->code_size), 0,
+        std::max<uint32_t>(1, record->entry_alias_count), record->code_identity_proof);
     if (code_target == nullptr) {
         SetLastError("artifact snapshot index produced an invalid CodeTarget");
         return DARTPLANT_METHOD_NOT_FOUND;
@@ -336,6 +336,8 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
     }
 
     std::unordered_map<uintptr_t, uint32_t> aliases;
+    std::unordered_map<uintptr_t, DartPlantCodeIdentityProof> identity_proofs;
+    std::unordered_map<uintptr_t, uint32_t> physical_alias_counts;
     for (auto& record : index->functions) {
         if (record.entry_kind != DARTPLANT_ENTRY_DEFAULT || record.entry_va == 0 ||
             record.code_size == 0 || record.code_size > UINT32_MAX || record.fingerprint.empty()) {
@@ -356,9 +358,34 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         record.runtime_entry = *runtime_entry;
         record.code_entry = *runtime_entry;
         ++aliases[*runtime_entry];
+
+        const auto proof = identity_proofs.find(*runtime_entry);
+        if (proof == identity_proofs.end()) {
+            identity_proofs.emplace(*runtime_entry, record.code_identity_proof);
+            physical_alias_counts.emplace(*runtime_entry, record.physical_entry_alias_count);
+        } else if (proof->second != record.code_identity_proof ||
+                   physical_alias_counts[*runtime_entry] != record.physical_entry_alias_count) {
+            SetLastError(
+                "artifact snapshot index has inconsistent compiler identity proof for one Code entry");
+            return DARTPLANT_METADATA_INVALID;
+        }
     }
     for (auto& record : index->functions) {
-        record.entry_alias_count = aliases[record.runtime_entry];
+        const uint32_t indexed_alias_count = aliases[record.runtime_entry];
+        if (record.code_identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE &&
+            indexed_alias_count != 1) {
+            SetLastError("artifact snapshot index contradicts compiler UNIQUE Code identity proof");
+            return DARTPLANT_METADATA_INVALID;
+        }
+        if (record.code_identity_proof == DARTPLANT_CODE_IDENTITY_SHARED &&
+            record.physical_entry_alias_count < indexed_alias_count) {
+            SetLastError(
+                "artifact snapshot index contains more aliases than the compiler identity proof");
+            return DARTPLANT_METADATA_INVALID;
+        }
+        record.entry_alias_count = std::max<uint32_t>(
+            indexed_alias_count,
+            record.physical_entry_alias_count == 0 ? 1 : record.physical_entry_alias_count);
     }
     ClearLastError();
     return DARTPLANT_OK;

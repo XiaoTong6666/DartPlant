@@ -193,6 +193,11 @@ def build_all(ctx: BuildContext, *, force: bool = False) -> None:
 def test_host(ctx: BuildContext, *, force: bool = False) -> None:
     build_host(ctx, force=force)
     run(
+        ["python3", str(ROOT_DIR / "tools" / "compiler-oracle" / "test_build_snapshot_sidecar.py")],
+        cwd=ROOT_DIR,
+    )
+    run(["python3", str(ROOT_DIR / "tests" / "cmake_parent_smoke.py")], cwd=ROOT_DIR)
+    run(
         [
             "cargo",
             "test",

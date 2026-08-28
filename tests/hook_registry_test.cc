@@ -3,10 +3,15 @@
 
 #include <dlfcn.h>
 
+#include <type_traits>
+
 #include "core/internal.h"
 #include "test_runner.h"
 
 namespace {
+
+static_assert(std::is_same_v<DartPlantHostHook, DartPlantNativeHook>);
+static_assert(std::is_same_v<DartPlantHostUnhook, DartPlantNativeUnhook>);
 
 int g_hook_calls = 0;
 int g_unhook_calls = 0;

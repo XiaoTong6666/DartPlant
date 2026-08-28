@@ -1,5 +1,7 @@
 #include "runtime/snapshot_index.h"
 
+#include <cstddef>
+
 #include "core/internal.h"
 #include "test_runner.h"
 
@@ -78,6 +80,8 @@ TEST_CASE(SnapshotIndexCopiesExternalRecords) {
     function.code_size = 76;
     function.code_section_va = 0x250000;
     function.fingerprint = fingerprint;
+    function.code_identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    function.physical_entry_alias_count = 1;
 
     DartPlantSnapshotIndexInfo source{};
     source.struct_size = sizeof(source);
@@ -96,4 +100,63 @@ TEST_CASE(SnapshotIndexCopiesExternalRecords) {
                                                      DARTPLANT_ENTRY_DEFAULT);
     EXPECT_TRUE(copied != nullptr);
     EXPECT_EQ(std::string(fingerprint), copied->fingerprint);
+    EXPECT_EQ(DARTPLANT_CODE_IDENTITY_UNIQUE, copied->code_identity_proof);
+    EXPECT_EQ(1U, copied->physical_entry_alias_count);
+}
+
+TEST_CASE(SnapshotIndexDoesNotInferUniqueIdentityFromOneRecord) {
+    DartPlantSnapshotFunctionInfo function{};
+    function.struct_size = offsetof(DartPlantSnapshotFunctionInfo, code_identity_proof);
+    function.library_uri = "package:app/main.dart";
+    function.class_name = "Global";
+    function.function_name = "dropped";
+    function.signature = "";
+    function.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    function.entry_va = 0x250100;
+    function.code_size = 16;
+    function.code_section_va = 0x250000;
+    function.fingerprint = "0123456789abcdef";
+
+    DartPlantSnapshotIndexInfo source{};
+    source.struct_size = sizeof(source);
+    source.module_name = "libapp.so";
+    source.module_build_id = "deadbeef";
+    source.snapshot_hash = "0123456789abcdef0123456789abcdef";
+    source.profile_version = "artifact-v1";
+    source.functions = &function;
+    source.function_count = 1;
+
+    std::string error;
+    const auto index = dartplant::BuildSnapshotIndex(source, &error);
+    EXPECT_TRUE(index.has_value());
+    EXPECT_EQ(DARTPLANT_CODE_IDENTITY_UNKNOWN, index->functions[0].code_identity_proof);
+    EXPECT_EQ(0U, index->functions[0].physical_entry_alias_count);
+}
+
+TEST_CASE(SnapshotIndexRejectsContradictoryIdentityProof) {
+    DartPlantSnapshotFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.library_uri = "package:app/main.dart";
+    function.class_name = "Global";
+    function.function_name = "dropped";
+    function.signature = "";
+    function.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    function.entry_va = 0x250100;
+    function.code_size = 16;
+    function.code_section_va = 0x250000;
+    function.fingerprint = "0123456789abcdef";
+    function.code_identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    function.physical_entry_alias_count = 2;
+
+    DartPlantSnapshotIndexInfo source{};
+    source.struct_size = sizeof(source);
+    source.module_name = "libapp.so";
+    source.module_build_id = "deadbeef";
+    source.snapshot_hash = "0123456789abcdef0123456789abcdef";
+    source.profile_version = "artifact-v2";
+    source.functions = &function;
+    source.function_count = 1;
+
+    std::string error;
+    EXPECT_TRUE(!dartplant::BuildSnapshotIndex(source, &error).has_value());
 }

@@ -28,13 +28,13 @@ bool negateBool(bool value) => !value;
 @pragma('vm:never-inline')
 T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
 
-// Keep both a normal optimized AOT body and an implicit closure. PRODUCT AOT
-// deliberately drops the parent RegularFunction identity from the live heap;
-// DartPlant binds the compiler sidecar to the final libapp.so before hooking it.
+// Keep this as an ordinary direct-call-only optimized AOT body. Without a
+// tear-off the compiler is free to use the unboxed double Dart calling
+// convention; the native fixture proves V0/V1 argument access from evidence.
 @pragma('vm:never-inline')
-double verifiedAbiDouble(double left, double right) => left + right;
-
-final verifiedAbiDoubleTearOff = verifiedAbiDouble;
+double verifiedAbiDouble(double left, double right) {
+  return (left * 1.5) + right + 0.25;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,13 +73,21 @@ Future<void> main() async {
     debugPrint('DartPlant live VM startup probe: $startupProbe');
     DartPlantNative.resetVerifiedAbiDoubleProbe();
     final ordinaryDirect = verifiedAbiDouble(1.25, 2.5);
-    final ordinaryTearOff = verifiedAbiDoubleTearOff(2.0, 3.0);
+    final lateSharedTransition = DartPlantNative.markVerifiedAbiDoubleShared();
+    final ordinaryAfterShared = verifiedAbiDouble(2.0, 3.0);
     final ordinaryProbe = DartPlantNative.verifiedAbiDoubleProbe();
     debugPrint(
-      'DartPlant ordinary AOT calls: direct=$ordinaryDirect tearOff=$ordinaryTearOff',
+      'DartPlant ordinary AOT calls: direct=$ordinaryDirect afterShared=$ordinaryAfterShared',
     );
     debugPrint(
-      'DartPlant ordinary AOT typed probe: $ordinaryProbe values=$ordinaryDirect/$ordinaryTearOff',
+      'DartPlant ordinary AOT typed probe: $ordinaryProbe values=$ordinaryDirect/$ordinaryAfterShared',
+    );
+    final lateSharedPassed = lateSharedTransition == 1 &&
+        ordinaryProbe == 1 &&
+        ordinaryDirect == 16.125 &&
+        ordinaryAfterShared == 6.25;
+    debugPrint(
+      'DartPlant late shared typed fail-close: ${lateSharedPassed ? 1 : 0} transition=$lateSharedTransition values=$ordinaryDirect/$ordinaryAfterShared',
     );
   });
 }

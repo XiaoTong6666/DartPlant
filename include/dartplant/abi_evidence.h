@@ -44,6 +44,15 @@ typedef struct DartPlantCompilerAbiEvidence {
     uint8_t has_optional_parameters;
     uint8_t has_overrides_with_less_direct_parameters;
     uint8_t reserved;
+    // V2 exact Function binding. Artifact-only Functions must provide these
+    // fields so identical machine bytes at different logical/physical entries
+    // cannot be rebound to a caller-selected DartPlantMethod.
+    const char* library_uri;
+    const char* class_name;
+    const char* function_name;
+    DartPlantEntryKind entry_kind;
+    uint64_t entry_va;
+    uint64_t code_size;
 } DartPlantCompilerAbiEvidence;
 
 typedef enum DartPlantMethodAbiState {

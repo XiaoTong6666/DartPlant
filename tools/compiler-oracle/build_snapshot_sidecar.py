@@ -51,6 +51,81 @@ class AbiEvidence:
     has_overrides_with_less_direct_parameters: bool = False
 
 
+@dataclass(frozen=True)
+class CodeIdentityEvidence:
+    proof: str
+    physical_entry_alias_count: int
+
+
+def _load_abi_oracle(
+    path: Path,
+    library_uri: str,
+    class_name: str,
+    function_name: str,
+) -> AbiEvidence:
+    document = json.loads(path.read_text())
+    if document.get("format") != 1 or document.get("source") != "vm.unboxing-info.metadata":
+        raise ValueError("ABI oracle JSON has an unsupported format/source")
+    functions = document.get("functions")
+    if not isinstance(functions, list):
+        raise ValueError("ABI oracle JSON has no functions array")
+
+    expected_class = "" if class_name == "Global" else class_name
+    matches = [
+        function
+        for function in functions
+        if isinstance(function, dict)
+        and function.get("library_uri") == library_uri
+        and function.get("class_name") == expected_class
+        and function.get("function_name") == function_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "ABI oracle did not identify exactly one compiler Function for "
+            f"{library_uri}/{class_name}/{function_name}: {len(matches)} candidates"
+        )
+    function = matches[0]
+    parameters = function.get("parameters")
+    result = function.get("result")
+    if not isinstance(parameters, list) or not all(isinstance(value, str) for value in parameters):
+        raise ValueError("ABI oracle parameter representation list is invalid")
+    allowed_parameters = {"tagged", "unboxed-int64", "unboxed-double"}
+    if any(value not in allowed_parameters for value in parameters):
+        raise ValueError(f"ABI oracle contains an unsupported parameter representation: {parameters}")
+    allowed_results = allowed_parameters | {"pair-of-tagged"}
+    if not isinstance(result, str) or result not in allowed_results:
+        raise ValueError(f"ABI oracle contains an unsupported result representation: {result!r}")
+
+    fixed_parameter_count = function.get("fixed_parameter_count")
+    max_parameters_in_registers = function.get("max_parameters_in_registers")
+    if fixed_parameter_count != len(parameters):
+        raise ValueError(
+            "ABI oracle fixed-parameter count does not match its representation vector"
+        )
+    if (
+        not isinstance(max_parameters_in_registers, int)
+        or max_parameters_in_registers < 0
+        or max_parameters_in_registers > len(parameters)
+    ):
+        raise ValueError("ABI oracle max_parameters_in_registers is invalid")
+    must_use_stack = function.get("must_use_stack_calling_convention")
+    has_optional = function.get("has_optional_parameters")
+    has_overrides = function.get("has_overrides_with_less_direct_parameters")
+    if not all(isinstance(value, bool) for value in (must_use_stack, has_optional, has_overrides)):
+        raise ValueError("ABI oracle calling-convention flags are invalid")
+    if must_use_stack and max_parameters_in_registers != 0:
+        raise ValueError("ABI oracle forced-stack Function still reports register parameters")
+
+    return AbiEvidence(
+        parameters=tuple(parameters),
+        result=result,
+        max_parameters_in_registers=max_parameters_in_registers,
+        must_use_stack_calling_convention=must_use_stack,
+        has_optional_parameters=has_optional,
+        has_overrides_with_less_direct_parameters=has_overrides,
+    )
+
+
 def _parse_elf64(data: bytes) -> ElfIdentity:
     header_fmt = "<16sHHIQQQIHHHHHH"
     header_size = struct.calcsize(header_fmt)
@@ -251,9 +326,101 @@ def _fnv1a64(data: bytes) -> str:
     return f"{value:016x}"
 
 
-def _run_gen_snapshot(gen_snapshot: Path, dill: Path, function_name: str) -> str:
+def _extract_code_identity_profile(
+    profile_path: Path,
+    library_uri: str,
+    class_name: str,
+    function_name: str,
+) -> CodeIdentityEvidence:
+    profile = json.loads(profile_path.read_text())
+    meta = profile["snapshot"]["meta"]
+    node_fields = meta["node_fields"]
+    edge_fields = meta["edge_fields"]
+    node_types = meta["node_types"][0]
+    edge_types = meta["edge_types"][0]
+    strings = profile["strings"]
+    nodes = profile["nodes"]
+    edges = profile["edges"]
+    node_width = len(node_fields)
+    edge_width = len(edge_fields)
+    node_field = {name: index for index, name in enumerate(node_fields)}
+    edge_field = {name: index for index, name in enumerate(edge_fields)}
+    node_count = len(nodes) // node_width
+
+    names: list[str] = []
+    types: list[str] = []
+    edge_counts: list[int] = []
+    for index in range(node_count):
+        base = index * node_width
+        names.append(strings[nodes[base + node_field["name"]]])
+        types.append(node_types[nodes[base + node_field["type"]]])
+        edge_counts.append(nodes[base + node_field["edge_count"]])
+
+    function_owner: dict[int, int] = {}
+    function_code: dict[int, int] = {}
+    class_library: dict[int, int] = {}
+    code_functions: dict[int, list[int]] = {}
+    edge_position = 0
+    for source, count in enumerate(edge_counts):
+        for _ in range(count):
+            base = edge_position * edge_width
+            edge_type = edge_types[edges[base + edge_field["type"]]]
+            name_value = edges[base + edge_field["name_or_index"]]
+            edge_name = (
+                strings[name_value]
+                if edge_type in ("context", "property", "internal")
+                else ""
+            )
+            target = edges[base + edge_field["to_node"]] // node_width
+            if types[source] == "Function":
+                if edge_name == "owner_":
+                    function_owner[source] = target
+                elif edge_name == "code_":
+                    function_code[source] = target
+                    code_functions.setdefault(target, []).append(source)
+            elif types[source] == "Class" and edge_name == "library_":
+                class_library[source] = target
+            edge_position += 1
+
+    profile_class_name = "::" if class_name == "Global" else class_name
+    candidates: list[tuple[int, int]] = []
+    for function, code in function_code.items():
+        if names[function] != function_name:
+            continue
+        owner = function_owner.get(function)
+        if owner is None or types[owner] != "Class" or names[owner] != profile_class_name:
+            continue
+        library = class_library.get(owner)
+        if library is None or types[library] != "Library" or names[library] != library_uri:
+            continue
+        candidates.append((function, code))
+
+    if len(candidates) != 1:
+        raise ValueError(
+            "snapshot profile did not identify exactly one compiler Function for "
+            f"{library_uri}/{class_name}/{function_name}: {len(candidates)} candidates"
+        )
+    _, code = candidates[0]
+    aliases = code_functions.get(code, [])
+    if not aliases:
+        raise ValueError("snapshot profile target Code has no Function.code_ references")
+    alias_count = len(aliases)
+    return CodeIdentityEvidence(
+        proof="unique" if alias_count == 1 else "shared",
+        physical_entry_alias_count=alias_count,
+    )
+
+
+def _run_gen_snapshot(
+    gen_snapshot: Path,
+    dill: Path,
+    library_uri: str,
+    class_name: str,
+    function_name: str,
+) -> tuple[str, CodeIdentityEvidence]:
     with tempfile.TemporaryDirectory(prefix="dartplant-oracle-") as temp_dir:
         elf = Path(temp_dir) / "oracle.so"
+        profile = Path(temp_dir) / "oracle.heapsnapshot"
         command = [
             str(gen_snapshot),
             "--deterministic",
@@ -264,6 +431,7 @@ def _run_gen_snapshot(gen_snapshot: Path, dill: Path, function_name: str) -> str
             "--print-flow-graph",
             "--print-flow-graph-optimized",
             f"--print-flow-graph-filter={function_name}",
+            f"--write-v8-snapshot-profile-to={profile}",
             str(dill),
         ]
         result = sp.run(command, check=False, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
@@ -271,7 +439,9 @@ def _run_gen_snapshot(gen_snapshot: Path, dill: Path, function_name: str) -> str
             raise RuntimeError(
                 f"gen_snapshot oracle failed with exit code {result.returncode}\n{result.stdout}"
             )
-        return result.stdout
+        return result.stdout, _extract_code_identity_profile(
+            profile, library_uri, class_name, function_name
+        )
 
 
 def _write_header(path: Path, record: dict[str, object]) -> None:
@@ -295,6 +465,8 @@ inline constexpr DartPlantSnapshotFunctionInfo kDartPlantOrdinaryAotFunctions[] 
     .code_size = {record['code_size']}ULL,
     .code_section_va = 0,
     .fingerprint = {json.dumps(record['fingerprint'])},
+    .code_identity_proof = DARTPLANT_CODE_IDENTITY_{str(record['code_identity_proof']).upper()},
+    .physical_entry_alias_count = {record['physical_entry_alias_count']},
 }}}};
 
 inline constexpr DartPlantSnapshotIndexInfo kDartPlantOrdinaryAotSnapshotIndex = {{
@@ -325,6 +497,12 @@ inline constexpr DartPlantCompilerAbiEvidence kDartPlantOrdinaryAotAbiEvidence =
     .has_optional_parameters = {1 if record['has_optional_parameters'] else 0},
     .has_overrides_with_less_direct_parameters = {1 if record['has_overrides_with_less_direct_parameters'] else 0},
     .reserved = 0,
+    .library_uri = {json.dumps(record['library_uri'])},
+    .class_name = {json.dumps(record['class_name'])},
+    .function_name = {json.dumps(record['function_name'])},
+    .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    .entry_va = 0x{record['entry_va']:x}ULL,
+    .code_size = {record['code_size']}ULL,
 }};
 """
     path.write_text(text)
@@ -340,15 +518,37 @@ def main() -> int:
     parser.add_argument("--library-uri", required=True)
     parser.add_argument("--class-name", required=True)
     parser.add_argument("--function-name", required=True)
+    parser.add_argument("--abi-oracle-json", type=Path, required=True)
     parser.add_argument("--output-header", type=Path, required=True)
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
 
     libapp = args.libapp.read_bytes()
     identity = _parse_elf64(libapp)
-    log = _run_gen_snapshot(args.gen_snapshot, args.dill, args.function_name)
+    log, code_identity = _run_gen_snapshot(
+        args.gen_snapshot,
+        args.dill,
+        args.library_uri,
+        args.class_name,
+        args.function_name,
+    )
     code = _extract_machine_code(log, args.function_name)
-    abi = _extract_abi(log, args.function_name)
+    abi = _load_abi_oracle(
+        args.abi_oracle_json,
+        args.library_uri,
+        args.class_name,
+        args.function_name,
+    )
+    # gen_snapshot's human-readable CFG is intentionally only an independent
+    # cross-check. Runtime ABI evidence is emitted from vm.unboxing-info.metadata
+    # above; changing printer text cannot silently become compiler truth.
+    cfg_abi = _extract_abi(log, args.function_name)
+    if cfg_abi.parameters != abi.parameters or cfg_abi.result != abi.result:
+        raise ValueError(
+            "compiler ABI oracle disagrees with optimized CFG cross-check: "
+            f"oracle={abi.parameters}->{abi.result} "
+            f"cfg={cfg_abi.parameters}->{cfg_abi.result}"
+        )
     entry_va = _find_unique_executable_va(libapp, identity, code)
     record: dict[str, object] = {
         "library_uri": args.library_uri,
@@ -359,6 +559,8 @@ def main() -> int:
         "fingerprint": _fnv1a64(code),
         "build_id": identity.build_id,
         "snapshot_hash": identity.snapshot_hash,
+        "code_identity_proof": code_identity.proof,
+        "physical_entry_alias_count": code_identity.physical_entry_alias_count,
         "abi_parameters": list(abi.parameters),
         "abi_result": abi.result,
         "max_parameters_in_registers": abi.max_parameters_in_registers,
@@ -375,6 +577,7 @@ def main() -> int:
     print(
         f"compiler sidecar: {args.library_uri}/{args.class_name}/{args.function_name} "
         f"entry_va=0x{entry_va:x} size={len(code)} fingerprint={record['fingerprint']} "
+        f"identity={code_identity.proof}/{code_identity.physical_entry_alias_count} "
         f"abi={abi.parameters}->{abi.result}"
     )
     return 0

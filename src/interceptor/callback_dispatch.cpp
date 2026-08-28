@@ -40,21 +40,37 @@ bool InvokeCallback(DartPlantInvocationCallback callback, DartPlantInvocation* i
 
 DispatchFrame* CurrentFrame() { return g_depth == 0 ? nullptr : &g_frames[g_depth - 1]; }
 
+void RefreshIdentityState(DartPlantInvocation* invocation) {
+    if (invocation == nullptr) return;
+    invocation->identity_ambiguous =
+        invocation->code_target != nullptr && invocation->code_target->IsShared();
+    if (invocation->identity_ambiguous) {
+        // A verified ABI belongs to one logical Function. Once the physical
+        // CodeTarget is known to be shared, typed interpretation must stop even
+        // when the hook was installed while the target still looked unique.
+        invocation->call_layout = nullptr;
+    }
+}
+
 void SelectListenerIdentity(DartPlantInvocation* invocation,
                             const std::shared_ptr<dartplant::DartPlantListenerRecord>& listener) {
     if (invocation == nullptr) return;
     invocation->requested_method = listener == nullptr || listener->requested_method == nullptr
                                        ? nullptr
                                        : listener->requested_method.get();
-    invocation->identity_ambiguous =
-        invocation->code_target != nullptr && invocation->code_target->IsShared();
+    RefreshIdentityState(invocation);
 }
 
-void ReleaseSnapshot(DartPlantInvocation* invocation) {
+void ClearEnteredListeners(DartPlantInvocation* invocation) {
+    if (invocation == nullptr) return;
     for (const auto& listener : invocation->entered_listeners) {
         listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
     }
     invocation->entered_listeners.clear();
+}
+
+void ReleaseSnapshot(DartPlantInvocation* invocation) {
+    ClearEnteredListeners(invocation);
     dartplant::InvocationExited(invocation->hook);
 }
 
@@ -112,10 +128,9 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     if (frame.invocation.code_target != nullptr) {
         frame.invocation.code_alias_snapshot = frame.invocation.code_target->AliasSnapshot();
     }
-    frame.invocation.identity_ambiguous =
-        frame.invocation.code_target != nullptr && frame.invocation.code_target->IsShared();
     frame.invocation.profile = &hook->profile;
     frame.invocation.call_layout = hook->call_layout.get();
+    RefreshIdentityState(&frame.invocation);
     frame.invocation.context = &frame.context;
     frame.invocation.phase = DARTPLANT_INVOCATION_ENTER;
     frame.invocation.depth = g_depth;
@@ -124,7 +139,10 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     frame.invocation.validated_bool_true_value = hook->validated_bool_true_value;
     frame.invocation.validated_bool_false_value = hook->validated_bool_false_value;
 
-    if (frame.invocation.vm_adapter != nullptr) {
+    const bool late_shared_fail_closed =
+        frame.invocation.identity_ambiguous && !hook->shared_code_opt_in;
+
+    if (!late_shared_fail_closed && frame.invocation.vm_adapter != nullptr) {
         if (dartplant_vm_enter_scope(frame.invocation.vm_adapter) != DARTPLANT_OK) {
             --g_depth;
             result.context = &frame.context;
@@ -139,7 +157,23 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
             dartplant_vm_leave_scope(frame.invocation.vm_adapter);
             frame.invocation.vm_scope_entered = false;
         }
-        --g_depth;
+        // The trampoline will still execute the original through the common
+        // continuation path. Keep a passthrough frame for that leave and make
+        // sure it cannot decrement a hook invocation that was never pinned.
+        frame.invocation.hook = nullptr;
+        result.context = &frame.context;
+        result.original = hook->backup;
+        return result;
+    }
+
+    if (late_shared_fail_closed) {
+        // The hook was installed while this target appeared unique, but a later
+        // alias made it shared. Without explicit shared-code opt-in, execute no
+        // user callback at all; keep only the hook invocation pin until the
+        // original returns through FinishFrame().
+        ClearEnteredListeners(&frame.invocation);
+        dartplant::SetLastError(
+            "callback target became shared after installation; callbacks were bypassed");
         result.context = &frame.context;
         result.original = hook->backup;
         return result;
@@ -147,8 +181,9 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
 
     size_t entered_count = 0;
     for (const auto& listener : frame.invocation.entered_listeners) {
-        ++entered_count;
         SelectListenerIdentity(&frame.invocation, listener);
+        if (frame.invocation.identity_ambiguous && !hook->shared_code_opt_in) break;
+        ++entered_count;
         InvokeCallback(listener->options.on_enter, &frame.invocation, listener->options.user_data);
         if (frame.invocation.skip_original) break;
     }

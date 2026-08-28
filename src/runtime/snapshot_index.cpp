@@ -1,6 +1,7 @@
 #include "runtime/snapshot_index.h"
 
 #include <algorithm>
+#include <cstddef>
 
 #include "core/internal.h"
 
@@ -105,10 +106,26 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
     index.functions.reserve(source.function_count);
     for (uint32_t position = 0; position < source.function_count; ++position) {
         const DartPlantSnapshotFunctionInfo& function = source.functions[position];
-        if (function.struct_size < sizeof(function) || function.library_uri == nullptr ||
+        constexpr size_t kSnapshotFunctionV1Size =
+            offsetof(DartPlantSnapshotFunctionInfo, code_identity_proof);
+        if (function.struct_size < kSnapshotFunctionV1Size || function.library_uri == nullptr ||
             function.function_name == nullptr || function.entry_va == 0 ||
             function.code_size == 0 || function.code_section_va > function.entry_va) {
             if (error != nullptr) *error = "snapshot function record is invalid";
+            return std::nullopt;
+        }
+        DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
+        uint32_t physical_entry_alias_count = 0;
+        if (function.struct_size >= sizeof(function)) {
+            identity_proof = function.code_identity_proof;
+            physical_entry_alias_count = function.physical_entry_alias_count;
+        }
+        if ((identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE && physical_entry_alias_count != 1) ||
+            (identity_proof == DARTPLANT_CODE_IDENTITY_SHARED && physical_entry_alias_count < 2) ||
+            (identity_proof != DARTPLANT_CODE_IDENTITY_UNKNOWN &&
+             identity_proof != DARTPLANT_CODE_IDENTITY_UNIQUE &&
+             identity_proof != DARTPLANT_CODE_IDENTITY_SHARED)) {
+            if (error != nullptr) *error = "snapshot function identity proof is invalid";
             return std::nullopt;
         }
         index.functions.push_back({
@@ -121,6 +138,8 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
             .code_size = function.code_size,
             .code_section_va = function.code_section_va,
             .fingerprint = function.fingerprint == nullptr ? "" : function.fingerprint,
+            .physical_entry_alias_count = physical_entry_alias_count,
+            .code_identity_proof = identity_proof,
         });
     }
     return index;

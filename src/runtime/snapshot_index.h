@@ -33,6 +33,8 @@ struct SnapshotFunction {
     uint64_t owner_class = 0;
     uint64_t library = 0;
     uint32_t entry_alias_count = 1;
+    uint32_t physical_entry_alias_count = 0;
+    DartPlantCodeIdentityProof code_identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
     uint32_t function_kind = 0;
     bool owner_is_toplevel_class = false;
     bool code_owner_matches_function = false;

@@ -4,14 +4,19 @@
 #ifndef DARTPLANT_RUNTIME_H_
 #define DARTPLANT_RUNTIME_H_
 
+// Advanced explicit-runtime API. Normal consumers should prefer
+// dartplant_init() + dartplant_find_method() + dartplant_hook_method(). This
+// header remains public for diagnostics, fixtures, custom bootstrap policy and
+// source compatibility with earlier DartPlant releases.
+
 #include <stdint.h>
 
-#include "dartplant/abi_evidence.h"
+#include "dartplant/advanced/abi_evidence.h"
+#include "dartplant/advanced/flutter_snapshot.h"
+#include "dartplant/advanced/live_vm.h"
+#include "dartplant/advanced/runtime_profile.h"
 #include "dartplant/dartplant.h"
-#include "dartplant/flutter_snapshot.h"
 #include "dartplant/invocation.h"
-#include "dartplant/live_vm.h"
-#include "dartplant/runtime_profile.h"
 #include "dartplant/signature.h"
 
 #ifdef __cplusplus
@@ -136,6 +141,13 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime*
                                                                const DartPlantMethod* method,
                                                                const DartPlantHookOptions* options,
                                                                DartPlantHook** out_hook);
+
+// Transitional advanced entry returning the same logical handle as the normal
+// dartplant_hook_method() facade while an explicitly managed runtime is still
+// required by diagnostics/fixtures.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_hook_method_handle(
+    DartPlantRuntime* runtime, const DartPlantMethod* method, const DartPlantHookOptions* options,
+    DartPlantHookHandle** out_handle);
 
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_hook_method_with_profile(
     DartPlantRuntime* runtime, const DartPlantMethod* method,

@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "abi/value_codec.h"
+#include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
 
 namespace dartplant {
@@ -1186,12 +1187,14 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime method query is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    const DartPlantStatus artifact_status = dartplant::BindRegisteredArtifactIndexIfReady(runtime);
+    if (artifact_status != DARTPLANT_OK) return artifact_status;
     auto operation = dartplant::AcquireRuntimeOperation(runtime);
     if (!operation) {
         dartplant::SetLastError("runtime is closing or destroyed");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    std::lock_guard lock(runtime->mutex);
+    std::unique_lock lock(runtime->mutex);
     if (runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError("runtime is not ready for method resolution");
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -1210,17 +1213,25 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime app module identity is not selected");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    const DartPlantStatus live_status = dartplant::ResolveLiveIndexedRuntimeMethod(
+    DartPlantStatus status = dartplant::ResolveLiveIndexedRuntimeMethod(
         *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->code_targets, *query,
         runtime->generation, runtime->generation->load(std::memory_order_acquire), out_method);
-    if (live_status != DARTPLANT_METHOD_NOT_FOUND ||
-        !runtime->artifact_snapshot_index.has_value()) {
-        return live_status;
+    if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->artifact_snapshot_index.has_value()) {
+        status = dartplant::ResolveArtifactIndexedRuntimeMethod(
+            *runtime->artifact_snapshot_index, *runtime->snapshot, *runtime->selected_app_module,
+            runtime->code_targets, *query, runtime->generation,
+            runtime->generation->load(std::memory_order_acquire), out_method);
     }
-    return dartplant::ResolveArtifactIndexedRuntimeMethod(
-        *runtime->artifact_snapshot_index, *runtime->snapshot, *runtime->selected_app_module,
-        runtime->code_targets, *query, runtime->generation,
-        runtime->generation->load(std::memory_order_acquire), out_method);
+    lock.unlock();
+    if (status != DARTPLANT_OK) return status;
+    const DartPlantStatus evidence_status =
+        dartplant::BindRegisteredCompilerEvidenceIfPresent(runtime, *out_method);
+    if (evidence_status != DARTPLANT_OK) {
+        dartplant_release_method(*out_method);
+        *out_method = nullptr;
+        return evidence_status;
+    }
+    return DARTPLANT_OK;
 }
 
 }  // extern "C"

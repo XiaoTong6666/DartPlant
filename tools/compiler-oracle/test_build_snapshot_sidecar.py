@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_snapshot_sidecar import _extract_code_identity_profile, _load_abi_oracle
+from build_snapshot_sidecar import _extract_code_identity_profile, _load_abi_oracle, _write_header
 from run_abi_oracle import _package_language_version
 
 
@@ -185,6 +185,37 @@ class OracleRunnerTest(unittest.TestCase):
             self.assertEqual("3.12", _package_language_version(pubspec))
             pubspec.write_text("name: vm\nenvironment:\n  sdk: '>=3.3.0 <4.0.0'\n")
             self.assertEqual("3.3", _package_language_version(pubspec))
+
+
+class GeneratedBundleTest(unittest.TestCase):
+    def test_generated_header_self_registers_artifact_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            header = Path(temp) / "sidecar.h"
+            _write_header(
+                header,
+                {
+                    "library_uri": "package:fixture/main.dart",
+                    "class_name": "Global",
+                    "function_name": "target",
+                    "entry_va": 0x1234,
+                    "code_size": 16,
+                    "fingerprint": "0123456789abcdef",
+                    "build_id": "00112233",
+                    "snapshot_hash": "0123456789abcdef0123456789abcdef",
+                    "code_identity_proof": "unique",
+                    "physical_entry_alias_count": 1,
+                    "abi_parameters": ["unboxed-double"],
+                    "abi_result": "unboxed-double",
+                    "max_parameters_in_registers": 1,
+                    "must_use_stack_calling_convention": False,
+                    "has_optional_parameters": False,
+                    "has_overrides_with_less_direct_parameters": False,
+                },
+            )
+            text = header.read_text()
+            self.assertIn('#include "dartplant/advanced/artifact.h"', text)
+            self.assertIn("DartPlantArtifactBundle", text)
+            self.assertIn("dartplant_register_embedded_artifact_bundle", text)
 
 
 if __name__ == "__main__":

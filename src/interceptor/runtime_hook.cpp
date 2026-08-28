@@ -3,6 +3,7 @@
 
 #include <algorithm>
 
+#include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
 
 extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* runtime,
@@ -74,6 +75,28 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
                                           nullptr, runtime->live_vm_null_value, runtime->generation,
                                           generation, runtime->live_vm_bool_true_value,
                                           runtime->live_vm_bool_false_value, call_layout);
+}
+
+extern "C" DartPlantStatus dartplant_runtime_hook_method_handle(DartPlantRuntime* runtime,
+                                                                const DartPlantMethod* method,
+                                                                const DartPlantHookOptions* options,
+                                                                DartPlantHookHandle** out_handle) {
+    if (runtime == nullptr || method == nullptr || options == nullptr || out_handle == nullptr) {
+        dartplant::SetLastError("runtime logical hook arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const DartPlantStatus evidence_status =
+        dartplant::BindRegisteredCompilerEvidenceIfPresent(runtime, method);
+    if (evidence_status != DARTPLANT_OK) return evidence_status;
+    DartPlantListener* listener = nullptr;
+    const DartPlantStatus status =
+        dartplant_runtime_add_listener(runtime, method, options, 0, &listener);
+    if (status != DARTPLANT_OK) return status;
+    auto* handle = new DartPlantHookHandle;
+    handle->listener = listener;
+    *out_handle = handle;
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
 }
 
 extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(

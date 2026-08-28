@@ -4,6 +4,8 @@ typedef _InitializeNative = Int32 Function(Pointer<Void> apiData);
 typedef _InitializeDart = int Function(Pointer<Void> apiData);
 typedef _ColdBootstrapStatusNative = Int32 Function();
 typedef _ColdBootstrapStatusDart = int Function();
+typedef _SimpleFacadeHookProbeNative = Uint64 Function();
+typedef _SimpleFacadeHookProbeDart = int Function();
 typedef _ShutdownNative = Void Function();
 typedef _ShutdownDart = void Function();
 typedef _BeginObjectProbeNative = Void Function();
@@ -42,6 +44,11 @@ final class DartPlantNative {
   static final _ColdBootstrapStatusDart _coldBootstrapStatus = _library
       .lookup<NativeFunction<_ColdBootstrapStatusNative>>(
         'dartplant_fixture_cold_bootstrap_status',
+      )
+      .asFunction();
+  static final _SimpleFacadeHookProbeDart _simpleFacadeHookProbe = _library
+      .lookup<NativeFunction<_SimpleFacadeHookProbeNative>>(
+        'dartplant_fixture_simple_facade_hook_probe',
       )
       .asFunction();
   static final _ShutdownDart _shutdown = _library
@@ -147,6 +154,8 @@ final class DartPlantNative {
   static void resetInstrumentedAddProbe() => _resetInstrumentedAddProbe();
 
   static int instrumentedAddProbe() => _instrumentedAddProbe();
+
+  static int simpleFacadeHookProbe() => _simpleFacadeHookProbe();
 
   static void resetNullSemanticProbe() => _resetNullSemanticProbe();
 

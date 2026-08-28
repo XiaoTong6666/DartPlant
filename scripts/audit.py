@@ -18,9 +18,17 @@ def run_audit() -> None:
         issues.append(f"Dobby submodule is missing: {dobby_root}")
     for required in (
         ROOT_DIR / "CMakeLists.txt",
+        ROOT_DIR / "include/dartplant/hook.h",
         ROOT_DIR / "include/dartplant/runtime.h",
         ROOT_DIR / "include/dartplant/runtime_profile.h",
+        ROOT_DIR / "include/dartplant/advanced/runtime_profile.h",
+        ROOT_DIR / "include/dartplant/adapters/dobby.h",
+        ROOT_DIR / "include/dartplant/adapters/shadowhook.h",
+        ROOT_DIR / "adapters/lsposed/lsposed_module.cpp",
+        ROOT_DIR / "adapters/dobby/dobby_host.cpp",
+        ROOT_DIR / "adapters/shadowhook/shadowhook_host.cpp",
         ROOT_DIR / "src/runtime/dart_runtime_resolver.cpp",
+        ROOT_DIR / "src/runtime/default_runtime.cpp",
         ROOT_DIR / "scripts/main.py",
         ROOT_DIR / "scripts/metadata.py",
         ROOT_DIR / "tools/dartplant-indexer/Cargo.toml",

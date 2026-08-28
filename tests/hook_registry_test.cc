@@ -6,6 +6,7 @@
 #include <type_traits>
 
 #include "core/internal.h"
+#include "dartplant/native_api.h"
 #include "test_runner.h"
 
 namespace {
@@ -36,6 +37,12 @@ int FakeUnhook(void* target) {
     return 0;
 }
 
+int FakeHostHook(void*, void* target, void* replacement, void** backup) {
+    return FakeHook(target, replacement, backup);
+}
+
+int FakeHostUnhook(void*, void* target) { return FakeUnhook(target); }
+
 int ContextHook(void* user_data, void* target, void*, void** backup) {
     auto* state = static_cast<ContextHostState*>(user_data);
     if (state == nullptr || backup == nullptr) return -1;
@@ -60,8 +67,14 @@ void ResetFakeHost() {
     g_hook_calls = 0;
     g_unhook_calls = 0;
     g_last_target = nullptr;
-    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&entries);
+    const DartPlantHostApi api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = nullptr,
+        .hook = FakeHostHook,
+        .unhook = FakeHostUnhook,
+    };
+    dartplant::InstallHostApi(&api);
     dartplant::RefreshModules();
 }
 
@@ -117,6 +130,46 @@ TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
     EXPECT_EQ(0, second.unhook_calls);
     dartplant_release_hook(hook);
     dlclose(fixture);
+}
+
+TEST_CASE(SimpleInitOwnsRuntimeProfileAndBootstrapsFindLazily) {
+    dartplant_reset();
+    ContextHostState host_state;
+    const DartPlantHostApi host_api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &host_state,
+        .hook = ContextHook,
+        .unhook = ContextUnhook,
+    };
+    const DartPlantInitInfo init = {
+        .struct_size = sizeof(DartPlantInitInfo),
+        .version = DARTPLANT_INIT_API_VERSION,
+        .host_api = &host_api,
+        .artifact_bundle = nullptr,
+        .app_module_name = nullptr,
+        .runtime_module_name = nullptr,
+    };
+    EXPECT_EQ(DARTPLANT_OK, dartplant_init(&init));
+    EXPECT_EQ(1, static_cast<int>(dartplant_is_initialized()));
+
+    // No Flutter images exist in the host test process. The important public
+    // contract is that find_method owns refresh/bootstrap and fails at runtime
+    // readiness rather than asking the caller for LiveVmContext/Profile data.
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "missing",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, dartplant_find_method(&query, &method));
+    EXPECT_TRUE(method == nullptr);
+
+    dartplant_shutdown();
+    EXPECT_EQ(0, static_cast<int>(dartplant_is_initialized()));
 }
 
 TEST_CASE(AddressHookUsesHostApiAndUnhooks) {

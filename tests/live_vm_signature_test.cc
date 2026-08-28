@@ -6,7 +6,7 @@
 #include <cstring>
 #include <string_view>
 
-#include "dartplant/live_vm.h"
+#include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
 
 namespace {

@@ -11,17 +11,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def configure(contents: str) -> str:
-    with tempfile.TemporaryDirectory(prefix="dartplant-cmake-parent-") as temp:
+    smoke_root = ROOT / "build"
+    smoke_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cmake-parent-smoke-", dir=smoke_root) as temp:
         source = Path(temp)
         build = source / "build"
         (source / "CMakeLists.txt").write_text(contents)
-        sp.run(
+        result = sp.run(
             ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja"],
-            check=True,
             stdout=sp.PIPE,
             stderr=sp.STDOUT,
             text=True,
         )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "temporary parent CMake configure failed:\n"
+                f"source: {source}\n"
+                f"build: {build}\n"
+                f"{result.stdout}"
+            )
         return (build / "CMakeCache.txt").read_text()
 
 
@@ -37,7 +45,7 @@ def main() -> int:
     cache = configure(
         f"""cmake_minimum_required(VERSION 3.22.1)
 project(dartplant_parent_smoke LANGUAGES CXX)
-set(CAPSTONE_BUILD_TESTS ON CACHE BOOL \"parent-owned\")
+set(CAPSTONE_BUILD_CSTOOL ON CACHE BOOL \"parent-owned\")
 add_subdirectory(\"{ROOT}\" dartplant)
 if(DARTPLANT_BUILD_TESTS)
   message(FATAL_ERROR \"DartPlant subdirectory default enabled tests\")
@@ -45,18 +53,18 @@ endif()
 """
     )
     assert cache_value(cache, "DARTPLANT_BUILD_TESTS") == "OFF"
-    assert cache_value(cache, "CAPSTONE_BUILD_TESTS") == "ON"
+    assert cache_value(cache, "CAPSTONE_BUILD_CSTOOL") == "ON"
 
     cache = configure(
         f"""cmake_minimum_required(VERSION 3.22.1)
 project(dartplant_parent_capstone_smoke LANGUAGES C CXX)
 set(DARTPLANT_BUILD_TESTS ON CACHE BOOL \"\")
-set(CAPSTONE_BUILD_TESTS ON CACHE BOOL \"parent-owned\")
+set(CAPSTONE_BUILD_CSTOOL ON CACHE BOOL \"parent-owned\")
 add_subdirectory(\"{ROOT}\" dartplant)
 """
     )
     assert cache_value(cache, "DARTPLANT_BUILD_TESTS") == "ON"
-    assert cache_value(cache, "CAPSTONE_BUILD_TESTS") == "ON"
+    assert cache_value(cache, "CAPSTONE_BUILD_CSTOOL") == "ON"
     return 0
 
 

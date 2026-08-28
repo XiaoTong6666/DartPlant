@@ -8,8 +8,9 @@
 
 #include "core/internal.h"
 #include "dart_api_adapter.h"
+#include "dartplant/adapters/dobby.h"
+#include "dartplant/advanced/live_vm.h"
 #include "dartplant/invocation.h"
-#include "dartplant/live_vm.h"
 #include "dartplant/native_api.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
@@ -18,7 +19,6 @@
 #else
 #define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 0
 #endif
-#include "standalone_dobby_host.h"
 
 namespace {
 
@@ -34,7 +34,9 @@ DartPlantMethod* g_verified_abi_double = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
 DartPlantHook* g_negate_bool_hook = nullptr;
-DartPlantHook* g_verified_abi_double_hook = nullptr;
+DartPlantHookHandle* g_verified_abi_double_hook = nullptr;
+DartPlantHookHandle* g_verified_abi_double_observer_hook = nullptr;
+DartPlantHookHandle* g_simple_facade_hook = nullptr;
 DartPlantListener* g_add_int_listener = nullptr;
 DartPlantFlutterSnapshotInfo g_snapshot_info{};
 std::atomic_flag g_object_bridge_probe = ATOMIC_FLAG_INIT;
@@ -47,6 +49,8 @@ std::atomic<uint64_t> g_instrumented_add_last_result = 0;
 std::atomic<uint64_t> g_live_vm_probe_ok = 0;
 std::atomic<uint64_t> g_live_vm_probe_failed = 0;
 std::atomic_bool g_runtime_live_vm_ready{false};
+std::atomic_bool g_simple_facade_initialized{false};
+std::atomic<uint64_t> g_simple_facade_hook_enter = 0;
 std::atomic_bool g_shared_policy_ok{false};
 std::atomic_bool g_shared_identity_ambiguous_seen{false};
 std::atomic<uint64_t> g_add_int_listener_enter = 0;
@@ -61,6 +65,7 @@ std::atomic<uint64_t> g_bool_semantic_failures = 0;
 std::atomic<uint64_t> g_verified_abi_double_enter = 0;
 std::atomic<uint64_t> g_verified_abi_double_leave = 0;
 std::atomic<uint64_t> g_verified_abi_double_failures = 0;
+std::atomic<uint64_t> g_verified_abi_double_observer_enter = 0;
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -410,6 +415,29 @@ void OnVerifiedAbiDoubleLeave(DartPlantInvocation* invocation, void*) {
     g_verified_abi_double_leave.fetch_add(1, std::memory_order_relaxed);
 }
 
+void OnVerifiedAbiDoubleObserver(DartPlantInvocation* invocation, void*) {
+    if (dartplant_invocation_has_verified_abi(invocation) == 0) {
+        g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("verified ordinary AOT observer ABI");
+        return;
+    }
+    g_verified_abi_double_observer_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnSimpleFacadeEnter(DartPlantInvocation* invocation, void*) {
+    // signatureProbe deliberately has no compiler ABI sidecar. The normal
+    // facade must still provide raw instrumentation while typed access remains
+    // fail-closed instead of requiring RuntimeProfile/LiveVmContext from the
+    // consumer.
+    uint64_t raw_x0 = 0;
+    if (dartplant_invocation_has_verified_abi(invocation) != 0 ||
+        dartplant_invocation_get_gp_register(invocation, 0, &raw_x0) != DARTPLANT_OK) {
+        LogFailure("simple facade raw callback");
+        return;
+    }
+    g_simple_facade_hook_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool FindLiveTopLevelMethod(const char* name, DartPlantMethod** out_method) {
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -472,6 +500,82 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     if (info_status != DARTPLANT_OK || runtime_info.live_function_index_ready == 0 ||
         runtime_info.state != DARTPLANT_RUNTIME_READY) {
         g_cold_bootstrap_status.store(DARTPLANT_RUNTIME_NOT_READY, std::memory_order_release);
+        return;
+    }
+
+    DartPlantMethod* facade_method = nullptr;
+    const DartPlantMethodQuery facade_query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "verifiedAbiDouble",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    const DartPlantStatus facade_status = dartplant_find_method(&facade_query, &facade_method);
+    const bool facade_lookup_ok =
+        g_simple_facade_initialized.load(std::memory_order_acquire) &&
+        facade_status == DARTPLANT_OK && facade_method != nullptr &&
+        facade_method->function != nullptr &&
+        facade_method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+        dartplant_method_runtime_address(facade_method) != 0;
+    __android_log_print(
+        facade_lookup_ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DartPlant simple facade lookup: %u status=%d source_offline=%u entry=0x%llx error=%s",
+        static_cast<unsigned>(facade_lookup_ok), facade_status,
+        static_cast<unsigned>(facade_method != nullptr && facade_method->function != nullptr &&
+                              facade_method->function->source ==
+                                  dartplant::DartFunctionSource::kOfflineSnapshotIndex),
+        static_cast<unsigned long long>(
+            facade_method == nullptr ? 0 : dartplant_method_runtime_address(facade_method)),
+        facade_lookup_ok ? "none" : dartplant_last_error());
+    if (facade_method != nullptr) dartplant_release_method(facade_method);
+    if (!facade_lookup_ok) {
+        g_cold_bootstrap_status.store(
+            facade_status == DARTPLANT_OK ? DARTPLANT_RUNTIME_NOT_READY : facade_status,
+            std::memory_order_release);
+        return;
+    }
+
+    DartPlantMethod* facade_hook_method = nullptr;
+    const DartPlantMethodQuery facade_hook_query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "facadeProbe",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    const DartPlantStatus facade_hook_lookup_status =
+        dartplant_find_method(&facade_hook_query, &facade_hook_method);
+    DartPlantStatus facade_hook_status = DARTPLANT_NOT_INITIALIZED;
+    if (facade_hook_lookup_status == DARTPLANT_OK && facade_hook_method != nullptr) {
+        DartPlantHookOptions facade_options = {
+            .struct_size = sizeof(facade_options),
+            .flags = 0,
+            .on_enter = OnSimpleFacadeEnter,
+            .on_leave = nullptr,
+            .user_data = nullptr,
+            .vm_adapter = nullptr,
+        };
+        g_simple_facade_hook_enter.store(0, std::memory_order_relaxed);
+        facade_hook_status =
+            dartplant_hook_method(facade_hook_method, &facade_options, &g_simple_facade_hook);
+    }
+    if (facade_hook_method != nullptr) dartplant_release_method(facade_hook_method);
+    const bool facade_hook_ready = facade_hook_lookup_status == DARTPLANT_OK &&
+                                   facade_hook_status == DARTPLANT_OK &&
+                                   g_simple_facade_hook != nullptr &&
+                                   dartplant_hook_handle_is_active(g_simple_facade_hook) != 0;
+    __android_log_print(
+        facade_hook_ready ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DartPlant simple facade hook ready: %u lookup_status=%d hook_status=%d error=%s",
+        static_cast<unsigned>(facade_hook_ready), facade_hook_lookup_status, facade_hook_status,
+        facade_hook_ready ? "none" : dartplant_last_error());
+    if (!facade_hook_ready) {
+        g_cold_bootstrap_status.store(
+            facade_hook_status != DARTPLANT_OK ? facade_hook_status : facade_hook_lookup_status,
+            std::memory_order_release);
         return;
     }
 
@@ -780,34 +884,30 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
 
     // This function is not a vm:entry-point. PRODUCT AOT drops its logical
     // RegularFunction object, so live lookup misses by design. The compiler
-    // sidecar restores only the deleted identity/address fact and is accepted
-    // after snapshot hash, build-id and final machine-code fingerprint checks.
-    DartPlantStatus ordinary_index_status = DARTPLANT_NOT_INITIALIZED;
-#if DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE
-    ordinary_index_status =
-        dartplant_runtime_register_snapshot_index(g_runtime, &kDartPlantOrdinaryAotSnapshotIndex);
-#endif
+    // generated sidecar self-registers its ArtifactBundle at module load. The
+    // runtime lookup below automatically binds both the deleted identity/index
+    // and matching compiler ABI evidence to this exact app incarnation.
     const bool ordinary_aot_resolved =
-        ordinary_index_status == DARTPLANT_OK &&
         FindLiveTopLevelMethod("verifiedAbiDouble", &g_verified_abi_double) &&
         g_verified_abi_double != nullptr && g_verified_abi_double->function != nullptr &&
         g_verified_abi_double->function->source ==
             dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
         dartplant_method_runtime_address(g_verified_abi_double) != 0;
+    const DartPlantStatus ordinary_index_status =
+        ordinary_aot_resolved ? DARTPLANT_OK : DARTPLANT_METHOD_NOT_FOUND;
     DartPlantStatus ordinary_evidence_status = DARTPLANT_NOT_INITIALIZED;
     DartPlantStatus ordinary_abi_info_status = DARTPLANT_NOT_INITIALIZED;
     DartPlantMethodAbiInfo ordinary_abi_info{};
     ordinary_abi_info.struct_size = sizeof(ordinary_abi_info);
     DartPlantStatus ordinary_hook_status = DARTPLANT_NOT_INITIALIZED;
+    DartPlantStatus ordinary_observer_hook_status = DARTPLANT_NOT_INITIALIZED;
     if (ordinary_aot_resolved) {
-#if DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE
-        ordinary_evidence_status = dartplant_runtime_register_compiler_abi_evidence(
-            g_runtime, g_verified_abi_double, &kDartPlantOrdinaryAotAbiEvidence);
-#endif
-        if (ordinary_evidence_status == DARTPLANT_OK) {
-            ordinary_abi_info_status = dartplant_runtime_get_method_abi_info(
-                g_runtime, g_verified_abi_double, &ordinary_abi_info);
-        }
+        ordinary_abi_info_status = dartplant_runtime_get_method_abi_info(
+            g_runtime, g_verified_abi_double, &ordinary_abi_info);
+        ordinary_evidence_status = ordinary_abi_info_status == DARTPLANT_OK &&
+                                           ordinary_abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED
+                                       ? DARTPLANT_OK
+                                       : DARTPLANT_UNSUPPORTED_ABI;
         if (ordinary_abi_info_status == DARTPLANT_OK &&
             ordinary_abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED &&
             ordinary_abi_info.has_verified_call_layout != 0) {
@@ -819,22 +919,37 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
                 .user_data = nullptr,
                 .vm_adapter = nullptr,
             };
-            ordinary_hook_status = dartplant_runtime_hook_method(
+            ordinary_hook_status = dartplant_runtime_hook_method_handle(
                 g_runtime, g_verified_abi_double, &ordinary_options, &g_verified_abi_double_hook);
+            if (ordinary_hook_status == DARTPLANT_OK) {
+                DartPlantHookOptions observer_options = {
+                    .struct_size = sizeof(observer_options),
+                    .flags = 0,
+                    .on_enter = OnVerifiedAbiDoubleObserver,
+                    .on_leave = nullptr,
+                    .user_data = nullptr,
+                    .vm_adapter = nullptr,
+                };
+                ordinary_observer_hook_status = dartplant_runtime_hook_method_handle(
+                    g_runtime, g_verified_abi_double, &observer_options,
+                    &g_verified_abi_double_observer_hook);
+            }
         }
     }
     const bool ordinary_aot_discovery =
         ordinary_aot_resolved && ordinary_evidence_status == DARTPLANT_OK &&
         ordinary_abi_info_status == DARTPLANT_OK &&
         ordinary_abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED &&
-        ordinary_abi_info.has_verified_call_layout != 0 && ordinary_hook_status == DARTPLANT_OK;
+        ordinary_abi_info.has_verified_call_layout != 0 && ordinary_hook_status == DARTPLANT_OK &&
+        ordinary_observer_hook_status == DARTPLANT_OK;
     __android_log_print(
         ordinary_aot_discovery ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "DartPlant ordinary AOT discovery: %u index_status=%d evidence_status=%d abi_info_status=%d abi_state=%u verified_layout=%u hook_status=%d source_offline=%u entry=0x%llx function=0x%llx code=0x%llx error=%s",
+        "DartPlant ordinary AOT discovery: %u index_status=%d evidence_status=%d abi_info_status=%d abi_state=%u verified_layout=%u hook_status=%d observer_hook_status=%d source_offline=%u entry=0x%llx function=0x%llx code=0x%llx error=%s",
         static_cast<unsigned>(ordinary_aot_discovery), ordinary_index_status,
         ordinary_evidence_status, ordinary_abi_info_status,
         static_cast<unsigned>(ordinary_abi_info.state),
         static_cast<unsigned>(ordinary_abi_info.has_verified_call_layout), ordinary_hook_status,
+        ordinary_observer_hook_status,
         static_cast<unsigned>(g_verified_abi_double != nullptr &&
                               g_verified_abi_double->function != nullptr &&
                               g_verified_abi_double->function->source ==
@@ -953,6 +1068,7 @@ dartplant_fixture_reset_verified_abi_double_probe() {
     g_verified_abi_double_enter.store(0, std::memory_order_relaxed);
     g_verified_abi_double_leave.store(0, std::memory_order_relaxed);
     g_verified_abi_double_failures.store(0, std::memory_order_relaxed);
+    g_verified_abi_double_observer_enter.store(0, std::memory_order_relaxed);
 }
 
 extern "C" __attribute__((visibility("default"))) uint64_t
@@ -962,6 +1078,26 @@ dartplant_fixture_mark_verified_abi_double_shared() {
         g_verified_abi_double->function->code_target == nullptr ||
         g_verified_abi_double_hook == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "late shared fixture marker unavailable");
+        return 0;
+    }
+
+    // The observer is a second logical subscription to the same physical
+    // CodeTarget. Remove it independently before mutating alias identity; the
+    // primary handle must remain active and keep owning the physical hook.
+    if (g_verified_abi_double_observer_hook == nullptr ||
+        g_verified_abi_double_observer_enter.load(std::memory_order_relaxed) != 1 ||
+        dartplant_unhook_handle(g_verified_abi_double_observer_hook) != DARTPLANT_OK ||
+        dartplant_hook_handle_is_idle(g_verified_abi_double_observer_hook) == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "logical HookHandle observer removal failed error=%s",
+                            dartplant_last_error());
+        return 0;
+    }
+    dartplant_release_hook_handle(g_verified_abi_double_observer_hook);
+    g_verified_abi_double_observer_hook = nullptr;
+    if (dartplant_hook_handle_is_active(g_verified_abi_double_hook) == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "primary logical HookHandle was removed with observer");
         return 0;
     }
 
@@ -978,17 +1114,17 @@ dartplant_fixture_mark_verified_abi_double_shared() {
     abi_info.struct_size = sizeof(abi_info);
     const DartPlantStatus info_status =
         dartplant_runtime_get_method_abi_info(g_runtime, g_verified_abi_double, &abi_info);
-    const bool passed =
-        g_verified_abi_double->function->code_target->IsShared() && info_status == DARTPLANT_OK &&
-        abi_info.state == DARTPLANT_METHOD_ABI_UNSUPPORTED &&
-        abi_info.has_verified_call_layout == 0 && !g_verified_abi_double_hook->shared_code_opt_in;
+    const bool passed = g_verified_abi_double->function->code_target->IsShared() &&
+                        info_status == DARTPLANT_OK &&
+                        abi_info.state == DARTPLANT_METHOD_ABI_UNSUPPORTED &&
+                        abi_info.has_verified_call_layout == 0 &&
+                        dartplant_hook_handle_is_active(g_verified_abi_double_hook) != 0;
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
         "DartPlant late shared transition: %u info_status=%d abi_state=%u verified_layout=%u aliases=%u opt_in=%u",
         static_cast<unsigned>(passed), info_status, static_cast<unsigned>(abi_info.state),
         static_cast<unsigned>(abi_info.has_verified_call_layout),
-        g_verified_abi_double->function->code_target->AliasCount(),
-        static_cast<unsigned>(g_verified_abi_double_hook->shared_code_opt_in));
+        g_verified_abi_double->function->code_target->AliasCount(), 0U);
     return passed ? 1 : 0;
 }
 
@@ -997,15 +1133,18 @@ dartplant_fixture_verified_abi_double_probe() {
     const uint64_t enter = g_verified_abi_double_enter.load(std::memory_order_relaxed);
     const uint64_t leave = g_verified_abi_double_leave.load(std::memory_order_relaxed);
     const uint64_t failures = g_verified_abi_double_failures.load(std::memory_order_relaxed);
+    const uint64_t observer_enter =
+        g_verified_abi_double_observer_enter.load(std::memory_order_relaxed);
     // The second call occurs after the fixture marks this physical target as
     // shared. The hook has no shared-code opt-in, so only the first invocation
     // is allowed to reach the typed callbacks.
-    const bool passed = enter == 1 && leave == 1 && failures == 0;
+    const bool passed = enter == 1 && leave == 1 && observer_enter == 1 && failures == 0;
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "verified ordinary AOT double probe enter=%llu leave=%llu failures=%llu passed=%u",
+        "verified ordinary AOT double probe enter=%llu leave=%llu observer=%llu failures=%llu passed=%u",
         static_cast<unsigned long long>(enter), static_cast<unsigned long long>(leave),
-        static_cast<unsigned long long>(failures), static_cast<unsigned>(passed));
+        static_cast<unsigned long long>(observer_enter), static_cast<unsigned long long>(failures),
+        static_cast<unsigned>(passed));
     return passed ? 1 : 0;
 }
 
@@ -1100,14 +1239,48 @@ dartplant_fixture_cold_bootstrap_status() {
     return g_cold_bootstrap_status.load(std::memory_order_acquire);
 }
 
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_simple_facade_hook_probe() {
+    const uint64_t enter = g_simple_facade_hook_enter.load(std::memory_order_relaxed);
+    const bool active = g_simple_facade_hook != nullptr &&
+                        dartplant_hook_handle_is_active(g_simple_facade_hook) != 0;
+    bool removed = false;
+    if (active && enter == 1) {
+        const DartPlantStatus unhook_status = dartplant_unhook_handle(g_simple_facade_hook);
+        removed = unhook_status == DARTPLANT_OK &&
+                  dartplant_hook_handle_is_idle(g_simple_facade_hook) != 0;
+        if (removed) {
+            dartplant_release_hook_handle(g_simple_facade_hook);
+            g_simple_facade_hook = nullptr;
+        }
+    }
+    const bool passed = enter == 1 && removed;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "DartPlant simple facade hook probe enter=%llu removed=%u passed=%u",
+                        static_cast<unsigned long long>(enter), static_cast<unsigned>(removed),
+                        static_cast<unsigned>(passed));
+    return passed ? 1 : 0;
+}
+
 extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initialize_with_registers(
     void* api_dl_data, uint64_t null_value, uint64_t thr, uint64_t pp, uint64_t heap_bits) {
     if (api_dl_data == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     if (g_runtime != nullptr) return DARTPLANT_OK;
     (void) api_dl_data;
 
-    const DartPlantNativeApiEntries* host_api = dartplant_fixture_standalone_dobby_host();
-    dartplant::InstallHostApi(host_api);
+    const DartPlantHostApi* host_api = dartplant_dobby_host_api();
+    if (dartplant_install_host_api(host_api) != DARTPLANT_OK) return DARTPLANT_HOST_API_UNAVAILABLE;
+    const DartPlantInitInfo simple_init = {
+        .struct_size = sizeof(DartPlantInitInfo),
+        .version = DARTPLANT_INIT_API_VERSION,
+        .host_api = nullptr,
+        .artifact_bundle = nullptr,
+        .app_module_name = nullptr,
+        .runtime_module_name = nullptr,
+    };
+    const DartPlantStatus simple_init_status = dartplant_init(&simple_init);
+    if (simple_init_status != DARTPLANT_OK) return simple_init_status;
+    g_simple_facade_initialized.store(true, std::memory_order_release);
     dartplant::RefreshModules();
 
     DartPlantRuntimeProfile profile{};
@@ -1222,8 +1395,16 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
         dartplant_release_hook(g_negate_bool_hook);
     }
     if (g_verified_abi_double_hook != nullptr) {
-        dartplant_unhook(g_verified_abi_double_hook);
-        dartplant_release_hook(g_verified_abi_double_hook);
+        dartplant_unhook_handle(g_verified_abi_double_hook);
+        dartplant_release_hook_handle(g_verified_abi_double_hook);
+    }
+    if (g_verified_abi_double_observer_hook != nullptr) {
+        dartplant_unhook_handle(g_verified_abi_double_observer_hook);
+        dartplant_release_hook_handle(g_verified_abi_double_observer_hook);
+    }
+    if (g_simple_facade_hook != nullptr) {
+        dartplant_unhook_handle(g_simple_facade_hook);
+        dartplant_release_hook_handle(g_simple_facade_hook);
     }
     if (g_add_int != nullptr) dartplant_release_method(g_add_int);
     if (g_instrumented_add != nullptr) dartplant_release_method(g_instrumented_add);
@@ -1232,6 +1413,9 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     if (g_signature_probe != nullptr) dartplant_release_method(g_signature_probe);
     if (g_verified_abi_double != nullptr) dartplant_release_method(g_verified_abi_double);
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
+    dartplant_shutdown();
+    g_simple_facade_initialized.store(false, std::memory_order_release);
+    g_simple_facade_hook_enter.store(0, std::memory_order_relaxed);
     g_instrumented_add = nullptr;
     g_add_int = nullptr;
     g_echo_object = nullptr;
@@ -1242,6 +1426,8 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_echo_object_hook = nullptr;
     g_negate_bool_hook = nullptr;
     g_verified_abi_double_hook = nullptr;
+    g_verified_abi_double_observer_hook = nullptr;
+    g_simple_facade_hook = nullptr;
     g_add_int_listener = nullptr;
     g_runtime = nullptr;
     g_snapshot_info = {};

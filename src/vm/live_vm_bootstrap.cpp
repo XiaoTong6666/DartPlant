@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "dartplant/live_vm.h"
+#include "dartplant/advanced/live_vm.h"
 
 #if defined(__linux__)
 #include <dirent.h>

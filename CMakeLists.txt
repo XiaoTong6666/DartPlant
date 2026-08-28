@@ -5,11 +5,19 @@ project(dartplant LANGUAGES CXX)
 option(DARTPLANT_BUILD_TESTS "Build DartPlant host tests" ${PROJECT_IS_TOP_LEVEL})
 option(DARTPLANT_BUILD_ANDROID_TESTS "Build DartPlant Android device tests" OFF)
 option(DARTPLANT_BUILD_ANDROID_MODULE "Build the optional LSPosed Native API shared module" OFF)
+option(DARTPLANT_BUILD_DOBBY_ADAPTER "Build the optional Dobby HostApi adapter" OFF)
+option(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER "Build the optional ShadowHook HostApi adapter" OFF)
 set(
     DARTPLANT_DOBBY_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dobby"
     CACHE PATH
     "Path to a Dobby source tree"
+)
+set(
+    DARTPLANT_SHADOWHOOK_ROOT
+    ""
+    CACHE PATH
+    "Path to a ShadowHook source tree when building the optional adapter"
 )
 
 add_library(
@@ -36,6 +44,7 @@ add_library(
     src/runtime/flutter_snapshot.cpp
     src/runtime/snapshot_index.cpp
     src/runtime/dart_runtime_resolver.cpp
+    src/runtime/default_runtime.cpp
     src/vm/profiles.cpp
     src/vm/live_vm.cpp
     src/vm/live_vm_bootstrap.cpp
@@ -66,6 +75,48 @@ target_include_directories(
 target_link_libraries(dartplant_core PUBLIC ${CMAKE_DL_LIBS})
 target_link_libraries(dartplant_core PRIVATE dartplant_abi)
 
+if(DARTPLANT_BUILD_DOBBY_ADAPTER)
+    if(NOT TARGET dobby)
+        if(NOT EXISTS "${DARTPLANT_DOBBY_ROOT}/CMakeLists.txt")
+            message(FATAL_ERROR "DARTPLANT_DOBBY_ROOT must point to a Dobby source tree")
+        endif()
+        # Seed Dobby's option in this directory scope without rewriting a
+        # parent project's cache when DartPlant is consumed via add_subdirectory.
+        set(DOBBY_GENERATE_SHARED OFF)
+        add_subdirectory(
+            "${DARTPLANT_DOBBY_ROOT}"
+            "${CMAKE_CURRENT_BINARY_DIR}/third_party/dobby-adapter"
+        )
+    endif()
+    add_library(dartplant_adapter_dobby STATIC adapters/dobby/dobby_host.cpp)
+    target_compile_features(dartplant_adapter_dobby PUBLIC cxx_std_20)
+    target_compile_options(dartplant_adapter_dobby PRIVATE -Wall -Wextra -Werror)
+    target_include_directories(
+        dartplant_adapter_dobby
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PRIVATE ${DARTPLANT_DOBBY_ROOT}/include
+    )
+    target_link_libraries(dartplant_adapter_dobby PUBLIC dartplant_core PRIVATE dobby)
+endif()
+
+if(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER)
+    if(NOT EXISTS "${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include/shadowhook.h")
+        message(FATAL_ERROR "DARTPLANT_SHADOWHOOK_ROOT must point to a ShadowHook source tree")
+    endif()
+    add_library(dartplant_adapter_shadowhook STATIC adapters/shadowhook/shadowhook_host.cpp)
+    target_compile_features(dartplant_adapter_shadowhook PUBLIC cxx_std_20)
+    target_compile_options(dartplant_adapter_shadowhook PRIVATE -Wall -Wextra -Werror)
+    target_include_directories(
+        dartplant_adapter_shadowhook
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PRIVATE ${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include
+    )
+    # Do not build or configure ShadowHook from DartPlant. A consumer may
+    # provide a CMake target named `shadowhook`; otherwise the plain library
+    # name is propagated and resolved by the final Android link step/prebuilt.
+    target_link_libraries(dartplant_adapter_shadowhook PUBLIC dartplant_core PRIVATE shadowhook)
+endif()
+
 if(ANDROID)
     enable_language(ASM)
     target_sources(
@@ -81,7 +132,7 @@ if(ANDROID)
         add_library(
             dartplant
             SHARED
-            src/host/lsposed_module.cpp
+            adapters/lsposed/lsposed_module.cpp
         )
         target_compile_features(dartplant PRIVATE cxx_std_20)
         target_compile_options(
@@ -116,14 +167,27 @@ if(ANDROID)
     endif()
 
     if(DARTPLANT_BUILD_ANDROID_TESTS)
-        if(NOT EXISTS "${DARTPLANT_DOBBY_ROOT}/CMakeLists.txt")
-            message(FATAL_ERROR "DARTPLANT_DOBBY_ROOT must point to a Dobby source tree")
+        if(NOT TARGET dobby)
+            if(NOT EXISTS "${DARTPLANT_DOBBY_ROOT}/CMakeLists.txt")
+                message(FATAL_ERROR "DARTPLANT_DOBBY_ROOT must point to a Dobby source tree")
+            endif()
+            set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
+            add_subdirectory(
+                "${DARTPLANT_DOBBY_ROOT}"
+                "${CMAKE_CURRENT_BINARY_DIR}/third_party/dobby"
+            )
         endif()
-        set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
-        add_subdirectory(
-            "${DARTPLANT_DOBBY_ROOT}"
-            "${CMAKE_CURRENT_BINARY_DIR}/third_party/dobby"
-        )
+        if(NOT TARGET dartplant_adapter_dobby)
+            add_library(dartplant_adapter_dobby STATIC adapters/dobby/dobby_host.cpp)
+            target_compile_features(dartplant_adapter_dobby PUBLIC cxx_std_20)
+            target_compile_options(dartplant_adapter_dobby PRIVATE -Wall -Wextra -Werror)
+            target_include_directories(
+                dartplant_adapter_dobby
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE ${DARTPLANT_DOBBY_ROOT}/include
+            )
+            target_link_libraries(dartplant_adapter_dobby PUBLIC dartplant_core PRIVATE dobby)
+        endif()
 
         add_library(
             dartplant_device_fixture
@@ -161,14 +225,15 @@ if(ANDROID)
             PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${DARTPLANT_DOBBY_ROOT}/include
         )
         target_link_libraries(
             dartplant_device_tests
             PRIVATE
             dartplant_core
+            dartplant_adapter_dobby
             dartplant_device_fixture
-            dobby
             log
             dl
         )

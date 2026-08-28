@@ -6,7 +6,7 @@
 #include <string_view>
 
 #include "core/internal.h"
-#include "dartplant/flutter_snapshot.h"
+#include "dartplant/advanced/flutter_snapshot.h"
 
 namespace dartplant {
 

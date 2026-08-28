@@ -3,17 +3,18 @@
 DartPlant provides verified Dart AOT method-to-address resolution and native
 instrumentation for Android arm64 Flutter applications.
 
-The core is developed and verified independently from LSPosed. Standalone host
-backends, including the Dobby-backed Android fixture, validate the runtime
-before the optional LSPosed Native API adapter is exercised.
+The core is developed and verified through standalone host backends, including
+the Dobby-backed Android fixture. Optional loader adapters are exercised
+separately from the runtime core.
 
 > Retained Dart `Function` objects are resolved metadata-free from the loaded
 > snapshot plus a validated `LiveVmContext`. PRODUCT AOT can deliberately drop a
 > logical `Function` object while retaining its `Code`; that deleted identity
 > cannot be reconstructed exactly from the runtime heap. Those methods may use
-> an explicit compiler/artifact snapshot index bound to the exact snapshot hash,
-> `libapp.so` build-id and final code fingerprint. Unbound legacy metadata is
-> never used as a `DartPlantRuntime` fallback.
+> a compiler-generated embedded `DartPlantArtifactBundle`, bound to the exact
+> snapshot hash, `libapp.so` build-id and final code fingerprint. The bundle
+> self-registers and is consumed automatically; unbound legacy metadata is never
+> used as a runtime fallback.
 
 Repository responsibilities:
 
@@ -26,19 +27,22 @@ scripts
 ```
 
 DartPlant is consumed as a third-party CMake dependency. The consuming Android
-or LSPosed project owns its Gradle/module packaging and selects a host backend
-in the same way it selects another native dependency such as Dobby:
+or native project owns its Gradle/module packaging and selects a host backend in
+the same way it selects another native dependency such as Dobby:
 
 ```cmake
+set(DARTPLANT_BUILD_DOBBY_ADAPTER ON)
 add_subdirectory(third_party/dartplant)
-target_link_libraries(consumer_native PRIVATE dartplant_core)
+target_link_libraries(consumer_native PRIVATE dartplant_core dartplant_adapter_dobby)
 ```
 
-The optional LSPosed Native API entry point can be built as the provided Android
-shared target or supplied by a consumer-owned module. LSPosed is not a core
-runtime dependency, and DartPlant does not own the consumer's module lifecycle.
+The optional adapter targets are `dartplant_adapter_dobby` and
+`dartplant_adapter_shadowhook`; the `native_init` compatibility module for
+LSPosed Native API integration is built with `DARTPLANT_BUILD_ANDROID_MODULE=ON`.
+None of these adapters is linked into `dartplant_core`, and DartPlant does not
+own the consumer's module lifecycle.
 
-The core host backend contract is independent of LSPosed and can bind a backend
+The core host backend contract is adapter-independent and can bind a backend
 instance through `user_data`:
 
 ```cpp
@@ -58,8 +62,8 @@ so replacing the process default backend does not redirect a later unhook.
 The current implementation provides:
 
 - A stable C ABI.
-- A generic `DartPlantHostApi` hook-backend contract, with the established
-  LSPosed `native_init` ABI retained as a compatibility adapter.
+- A generic `DartPlantHostApi` hook-backend contract, with `native_init`
+  compatibility retained as an optional loader adapter.
 - ELF module enumeration and load-bias aware address resolution.
 - Executable segment, build-id, and code fingerprint validation.
 - Metadata-free live VM `Library/Class/Function -> Code` resolution for retained
@@ -74,7 +78,7 @@ The current implementation provides:
 - Per-thread invocation depth and nested call tracking.
 - Shared HookChain listeners with priority ordering and safe removal snapshots.
 - Host unit tests and standalone ARM64 Android Dobby integration tests.
-- LSPosed `native_init` lifecycle adapter with already-loaded image rescan,
+- A `native_init` lifecycle adapter with already-loaded image rescan,
   dependency-load refresh, module identity selection, and runtime-generation
   fail-closed invalidation.
 - An internal ABI evidence contract/solver and SDK-aligned ARM64 Dart calling
@@ -83,70 +87,75 @@ The current implementation provides:
 - An experimental offline AOT ABI evidence analyzer plus a compiler-oracle
   exporter for matching transformed DILL `vm.unboxing-info.metadata`.
 
-LSPosed invokes native module callbacks while holding its module-registry mutex.
-The adapter callback therefore only increments an atomic refresh epoch and wakes
-a process-lifetime worker. ELF enumeration, snapshot discovery, runtime locking,
-hook invalidation, and host `unhook_func` calls all run on that worker after the
-LSPosed callback returns. Every successful loader callback schedules a full scan;
-events are coalesced by epoch rather than filtered by the top-level `dlopen` name.
+The provided loader adapter can receive module callbacks while its host still
+holds loader-side synchronization. The callback therefore only increments an
+atomic refresh epoch and wakes a process-lifetime worker. ELF enumeration,
+snapshot discovery, runtime locking, hook invalidation, and host `unhook_func`
+calls all run on that worker after the callback returns. Every successful loader
+callback schedules a full scan; events are coalesced by epoch rather than
+filtered by the top-level `dlopen` name.
 The worker and callback code are process-lifetime state; the Android module is
 linked `NODELETE` because the host ABI has no callback-unregister operation.
 This release supports process-lifetime Flutter app/runtime images. Arbitrary
 concurrent `dlclose` of an image with installed hooks is unsupported until a
 host supplies a pre-unload synchronization callback or a backend-safe retire API.
 
-The runtime API is intentionally separate from the legacy process-global API:
+Normal consumers use DartPlant's high-level public API. DartPlant owns runtime
+creation, module refresh, Live VM bootstrap, CodeTarget sharing, and matching
+embedded compiler artifacts:
 
 ```cpp
-DartPlantRuntimeProfile profile;
-dartplant_runtime_profile_init_arm64_aot(&profile);
+#include <dartplant/adapters/dobby.h>
+#include <dartplant/dartplant.h>
+#include <dartplant/hook.h>
+#include <dartplant/invocation.h>
 
-DartPlantRuntime* runtime = nullptr;
-dartplant_runtime_create(&profile, &runtime);
-dartplant_runtime_on_module_loaded(runtime, "libapp.so", module_handle);
-dartplant_runtime_bootstrap_live_vm(runtime, nullptr, &bootstrap_info);
-dartplant_runtime_find_method(runtime, &query, &method);
-dartplant_runtime_hook_method(runtime, method, &options, &hook);
-```
+DartPlantInitInfo init = {
+    .struct_size = sizeof(DartPlantInitInfo),
+    .version = DARTPLANT_INIT_API_VERSION,
+    .host_api = dartplant_dobby_host_api(),
+};
+dartplant_init(&init);
 
-The conservative public runtime profile supports raw method hooks and raw
-callback instrumentation by default. Callback installation itself does not
-require a guessed argument layout: `dartplant_invocation_get_gp_register()` /
-`dartplant_invocation_get_fp_register()` remain available while semantic
-argument/result APIs fail closed until a layout is proven.
-Its `argument_locations[]` / `result_location` fields are now the legacy/manual
-raw-mapping escape hatch; they are retained for compatibility and ABI research,
-not as the final typed-call design. Callers that explicitly use that legacy
-typed/raw-word mapping must still provide a validated register mapping:
+DartPlantMethodQuery query = {
+    .struct_size = sizeof(DartPlantMethodQuery),
+    .library_uri = "package:app/main.dart",
+    .class_name = "Calculator",
+    .function_name = "add",
+    .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+};
 
-```cpp
-profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS |
-                DARTPLANT_PROFILE_RAW_GP_RESULT;
-profile.argument_count = 2;
-profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
-profile.argument_locations[1] = {DARTPLANT_ABI_GP_REGISTER, 2, {0, 0}};
-profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+DartPlantMethod* method = nullptr;
+dartplant_find_method(&query, &method);
 
 DartPlantHookOptions options = {
-    .struct_size = sizeof(options),
+    .struct_size = sizeof(DartPlantHookOptions),
     .on_enter = on_enter,
     .on_leave = on_leave,
 };
+DartPlantHookHandle* hook = nullptr;
+dartplant_hook_method(method, &options, &hook);
 ```
 
-Inside `on_enter`, `dartplant_invocation_set_argument()` mutates mapped raw GP
-arguments. `dartplant_invocation_set_result()` sets the return word and skips
-the original call. `dartplant_invocation_call_original()` explicitly selects
-the original path. Inside `on_leave`, result mutation changes x0 before returning
-to the caller.
+Callbacks read/write logical values rather than ARM64 locations:
 
-Raw GP mappings expose `DARTPLANT_VALUE_RAW_WORD` only. A profile may add
-`DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS` and/or
-`DARTPLANT_PROFILE_TAGGED_GP_RESULT` only when those locations are proven Dart
-tagged values. Tagged locations expose Smi/heap-object semantics and canonical
-null after the runtime has validated `NULL_REG`; unproven locations remain raw.
+```cpp
+void on_enter(DartPlantInvocation* invocation, void*) {
+    DartPlantValue value{};
+    if (dartplant_invocation_get_argument(invocation, 0, &value) == DARTPLANT_OK) {
+        // inspect or replace value...
+        dartplant_invocation_set_argument(invocation, 0, &value);
+    }
+}
+```
 
-The new internal typed path is separated into:
+`dartplant_invocation_call_original()` and
+`dartplant_invocation_skip_original()` control the original call. Raw GP/FP
+register access remains available as an escape hatch when a method ABI cannot
+be proven; semantic argument/result APIs then fail closed with
+`DARTPLANT_UNSUPPORTED_ABI` instead of guessing a layout.
+
+The internal typed path is separated into:
 
 ```text
 compiler/AOT evidence
@@ -162,72 +171,50 @@ from FP parameters (`x1,x2,x3,x5,x6,x7` vs `v0..v5`), overflow/forced-stack
 parameters are normalized to Dart entry `SPREG/x15`, and returns cover `x0`,
 `v0`, and the `x0+x1` pair channel. Verified `kUnboxedInt64` values are exposed
 as `DARTPLANT_VALUE_INT64`, not as Smi or an untyped raw word. The original
-return bridge now captures `x0+x1+v0` before the leave callback.
+return bridge captures `x0+x1+v0` before the leave callback.
 
-Exact compiler evidence can be registered after resolving the live method and
-before installing its physical hook:
+Compiler-generated sidecars emit one `DartPlantArtifactBundle`. Including the
+generated C++ header self-registers that bundle at module load. Method lookup
+automatically binds its exact snapshot index after a live-index miss and
+automatically attaches matching compiler ABI evidence before the logical hook
+is installed. Normal consumers do not call snapshot-index or ABI-evidence
+registration APIs.
 
-```cpp
-const DartPlantAbiRepresentation parameters[] = {
-    DARTPLANT_ABI_REPRESENTATION_UNBOXED_INT64,
-    DARTPLANT_ABI_REPRESENTATION_UNBOXED_DOUBLE,
-};
-DartPlantCompilerAbiEvidence evidence = {
-    .struct_size = sizeof(evidence),
-    .snapshot_hash = sidecar.snapshot_hash,
-    .app_build_id = sidecar.app_build_id,
-    .code_fingerprint = sidecar.code_fingerprint,
-    .parameter_representations = parameters,
-    .parameter_count = 2,
-    .result_representation = DARTPLANT_ABI_REPRESENTATION_UNBOXED_DOUBLE,
-    .max_parameters_in_registers = 2,
-};
-dartplant_runtime_register_compiler_abi_evidence(runtime, method, &evidence);
-dartplant_runtime_hook_method(runtime, method, &options, &hook);
-```
+The retained `FunctionType` is used only for semantic/formal-shape validation;
+machine representation is never inferred from Dart source types. Exact evidence
+is additionally bound to snapshot hash, `libapp.so` build-id, logical Function
+identity, entry VA, code size, Code identity proof, and final Code bytes. Shared
+`CodeTarget`s deliberately suppress the typed overlay because a physical entry
+cannot prove which logical alias reached it.
 
-Registration validates the retained `FunctionType` only for formal-slot shape;
-it never derives representation from Dart source types. The evidence must also
-match the current snapshot hash, `libapp.so` build-id and physical Code bytes.
-`dartplant_runtime_get_method_abi_info()` reports whether the method ABI is
-none, incomplete, verified, conflicting or unsupported, and callbacks can use
-`dartplant_invocation_has_verified_abi()` to distinguish the typed overlay from
-the always-available raw context. Shared `CodeTarget`s deliberately suppress
-the typed overlay because a physical entry cannot prove which logical alias
-reached it.
+This remains a native C/C++ callback API. A sidecar is optional: retained
+Functions can still be resolved metadata-free and raw instrumentation remains
+available without typed ABI evidence. Optional-argument transport, closures,
+arbitrary Dart heap-object construction, and synchronous Dart callbacks remain
+fail-closed.
 
-This remains a native C/C++ callback API. Evidence loading/sidecar policy is
-owned by the consuming host; DartPlant does not make an ABI sidecar a production
-runtime prerequisite. Optional-argument transport, closures, arbitrary Dart
-heap-object construction, and synchronous Dart callbacks remain fail-closed.
-
-HookChain listener lifecycle:
+Public logical-hook lifecycle:
 
 ```text
-runtime_hook_method()
-    -> creates one HookRecord and first listener
+dartplant_hook_method()
+    -> returns one DartPlantHookHandle subscription
+    -> internally creates/reuses the CodeTarget PhysicalHook
 
-runtime_add_listener()
-    -> adds a priority-ordered listener to the same trampoline
+dartplant_unhook_handle()
+    -> removes only this logical subscription
+    -> final subscription removes the physical trampoline
 
-remove_listener()
-    -> marks the listener inactive; existing invocation snapshots finish
-
-listener_is_idle()
-    -> becomes true after all in-flight snapshots release the listener
-
-release_listener()
-    -> release only after remove + idle
+dartplant_hook_handle_is_idle()
+    -> becomes true after in-flight callback snapshots drain
 ```
 
-Offline tooling still records the snapshot-instructions offset used by the SDK
-analyzer (`code_section_va + code_offset`) for analysis and compatibility.
-`DartPlantRuntime` never consumes the legacy process-global metadata cache.
-Instead, a consumer that needs an AOT-dropped logical Function may explicitly
-register a `DartPlantSnapshotIndexInfo`. Retained methods always prefer the live
-VM index; the artifact index is consulted only after an exact live miss and is
-validated against the current snapshot hash, module build-id, executable range,
-and final machine-code fingerprint.
+Advanced/runtime tooling remains available through `dartplant/runtime.h` and
+`dartplant/advanced/*` for diagnostics, fixture construction, exact VM layout
+research, and compatibility. `live_vm.h`, `abi_evidence.h`, and
+`flutter_snapshot.h` at their historical paths are compatibility forwarding
+headers; new tooling should include the corresponding `dartplant/advanced/*`
+header directly. The legacy RuntimeProfile/manual mapping API is not part of the
+normal consumer workflow.
 
 ## Current AOT status
 
@@ -262,11 +249,11 @@ process-wide signal sampler remains a fallback for hosts without such a mutator
 entry. Current production limitations include raw-layout profile coverage, ABI
 scope, and exact identity availability for AOT-dropped Functions; unknown or
 heuristic identities fail closed.
-The optional LSPosed adapter owns loader-facing lifecycle only: it validates and
+The optional `native_init` adapter owns loader-facing lifecycle only: it validates and
 stores the host entries, refreshes the process module inventory on initialization
 and every module-loaded callback, and lets each runtime instance select its own
-app/runtime image incarnation. The core resolver remains independent of LSPosed's
-Java/Kotlin APIs.
+app/runtime image incarnation. The core resolver remains independent of
+host-specific Java/Kotlin APIs.
 
 The ARM64 device regression currently proves the public runtime method hook API
 with a standalone Dobby host backend, including enter, original call, leave,
@@ -274,13 +261,15 @@ result mutation, skip-original, unhook, and executable-range validation.
 
 The target-specific metadata generator in `scripts/metadata.py` remains legacy
 offline tooling. Exact dropped-Function sidecars are a separate compiler-oracle
-path: they are optional per target, explicitly registered, and cannot replace a
-missing exact identity with a heuristic name.
+path: they are optional per target, self-register as an embedded
+`DartPlantArtifactBundle`, and cannot replace a missing exact identity with a
+heuristic name.
 
-The exposed invocation frame is deliberately limited to explicitly mapped ARM64
-locations. Raw GP words remain opaque. Tagged GP profiles can decode Smi,
-heap-object, and validated canonical-null values; object retention still requires
-an attached VM adapter and the correct isolate scope.
+The exposed invocation frame always preserves raw ARM64 machine truth. When
+exact compiler evidence and Code identity prove a `DartCallLayout`, the same
+frame additionally exposes semantic argument/result values. Unknown layouts
+remain raw rather than being guessed. Object retention still requires an
+attached VM adapter and the correct isolate scope.
 
 ## Host tests
 
@@ -368,9 +357,9 @@ Run on an attached ARM64 device:
 python3 scripts/main.py test device --device <serial>
 ```
 
-This standalone device path does not build or deploy the LSPosed module. Build
-the optional `dartplant` shared target separately with
-`-DDARTPLANT_BUILD_ANDROID_MODULE=ON` when testing LSPosed integration.
+This standalone device path does not build or deploy the optional `native_init`
+module. Build the `dartplant` shared target separately with
+`-DDARTPLANT_BUILD_ANDROID_MODULE=ON` when testing loader-host integration.
 
 The runtime-layer files are:
 

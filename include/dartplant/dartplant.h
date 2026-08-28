@@ -20,6 +20,8 @@ extern "C" {
 typedef struct DartPlantMethod DartPlantMethod;
 typedef struct DartPlantHook DartPlantHook;
 typedef struct DartPlantListener DartPlantListener;
+typedef struct DartPlantHostApi DartPlantHostApi;
+typedef struct DartPlantArtifactBundle DartPlantArtifactBundle;
 
 typedef enum DartPlantStatus {
     DARTPLANT_OK = 0,
@@ -84,6 +86,31 @@ typedef struct DartPlantAddressQuery {
     const char* expected_fingerprint;
 } DartPlantAddressQuery;
 
+enum { DARTPLANT_INIT_API_VERSION = 1 };
+
+// Normal consumer initialization. DartPlant internally creates the conservative
+// Flutter ARM64 runtime, discovers loaded images/snapshot state, and performs a
+// Live VM bootstrap lazily on the first method lookup. app/runtime module names
+// default to libapp.so/libflutter.so when null or empty.
+//
+// artifact_bundle is optional and intentionally opaque here. A matching
+// compiler-generated bundle can be supplied without exposing snapshot/ABI
+// details to the normal hook API; DartPlant binds its index/evidence lazily to
+// the exact loaded app incarnation.
+typedef struct DartPlantInitInfo {
+    uint32_t struct_size;
+    uint32_t version;
+    const DartPlantHostApi* host_api;
+    const DartPlantArtifactBundle* artifact_bundle;
+    const char* app_module_name;
+    const char* runtime_module_name;
+} DartPlantInitInfo;
+
+DARTPLANT_EXPORT DartPlantStatus dartplant_init(const DartPlantInitInfo* info);
+DARTPLANT_EXPORT void dartplant_shutdown(void);
+DARTPLANT_EXPORT uint8_t dartplant_is_initialized(void);
+
+// Legacy/offline compatibility API. New consumers should call dartplant_init().
 DARTPLANT_EXPORT DartPlantStatus dartplant_initialize_from_json(const char* metadata_json);
 DARTPLANT_EXPORT void dartplant_reset(void);
 DARTPLANT_EXPORT const char* dartplant_last_error(void);

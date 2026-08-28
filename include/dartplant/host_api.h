@@ -24,13 +24,13 @@ typedef int (*DartPlantHostHookCallback)(void* user_data, void* target, void* re
                                          void** backup);
 typedef int (*DartPlantHostUnhookCallback)(void* user_data, void* target);
 
-typedef struct DartPlantHostApi {
+struct DartPlantHostApi {
     uint32_t struct_size;
     uint32_t version;
     void* user_data;
     DartPlantHostHookCallback hook;
     DartPlantHostUnhookCallback unhook;
-} DartPlantHostApi;
+};
 
 enum { DARTPLANT_HOST_API_VERSION = 1 };
 

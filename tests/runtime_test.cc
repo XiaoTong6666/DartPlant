@@ -238,6 +238,40 @@ int BackendBUnhook(void*) {
     return 0;
 }
 
+using TestHostHook = int (*)(void* target, void* replacement, void** backup);
+using TestHostUnhook = int (*)(void* target);
+
+struct TestHostBridge {
+    TestHostHook hook = nullptr;
+    TestHostUnhook unhook = nullptr;
+};
+
+int TestHostHookAdapter(void* user_data, void* target, void* replacement, void** backup) {
+    const auto* bridge = static_cast<const TestHostBridge*>(user_data);
+    return bridge == nullptr || bridge->hook == nullptr ? -1
+                                                        : bridge->hook(target, replacement, backup);
+}
+
+int TestHostUnhookAdapter(void* user_data, void* target) {
+    const auto* bridge = static_cast<const TestHostBridge*>(user_data);
+    return bridge == nullptr || bridge->unhook == nullptr ? -1 : bridge->unhook(target);
+}
+
+void InstallTestHost(TestHostHook hook, TestHostUnhook unhook) {
+    // HostApi.user_data is borrowed for as long as hooks created from the
+    // binding can exist. Keep these tiny test bridges process-lifetime so test
+    // order cannot leave the current default binding pointing at stack data.
+    auto* bridge = new TestHostBridge{.hook = hook, .unhook = unhook};
+    const DartPlantHostApi api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = bridge,
+        .hook = TestHostHookAdapter,
+        .unhook = TestHostUnhookAdapter,
+    };
+    dartplant::InstallHostApi(&api);
+}
+
 void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
                                     void* target) {
     EXPECT_TRUE(runtime != nullptr);
@@ -659,8 +693,7 @@ TEST_CASE(RuntimeDestroyWaitsForPinnedOperations) {
 }
 
 TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
-    const DartPlantNativeApiEntries failing_entries = {2, FakeHook, FakeFailUnhook};
-    dartplant::InstallHostApi(&failing_entries);
+    InstallTestHost(FakeHook, FakeFailUnhook);
     g_fake_unhook_calls = 0;
     g_fake_fail_unhook_enabled = true;
 
@@ -682,8 +715,7 @@ TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
                                      reinterpret_cast<void*>(Replacement), &backup, &duplicate));
     EXPECT_TRUE(duplicate == nullptr);
 
-    const DartPlantNativeApiEntries working_entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&working_entries);
+    InstallTestHost(FakeHook, FakeUnhook);
     EXPECT_EQ(DARTPLANT_UNHOOK_FAILED, dartplant_unhook(hook));
     EXPECT_EQ(2, g_fake_unhook_calls);
     g_fake_fail_unhook_enabled = false;
@@ -692,9 +724,7 @@ TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
 }
 
 TEST_CASE(HookUnhooksWithItsInstallingBackend) {
-    const DartPlantNativeApiEntries backend_a = {2, FakeHook, BackendAUnhook};
-    const DartPlantNativeApiEntries backend_b = {2, FakeHook, BackendBUnhook};
-    dartplant::InstallHostApi(&backend_a);
+    InstallTestHost(FakeHook, BackendAUnhook);
     g_backend_a_unhook_calls = 0;
     g_backend_b_unhook_calls = 0;
 
@@ -703,7 +733,7 @@ TEST_CASE(HookUnhooksWithItsInstallingBackend) {
     EXPECT_EQ(DARTPLANT_OK,
               dartplant::InstallHook(reinterpret_cast<uintptr_t>(Replacement),
                                      reinterpret_cast<void*>(Replacement), &backup, &hook));
-    dartplant::InstallHostApi(&backend_b);
+    InstallTestHost(FakeHook, BackendBUnhook);
     EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
     EXPECT_EQ(1, g_backend_a_unhook_calls);
     EXPECT_EQ(0, g_backend_b_unhook_calls);
@@ -711,8 +741,7 @@ TEST_CASE(HookUnhooksWithItsInstallingBackend) {
 }
 
 TEST_CASE(RetiredRuntimeHookRetainsBackendOwnership) {
-    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&entries);
+    InstallTestHost(FakeHook, FakeUnhook);
     g_fake_unhook_calls = 0;
 
     auto generation = std::make_shared<std::atomic_uint64_t>(1);
@@ -742,8 +771,7 @@ TEST_CASE(RetiredRuntimeHookRetainsBackendOwnership) {
 }
 
 TEST_CASE(RetiredRuntimeHookDoesNotBlockLaterGenerationInvalidation) {
-    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&entries);
+    InstallTestHost(FakeHook, FakeUnhook);
     g_fake_unhook_calls = 0;
 
     auto generation = std::make_shared<std::atomic_uint64_t>(1);
@@ -764,8 +792,7 @@ TEST_CASE(RetiredRuntimeHookDoesNotBlockLaterGenerationInvalidation) {
 }
 
 TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
-    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&entries);
+    InstallTestHost(FakeHook, FakeUnhook);
     g_fake_unhook_calls = 0;
 
     void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -1859,8 +1886,7 @@ TEST_CASE(LiveVmProfilesRequireExactSnapshotIdentity) {
 }
 
 TEST_CASE(ListenerRemovalInsideEnterDefersUnhookUntilLeave) {
-    const DartPlantNativeApiEntries entries = {2, FakeHook, FakeUnhook};
-    dartplant::InstallHostApi(&entries);
+    InstallTestHost(FakeHook, FakeUnhook);
     g_fake_unhook_calls = 0;
 
     DartPlantRuntimeProfile profile{};

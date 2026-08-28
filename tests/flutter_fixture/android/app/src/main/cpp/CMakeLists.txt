@@ -9,15 +9,12 @@ set(DART_SDK_ROOT "${DARTPLANT_ROOT}/../sdk" CACHE PATH "Dart SDK source tree")
 set(DARTPLANT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(DARTPLANT_BUILD_ANDROID_TESTS OFF CACHE BOOL "" FORCE)
 set(DARTPLANT_BUILD_ANDROID_MODULE OFF CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_DOBBY_ADAPTER ON CACHE BOOL "" FORCE)
 set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(
     "${DARTPLANT_ROOT}"
     "${CMAKE_CURRENT_BINARY_DIR}/dartplant"
-)
-add_subdirectory(
-    "${DARTPLANT_ROOT}/third_party/dobby"
-    "${CMAKE_CURRENT_BINARY_DIR}/dobby"
 )
 
 add_library(
@@ -26,7 +23,6 @@ add_library(
     fixture_bridge.cpp
     dart_api_adapter.cpp
     dart_raw_bridge.cpp
-    standalone_dobby_host.cpp
     "${DART_SDK_ROOT}/runtime/include/dart_api_dl.c"
 )
 set_source_files_properties(
@@ -48,14 +44,13 @@ target_include_directories(
     "${DARTPLANT_ROOT}/tests/flutter_fixture/.dart_tool/dartplant/generated"
     "${DARTPLANT_ROOT}/include"
     "${DARTPLANT_ROOT}/src"
-    "${DARTPLANT_ROOT}/third_party/dobby/include"
     "${DART_SDK_ROOT}/runtime/include"
 )
 target_link_libraries(
     dartplant_fixture_bridge
     PRIVATE
     dartplant_core
-    dobby
+    dartplant_adapter_dobby
     log
     dl
 )

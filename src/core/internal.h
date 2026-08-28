@@ -15,11 +15,10 @@
 
 #include "abi/call_layout.h"
 #include "core/method_model.h"
+#include "dartplant/advanced/runtime_profile.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/host_api.h"
 #include "dartplant/invocation.h"
-#include "dartplant/native_api.h"
-#include "dartplant/runtime_profile.h"
 #include "vm/object_bridge.h"
 
 namespace dartplant {
@@ -119,7 +118,6 @@ std::optional<ModuleImage> FindModule(const std::vector<ModuleImage>& modules,
                                       const std::string& name);
 std::string FingerprintCode(const void* address, size_t size);
 
-void InstallHostApi(const DartPlantNativeApiEntries* entries);
 void InstallHostApi(const DartPlantHostApi* api);
 void RefreshModules();
 void ReplaceModules(std::vector<ModuleImage> modules);
@@ -231,6 +229,11 @@ struct DartPlantHook {
 struct DartPlantListener {
     DartPlantHook* hook = nullptr;
     std::shared_ptr<dartplant::DartPlantListenerRecord> record;
+};
+
+struct DartPlantHookHandle {
+    DartPlantListener* listener = nullptr;
+    bool removed = false;
 };
 
 #endif  // DARTPLANT_CORE_INTERNAL_H_

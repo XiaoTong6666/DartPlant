@@ -12,23 +12,6 @@ constexpr uint32_t kSupportedCallbackProfileFlags =
     DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
     DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
 
-struct NativeHostAdapter {
-    DartPlantNativeHook hook = nullptr;
-    DartPlantNativeUnhook unhook = nullptr;
-};
-
-int NativeHostHookAdapter(void* user_data, void* target, void* replacement, void** backup) {
-    const auto* adapter = static_cast<const NativeHostAdapter*>(user_data);
-    return adapter == nullptr || adapter->hook == nullptr
-               ? -1
-               : adapter->hook(target, replacement, backup);
-}
-
-int NativeHostUnhookAdapter(void* user_data, void* target) {
-    const auto* adapter = static_cast<const NativeHostAdapter*>(user_data);
-    return adapter == nullptr || adapter->unhook == nullptr ? -1 : adapter->unhook(target);
-}
-
 std::vector<std::unique_ptr<DartPlantHook>>& Hooks() {
     static std::vector<std::unique_ptr<DartPlantHook>> hooks;
     return hooks;
@@ -176,30 +159,6 @@ bool CanDestroyLocked(const DartPlantHook* hook) {
 RuntimeState& State() {
     static RuntimeState state;
     return state;
-}
-
-void InstallHostApi(const DartPlantNativeApiEntries* entries) {
-    if (entries == nullptr || entries->version < 2 || entries->hook_func == nullptr ||
-        entries->unhook_func == nullptr) {
-        State().host.binding.store(nullptr, std::memory_order_release);
-        SetLastError("host API version or function pointers are invalid");
-        return;
-    }
-    // native_init's callback ABI has no user_data slot. Keep an immutable
-    // adapter object for process lifetime and bind it through the generic host
-    // contract instead of letting LSPosed-specific types define the core.
-    auto* adapter = new NativeHostAdapter{
-        .hook = entries->hook_func,
-        .unhook = entries->unhook_func,
-    };
-    const DartPlantHostApi api = {
-        .struct_size = sizeof(DartPlantHostApi),
-        .version = DARTPLANT_HOST_API_VERSION,
-        .user_data = adapter,
-        .hook = NativeHostHookAdapter,
-        .unhook = NativeHostUnhookAdapter,
-    };
-    InstallHostApi(&api);
 }
 
 void InstallHostApi(const DartPlantHostApi* api) {

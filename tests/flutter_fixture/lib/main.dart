@@ -28,6 +28,10 @@ bool negateBool(bool value) => !value;
 @pragma('vm:never-inline')
 T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
 
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+int facadeProbe(int value) => (value * 3) + 1;
+
 // Keep this as an ordinary direct-call-only optimized AOT body. Without a
 // tear-off the compiler is free to use the unboxed double Dart calling
 // convention; the native fixture proves V0/V1 argument access from evidence.
@@ -51,6 +55,11 @@ Future<void> main() async {
         ? await DartPlantNative.waitForInitialization()
         : initializeStartStatus;
     debugPrint('DartPlant initialize status: $initializeStatus');
+    final simpleFacadeValue = facadeProbe(7);
+    final simpleFacadeHookProbe = DartPlantNative.simpleFacadeHookProbe();
+    debugPrint(
+      'DartPlant simple facade hook: $simpleFacadeHookProbe value=$simpleFacadeValue',
+    );
     DartPlantNative.resetNullSemanticProbe();
     final canonicalNull = nullableEchoObject(null);
     final rewrittenToNull = nullableEchoObject(const FixtureObject(11));

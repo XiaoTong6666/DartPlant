@@ -40,10 +40,14 @@ from the same `gen_snapshot` run to prove physical Code identity multiplicity
 (`UNIQUE`/`SHARED`) across the whole compiler object graph. A single sidecar
 record is never treated as proof of uniqueness.
 
-`dartplant_runtime_register_compiler_abi_evidence()` revalidates snapshot hash,
-build-id, logical Function identity, entry VA, code size and code fingerprint
-against the live runtime. Typed `DartCallLayout` creation additionally requires
-a compiler-proven unique `CodeTarget`.
+The generated header wraps the snapshot index and compiler evidence in one
+`DartPlantArtifactBundle` and self-registers it when the containing native
+module loads. Normal method lookup binds the matching index/evidence lazily;
+the advanced explicit registration functions remain available for tooling and
+tests. Runtime binding revalidates snapshot hash, build-id, logical Function
+identity, entry VA, code size and code fingerprint against the live runtime.
+Typed `DartCallLayout` creation additionally requires a compiler-proven unique
+`CodeTarget`.
 
 For ordinary Kernel members, the producer mirrors the same rules used by
 `Function::MaxNumberOfParametersInRegisters()`: generic functions and

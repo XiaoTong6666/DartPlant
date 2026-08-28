@@ -8,8 +8,8 @@
 #include <string_view>
 #include <vector>
 
-#include "dartplant/flutter_snapshot.h"
-#include "dartplant/live_vm.h"
+#include "dartplant/advanced/flutter_snapshot.h"
+#include "dartplant/advanced/live_vm.h"
 
 namespace dartplant {
 

@@ -250,6 +250,10 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(f"cold start {round_index}: automatic live Function index was not ready\n{logs}")
     if "DartPlant initialize status: 0" not in logs:
         raise RuntimeError(f"cold start {round_index}: runtime init failed\n{logs}")
+    if "DartPlant simple facade hook: 1 value=22" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: simple init/find/hook/unhook facade failed\n{logs}"
+        )
     if "DartPlant live VM startup probe: 115" not in logs:
         raise RuntimeError(f"cold start {round_index}: hook probe did not return 115\n{logs}")
     if "DartPlant null semantic probe: 1 values=null/null" not in logs:
@@ -266,12 +270,17 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT Function discovery failed\n{logs}"
         )
+    if "DartPlant simple facade lookup: 1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: simple API did not own runtime bootstrap/artifact lookup\n{logs}"
+        )
     required_ordinary_markers = (
         "evidence_status=0",
         "abi_info_status=0",
         "abi_state=2",
         "verified_layout=1",
         "hook_status=0",
+        "observer_hook_status=0",
         "source_offline=1",
     )
     if any(marker not in logs for marker in required_ordinary_markers):
@@ -285,6 +294,13 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     if "DartPlant ordinary AOT typed probe: 1 values=16.125/6.25" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT typed callback probe failed\n{logs}"
+        )
+    if (
+        "verified ordinary AOT double probe enter=1 leave=1 observer=1 failures=0 passed=1"
+        not in logs
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: logical HookHandle subscription sharing failed\n{logs}"
         )
     if "DartPlant late shared transition: 1" not in logs:
         raise RuntimeError(

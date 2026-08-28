@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <dlfcn.h>
-#include <dobby.h>
 
 #include <cstdio>
 #include <string>
 
 #include "core/internal.h"
+#include "dartplant/adapters/dobby.h"
 #include "dartplant/invocation.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
@@ -77,16 +77,6 @@ __attribute__((noinline)) int HookedAdd(int left, int right) {
     return g_original_add(left, right) + 100;
 }
 
-int HostHook(void* user_data, void* target, void* replacement, void** backup) {
-    if (user_data == nullptr) return -1;
-    return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replacement),
-                     reinterpret_cast<dobby_dummy_func_t*>(backup));
-}
-
-int HostUnhook(void* user_data, void* target) {
-    return user_data == nullptr ? -1 : DobbyDestroy(target);
-}
-
 int Fail(const char* message) {
     std::fprintf(stderr, "[FAIL] %s: %s\n", message, dartplant_last_error());
     return 1;
@@ -127,15 +117,7 @@ int main() {
     return 1;
 #endif
 
-    int host_backend_identity = 1;
-    const DartPlantHostApi host_api = {
-        .struct_size = sizeof(DartPlantHostApi),
-        .version = DARTPLANT_HOST_API_VERSION,
-        .user_data = &host_backend_identity,
-        .hook = HostHook,
-        .unhook = HostUnhook,
-    };
-    if (dartplant_install_host_api(&host_api) != DARTPLANT_OK) {
+    if (dartplant_install_host_api(dartplant_dobby_host_api()) != DARTPLANT_OK) {
         return Fail("generic host API install");
     }
     dartplant::RefreshModules();

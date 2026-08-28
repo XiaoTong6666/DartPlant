@@ -13,8 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dartplant/advanced/flutter_snapshot.h"
 #include "dartplant/dartplant.h"
-#include "dartplant/flutter_snapshot.h"
 
 namespace dartplant {
 

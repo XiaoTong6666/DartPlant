@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "core/internal.h"
+#include "runtime/default_runtime.h"
 
 namespace dartplant {
 namespace {
@@ -82,6 +83,7 @@ DartPlantStatus dartplant_initialize_from_json(const char* metadata_json) {
 }
 
 void dartplant_reset(void) {
+    dartplant_shutdown();
     dartplant::ResetHooks();
     auto& state = dartplant::State();
     std::lock_guard lock(state.mutex);
@@ -100,6 +102,13 @@ DartPlantStatus dartplant_find_method(const DartPlantMethodQuery* query,
         query->function_name == nullptr) {
         dartplant::SetLastError("method query is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    // The normal LSPlant-style API resolves through the internally managed
+    // runtime. Legacy JSON metadata remains available only when dartplant_init()
+    // has not created that default runtime.
+    if (dartplant::DefaultRuntimeInitialized()) {
+        return dartplant::FindDefaultRuntimeMethod(query, out_method);
     }
 
     auto& state = dartplant::State();

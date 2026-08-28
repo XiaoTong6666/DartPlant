@@ -7,31 +7,12 @@
 #include <stdint.h>
 
 #include "dartplant/dartplant.h"
+#include "dartplant/hook.h"
 #include "dartplant/vm_adapter.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef struct DartPlantInvocation DartPlantInvocation;
-
-typedef void (*DartPlantInvocationCallback)(DartPlantInvocation* invocation, void* user_data);
-
-typedef enum DartPlantHookFlags {
-    // A shared AOT Code entry can represent multiple logical Dart Functions.
-    // Method callbacks fail closed for known shared targets unless the caller
-    // explicitly opts into a physical CodeTarget hook with ambiguous identity.
-    DARTPLANT_HOOK_ALLOW_SHARED_CODE = 1u << 0,
-} DartPlantHookFlags;
-
-typedef struct DartPlantHookOptions {
-    uint32_t struct_size;
-    uint32_t flags;
-    DartPlantInvocationCallback on_enter;
-    DartPlantInvocationCallback on_leave;
-    void* user_data;
-    DartPlantVmAdapter* vm_adapter;
-} DartPlantHookOptions;
 
 typedef enum DartPlantValueKind {
     DARTPLANT_VALUE_UNKNOWN = 0,

@@ -4,8 +4,12 @@ typedef _InitializeNative = Int32 Function(Pointer<Void> apiData);
 typedef _InitializeDart = int Function(Pointer<Void> apiData);
 typedef _ColdBootstrapStatusNative = Int32 Function();
 typedef _ColdBootstrapStatusDart = int Function();
-typedef _SimpleFacadeHookProbeNative = Uint64 Function();
-typedef _SimpleFacadeHookProbeDart = int Function();
+typedef _SimpleFacadeInstallNative = Int32 Function();
+typedef _SimpleFacadeInstallDart = int Function();
+typedef _SimpleFacadeStageNative = Uint64 Function();
+typedef _SimpleFacadeStageDart = int Function();
+typedef _EnableAdvancedOrdinaryHookNative = Int32 Function();
+typedef _EnableAdvancedOrdinaryHookDart = int Function();
 typedef _ShutdownNative = Void Function();
 typedef _ShutdownDart = void Function();
 typedef _BeginObjectProbeNative = Void Function();
@@ -46,11 +50,27 @@ final class DartPlantNative {
         'dartplant_fixture_cold_bootstrap_status',
       )
       .asFunction();
-  static final _SimpleFacadeHookProbeDart _simpleFacadeHookProbe = _library
-      .lookup<NativeFunction<_SimpleFacadeHookProbeNative>>(
-        'dartplant_fixture_simple_facade_hook_probe',
+  static final _SimpleFacadeInstallDart _simpleFacadeInstall = _library
+      .lookup<NativeFunction<_SimpleFacadeInstallNative>>(
+        'dartplant_fixture_simple_facade_install',
       )
       .asFunction();
+  static final _SimpleFacadeStageDart _simpleFacadeStage1 = _library
+      .lookup<NativeFunction<_SimpleFacadeStageNative>>(
+        'dartplant_fixture_simple_facade_stage1',
+      )
+      .asFunction();
+  static final _SimpleFacadeStageDart _simpleFacadeStage2 = _library
+      .lookup<NativeFunction<_SimpleFacadeStageNative>>(
+        'dartplant_fixture_simple_facade_stage2',
+      )
+      .asFunction();
+  static final _EnableAdvancedOrdinaryHookDart _enableAdvancedOrdinaryHook =
+      _library
+          .lookup<NativeFunction<_EnableAdvancedOrdinaryHookNative>>(
+            'dartplant_fixture_enable_advanced_ordinary_hook',
+          )
+          .asFunction();
   static final _ShutdownDart _shutdown = _library
       .lookup<NativeFunction<_ShutdownNative>>('dartplant_fixture_shutdown')
       .asFunction();
@@ -155,7 +175,13 @@ final class DartPlantNative {
 
   static int instrumentedAddProbe() => _instrumentedAddProbe();
 
-  static int simpleFacadeHookProbe() => _simpleFacadeHookProbe();
+  static int simpleFacadeInstall() => _simpleFacadeInstall();
+
+  static int simpleFacadeStage1() => _simpleFacadeStage1();
+
+  static int simpleFacadeStage2() => _simpleFacadeStage2();
+
+  static int enableAdvancedOrdinaryHook() => _enableAdvancedOrdinaryHook();
 
   static void resetNullSemanticProbe() => _resetNullSemanticProbe();
 

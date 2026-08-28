@@ -19,7 +19,10 @@ extern "C" {
 // for every installed physical hook so backend replacement cannot redirect a
 // later unhook. user_data is borrowed, not owned: the host must keep the
 // pointed-to backend instance alive until every hook created with this binding
-// has been unhooked and released.
+// has been unhooked and released. dartplant_shutdown() clears the current
+// default binding so a later dartplant_init(... host_api=nullptr) cannot reuse a
+// stale backend accidentally; already-created physical hooks retain their own
+// immutable callback binding for safe teardown.
 typedef int (*DartPlantHostHookCallback)(void* user_data, void* target, void* replacement,
                                          void** backup);
 typedef int (*DartPlantHostUnhookCallback)(void* user_data, void* target);

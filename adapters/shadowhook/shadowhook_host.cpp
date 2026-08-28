@@ -33,7 +33,13 @@ int Hook(void* user_data, void* target, void* replacement, void** backup) {
     if (state == nullptr || target == nullptr || replacement == nullptr || backup == nullptr) {
         return -1;
     }
-    void* stub = shadowhook_hook_func_addr(target, replacement, backup);
+    // DartPlant's physical-hook model owns one trampoline/original chain for
+    // each CodeTarget. Do not inherit ShadowHook's process-wide default mode:
+    // another module may have initialized ShadowHook in SHARED/MULTI mode
+    // before us, in which case calling orig_addr directly would bypass that
+    // proxy chain. Force UNIQUE per hook and fail closed on a mode conflict.
+    void* stub =
+        shadowhook_hook_func_addr_2(target, replacement, backup, SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
     if (stub == nullptr) return -1;
     std::lock_guard lock(state->mutex);
     const auto [_, inserted] = state->stubs.emplace(target, stub);

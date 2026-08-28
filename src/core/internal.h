@@ -71,8 +71,10 @@ struct HostApiBinding {
 };
 
 struct HostApi {
-    // Bindings are immutable and process-lifetime. This supports callbacks that
-    // outlive a host backend replacement without requiring shared_ptr atomics.
+    // Individual bindings are immutable/process-lifetime, while the current
+    // default pointer may be replaced or cleared. Physical hooks retain the
+    // immutable binding that created them, so shutdown/re-init cannot redirect
+    // their eventual unhook callback.
     std::atomic<const HostApiBinding*> binding{nullptr};
 };
 
@@ -119,6 +121,7 @@ std::optional<ModuleImage> FindModule(const std::vector<ModuleImage>& modules,
 std::string FingerprintCode(const void* address, size_t size);
 
 void InstallHostApi(const DartPlantHostApi* api);
+void ClearHostApi(const HostApiBinding* expected_binding);
 void RefreshModules();
 void ReplaceModules(std::vector<ModuleImage> modules);
 DartPlantStatus InvalidateRuntimeHooks(

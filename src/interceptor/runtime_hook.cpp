@@ -21,7 +21,7 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* r
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY) {
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
         dartplant::SetLastError("runtime is not ready for method hooks");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
@@ -57,7 +57,7 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY) {
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
         dartplant::SetLastError("runtime is not ready for method hooks");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
@@ -84,6 +84,11 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_handle(DartPlantRuntime
     if (runtime == nullptr || method == nullptr || options == nullptr || out_handle == nullptr) {
         dartplant::SetLastError("runtime logical hook arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
     }
     const DartPlantStatus evidence_status =
         dartplant::BindRegisteredCompilerEvidenceIfPresent(runtime, method);
@@ -114,7 +119,7 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY) {
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
         dartplant::SetLastError("runtime is not ready for method hooks");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
@@ -149,7 +154,7 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
     }
 
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY) {
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
         dartplant::SetLastError("runtime is not ready for method listeners");
         return DARTPLANT_RUNTIME_NOT_READY;
     }

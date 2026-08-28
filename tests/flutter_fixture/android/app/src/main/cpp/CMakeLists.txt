@@ -21,6 +21,7 @@ add_library(
     dartplant_fixture_bridge
     SHARED
     fixture_bridge.cpp
+    simple_facade_consumer.cpp
     dart_api_adapter.cpp
     dart_raw_bridge.cpp
     "${DART_SDK_ROOT}/runtime/include/dart_api_dl.c"
@@ -44,6 +45,7 @@ target_include_directories(
     "${DARTPLANT_ROOT}/tests/flutter_fixture/.dart_tool/dartplant/generated"
     "${DARTPLANT_ROOT}/include"
     "${DARTPLANT_ROOT}/src"
+    "${DARTPLANT_ROOT}/third_party/dobby/include"
     "${DART_SDK_ROOT}/runtime/include"
 )
 target_link_libraries(

@@ -12,9 +12,11 @@
 
 #include "abi/calling_convention.h"
 #include "core/internal.h"
+#include "dartplant/advanced/artifact.h"
 #include "dartplant/invocation.h"
 #include "dartplant/runtime_profile.h"
 #include "dartplant/vm_adapter.h"
+#include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
 #include "test_runner.h"
 
@@ -322,6 +324,28 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     runtime->live_function_index_info.function_count = 1;
     runtime->live_function_index_info.code_target_count = 1;
     runtime->state = DARTPLANT_RUNTIME_READY;
+}
+
+void SeedSyntheticArtifactImage(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
+                                void* target, const char* snapshot_hash) {
+    EXPECT_TRUE(runtime != nullptr);
+    runtime->modules = dartplant::EnumerateModules();
+    runtime->selected_app_module = module;
+    runtime->selected_runtime_module = module;
+    runtime->profile_matched = true;
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = module.name;
+    snapshot.module_path = module.path;
+    snapshot.module_build_id = module.build_id;
+    snapshot.snapshot_hash = snapshot_hash;
+    snapshot.snapshot_features = "arm64 product compressed-pointers";
+    snapshot.profile_name = "synthetic-artifact-index";
+    snapshot.isolate_instructions_va = 0x1000;
+    snapshot.isolate_instructions_size = 0x100;
+    snapshot.isolate_instructions_runtime = reinterpret_cast<uintptr_t>(target);
+    runtime->snapshot = std::move(snapshot);
+    runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
 }
 
 }  // namespace
@@ -690,6 +714,114 @@ TEST_CASE(RuntimeDestroyWaitsForPinnedOperations) {
     operation = {};
     destroyer.join();
     EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+}
+
+TEST_CASE(RuntimeHookMethodHandleKeepsOuterOperationPinnedAcrossHelpers) {
+    InstallTestHost(FakeHook, FakeUnhook);
+
+    DartPlantCompilerAbiEvidence unrelated_evidence{};
+    unrelated_evidence.struct_size = sizeof(unrelated_evidence);
+    unrelated_evidence.snapshot_hash = "outer-pin-unrelated";
+    unrelated_evidence.app_build_id = "outer-pin-unrelated";
+    unrelated_evidence.code_fingerprint = "0000000000000000";
+    unrelated_evidence.result_representation = DARTPLANT_ABI_REPRESENTATION_TAGGED;
+    unrelated_evidence.library_uri = "package:unrelated/main.dart";
+    unrelated_evidence.class_name = "Global";
+    unrelated_evidence.function_name = "unrelated";
+    unrelated_evidence.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    unrelated_evidence.entry_va = 0x1000;
+    unrelated_evidence.code_size = 4;
+    DartPlantArtifactBundle unrelated_bundle{};
+    unrelated_bundle.struct_size = sizeof(unrelated_bundle);
+    unrelated_bundle.version = DARTPLANT_ARTIFACT_BUNDLE_VERSION;
+    unrelated_bundle.compiler_abi_evidence = &unrelated_evidence;
+    unrelated_bundle.compiler_abi_evidence_count = 1;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_register_embedded_artifact_bundle(&unrelated_bundle));
+
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto modules = dartplant::EnumerateModules();
+    const auto module = dartplant::FindModule(modules, "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &method));
+    EXPECT_TRUE(method != nullptr);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = OnLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantStatus hook_status = DARTPLANT_OK;
+    DartPlantHookHandle* handle = nullptr;
+
+    // Hold runtime->mutex so hook_method_handle stops inside the first nested
+    // helper after acquiring both its API-wide operation lease and the helper
+    // lease. Seeing two active operations makes the outer pin an explicit,
+    // deterministic part of this regression rather than relying on timing.
+    std::unique_lock runtime_lock(runtime->mutex);
+    std::thread hooker([&] {
+        hook_status = dartplant_runtime_hook_method_handle(runtime, method, &options, &handle);
+    });
+    bool saw_outer_and_nested = false;
+    for (int attempt = 0; attempt < 100000; ++attempt) {
+        if (dartplant::RuntimeActiveOperationCountForTesting(runtime) >= 2) {
+            saw_outer_and_nested = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(saw_outer_and_nested);
+
+    std::atomic_bool destroyed{false};
+    std::thread destroyer([&] {
+        dartplant_runtime_destroy(runtime);
+        destroyed.store(true, std::memory_order_release);
+    });
+    bool closing = false;
+    for (int attempt = 0; attempt < 100000; ++attempt) {
+        auto probe = dartplant::AcquireRuntimeOperation(runtime);
+        if (!probe) {
+            closing = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(closing);
+    EXPECT_TRUE(!destroyed.load(std::memory_order_acquire));
+
+    runtime_lock.unlock();
+    hooker.join();
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, hook_status);
+    EXPECT_TRUE(handle == nullptr);
+    destroyer.join();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+
+    dartplant_release_method(method);
+    dlclose(fixture);
 }
 
 TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
@@ -1105,6 +1237,218 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     dlclose(fixture);
 }
 
+TEST_CASE(EmbeddedArtifactRegistryOwnsDataAndMergesLateSnapshotBundles) {
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    constexpr char kSnapshotHash[] = "artifact-owned-late-merge";
+    SeedSyntheticArtifactImage(runtime, *module, target, kSnapshotHash);
+
+    const std::string fingerprint = dartplant::FingerprintCode(target, 1);
+    DartPlantSnapshotFunctionInfo first_function{};
+    first_function.struct_size = sizeof(first_function);
+    first_function.library_uri = "package:artifact_owned/main.dart";
+    first_function.class_name = "Global";
+    first_function.function_name = "lateOne";
+    first_function.signature = "";
+    first_function.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    first_function.entry_va = 0x1000;
+    first_function.code_size = 1;
+    first_function.code_section_va = 0x1000;
+    first_function.fingerprint = fingerprint.c_str();
+    first_function.code_identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
+    first_function.physical_entry_alias_count = 2;
+    DartPlantSnapshotIndexInfo first_index{};
+    first_index.struct_size = sizeof(first_index);
+    first_index.module_name = module->name.c_str();
+    first_index.module_build_id = module->build_id.c_str();
+    first_index.snapshot_hash = kSnapshotHash;
+    first_index.dart_version = "test";
+    first_index.profile_version = "owned-v1";
+    first_index.functions = &first_function;
+    first_index.function_count = 1;
+    DartPlantArtifactBundle first_bundle{};
+    first_bundle.struct_size = sizeof(first_bundle);
+    first_bundle.version = DARTPLANT_ARTIFACT_BUNDLE_VERSION;
+    first_bundle.snapshot_index = &first_index;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_register_embedded_artifact_bundle(&first_bundle));
+
+    // Registration owns a deep copy. Mutating every caller-visible pointer
+    // after the call must not alter the lazily consumed artifact.
+    first_function.function_name = "corruptedAfterRegistration";
+    first_index.snapshot_hash = "corrupted-after-registration";
+    EXPECT_EQ(DARTPLANT_OK, dartplant::BindRegisteredArtifactIndexIfReady(runtime));
+
+    const DartPlantMethodQuery first_query = {
+        .struct_size = sizeof(first_query),
+        .library_uri = "package:artifact_owned/main.dart",
+        .class_name = "Global",
+        .function_name = "lateOne",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* first_method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &first_query, &first_method));
+    EXPECT_TRUE(first_method != nullptr);
+    dartplant_release_method(first_method);
+
+    DartPlantSnapshotFunctionInfo second_function{};
+    second_function.struct_size = sizeof(second_function);
+    second_function.library_uri = "package:artifact_owned/main.dart";
+    second_function.class_name = "Global";
+    second_function.function_name = "lateTwo";
+    second_function.signature = "";
+    second_function.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    second_function.entry_va = 0x1000;
+    second_function.code_size = 1;
+    second_function.code_section_va = 0x1000;
+    second_function.fingerprint = fingerprint.c_str();
+    second_function.code_identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
+    second_function.physical_entry_alias_count = 2;
+    DartPlantSnapshotIndexInfo second_index{};
+    second_index.struct_size = sizeof(second_index);
+    second_index.module_name = module->name.c_str();
+    second_index.module_build_id = module->build_id.c_str();
+    second_index.snapshot_hash = kSnapshotHash;
+    second_index.dart_version = "test";
+    second_index.profile_version = "owned-v1";
+    second_index.functions = &second_function;
+    second_index.function_count = 1;
+    DartPlantArtifactBundle second_bundle{};
+    second_bundle.struct_size = sizeof(second_bundle);
+    second_bundle.version = DARTPLANT_ARTIFACT_BUNDLE_VERSION;
+    second_bundle.snapshot_index = &second_index;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_register_embedded_artifact_bundle(&second_bundle));
+
+    // A registry generation change must rebuild the already-bound merged index
+    // instead of silently ignoring a sidecar from a later-loaded DSO.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::BindRegisteredArtifactIndexIfReady(runtime));
+    EXPECT_TRUE(runtime->artifact_snapshot_index.has_value());
+    EXPECT_EQ(2U, static_cast<uint32_t>(runtime->artifact_snapshot_index->functions.size()));
+    const DartPlantMethodQuery second_query = {
+        .struct_size = sizeof(second_query),
+        .library_uri = "package:artifact_owned/main.dart",
+        .class_name = "Global",
+        .function_name = "lateTwo",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* second_method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &second_query, &second_method));
+    EXPECT_TRUE(second_method != nullptr);
+    dartplant_release_method(second_method);
+
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
+TEST_CASE(EmbeddedArtifactEvidenceSkipsStaleSameNameBundle) {
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    constexpr char kSnapshotHash[] = "artifact-evidence-selection";
+    SeedSyntheticArtifactImage(runtime, *module, target, kSnapshotHash);
+
+    const std::string fingerprint = dartplant::FingerprintCode(target, 1);
+    DartPlantCompilerAbiEvidence stale_evidence{};
+    stale_evidence.struct_size = sizeof(stale_evidence);
+    stale_evidence.snapshot_hash = "older-app-incarnation";
+    stale_evidence.app_build_id = module->build_id.c_str();
+    stale_evidence.code_fingerprint = fingerprint.c_str();
+    stale_evidence.result_representation = DARTPLANT_ABI_REPRESENTATION_TAGGED;
+    stale_evidence.library_uri = "package:evidence_select/main.dart";
+    stale_evidence.class_name = "Global";
+    stale_evidence.function_name = "sameName";
+    stale_evidence.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    stale_evidence.entry_va = 0x1000;
+    stale_evidence.code_size = 1;
+    DartPlantArtifactBundle stale_bundle{};
+    stale_bundle.struct_size = sizeof(stale_bundle);
+    stale_bundle.version = DARTPLANT_ARTIFACT_BUNDLE_VERSION;
+    stale_bundle.compiler_abi_evidence = &stale_evidence;
+    stale_bundle.compiler_abi_evidence_count = 1;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_register_embedded_artifact_bundle(&stale_bundle));
+
+    DartPlantSnapshotFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.library_uri = "package:evidence_select/main.dart";
+    function.class_name = "Global";
+    function.function_name = "sameName";
+    function.signature = "";
+    function.entry_kind = DARTPLANT_ENTRY_DEFAULT;
+    function.entry_va = 0x1000;
+    function.code_size = 1;
+    function.code_section_va = 0x1000;
+    function.fingerprint = fingerprint.c_str();
+    function.code_identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    function.physical_entry_alias_count = 1;
+    DartPlantSnapshotIndexInfo index{};
+    index.struct_size = sizeof(index);
+    index.module_name = module->name.c_str();
+    index.module_build_id = module->build_id.c_str();
+    index.snapshot_hash = kSnapshotHash;
+    index.dart_version = "test";
+    index.profile_version = "evidence-v1";
+    index.functions = &function;
+    index.function_count = 1;
+
+    DartPlantCompilerAbiEvidence current_evidence = stale_evidence;
+    current_evidence.snapshot_hash = kSnapshotHash;
+    DartPlantArtifactBundle current_bundle{};
+    current_bundle.struct_size = sizeof(current_bundle);
+    current_bundle.version = DARTPLANT_ARTIFACT_BUNDLE_VERSION;
+    current_bundle.snapshot_index = &index;
+    current_bundle.compiler_abi_evidence = &current_evidence;
+    current_bundle.compiler_abi_evidence_count = 1;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_register_embedded_artifact_bundle(&current_bundle));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::BindRegisteredArtifactIndexIfReady(runtime));
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:evidence_select/main.dart",
+        .class_name = "Global",
+        .function_name = "sameName",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &method));
+    EXPECT_TRUE(method != nullptr);
+    DartPlantMethodAbiInfo abi{};
+    abi.struct_size = sizeof(abi);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_method_abi_info(runtime, method, &abi));
+    EXPECT_EQ(DARTPLANT_METHOD_ABI_VERIFIED, abi.state);
+    EXPECT_EQ(1U, static_cast<uint32_t>(abi.has_verified_call_layout));
+
+    dartplant_release_method(method);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
 TEST_CASE(RuntimeLiveVmCaptureRejectsForeignAndStaleInvocation) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
@@ -1222,6 +1566,47 @@ TEST_CASE(InvocationDecodesAndEncodesValidatedDartNull) {
     EXPECT_EQ(DARTPLANT_VALUE_RAW_WORD, value.kind);
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant_invocation_set_argument(&untagged_invocation, 0, &null_value));
+}
+
+TEST_CASE(VerifiedCallLayoutDoesNotImplyCanonicalSemanticRoots) {
+    constexpr uint64_t kUnvalidatedCanonicalObject = 0x7300000001;
+    dartplant::abi::DartCallLayout layout;
+    layout.parameters.resize(1);
+    layout.parameters[0].representation = dartplant::abi::DartAbiRepresentation::kTagged;
+    layout.parameters[0].location.count = 1;
+    layout.parameters[0].location.locations[0] = {dartplant::abi::DartAbiLocationKind::kGpRegister,
+                                                  1, 0};
+    layout.result.representation = dartplant::abi::DartAbiRepresentation::kTagged;
+    layout.result.location.count = 1;
+    layout.result.location.locations[0] = {dartplant::abi::DartAbiLocationKind::kGpRegister, 0, 0};
+
+    DartPlantArm64Context context{};
+    context.x[0] = kUnvalidatedCanonicalObject;
+    context.x[1] = kUnvalidatedCanonicalObject;
+    DartPlantInvocation invocation{};
+    invocation.call_layout = &layout;
+    invocation.context = &context;
+    // This models artifact-first installation in IMAGES_READY: transport is
+    // compiler-verified, while LiveVm canonical NULL/Bool roots are still 0.
+    EXPECT_EQ(1U, static_cast<uint32_t>(dartplant_invocation_has_verified_abi(&invocation)));
+
+    DartPlantValue value{};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_HEAP_OBJECT, value.kind);
+    EXPECT_EQ(kUnvalidatedCanonicalObject, value.raw);
+    invocation.phase = DARTPLANT_INVOCATION_LEAVE;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_result(&invocation, &value));
+    EXPECT_EQ(DARTPLANT_VALUE_HEAP_OBJECT, value.kind);
+
+    const DartPlantValue null_value = {DARTPLANT_VALUE_NULL, 0, 0};
+    const DartPlantValue bool_value = {DARTPLANT_VALUE_BOOL, 0, 1};
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant_invocation_set_argument(&invocation, 0, &null_value));
+    invocation.phase = DARTPLANT_INVOCATION_LEAVE;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI, dartplant_invocation_set_result(&invocation, &bool_value));
+    EXPECT_EQ(kUnvalidatedCanonicalObject, context.x[0]);
+    EXPECT_EQ(kUnvalidatedCanonicalObject, context.x[1]);
 }
 
 TEST_CASE(InvocationDecodesAndEncodesValidatedCanonicalDartBool) {

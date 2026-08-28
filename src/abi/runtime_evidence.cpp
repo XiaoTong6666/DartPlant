@@ -114,7 +114,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY ||
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method) ||
         !dartplant::IsCurrentRuntimeMethod(runtime, method)) {
         dartplant::SetLastError("compiler ABI evidence targets a stale or unready runtime method");
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -334,7 +334,7 @@ extern "C" DartPlantStatus dartplant_runtime_get_method_abi_info(const DartPlant
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
-    if (runtime->state != DARTPLANT_RUNTIME_READY ||
+    if (!dartplant::RuntimeReadyForMethodOperation(runtime, method) ||
         !dartplant::IsCurrentRuntimeMethod(runtime, method)) {
         dartplant::SetLastError("method ABI info targets a stale or unready runtime method");
         return DARTPLANT_RUNTIME_NOT_READY;

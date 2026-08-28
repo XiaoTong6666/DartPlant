@@ -3,6 +3,10 @@
 
 #include "dartplant/advanced/live_vm.h"
 
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -351,6 +355,26 @@ public:
         return true;
     }
 
+    // Managed Dart heap mappings can change after /proc/self/maps is sampled.
+    // process_vm_readv() turns that race into EFAULT/short-read instead of a
+    // synchronous SIGSEGV in diagnostic APIs that inspect volatile VM memory.
+    bool ReadSafely(uintptr_t address, void* output, size_t size) const {
+        if (output == nullptr || !Contains(address, size)) return false;
+#if defined(__linux__) && defined(SYS_process_vm_readv)
+        iovec local = {.iov_base = output, .iov_len = size};
+        iovec remote = {.iov_base = reinterpret_cast<void*>(address), .iov_len = size};
+        const long result = syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
+        return result == static_cast<long>(size);
+#else
+        return false;
+#endif
+    }
+
+    template <typename T>
+    bool ReadSafely(uintptr_t address, T* out_value) const {
+        return ReadSafely(address, out_value, sizeof(T));
+    }
+
 private:
     std::vector<MemoryRange> ranges_;
 };
@@ -436,6 +460,14 @@ bool ReadCid(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t* out_c
 bool RequireCid(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t expected) {
     uint32_t cid = 0;
     return ReadCid(reader, tagged, &cid) && cid == expected;
+}
+
+bool ReadCidSafely(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t* out_cid) {
+    if (out_cid == nullptr || !IsHeapObject(tagged)) return false;
+    uint64_t tags = 0;
+    if (!reader.ReadSafely(Untag(tagged), &tags)) return false;
+    *out_cid = static_cast<uint32_t>((tags >> kClassIdTagShift) & kClassIdTagMask);
+    return true;
 }
 
 bool ReadCompressedObject(const ProcessMemoryReader& reader, uintptr_t object_address,
@@ -2199,13 +2231,14 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
     }
 
     dartplant::ProcessMemoryReader reader;
-    if (!reader.Refresh() ||
-        !dartplant::RequireCid(reader, tagged_object_pool, profile.cid_object_pool)) {
+    uint32_t pool_cid = 0;
+    if (!reader.Refresh() || !dartplant::ReadCidSafely(reader, tagged_object_pool, &pool_cid) ||
+        pool_cid != profile.cid_object_pool) {
         return dartplant::FailProbe("ObjectPool is stale or has an invalid CID");
     }
     const uintptr_t pool = dartplant::Untag(tagged_object_pool);
     uint64_t length = 0;
-    if (!reader.Read(pool + profile.object_pool_length_offset, &length) ||
+    if (!reader.ReadSafely(pool + profile.object_pool_length_offset, &length) ||
         length > dartplant::kMaxObjectPoolEntries || index >= length) {
         dartplant::SetLastError("ObjectPool index is out of range");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -2214,9 +2247,9 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
     const uintptr_t data_start = pool + profile.object_pool_elements_offset;
     uint64_t raw = 0;
     uint8_t bits = 0;
-    if (!reader.Read(data_start + static_cast<uintptr_t>(index) * sizeof(uint64_t), &raw) ||
-        !reader.Read(data_start + static_cast<uintptr_t>(length) * sizeof(uint64_t) + index,
-                     &bits)) {
+    if (!reader.ReadSafely(data_start + static_cast<uintptr_t>(index) * sizeof(uint64_t), &raw) ||
+        !reader.ReadSafely(data_start + static_cast<uintptr_t>(length) * sizeof(uint64_t) + index,
+                           &bits)) {
         return dartplant::FailProbe("ObjectPool entry data or type bits are unreadable");
     }
 
@@ -2238,7 +2271,7 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
     if (entry.type == DARTPLANT_OBJECT_POOL_TAGGED_OBJECT) {
         entry.tagged_object = raw;
         if (dartplant::IsHeapObject(raw)) {
-            (void) dartplant::ReadCid(reader, raw, &entry.object_cid);
+            (void) dartplant::ReadCidSafely(reader, raw, &entry.object_cid);
         }
     }
     *out_entry = entry;

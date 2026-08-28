@@ -12,6 +12,8 @@ struct DartPlantRuntime;
 namespace dartplant {
 
 bool DefaultRuntimeInitialized();
+// Internal host-test visibility only; not part of the exported C ABI.
+DartPlantRuntime* DefaultRuntimeInstanceForTesting();
 DartPlantStatus FindDefaultRuntimeMethod(const DartPlantMethodQuery* query,
                                          DartPlantMethod** out_method);
 DartPlantStatus BindRegisteredArtifactIndexIfReady(::DartPlantRuntime* runtime);

@@ -27,8 +27,10 @@ typedef struct DartPlantArtifactBundle {
 } DartPlantArtifactBundle;
 
 // Generated sidecars call this from a tiny C++ static registrar. Registration
-// may happen before dartplant_init(); the normal runtime consumes the embedded
-// bundle lazily when it is initialized and when the matching app image appears.
+// may happen before dartplant_init(); DartPlant deep-copies the bundle and all
+// nested arrays/strings before returning, so callers may release temporary
+// storage or unload the registering DSO afterwards. The normal runtime consumes
+// the owned copy lazily when the matching app image appears.
 DARTPLANT_EXPORT DartPlantStatus
 dartplant_register_embedded_artifact_bundle(const DartPlantArtifactBundle* bundle);
 

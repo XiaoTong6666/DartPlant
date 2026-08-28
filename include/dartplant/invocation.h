@@ -92,7 +92,13 @@ dartplant_invocation_phase(const DartPlantInvocation* invocation);
 DARTPLANT_EXPORT uint32_t dartplant_invocation_depth(const DartPlantInvocation* invocation);
 
 // True only when this physical invocation has a verified per-Function
-// DartCallLayout. Raw GP/FP context access remains available when this is false.
+// DartCallLayout. This proves argument/result transport, not canonical Dart
+// semantic roots. An artifact-first hook installed before Live VM bootstrap can
+// therefore have verified ABI while NULL/BOOL refinement remains unavailable:
+// tagged values still decode safely as SMI/HEAP_OBJECT, and writing NULL/BOOL
+// fails closed unless canonical roots were already validated when that physical
+// hook was installed. A later bootstrap does not retroactively upgrade an
+// existing hook. Raw GP/FP context access remains available when this is false.
 DARTPLANT_EXPORT uint8_t
 dartplant_invocation_has_verified_abi(const DartPlantInvocation* invocation);
 

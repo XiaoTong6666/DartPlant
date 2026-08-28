@@ -68,6 +68,8 @@ struct RuntimeOperationLease {
 bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right);
 bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMethod* method);
 RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime);
+// Internal host-test observation for deterministic close/drain regressions.
+size_t RuntimeActiveOperationCountForTesting(const DartPlantRuntime* runtime);
 DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                                       const std::vector<ModuleImage>& modules);
 void StartRuntimeModuleRefreshWorker(RuntimeModuleRefreshReporter reporter);
@@ -104,6 +106,7 @@ struct DartPlantRuntime {
     // dropped from the PRODUCT object graph. Bound to one app/snapshot
     // incarnation and cleared when that artifact identity changes.
     std::optional<dartplant::SnapshotIndex> artifact_snapshot_index;
+    uint64_t bound_artifact_snapshot_generation = 0;
     DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
     std::optional<DartPlantLiveVmContext> live_vm_context;
     // Canonical semantic roots are captured only from an exact, validated live
@@ -117,6 +120,26 @@ struct DartPlantRuntime {
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
     bool profile_matched = false;
 };
+
+namespace dartplant {
+
+inline bool IsArtifactRuntimeMethod(const DartPlantMethod* method) {
+    return method != nullptr && method->function != nullptr &&
+           method->function->source == DartFunctionSource::kOfflineSnapshotIndex;
+}
+
+inline bool RuntimeReadyForMethodOperation(const DartPlantRuntime* runtime,
+                                           const DartPlantMethod* method) {
+    if (runtime == nullptr) return false;
+    if (runtime->state == DARTPLANT_RUNTIME_READY) return true;
+    return runtime->state == DARTPLANT_RUNTIME_IMAGES_READY && IsArtifactRuntimeMethod(method);
+}
+
+DartPlantStatus ReplaceRuntimeArtifactSnapshotIndex(DartPlantRuntime* runtime,
+                                                    const DartPlantSnapshotIndexInfo* source,
+                                                    uint64_t registry_generation);
+
+}  // namespace dartplant
 
 struct DartPlantInvocation {
     DartPlantHook* hook = nullptr;

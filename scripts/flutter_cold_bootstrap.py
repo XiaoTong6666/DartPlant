@@ -250,9 +250,29 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(f"cold start {round_index}: automatic live Function index was not ready\n{logs}")
     if "DartPlant initialize status: 0" not in logs:
         raise RuntimeError(f"cold start {round_index}: runtime init failed\n{logs}")
-    if "DartPlant simple facade hook: 1 value=22" not in logs:
+    if "DartPlant simple facade install: 0" not in logs:
         raise RuntimeError(
-            f"cold start {round_index}: simple init/find/hook/unhook facade failed\n{logs}"
+            f"cold start {round_index}: simple facade current-thread bootstrap failed\n{logs}"
+        )
+    if "DartPlant simple facade typed hook: 1 values=27.625/29.25 stages=1/1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: simple typed facade lifecycle failed\n{logs}"
+        )
+    if "simple facade typed install ready=1 status=0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: simple facade lazy bootstrap/artifact hook failed\n{logs}"
+        )
+    if "simple facade typed stage1 enter=1 leave=1 observer=1 failures=0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: first logical HookHandle removal failed\n{logs}"
+        )
+    if "simple facade typed stage2 enter=2 leave=2 observer=1 failures=0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: final logical HookHandle removal failed\n{logs}"
+        )
+    if "DartPlant advanced ordinary hook enable: 0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: advanced ordinary hook handoff failed\n{logs}"
         )
     if "DartPlant live VM startup probe: 115" not in logs:
         raise RuntimeError(f"cold start {round_index}: hook probe did not return 115\n{logs}")
@@ -269,10 +289,6 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     if "DartPlant ordinary AOT discovery: 1" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT Function discovery failed\n{logs}"
-        )
-    if "DartPlant simple facade lookup: 1" not in logs:
-        raise RuntimeError(
-            f"cold start {round_index}: simple API did not own runtime bootstrap/artifact lookup\n{logs}"
         )
     required_ordinary_markers = (
         "evidence_status=0",

@@ -89,14 +89,22 @@ typedef struct DartPlantAddressQuery {
 enum { DARTPLANT_INIT_API_VERSION = 1 };
 
 // Normal consumer initialization. DartPlant internally creates the conservative
-// Flutter ARM64 runtime, discovers loaded images/snapshot state, and performs a
-// Live VM bootstrap lazily on the first method lookup. app/runtime module names
-// default to libapp.so/libflutter.so when null or empty.
+// Flutter ARM64 runtime and discovers loaded images/snapshot state lazily.
+// Exact compiler-generated artifact methods can resolve as soon as the matching
+// AOT images are ready; a Live VM bootstrap is only required when artifact
+// lookup cannot satisfy the method query. app/runtime module names default to
+// libapp.so/libflutter.so when null or empty.
 //
 // artifact_bundle is optional and intentionally opaque here. A matching
 // compiler-generated bundle can be supplied without exposing snapshot/ABI
-// details to the normal hook API; DartPlant binds its index/evidence lazily to
-// the exact loaded app incarnation.
+// details to the normal hook API; DartPlant deep-copies and binds its
+// index/evidence lazily to the exact loaded app incarnation.
+//
+// Repeating dartplant_init() with an equivalent host/module configuration is
+// idempotent. A repeated call may additionally register a compatible artifact
+// bundle. Changing the host backend or app/runtime module identity while the
+// default runtime is active fails with DARTPLANT_PROFILE_MISMATCH rather than
+// silently ignoring the new configuration.
 typedef struct DartPlantInitInfo {
     uint32_t struct_size;
     uint32_t version;

@@ -177,6 +177,13 @@ void InstallHostApi(const DartPlantHostApi* api) {
     ClearLastError();
 }
 
+void ClearHostApi(const HostApiBinding* expected_binding) {
+    if (expected_binding == nullptr) return;
+    const HostApiBinding* expected = expected_binding;
+    (void) State().host.binding.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 void RefreshModules() { ReplaceModules(EnumerateModules()); }
 
 void ReplaceModules(std::vector<ModuleImage> modules) {

@@ -100,20 +100,24 @@ if(DARTPLANT_BUILD_DOBBY_ADAPTER)
 endif()
 
 if(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER)
-    if(NOT EXISTS "${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include/shadowhook.h")
-        message(FATAL_ERROR "DARTPLANT_SHADOWHOOK_ROOT must point to a ShadowHook source tree")
-    endif()
     add_library(dartplant_adapter_shadowhook STATIC adapters/shadowhook/shadowhook_host.cpp)
     target_compile_features(dartplant_adapter_shadowhook PUBLIC cxx_std_20)
     target_compile_options(dartplant_adapter_shadowhook PRIVATE -Wall -Wextra -Werror)
-    target_include_directories(
-        dartplant_adapter_shadowhook
-        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-        PRIVATE ${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include
-    )
-    # Do not build or configure ShadowHook from DartPlant. A consumer may
-    # provide a CMake target named `shadowhook`; otherwise the plain library
-    # name is propagated and resolved by the final Android link step/prebuilt.
+    target_include_directories(dartplant_adapter_shadowhook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(TARGET shadowhook)
+        # Consume include/link usage requirements from a parent-provided target.
+    elseif(EXISTS "${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include/shadowhook.h")
+        target_include_directories(
+            dartplant_adapter_shadowhook
+            PRIVATE ${DARTPLANT_SHADOWHOOK_ROOT}/shadowhook/src/main/cpp/include
+        )
+    else()
+        message(FATAL_ERROR
+            "Provide a CMake target named shadowhook or set DARTPLANT_SHADOWHOOK_ROOT to a ShadowHook source tree")
+    endif()
+    # DartPlant never configures/builds ShadowHook itself. A parent target can
+    # supply a source/prebuilt implementation; otherwise the plain library
+    # name is resolved by the final Android link step.
     target_link_libraries(dartplant_adapter_shadowhook PUBLIC dartplant_core PRIVATE shadowhook)
 endif()
 
@@ -299,6 +303,8 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         tests/abi_contract_test.cc
         tests/calling_convention_test.cc
         tests/aot_abi_analyzer_test.cc
+        tests/shadowhook_adapter_test.cc
+        adapters/shadowhook/shadowhook_host.cpp
     )
     target_compile_features(dartplant_tests PRIVATE cxx_std_20)
     target_compile_options(dartplant_tests PRIVATE -Wall -Wextra -Werror)
@@ -308,6 +314,7 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fakes
     )
     target_link_libraries(
         dartplant_tests

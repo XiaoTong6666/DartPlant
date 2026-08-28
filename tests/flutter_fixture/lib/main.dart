@@ -28,10 +28,6 @@ bool negateBool(bool value) => !value;
 @pragma('vm:never-inline')
 T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
 
-@pragma('vm:entry-point')
-@pragma('vm:never-inline')
-int facadeProbe(int value) => (value * 3) + 1;
-
 // Keep this as an ordinary direct-call-only optimized AOT body. Without a
 // tear-off the compiler is free to use the unboxed double Dart calling
 // convention; the native fixture proves V0/V1 argument access from evidence.
@@ -55,11 +51,33 @@ Future<void> main() async {
         ? await DartPlantNative.waitForInitialization()
         : initializeStartStatus;
     debugPrint('DartPlant initialize status: $initializeStatus');
-    final simpleFacadeValue = facadeProbe(7);
-    final simpleFacadeHookProbe = DartPlantNative.simpleFacadeHookProbe();
+
+    // The first two calls are owned only by the simple-facade consumer TU.
+    // It lazy-bootstraps its own default runtime, consumes the embedded
+    // compiler artifact, derives the typed V0/V1 -> V0 layout, and installs two
+    // logical HookHandles without including any advanced DartPlant header.
+    final simpleFacadeInstall = DartPlantNative.simpleFacadeInstall();
+    debugPrint('DartPlant simple facade install: $simpleFacadeInstall');
+    final simpleFacadeFirst = verifiedAbiDouble(1.25, 2.5);
+    final simpleFacadeStage1 = DartPlantNative.simpleFacadeStage1();
+    final simpleFacadeSecond = verifiedAbiDouble(2.0, 3.0);
+    final simpleFacadeStage2 = DartPlantNative.simpleFacadeStage2();
+    final simpleFacadePassed = simpleFacadeInstall == 0 &&
+        simpleFacadeFirst == 27.625 &&
+        simpleFacadeSecond == 29.25 &&
+        simpleFacadeStage1 == 1 &&
+        simpleFacadeStage2 == 1;
     debugPrint(
-      'DartPlant simple facade hook: $simpleFacadeHookProbe value=$simpleFacadeValue',
+      'DartPlant simple facade typed hook: ${simpleFacadePassed ? 1 : 0} values=$simpleFacadeFirst/$simpleFacadeSecond stages=$simpleFacadeStage1/$simpleFacadeStage2',
     );
+
+    // Only after the simple consumer has removed its final subscription and
+    // shut down the default runtime may the advanced fixture reuse this exact
+    // physical CodeTarget for its ABI/late-shared diagnostics.
+    final advancedOrdinaryHook = DartPlantNative.enableAdvancedOrdinaryHook();
+    debugPrint(
+        'DartPlant advanced ordinary hook enable: $advancedOrdinaryHook');
+
     DartPlantNative.resetNullSemanticProbe();
     final canonicalNull = nullableEchoObject(null);
     final rewrittenToNull = nullableEchoObject(const FixtureObject(11));

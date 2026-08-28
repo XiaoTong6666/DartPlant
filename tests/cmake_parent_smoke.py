@@ -65,6 +65,19 @@ add_subdirectory(\"{ROOT}\" dartplant)
     )
     assert cache_value(cache, "DARTPLANT_BUILD_TESTS") == "ON"
     assert cache_value(cache, "CAPSTONE_BUILD_CSTOOL") == "ON"
+
+    configure(
+        f"""cmake_minimum_required(VERSION 3.22.1)
+project(dartplant_parent_shadowhook_smoke LANGUAGES CXX)
+add_library(shadowhook INTERFACE)
+target_include_directories(shadowhook INTERFACE \"{ROOT / 'tests' / 'fakes'}\")
+set(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER ON CACHE BOOL \"\")
+add_subdirectory(\"{ROOT}\" dartplant)
+if(NOT TARGET dartplant_adapter_shadowhook)
+  message(FATAL_ERROR \"DartPlant did not consume parent-provided ShadowHook target\")
+endif()
+"""
+    )
     return 0
 
 

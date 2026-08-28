@@ -1,8 +1,8 @@
 // Copyright (C) 2026 XiaoTong6666
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef DARTPLANT_SRC_RUNTIME_DART_VM_ABI_H_
-#define DARTPLANT_SRC_RUNTIME_DART_VM_ABI_H_
+#ifndef DARTPLANT_ABI_VALUE_CODEC_H_
+#define DARTPLANT_ABI_VALUE_CODEC_H_
 
 #include <stdint.h>
 
@@ -28,4 +28,4 @@ DartPlantStatus dartplant_vm_abi_encode_fp_word(const DartPlantValue* value, uin
 
 }  // namespace dartplant
 
-#endif  // DARTPLANT_SRC_RUNTIME_DART_VM_ABI_H_
+#endif  // DARTPLANT_ABI_VALUE_CODEC_H_

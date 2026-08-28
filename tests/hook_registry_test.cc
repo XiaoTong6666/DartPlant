@@ -12,6 +12,12 @@ int g_hook_calls = 0;
 int g_unhook_calls = 0;
 void* g_last_target = nullptr;
 
+struct ContextHostState {
+    int hook_calls = 0;
+    int unhook_calls = 0;
+    void* last_target = nullptr;
+};
+
 int FakeHook(void* target, void*, void** backup) {
     ++g_hook_calls;
     g_last_target = target;
@@ -22,6 +28,23 @@ int FakeHook(void* target, void*, void** backup) {
 int FakeUnhook(void* target) {
     ++g_unhook_calls;
     g_last_target = target;
+    return 0;
+}
+
+int ContextHook(void* user_data, void* target, void*, void** backup) {
+    auto* state = static_cast<ContextHostState*>(user_data);
+    if (state == nullptr || backup == nullptr) return -1;
+    ++state->hook_calls;
+    state->last_target = target;
+    *backup = target;
+    return 0;
+}
+
+int ContextUnhook(void* user_data, void* target) {
+    auto* state = static_cast<ContextHostState*>(user_data);
+    if (state == nullptr) return -1;
+    ++state->unhook_calls;
+    state->last_target = target;
     return 0;
 }
 
@@ -38,6 +61,58 @@ void ResetFakeHost() {
 }
 
 }  // namespace
+
+TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
+    dartplant_reset();
+    ContextHostState first;
+    ContextHostState second;
+    const DartPlantHostApi first_api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &first,
+        .hook = ContextHook,
+        .unhook = ContextUnhook,
+    };
+    const DartPlantHostApi second_api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &second,
+        .hook = ContextHook,
+        .unhook = ContextUnhook,
+    };
+    EXPECT_EQ(DARTPLANT_OK, dartplant_install_host_api(&first_api));
+
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+
+    DartPlantAddressQuery query = {
+        .struct_size = sizeof(query),
+        .module_name = "libdartplant_fixture.so",
+        .address = reinterpret_cast<uint64_t>(target),
+        .address_kind = DARTPLANT_ADDRESS_RUNTIME,
+        .code_size = 1,
+        .expected_build_id = nullptr,
+        .expected_fingerprint = nullptr,
+    };
+    void* backup = nullptr;
+    DartPlantHook* hook = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_hook_address(&query, reinterpret_cast<void*>(Replacement), &backup, &hook));
+    EXPECT_EQ(1, first.hook_calls);
+    EXPECT_EQ(0, second.hook_calls);
+
+    // Replacing the process default backend must not change ownership of a
+    // physical hook already installed by the first backend instance.
+    EXPECT_EQ(DARTPLANT_OK, dartplant_install_host_api(&second_api));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
+    EXPECT_EQ(1, first.unhook_calls);
+    EXPECT_EQ(0, second.unhook_calls);
+    dartplant_release_hook(hook);
+    dlclose(fixture);
+}
 
 TEST_CASE(AddressHookUsesHostApiAndUnhooks) {
     ResetFakeHost();

@@ -1,4 +1,4 @@
-#include "runtime/dart_vm_abi.h"
+#include "abi/value_codec.h"
 
 #include "core/internal.h"
 
@@ -56,7 +56,8 @@ DartPlantStatus dartplant_vm_abi_encode_gp_word(const DartPlantValue* value, boo
         SetLastError("heap object values must use a tagged raw word");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    if (value->kind == DARTPLANT_VALUE_BOOL || value->kind == DARTPLANT_VALUE_DOUBLE) {
+    if (value->kind == DARTPLANT_VALUE_BOOL || value->kind == DARTPLANT_VALUE_DOUBLE ||
+        value->kind == DARTPLANT_VALUE_INT64) {
         SetLastError("GP value kind is not supported by the validated Dart ABI profile");
         return DARTPLANT_UNSUPPORTED_ABI;
     }

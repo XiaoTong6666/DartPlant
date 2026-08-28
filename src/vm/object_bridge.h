@@ -1,8 +1,8 @@
 // Copyright (C) 2026 XiaoTong6666
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef DARTPLANT_RUNTIME_VM_ADAPTER_INTERNAL_H_
-#define DARTPLANT_RUNTIME_VM_ADAPTER_INTERNAL_H_
+#ifndef DARTPLANT_VM_OBJECT_BRIDGE_H_
+#define DARTPLANT_VM_OBJECT_BRIDGE_H_
 
 #include <stdint.h>
 
@@ -51,4 +51,4 @@ DartPlantStatus VmAdapterCheckHandle(const DartPlantVmAdapter* adapter,
 
 }  // namespace dartplant
 
-#endif  // DARTPLANT_RUNTIME_VM_ADAPTER_INTERNAL_H_
+#endif  // DARTPLANT_VM_OBJECT_BRIDGE_H_

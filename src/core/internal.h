@@ -13,12 +13,14 @@
 #include <string>
 #include <vector>
 
+#include "abi/call_layout.h"
 #include "core/method_model.h"
 #include "dartplant/dartplant.h"
+#include "dartplant/host_api.h"
 #include "dartplant/invocation.h"
 #include "dartplant/native_api.h"
 #include "dartplant/runtime_profile.h"
-#include "runtime/vm_adapter_internal.h"
+#include "vm/object_bridge.h"
 
 namespace dartplant {
 
@@ -64,8 +66,9 @@ struct MetadataIndex {
 };
 
 struct HostApiBinding {
-    DartPlantHostHook hook = nullptr;
-    DartPlantHostUnhook unhook = nullptr;
+    void* user_data = nullptr;
+    DartPlantHostHookCallback hook = nullptr;
+    DartPlantHostUnhookCallback unhook = nullptr;
 };
 
 struct HostApi {
@@ -117,6 +120,7 @@ std::optional<ModuleImage> FindModule(const std::vector<ModuleImage>& modules,
 std::string FingerprintCode(const void* address, size_t size);
 
 void InstallHostApi(const DartPlantNativeApiEntries* entries);
+void InstallHostApi(const DartPlantHostApi* api);
 void RefreshModules();
 void ReplaceModules(std::vector<ModuleImage> modules);
 DartPlantStatus InvalidateRuntimeHooks(
@@ -135,7 +139,8 @@ DartPlantStatus InstallCallbackHook(const DartPlantMethod* method,
                                     std::shared_ptr<std::atomic_uint64_t> runtime_generation = {},
                                     uint64_t expected_runtime_generation = 0,
                                     uint64_t validated_bool_true_value = 0,
-                                    uint64_t validated_bool_false_value = 0);
+                                    uint64_t validated_bool_false_value = 0,
+                                    std::shared_ptr<const abi::DartCallLayout> call_layout = {});
 DartPlantStatus AddCallbackListener(
     DartPlantHook* hook, const DartPlantMethod* requested_method,
     const DartPlantHookOptions& options, int32_t priority, DartPlantListener** out_listener,
@@ -215,6 +220,7 @@ struct DartPlantHook {
     uint64_t validated_null_value = 0;
     uint64_t validated_bool_true_value = 0;
     uint64_t validated_bool_false_value = 0;
+    std::shared_ptr<const dartplant::abi::DartCallLayout> call_layout;
     const dartplant::HostApiBinding* host_binding = nullptr;
     std::shared_ptr<std::atomic_uint64_t> runtime_generation;
     uint64_t expected_runtime_generation = 0;

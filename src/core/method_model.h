@@ -32,9 +32,10 @@ struct DartMethodIdentity {
 };
 
 enum class DartFunctionSource {
-    // Legacy process-global/offline tooling only. DartPlantRuntime never
-    // constructs method handles from either of these sources.
+    // Legacy process-global metadata path only.
     kLegacyMetadata,
+    // Exact artifact-bound snapshot sidecar used only when PRODUCT AOT has
+    // dropped the logical Function object from the live heap.
     kOfflineSnapshotIndex,
     kLiveVm,
     // Native unit/device fixtures that exercise the hook backend without a

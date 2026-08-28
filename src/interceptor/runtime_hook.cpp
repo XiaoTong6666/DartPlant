@@ -69,10 +69,11 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
+    const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
     return dartplant::InstallCallbackHook(method, runtime->profile.profile, *options, 0, out_hook,
                                           nullptr, runtime->live_vm_null_value, runtime->generation,
                                           generation, runtime->live_vm_bool_true_value,
-                                          runtime->live_vm_bool_false_value);
+                                          runtime->live_vm_bool_false_value, call_layout);
 }
 
 extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
@@ -142,10 +143,11 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
     DartPlantStatus status = dartplant::AddCallbackListenerForMethod(
         method, *options, priority, out_listener, runtime->generation, generation);
     if (status == DARTPLANT_NOT_INITIALIZED) {
+        const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
         return dartplant::InstallCallbackHook(
             method, runtime->profile.profile, *options, priority, nullptr, out_listener,
             runtime->live_vm_null_value, runtime->generation, generation,
-            runtime->live_vm_bool_true_value, runtime->live_vm_bool_false_value);
+            runtime->live_vm_bool_true_value, runtime->live_vm_bool_false_value, call_layout);
     }
     return status;
 }

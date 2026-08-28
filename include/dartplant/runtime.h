@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 
+#include "dartplant/abi_evidence.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/flutter_snapshot.h"
 #include "dartplant/invocation.h"
@@ -83,6 +84,15 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_index_info(
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_info(
     const DartPlantRuntime* runtime, uint32_t index, DartPlantLiveVmFunctionInfo* out_info);
 
+// Registers an exact, build-bound snapshot index for logical Functions that the
+// Dart AOT precompiler removed from the PRODUCT heap. Retained Function objects
+// are still resolved from the live VM first; this index is consulted only after
+// an exact live-index miss. The index must match the current snapshot hash and
+// libapp.so build-id and every record must carry a code fingerprint. An index is
+// immutable for the lifetime of the current app/snapshot incarnation.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_register_snapshot_index(
+    DartPlantRuntime* runtime, const DartPlantSnapshotIndexInfo* index);
+
 // Reads the retained Dart FunctionType for a live runtime method. A stale method
 // or an AOT-dropped Function.signature fails closed; no ABI is inferred here.
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_method_signature(
@@ -96,10 +106,23 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_read_global_object_pool_entry
     const DartPlantRuntime* runtime, uint32_t index, DartPlantObjectPoolEntryInfo* out_entry);
 
 // Resolves supported runtime identities only from the automatically built live
-// Function index. There is no metadata/offline-index fallback in DartPlantRuntime.
+// Function index first. If an exact snapshot index was explicitly registered,
+// Functions dropped from the PRODUCT heap may fall back to that artifact-bound
+// index after a live-index miss.
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
                                                                const DartPlantMethodQuery* query,
                                                                DartPlantMethod** out_method);
+
+// Registers exact compiler-side ABI evidence for the current live method
+// incarnation. DartPlant binds the evidence to the method identity, physical
+// CodeTarget and runtime generation before deriving a DartCallLayout. Evidence
+// cannot be installed after that physical target is already hooked.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
+    DartPlantRuntime* runtime, const DartPlantMethod* method,
+    const DartPlantCompilerAbiEvidence* evidence);
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_method_abi_info(
+    const DartPlantRuntime* runtime, const DartPlantMethod* method,
+    DartPlantMethodAbiInfo* out_info);
 
 // Raw replacement path. The replacement must exactly match the target AOT
 // entry ABI. Typed Dart invocation callbacks are only enabled by a validated

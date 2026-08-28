@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "core/internal.h"
+#include "dartplant/flutter_snapshot.h"
 
 namespace dartplant {
 
@@ -30,6 +31,8 @@ std::optional<std::string> SelectFlutterSnapshotProfile(std::string_view feature
 
 std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& module,
                                                              std::string* error);
+
+void FillSnapshotInfo(const FlutterSnapshotSource& snapshot, DartPlantFlutterSnapshotInfo* info);
 
 }  // namespace dartplant
 

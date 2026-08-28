@@ -110,8 +110,10 @@ dartplant_arm64_callback_entry:
 
 dartplant_arm64_continuation:
 .Ldartplant_continuation:
-  // x0 is the original return word. The C dispatcher updates context.x[0]
-  // before invoking the leave callback and returns the context plus result.
+  // Preserve every currently supported Dart AOT return channel across the C
+  // dispatcher call: tagged/int64 use x0, pair-of-tagged uses x0+x1, and
+  // unboxed double uses v0. Pass the low 64 bits of v0 through C ABI x2.
+  fmov x2, d0
   bl dartplant_arm64_dispatch_leave_from_tls
   mov x14, x0
 .Ldartplant_restore_and_return:

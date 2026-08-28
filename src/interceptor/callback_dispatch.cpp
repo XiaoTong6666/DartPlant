@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
+#include <cstring>
 
 #include "runtime/runtime_internal.h"
 
@@ -57,9 +58,19 @@ void ReleaseSnapshot(DartPlantInvocation* invocation) {
     dartplant::InvocationExited(invocation->hook);
 }
 
-void FinishFrame(DispatchFrame* frame, uint64_t result) {
+uint64_t ReadV0Bits(const DartPlantArm64Context& context) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) <= sizeof(context.v[0]));
+    std::memcpy(&bits, context.v[0], sizeof(bits));
+    return bits;
+}
+
+void FinishFrame(DispatchFrame* frame, uint64_t result0, uint64_t result1,
+                 uint64_t fp_result_bits) {
     if (frame == nullptr) return;
-    frame->invocation.context->x[0] = result;
+    frame->invocation.context->x[0] = result0;
+    frame->invocation.context->x[1] = result1;
+    std::memcpy(frame->invocation.context->v[0], &fp_result_bits, sizeof(fp_result_bits));
     frame->invocation.phase = DARTPLANT_INVOCATION_LEAVE;
 
     // Pine-style pairing: callbacks that entered are left in reverse order,
@@ -104,6 +115,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     frame.invocation.identity_ambiguous =
         frame.invocation.code_target != nullptr && frame.invocation.code_target->IsShared();
     frame.invocation.profile = &hook->profile;
+    frame.invocation.call_layout = hook->call_layout.get();
     frame.invocation.context = &frame.context;
     frame.invocation.phase = DARTPLANT_INVOCATION_ENTER;
     frame.invocation.depth = g_depth;
@@ -147,7 +159,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     frame.invocation.entered_listeners.resize(entered_count);
 
     if (frame.invocation.skip_original) {
-        FinishFrame(&frame, frame.context.x[0]);
+        FinishFrame(&frame, frame.context.x[0], frame.context.x[1], ReadV0Bits(frame.context));
         --g_depth;
         result.context = &frame.context;
         return result;
@@ -158,15 +170,16 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     return result;
 }
 
-extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(uint64_t result) {
+extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(
+    uint64_t result0, uint64_t result1, uint64_t fp_result_bits) {
     DartPlantArm64LeaveResult output{};
     DispatchFrame* frame = CurrentFrame();
     if (frame == nullptr || frame->invocation.context == nullptr) {
         dartplant::SetLastError("leave callback has no active invocation");
-        output.result = result;
+        output.result = result0;
         return output;
     }
-    FinishFrame(frame, result);
+    FinishFrame(frame, result0, result1, fp_result_bits);
     output.context = frame->invocation.context;
     output.result = output.context->x[0];
     --g_depth;

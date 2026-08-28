@@ -868,6 +868,82 @@ struct CollectedLiveFunction {
     DartPlantLiveVmFunctionInfo info{};
 };
 
+bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                         uint64_t heap_base, uint64_t tagged_function, uint32_t kind,
+                         uint64_t tagged_class, uint64_t library, bool is_top_level,
+                         const char* library_uri, const char* class_name,
+                         const DartPlantFlutterSnapshotInfo& snapshot,
+                         std::vector<CollectedLiveFunction>* functions) {
+    if (functions == nullptr || library_uri == nullptr || class_name == nullptr ||
+        !RequireCid(reader, tagged_function, profile.cid_function)) {
+        return false;
+    }
+
+    const uintptr_t function_address = Untag(tagged_function);
+    CollectedLiveFunction collected{};
+    collected.info.struct_size = sizeof(collected.info);
+    collected.info.function = tagged_function;
+    collected.info.owner_class = tagged_class;
+    collected.info.library = library;
+    collected.info.owner_is_toplevel_class = is_top_level ? 1 : 0;
+    collected.info.function_kind = kind;
+    std::snprintf(collected.info.library_uri, sizeof(collected.info.library_uri), "%s",
+                  library_uri);
+    std::snprintf(collected.info.class_name, sizeof(collected.info.class_name), "%s", class_name);
+
+    uint64_t tagged_name = 0;
+    uint64_t function_owner = 0;
+    if (!reader.Read(function_address + profile.function_entry_point_offset,
+                     &collected.info.function_entry_point) ||
+        !ReadCompressedObject(reader, function_address, profile.function_name_offset, heap_base,
+                              &tagged_name) ||
+        !ReadDartString(reader, profile, tagged_name, collected.info.function_name,
+                        sizeof(collected.info.function_name)) ||
+        !ReadCompressedObject(reader, function_address, profile.function_owner_offset, heap_base,
+                              &function_owner) ||
+        function_owner != tagged_class ||
+        !ReadCompressedObject(reader, function_address, profile.function_code_offset, heap_base,
+                              &collected.info.code) ||
+        !RequireCid(reader, collected.info.code, profile.cid_code)) {
+        return false;
+    }
+
+    uint64_t code_owner = 0;
+    const uintptr_t code_address = Untag(collected.info.code);
+    if (!reader.Read(code_address + profile.code_entry_point_offset,
+                     &collected.info.code_entry_point) ||
+        !reader.Read(code_address + profile.code_object_pool_offset,
+                     &collected.info.code_object_pool) ||
+        !reader.Read(code_address + profile.code_owner_offset, &code_owner) ||
+        !reader.Read(code_address + profile.code_instructions_length_offset,
+                     &collected.info.code_size) ||
+        collected.info.function_entry_point == 0 || collected.info.code_size == 0) {
+        return false;
+    }
+    collected.info.code_owner_matches_function = code_owner == tagged_function ? 1 : 0;
+    if (!collected.info.code_owner_matches_function &&
+        (!RequireCid(reader, code_owner, profile.cid_function) ||
+         !HasSnapshotFeature(snapshot.snapshot_features, "dedup_instructions"))) {
+        return false;
+    }
+
+    if (snapshot.isolate_instructions_size == 0 ||
+        collected.info.function_entry_point < snapshot.isolate_instructions_runtime) {
+        return false;
+    }
+    const uint64_t instruction_offset =
+        collected.info.function_entry_point - snapshot.isolate_instructions_runtime;
+    if (instruction_offset >= snapshot.isolate_instructions_size ||
+        snapshot.isolate_instructions_va >
+            std::numeric_limits<uint64_t>::max() - instruction_offset) {
+        return false;
+    }
+    collected.info.entry_va = snapshot.isolate_instructions_va + instruction_offset;
+    collected.info.code_section_va = snapshot.isolate_instructions_va;
+    functions->push_back(collected);
+    return true;
+}
+
 bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
                              const DartPlantLiveVmProfile& profile, uint64_t heap_base,
                              uint64_t tagged_class, bool is_top_level,
@@ -936,77 +1012,10 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
             ++*skipped_function_count;
             continue;
         }
-
-        CollectedLiveFunction collected{};
-        collected.info.struct_size = sizeof(collected.info);
-        collected.info.function = function;
-        collected.info.owner_class = tagged_class;
-        collected.info.library = library;
-        collected.info.owner_is_toplevel_class = is_top_level ? 1 : 0;
-        collected.info.function_kind = kind;
-        std::snprintf(collected.info.library_uri, sizeof(collected.info.library_uri), "%s",
-                      library_uri);
-        std::snprintf(collected.info.class_name, sizeof(collected.info.class_name), "%s",
-                      class_name);
-
-        uint64_t tagged_name = 0;
-        uint64_t function_owner = 0;
-        if (!reader.Read(function_address + profile.function_entry_point_offset,
-                         &collected.info.function_entry_point) ||
-            !ReadCompressedObject(reader, function_address, profile.function_name_offset, heap_base,
-                                  &tagged_name) ||
-            !ReadDartString(reader, profile, tagged_name, collected.info.function_name,
-                            sizeof(collected.info.function_name)) ||
-            !ReadCompressedObject(reader, function_address, profile.function_owner_offset,
-                                  heap_base, &function_owner) ||
-            function_owner != tagged_class ||
-            !ReadCompressedObject(reader, function_address, profile.function_code_offset, heap_base,
-                                  &collected.info.code) ||
-            !RequireCid(reader, collected.info.code, profile.cid_code)) {
+        if (!CollectLiveFunction(reader, profile, heap_base, function, kind, tagged_class, library,
+                                 is_top_level, library_uri, class_name, snapshot, functions)) {
             ++*skipped_function_count;
-            continue;
         }
-
-        uint64_t code_owner = 0;
-        const uintptr_t code_address = Untag(collected.info.code);
-        if (!reader.Read(code_address + profile.code_entry_point_offset,
-                         &collected.info.code_entry_point) ||
-            !reader.Read(code_address + profile.code_object_pool_offset,
-                         &collected.info.code_object_pool) ||
-            !reader.Read(code_address + profile.code_owner_offset, &code_owner) ||
-            !reader.Read(code_address + profile.code_instructions_length_offset,
-                         &collected.info.code_size) ||
-            collected.info.function_entry_point == 0 || collected.info.code_size == 0) {
-            ++*skipped_function_count;
-            continue;
-        }
-        collected.info.code_owner_matches_function = code_owner == function ? 1 : 0;
-        if (!collected.info.code_owner_matches_function &&
-            (!RequireCid(reader, code_owner, profile.cid_function) ||
-             !HasSnapshotFeature(snapshot.snapshot_features, "dedup_instructions"))) {
-            ++*skipped_function_count;
-            continue;
-        }
-
-        // Express the live entry in the snapshot-instructions coordinate space,
-        // rather than assuming ELF VA == runtime - load_bias. This is the same
-        // relationship used by FlutterSnapshotSource::ResolveInstructionVa().
-        if (snapshot.isolate_instructions_size == 0 ||
-            collected.info.function_entry_point < snapshot.isolate_instructions_runtime) {
-            ++*skipped_function_count;
-            continue;
-        }
-        const uint64_t instruction_offset =
-            collected.info.function_entry_point - snapshot.isolate_instructions_runtime;
-        if (instruction_offset >= snapshot.isolate_instructions_size ||
-            snapshot.isolate_instructions_va >
-                std::numeric_limits<uint64_t>::max() - instruction_offset) {
-            ++*skipped_function_count;
-            continue;
-        }
-        collected.info.entry_va = snapshot.isolate_instructions_va + instruction_offset;
-        collected.info.code_section_va = snapshot.isolate_instructions_va;
-        functions->push_back(collected);
     }
     return true;
 }

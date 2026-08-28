@@ -8,6 +8,27 @@
 namespace dartplant {
 namespace {
 
+constexpr uint32_t kSupportedCallbackProfileFlags =
+    DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
+    DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+
+struct NativeHostAdapter {
+    DartPlantNativeHook hook = nullptr;
+    DartPlantNativeUnhook unhook = nullptr;
+};
+
+int NativeHostHookAdapter(void* user_data, void* target, void* replacement, void** backup) {
+    const auto* adapter = static_cast<const NativeHostAdapter*>(user_data);
+    return adapter == nullptr || adapter->hook == nullptr
+               ? -1
+               : adapter->hook(target, replacement, backup);
+}
+
+int NativeHostUnhookAdapter(void* user_data, void* target) {
+    const auto* adapter = static_cast<const NativeHostAdapter*>(user_data);
+    return adapter == nullptr || adapter->unhook == nullptr ? -1 : adapter->unhook(target);
+}
+
 std::vector<std::unique_ptr<DartPlantHook>>& Hooks() {
     static std::vector<std::unique_ptr<DartPlantHook>> hooks;
     return hooks;
@@ -74,10 +95,7 @@ DartPlantHook* FindHookLocked(uintptr_t target) {
 }
 
 bool ValidateProfile(const DartPlantRuntimeProfile& profile) {
-    constexpr uint32_t kSupportedFlags =
-        DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
-        DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
-    if ((profile.flags & ~kSupportedFlags) != 0 ||
+    if ((profile.flags & ~kSupportedCallbackProfileFlags) != 0 ||
         (profile.flags & DARTPLANT_PROFILE_RAW_GP_ARGUMENTS) == 0 ||
         (profile.flags & DARTPLANT_PROFILE_RAW_GP_RESULT) == 0 || profile.argument_count > 8 ||
         !IsSupportedLocation(profile.result_location)) {
@@ -100,6 +118,10 @@ bool ValidateProfile(const DartPlantRuntimeProfile& profile) {
     return true;
 }
 
+bool HasLegacyCallbackMapping(const DartPlantRuntimeProfile& profile) {
+    return (profile.flags & kSupportedCallbackProfileFlags) != 0;
+}
+
 DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
     const uintptr_t target = HookTarget(hook);
     // Synthetic internal tests can construct a hook without the public
@@ -107,10 +129,10 @@ DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
     const auto* host_binding = hook->host_binding == nullptr
                                    ? State().host.binding.load(std::memory_order_acquire)
                                    : hook->host_binding;
-    const DartPlantHostUnhook host_unhook =
+    const DartPlantHostUnhookCallback host_unhook =
         host_binding == nullptr ? nullptr : host_binding->unhook;
     if (target == 0 || host_unhook == nullptr ||
-        host_unhook(reinterpret_cast<void*>(target)) != 0) {
+        host_unhook(host_binding->user_data, reinterpret_cast<void*>(target)) != 0) {
         std::lock_guard hook_lock(hook->mutex);
         hook->state = HookRecordState::kFailed;
         SetLastError("host unhook function failed");
@@ -163,9 +185,35 @@ void InstallHostApi(const DartPlantNativeApiEntries* entries) {
         SetLastError("host API version or function pointers are invalid");
         return;
     }
+    // native_init's callback ABI has no user_data slot. Keep an immutable
+    // adapter object for process lifetime and bind it through the generic host
+    // contract instead of letting LSPosed-specific types define the core.
+    auto* adapter = new NativeHostAdapter{
+        .hook = entries->hook_func,
+        .unhook = entries->unhook_func,
+    };
+    const DartPlantHostApi api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = adapter,
+        .hook = NativeHostHookAdapter,
+        .unhook = NativeHostUnhookAdapter,
+    };
+    InstallHostApi(&api);
+}
+
+void InstallHostApi(const DartPlantHostApi* api) {
+    if (api == nullptr || api->struct_size < sizeof(DartPlantHostApi) ||
+        api->version < DARTPLANT_HOST_API_VERSION || api->hook == nullptr ||
+        api->unhook == nullptr) {
+        State().host.binding.store(nullptr, std::memory_order_release);
+        SetLastError("host API version or function pointers are invalid");
+        return;
+    }
     auto* binding = new HostApiBinding();
-    binding->hook = entries->hook_func;
-    binding->unhook = entries->unhook_func;
+    binding->user_data = api->user_data;
+    binding->hook = api->hook;
+    binding->unhook = api->unhook;
     State().host.binding.store(binding, std::memory_order_release);
     ClearLastError();
 }
@@ -234,7 +282,8 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
         return DARTPLANT_ALREADY_HOOKED;
     }
     void* original = nullptr;
-    if (host_binding->hook(reinterpret_cast<void*>(target), replacement, &original) != 0 ||
+    if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target), replacement,
+                           &original) != 0 ||
         original == nullptr) {
         SetLastError("host hook function failed");
         return DARTPLANT_HOOK_FAILED;
@@ -351,7 +400,8 @@ DartPlantStatus InstallCallbackHook(
     const DartPlantHookOptions& options, int32_t priority, DartPlantHook** out_hook,
     DartPlantListener** out_listener, uint64_t validated_null_value,
     std::shared_ptr<std::atomic_uint64_t> runtime_generation, uint64_t expected_runtime_generation,
-    uint64_t validated_bool_true_value, uint64_t validated_bool_false_value) {
+    uint64_t validated_bool_true_value, uint64_t validated_bool_false_value,
+    std::shared_ptr<const abi::DartCallLayout> call_layout) {
     const uintptr_t target = MethodTarget(method);
     if (target == 0 || method == nullptr || method->function == nullptr ||
         method->function->code_target == nullptr ||
@@ -359,11 +409,34 @@ DartPlantStatus InstallCallbackHook(
         SetLastError("callback hook arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    if (!ValidateProfile(profile)) return DARTPLANT_UNSUPPORTED_ABI;
+    // A verified per-Function DartCallLayout supersedes the legacy/manual
+    // argument_locations[] escape hatch. Keep both paths independent so the
+    // normal runtime API can use an otherwise conservative RuntimeProfile.
+    // The trampoline itself is a raw instrumentation primitive and does not
+    // require typed argument knowledge. Validate the legacy mapping only when
+    // the caller explicitly opts into it; otherwise raw register/context APIs
+    // remain available while typed argument/result APIs fail closed.
+    if (call_layout == nullptr && HasLegacyCallbackMapping(profile) && !ValidateProfile(profile)) {
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if ((profile.flags & ~kSupportedCallbackProfileFlags) != 0) {
+        SetLastError("callback profile contains unsupported flags");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (call_layout != nullptr && call_layout->dart_sp_register >= 31) {
+        SetLastError("verified DartCallLayout has an invalid Dart SP register");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
     if (method->function->code_target->IsShared() && !AllowsSharedCode(options)) {
         SetLastError(
             "method callback target is shared by multiple Dart Functions; explicit shared-code opt-in is required");
         return DARTPLANT_SHARED_CODE_ENTRY;
+    }
+    if (method->function->code_target->IsShared() && call_layout != nullptr) {
+        // A physical shared Code entry cannot prove which logical Function
+        // reached it. Shared-code callbacks remain available through the raw
+        // profile path, but typed interpretation is deliberately suppressed.
+        call_layout.reset();
     }
 
     std::lock_guard lock(State().mutex);
@@ -389,6 +462,7 @@ DartPlantStatus InstallCallbackHook(
     hook->validated_null_value = validated_null_value;
     hook->validated_bool_true_value = validated_bool_true_value;
     hook->validated_bool_false_value = validated_bool_false_value;
+    hook->call_layout = std::move(call_layout);
     hook->host_binding = host_binding;
     hook->runtime_generation = std::move(runtime_generation);
     hook->expected_runtime_generation = expected_runtime_generation;
@@ -402,8 +476,8 @@ DartPlantStatus InstallCallbackHook(
     }
 
     void* original = nullptr;
-    if (host_binding->hook(reinterpret_cast<void*>(target), hook->replacement_entry, &original) !=
-            0 ||
+    if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target),
+                           hook->replacement_entry, &original) != 0 ||
         original == nullptr) {
         DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
         SetLastError("host hook function failed");

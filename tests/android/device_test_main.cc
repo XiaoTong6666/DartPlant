@@ -22,6 +22,7 @@ int g_enter_calls = 0;
 int g_leave_calls = 0;
 int g_listener_calls = 0;
 bool g_null_semantic_callback_ok = false;
+bool g_raw_context_callback_ok = false;
 
 void OnEnter(DartPlantInvocation* invocation, void*) {
     ++g_enter_calls;
@@ -61,18 +62,30 @@ void SkipWithValidatedNull(DartPlantInvocation* invocation, void*) {
 
 void ObserveEnter(DartPlantInvocation*, void*) { ++g_listener_calls; }
 
+void ObserveRawContext(DartPlantInvocation* invocation, void*) {
+    uint64_t x0 = 0;
+    DartPlantValue typed{};
+    g_raw_context_callback_ok =
+        dartplant_invocation_has_verified_abi(invocation) == 0 &&
+        dartplant_invocation_get_gp_register(invocation, 0, &x0) == DARTPLANT_OK && x0 == 2 &&
+        dartplant_invocation_get_argument(invocation, 0, &typed) == DARTPLANT_UNSUPPORTED_ABI;
+}
+
 extern "C" int DartPlantFixtureAdd(int left, int right);
 
 __attribute__((noinline)) int HookedAdd(int left, int right) {
     return g_original_add(left, right) + 100;
 }
 
-int HostHook(void* target, void* replacement, void** backup) {
+int HostHook(void* user_data, void* target, void* replacement, void** backup) {
+    if (user_data == nullptr) return -1;
     return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replacement),
                      reinterpret_cast<dobby_dummy_func_t*>(backup));
 }
 
-int HostUnhook(void* target) { return DobbyDestroy(target); }
+int HostUnhook(void* user_data, void* target) {
+    return user_data == nullptr ? -1 : DobbyDestroy(target);
+}
 
 int Fail(const char* message) {
     std::fprintf(stderr, "[FAIL] %s: %s\n", message, dartplant_last_error());
@@ -114,8 +127,17 @@ int main() {
     return 1;
 #endif
 
-    const DartPlantNativeApiEntries entries = {2, HostHook, HostUnhook};
-    dartplant::InstallHostApi(&entries);
+    int host_backend_identity = 1;
+    const DartPlantHostApi host_api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &host_backend_identity,
+        .hook = HostHook,
+        .unhook = HostUnhook,
+    };
+    if (dartplant_install_host_api(&host_api) != DARTPLANT_OK) {
+        return Fail("generic host API install");
+    }
     dartplant::RefreshModules();
 
     Dl_info info{};
@@ -204,18 +226,36 @@ int main() {
     method.record.code_size = 4;
     method.function = function;
 
+    // A conservative profile can still install a raw callback. No argument
+    // mapping is guessed: only the raw ARM64 context API is available.
+    DartPlantRuntimeProfile raw_context_profile{};
+    dartplant_runtime_profile_init_arm64_aot(&raw_context_profile);
     DartPlantHookOptions callback_options = {
         .struct_size = sizeof(DartPlantHookOptions),
         .flags = 0,
-        .on_enter = OnEnter,
-        .on_leave = OnLeave,
+        .on_enter = ObserveRawContext,
+        .on_leave = nullptr,
         .user_data = nullptr,
         .vm_adapter = nullptr,
     };
+    g_raw_context_callback_ok = false;
+    DartPlantHook* callback_hook = nullptr;
+    if (dartplant::InstallCallbackHook(&method, raw_context_profile, callback_options, 0,
+                                       &callback_hook, nullptr) != DARTPLANT_OK ||
+        DartPlantFixtureAdd(2, 3) != 5 || !g_raw_context_callback_ok) {
+        return Fail("raw context callback without ABI mapping");
+    }
+    if (dartplant_unhook(callback_hook) != DARTPLANT_OK) {
+        return Fail("raw context callback unhook");
+    }
+    dartplant_release_hook(callback_hook);
+
+    callback_options.on_enter = OnEnter;
+    callback_options.on_leave = OnLeave;
     g_enter_calls = 0;
     g_leave_calls = 0;
     g_listener_calls = 0;
-    DartPlantHook* callback_hook = nullptr;
+    callback_hook = nullptr;
     if (dartplant::InstallCallbackHook(&method, profile, callback_options, 0, &callback_hook,
                                        nullptr) != DARTPLANT_OK) {
         return Fail("callback hook install");
@@ -269,6 +309,7 @@ int main() {
 
     std::printf("[PASS] ARM64 Dobby hook/original/unhook\n");
     std::printf("[PASS] ARM64 callback enter/leave/result mutation\n");
+    std::printf("[PASS] ARM64 raw callback without ABI mapping\n");
     std::printf("[PASS] ARM64 callback skip-original\n");
     std::printf("[PASS] ARM64 validated null callback semantic\n");
     std::printf("[PASS] duplicate hook rejection\n");

@@ -127,11 +127,19 @@ def run_format(*, check: bool, list_only: bool, ndk: str | None) -> None:
     cpp_files = iter_files(CPP_EXTENSIONS)
     dart_root = ROOT_DIR / "tests" / "dart"
     flutter_root = ROOT_DIR / "tests" / "flutter_fixture"
+    compiler_oracle_root = ROOT_DIR / "tools" / "compiler-oracle"
     dart_files = iter_dart_files(dart_root)
     flutter_dart_files = iter_dart_files(flutter_root)
+    compiler_oracle_dart_files = iter_dart_files(compiler_oracle_root)
 
     if list_only:
-        for path in rust_files + cpp_files + dart_files + flutter_dart_files:
+        for path in (
+            rust_files
+            + cpp_files
+            + dart_files
+            + flutter_dart_files
+            + compiler_oracle_dart_files
+        ):
             print(path.relative_to(ROOT_DIR).as_posix())
         return
 
@@ -143,6 +151,12 @@ def run_format(*, check: bool, list_only: bool, ndk: str | None) -> None:
         dart=resolve_flutter_dart(),
         check=check,
         cwd=flutter_root,
+    )
+    format_dart(
+        compiler_oracle_dart_files,
+        dart=resolve_dart(),
+        check=check,
+        cwd=compiler_oracle_root,
     )
 
 

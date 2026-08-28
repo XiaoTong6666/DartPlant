@@ -45,6 +45,7 @@ target_compile_options(
 target_include_directories(
     dartplant_fixture_bridge
     PRIVATE
+    "${DARTPLANT_ROOT}/tests/flutter_fixture/.dart_tool/dartplant/generated"
     "${DARTPLANT_ROOT}/include"
     "${DARTPLANT_ROOT}/src"
     "${DARTPLANT_ROOT}/third_party/dobby/include"

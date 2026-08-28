@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess as sp
+import sys
 import time
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from util import ROOT_DIR, adb_cmd, find_arm64_device, run
 
 FIXTURE_DIR = ROOT_DIR / "tests" / "flutter_fixture"
 APK_PATH = FIXTURE_DIR / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk"
+GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
+SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 PACKAGE = "dev.dartplant.dartplant_fixture"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 
@@ -60,24 +63,87 @@ def _resolve_flutter(flutter: str | None) -> str:
 
 
 def _build_fixture(flutter: str) -> None:
-    run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=os.environ.copy())
-    run(
-        [
-            flutter,
-            "build",
-            "apk",
-            "--release",
-            "--target-platform",
-            "android-arm64",
-        ],
-        cwd=FIXTURE_DIR,
-        env=os.environ.copy(),
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    SIDECAR_HEADER.write_text(
+        "// Generated placeholder; replaced after the first AOT build.\n"
+        "#pragma once\n"
+        "#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 0\n"
     )
+    run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=os.environ.copy())
+    build_command = [
+        flutter,
+        "build",
+        "apk",
+        "--release",
+        "--target-platform",
+        "android-arm64",
+    ]
+    run(build_command, cwd=FIXTURE_DIR, env=os.environ.copy())
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"Flutter release APK was not produced: {APK_PATH}")
 
+    dill_candidates = sorted(
+        (FIXTURE_DIR / ".dart_tool" / "flutter_build").glob("*/app.dill"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    if not dill_candidates:
+        raise FileNotFoundError("Flutter release build did not leave an app.dill for the oracle")
+    dill = GENERATED_DIR / "oracle_app.dill"
+    shutil.copy2(dill_candidates[0], dill)
+    libapp = GENERATED_DIR / "libapp.so"
+    with zipfile.ZipFile(APK_PATH) as archive:
+        libapp.write_bytes(archive.read("lib/arm64-v8a/libapp.so"))
 
-def _assert_no_runtime_metadata() -> None:
+    flutter_root = Path(flutter).resolve().parent.parent
+    gen_snapshot = (
+        flutter_root
+        / "bin"
+        / "cache"
+        / "artifacts"
+        / "engine"
+        / "android-arm64-release"
+        / "linux-x64"
+        / "gen_snapshot"
+    )
+    if not gen_snapshot.is_file():
+        raise FileNotFoundError(f"Flutter ARM64 gen_snapshot not found: {gen_snapshot}")
+    run(
+        [
+            sys.executable,
+            str(ROOT_DIR / "tools" / "compiler-oracle" / "build_snapshot_sidecar.py"),
+            "--gen-snapshot",
+            str(gen_snapshot),
+            "--dill",
+            str(dill),
+            "--libapp",
+            str(libapp),
+            "--library-uri",
+            "package:dartplant_fixture/main.dart",
+            "--class-name",
+            "Global",
+            "--function-name",
+            "verifiedAbiDouble",
+            "--output-header",
+            str(SIDECAR_HEADER),
+        ],
+        cwd=ROOT_DIR,
+        env=os.environ.copy(),
+    )
+
+    # The generated header changes only the native fixture bridge. Dart source
+    # and app.dill are unchanged, so deterministic libapp.so remains the exact
+    # artifact to which the sidecar above was bound.
+    run(build_command, cwd=FIXTURE_DIR, env=os.environ.copy())
+    with zipfile.ZipFile(APK_PATH) as archive:
+        rebuilt_libapp = archive.read("lib/arm64-v8a/libapp.so")
+    if rebuilt_libapp != libapp.read_bytes():
+        raise RuntimeError(
+            "second-stage native fixture rebuild changed libapp.so; generated sidecar is stale"
+        )
+
+
+def _assert_no_packaged_runtime_metadata() -> None:
     with zipfile.ZipFile(APK_PATH) as archive:
         entries = archive.namelist()
     forbidden = [
@@ -87,7 +153,7 @@ def _assert_no_runtime_metadata() -> None:
     ]
     if forbidden:
         raise RuntimeError(
-            "metadata-free fixture still packages DartPlant metadata: " + ", ".join(forbidden)
+            "fixture unexpectedly packages a raw DartPlant metadata asset: " + ", ".join(forbidden)
         )
 
 
@@ -119,6 +185,7 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             and "DartPlant FunctionType named semantic probe:" in latest
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
+            and "DartPlant ordinary AOT typed probe:" in latest
         ):
             return latest
         time.sleep(0.05)
@@ -164,6 +231,30 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         )
     if "DartPlant bool semantic probe: 1 values=false/true" not in logs:
         raise RuntimeError(f"cold start {round_index}: bool semantic probe failed\n{logs}")
+    if "DartPlant ordinary AOT discovery: 1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: ordinary AOT Function discovery failed\n{logs}"
+        )
+    required_ordinary_markers = (
+        "evidence_status=0",
+        "abi_info_status=0",
+        "abi_state=2",
+        "verified_layout=1",
+        "hook_status=0",
+        "source_offline=1",
+    )
+    if any(marker not in logs for marker in required_ordinary_markers):
+        raise RuntimeError(
+            f"cold start {round_index}: ordinary AOT compiler ABI binding failed\n{logs}"
+        )
+    if "source_offline=1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: ordinary AOT lookup did not use the artifact index\n{logs}"
+        )
+    if "DartPlant ordinary AOT typed probe: 1 values=13.75/15.0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: ordinary AOT typed callback probe failed\n{logs}"
+        )
     if "runtime live-vm lookup addInt ok" not in logs or "model_ok=1" not in logs:
         raise RuntimeError(f"cold start {round_index}: live model regression failed\n{logs}")
     required_shared_markers = (
@@ -213,7 +304,7 @@ def run_flutter_cold_bootstrap_test(
         _build_fixture(flutter_bin)
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"missing Flutter fixture APK: {APK_PATH}")
-    _assert_no_runtime_metadata()
+    _assert_no_packaged_runtime_metadata()
 
     serial = find_arm64_device(device)
     run(adb_cmd(["install", "-r", str(APK_PATH)], device=serial))
@@ -224,7 +315,7 @@ def run_flutter_cold_bootstrap_test(
     sampled = [result.sampled for result in results]
     no_dart_pc = sum(result.dart_pc == 0 for result in results)
     print(
-        "metadata-free cold bootstrap: "
+        "hybrid live/artifact cold bootstrap: "
         f"{len(results)}/{rounds} passed; "
         f"sampled min={min(sampled)} max={max(sampled)}; "
         f"validated={sum(result.validated for result in results)}; "

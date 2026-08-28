@@ -1,6 +1,7 @@
 #include <android/log.h>
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -12,6 +13,7 @@
 #include "dartplant/native_api.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
+#include "ordinary_aot_sidecar.h"
 #include "standalone_dobby_host.h"
 
 namespace {
@@ -24,9 +26,11 @@ DartPlantMethod* g_add_int = nullptr;
 DartPlantMethod* g_echo_object = nullptr;
 DartPlantMethod* g_negate_bool = nullptr;
 DartPlantMethod* g_signature_probe = nullptr;
+DartPlantMethod* g_verified_abi_double = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
 DartPlantHook* g_negate_bool_hook = nullptr;
+DartPlantHook* g_verified_abi_double_hook = nullptr;
 DartPlantListener* g_add_int_listener = nullptr;
 DartPlantFlutterSnapshotInfo g_snapshot_info{};
 std::atomic_flag g_object_bridge_probe = ATOMIC_FLAG_INIT;
@@ -50,6 +54,9 @@ std::atomic<uint64_t> g_null_semantic_failures = 0;
 std::atomic<uint64_t> g_bool_true_results = 0;
 std::atomic<uint64_t> g_bool_false_results = 0;
 std::atomic<uint64_t> g_bool_semantic_failures = 0;
+std::atomic<uint64_t> g_verified_abi_double_enter = 0;
+std::atomic<uint64_t> g_verified_abi_double_leave = 0;
+std::atomic<uint64_t> g_verified_abi_double_failures = 0;
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -354,6 +361,43 @@ void OnBoolLeave(DartPlantInvocation* invocation, void*) {
                             static_cast<unsigned long long>(value.raw));
         // Observation only. The raw value is valid for this callback lifetime.
     }
+}
+
+void OnVerifiedAbiDoubleEnter(DartPlantInvocation* invocation, void*) {
+    DartPlantValue left{};
+    DartPlantValue right{};
+    const bool valid = dartplant_invocation_has_verified_abi(invocation) != 0 &&
+                       dartplant_invocation_argument_count(invocation) == 2 &&
+                       dartplant_invocation_get_argument(invocation, 0, &left) == DARTPLANT_OK &&
+                       dartplant_invocation_get_argument(invocation, 1, &right) == DARTPLANT_OK &&
+                       left.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                       right.kind == DARTPLANT_VALUE_HEAP_OBJECT;
+    if (!valid) {
+        g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("verified ordinary AOT double enter ABI");
+        return;
+    }
+    g_verified_abi_double_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnVerifiedAbiDoubleLeave(DartPlantInvocation* invocation, void*) {
+    DartPlantValue result{};
+    if (dartplant_invocation_has_verified_abi(invocation) == 0 ||
+        dartplant_invocation_get_result(invocation, &result) != DARTPLANT_OK ||
+        result.kind != DARTPLANT_VALUE_DOUBLE) {
+        g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("verified ordinary AOT double result ABI");
+        return;
+    }
+    double value = std::bit_cast<double>(result.raw);
+    value += 10.0;
+    result.raw = std::bit_cast<uint64_t>(value);
+    if (dartplant_invocation_set_result(invocation, &result) != DARTPLANT_OK) {
+        g_verified_abi_double_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("verified ordinary AOT double result rewrite");
+        return;
+    }
+    g_verified_abi_double_leave.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool FindLiveTopLevelMethod(const char* name, DartPlantMethod** out_method) {
@@ -723,6 +767,82 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     }
 
     g_runtime_live_vm_ready.store(true, std::memory_order_release);
+
+    // This function is not a vm:entry-point. PRODUCT AOT drops its logical
+    // RegularFunction object, so live lookup misses by design. The compiler
+    // sidecar restores only the deleted identity/address fact and is accepted
+    // after snapshot hash, build-id and final machine-code fingerprint checks.
+    DartPlantStatus ordinary_index_status = DARTPLANT_NOT_INITIALIZED;
+#if DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE
+    ordinary_index_status =
+        dartplant_runtime_register_snapshot_index(g_runtime, &kDartPlantOrdinaryAotSnapshotIndex);
+#endif
+    const bool ordinary_aot_resolved =
+        ordinary_index_status == DARTPLANT_OK &&
+        FindLiveTopLevelMethod("verifiedAbiDouble", &g_verified_abi_double) &&
+        g_verified_abi_double != nullptr && g_verified_abi_double->function != nullptr &&
+        g_verified_abi_double->function->source ==
+            dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+        dartplant_method_runtime_address(g_verified_abi_double) != 0;
+    DartPlantStatus ordinary_evidence_status = DARTPLANT_NOT_INITIALIZED;
+    DartPlantStatus ordinary_abi_info_status = DARTPLANT_NOT_INITIALIZED;
+    DartPlantMethodAbiInfo ordinary_abi_info{};
+    ordinary_abi_info.struct_size = sizeof(ordinary_abi_info);
+    DartPlantStatus ordinary_hook_status = DARTPLANT_NOT_INITIALIZED;
+    if (ordinary_aot_resolved) {
+#if DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE
+        ordinary_evidence_status = dartplant_runtime_register_compiler_abi_evidence(
+            g_runtime, g_verified_abi_double, &kDartPlantOrdinaryAotAbiEvidence);
+#endif
+        if (ordinary_evidence_status == DARTPLANT_OK) {
+            ordinary_abi_info_status = dartplant_runtime_get_method_abi_info(
+                g_runtime, g_verified_abi_double, &ordinary_abi_info);
+        }
+        if (ordinary_abi_info_status == DARTPLANT_OK &&
+            ordinary_abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED &&
+            ordinary_abi_info.has_verified_call_layout != 0) {
+            DartPlantHookOptions ordinary_options = {
+                .struct_size = sizeof(ordinary_options),
+                .flags = 0,
+                .on_enter = OnVerifiedAbiDoubleEnter,
+                .on_leave = OnVerifiedAbiDoubleLeave,
+                .user_data = nullptr,
+                .vm_adapter = nullptr,
+            };
+            ordinary_hook_status = dartplant_runtime_hook_method(
+                g_runtime, g_verified_abi_double, &ordinary_options, &g_verified_abi_double_hook);
+        }
+    }
+    const bool ordinary_aot_discovery =
+        ordinary_aot_resolved && ordinary_evidence_status == DARTPLANT_OK &&
+        ordinary_abi_info_status == DARTPLANT_OK &&
+        ordinary_abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED &&
+        ordinary_abi_info.has_verified_call_layout != 0 && ordinary_hook_status == DARTPLANT_OK;
+    __android_log_print(
+        ordinary_aot_discovery ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DartPlant ordinary AOT discovery: %u index_status=%d evidence_status=%d abi_info_status=%d abi_state=%u verified_layout=%u hook_status=%d source_offline=%u entry=0x%llx function=0x%llx code=0x%llx error=%s",
+        static_cast<unsigned>(ordinary_aot_discovery), ordinary_index_status,
+        ordinary_evidence_status, ordinary_abi_info_status,
+        static_cast<unsigned>(ordinary_abi_info.state),
+        static_cast<unsigned>(ordinary_abi_info.has_verified_call_layout), ordinary_hook_status,
+        static_cast<unsigned>(g_verified_abi_double != nullptr &&
+                              g_verified_abi_double->function != nullptr &&
+                              g_verified_abi_double->function->source ==
+                                  dartplant::DartFunctionSource::kOfflineSnapshotIndex),
+        static_cast<unsigned long long>(
+            g_verified_abi_double == nullptr
+                ? 0
+                : dartplant_method_runtime_address(g_verified_abi_double)),
+        static_cast<unsigned long long>(g_verified_abi_double == nullptr ||
+                                                g_verified_abi_double->function == nullptr
+                                            ? 0
+                                            : g_verified_abi_double->function->function_object),
+        static_cast<unsigned long long>(g_verified_abi_double == nullptr ||
+                                                g_verified_abi_double->function == nullptr
+                                            ? 0
+                                            : g_verified_abi_double->function->code_object),
+        ordinary_aot_discovery ? "none" : dartplant_last_error());
+
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
         "live-vm hook ready method=%s/%s/%s entry=0x%llx function=0x%llx code=0x%llx aliases=%u known_aliases=%u shared=%u explicit_opt_in=1 fail_closed=1 second_listener=1",
@@ -815,6 +935,27 @@ extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_boo
                         static_cast<unsigned long long>(true_results),
                         static_cast<unsigned long long>(false_results),
                         static_cast<unsigned long long>(failures), static_cast<unsigned>(passed));
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+dartplant_fixture_reset_verified_abi_double_probe() {
+    g_verified_abi_double_enter.store(0, std::memory_order_relaxed);
+    g_verified_abi_double_leave.store(0, std::memory_order_relaxed);
+    g_verified_abi_double_failures.store(0, std::memory_order_relaxed);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_verified_abi_double_probe() {
+    const uint64_t enter = g_verified_abi_double_enter.load(std::memory_order_relaxed);
+    const uint64_t leave = g_verified_abi_double_leave.load(std::memory_order_relaxed);
+    const uint64_t failures = g_verified_abi_double_failures.load(std::memory_order_relaxed);
+    const bool passed = enter == 2 && leave == 2 && failures == 0;
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "verified ordinary AOT double probe enter=%llu leave=%llu failures=%llu passed=%u",
+        static_cast<unsigned long long>(enter), static_cast<unsigned long long>(leave),
+        static_cast<unsigned long long>(failures), static_cast<unsigned>(passed));
     return passed ? 1 : 0;
 }
 
@@ -1030,20 +1171,27 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
         dartplant_unhook(g_negate_bool_hook);
         dartplant_release_hook(g_negate_bool_hook);
     }
+    if (g_verified_abi_double_hook != nullptr) {
+        dartplant_unhook(g_verified_abi_double_hook);
+        dartplant_release_hook(g_verified_abi_double_hook);
+    }
     if (g_add_int != nullptr) dartplant_release_method(g_add_int);
     if (g_instrumented_add != nullptr) dartplant_release_method(g_instrumented_add);
     if (g_echo_object != nullptr) dartplant_release_method(g_echo_object);
     if (g_negate_bool != nullptr) dartplant_release_method(g_negate_bool);
     if (g_signature_probe != nullptr) dartplant_release_method(g_signature_probe);
+    if (g_verified_abi_double != nullptr) dartplant_release_method(g_verified_abi_double);
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
     g_instrumented_add = nullptr;
     g_add_int = nullptr;
     g_echo_object = nullptr;
     g_negate_bool = nullptr;
     g_signature_probe = nullptr;
+    g_verified_abi_double = nullptr;
     g_instrumented_add_hook = nullptr;
     g_echo_object_hook = nullptr;
     g_negate_bool_hook = nullptr;
+    g_verified_abi_double_hook = nullptr;
     g_add_int_listener = nullptr;
     g_runtime = nullptr;
     g_snapshot_info = {};
@@ -1055,4 +1203,5 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     dartplant_fixture_reset_null_semantic_probe();
     dartplant_fixture_reset_bool_semantic_probe();
+    dartplant_fixture_reset_verified_abi_double_probe();
 }

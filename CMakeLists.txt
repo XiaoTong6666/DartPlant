@@ -13,24 +13,37 @@ set(
 )
 
 add_library(
+    dartplant_abi
+    STATIC
+    src/abi/representation.cpp
+    src/abi/evidence_solver.cpp
+    src/abi/calling_convention.cpp
+)
+set_target_properties(dartplant_abi PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(dartplant_abi PUBLIC cxx_std_20)
+target_compile_options(dartplant_abi PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)
+target_include_directories(dartplant_abi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_library(
     dartplant_core
     STATIC
     src/core/dartplant.cpp
     src/core/hook_registry.cpp
     src/elf/module_image.cpp
     src/metadata/metadata.cpp
-    src/runtime/runtime_profile.cpp
+    src/abi/runtime_evidence.cpp
+    src/abi/value_codec.cpp
     src/runtime/flutter_snapshot.cpp
     src/runtime/snapshot_index.cpp
     src/runtime/dart_runtime_resolver.cpp
-    src/runtime/dart_vm_abi.cpp
-    src/runtime/live_vm.cpp
-    src/runtime/live_vm_bootstrap.cpp
-    src/runtime/vm_adapter.cpp
-    src/runtime/dart_dispatch_hook.cpp
-    src/runtime/dart_invocation.cpp
-    src/runtime/dart_callback_dispatch.cpp
-    src/runtime/arm64_callback_stub.cpp
+    src/vm/profiles.cpp
+    src/vm/live_vm.cpp
+    src/vm/live_vm_bootstrap.cpp
+    src/vm/object_bridge.cpp
+    src/interceptor/runtime_hook.cpp
+    src/interceptor/invocation.cpp
+    src/interceptor/callback_dispatch.cpp
+    src/interceptor/arm64_bridge.cpp
 )
 set_target_properties(dartplant_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -51,13 +64,14 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(dartplant_core PUBLIC ${CMAKE_DL_LIBS})
+target_link_libraries(dartplant_core PRIVATE dartplant_abi)
 
 if(ANDROID)
     enable_language(ASM)
     target_sources(
         dartplant_core
         PRIVATE
-        src/runtime/arm64_callback_trampoline.S
+        src/interceptor/arm64_bridge.S
     )
     if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
         message(FATAL_ERROR "DartPlant currently supports Android arm64-v8a only")
@@ -173,6 +187,33 @@ endif()
 
 if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
     enable_testing()
+    set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_AARCH64_SUPPORT ON CACHE BOOL "" FORCE)
+    set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/capstone EXCLUDE_FROM_ALL)
+
+    add_library(
+        dartplant_aot_abi_analyzer
+        STATIC
+        tools/aot-abi-analyzer/aot_abi_analyzer.cpp
+    )
+    target_compile_features(dartplant_aot_abi_analyzer PUBLIC cxx_std_20)
+    target_compile_options(dartplant_aot_abi_analyzer PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(
+        dartplant_aot_abi_analyzer
+        PRIVATE
+        CAPSTONE_AARCH64_COMPAT_HEADER
+    )
+    target_include_directories(
+        dartplant_aot_abi_analyzer
+        PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/aot-abi-analyzer
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(dartplant_aot_abi_analyzer PUBLIC dartplant_abi capstone)
+
     add_library(dartplant_fixture SHARED tests/fixtures/hook_fixture.cc)
     target_compile_features(dartplant_fixture PRIVATE cxx_std_20)
     target_compile_options(dartplant_fixture PRIVATE -Wall -Wextra -Werror)
@@ -187,6 +228,9 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         tests/live_vm_signature_test.cc
         tests/snapshot_index_test.cc
         tests/flutter_snapshot_test.cc
+        tests/abi_contract_test.cc
+        tests/calling_convention_test.cc
+        tests/aot_abi_analyzer_test.cc
     )
     target_compile_features(dartplant_tests PRIVATE cxx_std_20)
     target_compile_options(dartplant_tests PRIVATE -Wall -Wextra -Werror)
@@ -197,7 +241,13 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
-    target_link_libraries(dartplant_tests PRIVATE dartplant_core ${CMAKE_DL_LIBS})
+    target_link_libraries(
+        dartplant_tests
+        PRIVATE
+        dartplant_core
+        dartplant_aot_abi_analyzer
+        ${CMAKE_DL_LIBS}
+    )
     target_compile_definitions(
         dartplant_tests
         PRIVATE

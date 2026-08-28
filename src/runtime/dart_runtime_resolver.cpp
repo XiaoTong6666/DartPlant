@@ -6,8 +6,9 @@
 #include <cstdio>
 #include <deque>
 #include <thread>
+#include <unordered_map>
 
-#include "runtime/dart_vm_abi.h"
+#include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
 
 namespace dartplant {
@@ -50,20 +51,6 @@ ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
         selection.module = module;
     }
     return selection;
-}
-
-void FillSnapshotInfo(const FlutterSnapshotSource& snapshot, DartPlantFlutterSnapshotInfo* info) {
-    info->module_name = snapshot.module_name.c_str();
-    info->module_path = snapshot.module_path.c_str();
-    info->module_build_id = snapshot.module_build_id.c_str();
-    info->snapshot_hash = snapshot.snapshot_hash.c_str();
-    info->snapshot_features = snapshot.snapshot_features.c_str();
-    info->profile_name = snapshot.profile_name.c_str();
-    info->load_bias = snapshot.isolate_instructions_runtime - snapshot.isolate_instructions_va;
-    info->isolate_instructions_va = snapshot.isolate_instructions_va;
-    info->isolate_instructions_size = snapshot.isolate_instructions_size;
-    info->isolate_instructions_runtime = snapshot.isolate_instructions_runtime;
-    info->compressed_pointers = snapshot.compressed_pointers ? 1 : 0;
 }
 
 bool CanUseLiveVmForQuery(const DartPlantMethodQuery& query) {
@@ -266,6 +253,117 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     return DARTPLANT_OK;
 }
 
+DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
+    const SnapshotIndex& index, const FlutterSnapshotSource& snapshot, const ModuleImage& module,
+    DartCodeTargetRegistry& code_targets, const DartPlantMethodQuery& query,
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
+    uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
+    bool ambiguous = false;
+    const SnapshotFunction* record = index.FindSnapshotFunction(
+        query.library_uri, query.class_name == nullptr ? "" : query.class_name, query.function_name,
+        query.signature == nullptr ? "" : query.signature, query.entry_kind, &ambiguous);
+    if (ambiguous) {
+        SetLastError("Dart method identity is ambiguous in the artifact snapshot index");
+        return DARTPLANT_AMBIGUOUS_METHOD;
+    }
+    if (record == nullptr) {
+        SetLastError("Dart method was not found in the artifact snapshot index");
+        return DARTPLANT_METHOD_NOT_FOUND;
+    }
+    if (record->runtime_entry == 0 || record->code_size == 0 || record->fingerprint.empty()) {
+        SetLastError("artifact snapshot index record is not runtime-bound");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!snapshot.Matches(module) || module.name != index.module_name ||
+        !BuildIdMatches(module, index.build_id) || snapshot.snapshot_hash != index.snapshot_hash) {
+        SetLastError("artifact snapshot index identity does not match the selected app image");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (!module.ContainsExecutable(record->runtime_entry, record->code_size)) {
+        SetLastError("artifact snapshot index entry is outside executable module ranges");
+        return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
+    }
+    if (FingerprintCode(reinterpret_cast<const void*>(record->runtime_entry), record->code_size) !=
+        record->fingerprint) {
+        SetLastError("artifact snapshot index code fingerprint no longer matches the live image");
+        return DARTPLANT_FINGERPRINT_MISMATCH;
+    }
+
+    MethodRecord method_record;
+    method_record.library_uri = record->library_uri;
+    method_record.class_name = record->class_name;
+    method_record.function_name = record->function_name;
+    method_record.signature = record->signature;
+    method_record.entry_kind = record->entry_kind;
+    method_record.address_kind = DARTPLANT_ADDRESS_RUNTIME;
+    method_record.address = record->runtime_entry;
+    method_record.code_size = static_cast<uint32_t>(record->code_size);
+    method_record.fingerprint = record->fingerprint;
+
+    auto code_target =
+        code_targets.GetOrCreate(record->runtime_entry, static_cast<uint32_t>(record->code_size), 0,
+                                 std::max<uint32_t>(1, record->entry_alias_count));
+    if (code_target == nullptr) {
+        SetLastError("artifact snapshot index produced an invalid CodeTarget");
+        return DARTPLANT_METHOD_NOT_FOUND;
+    }
+    auto function = std::make_shared<DartFunctionHandle>();
+    function->identity = MethodIdentityFromRecord(method_record);
+    function->source = DartFunctionSource::kOfflineSnapshotIndex;
+    function->code_target = code_target;
+    code_target->AddAlias(function->identity);
+
+    auto* method = new DartPlantMethod;
+    method->record = std::move(method_record);
+    method->module = module;
+    method->function = std::move(function);
+    method->runtime_generation = runtime_generation;
+    method->expected_runtime_generation = expected_runtime_generation;
+    *out_method = method;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
+                                          const FlutterSnapshotSource& snapshot,
+                                          const ModuleImage& module) {
+    if (index == nullptr || index->functions.empty() || index->module_name != module.name ||
+        index->build_id.empty() || !EqualsIgnoreCaseAscii(index->build_id, module.build_id) ||
+        index->snapshot_hash.empty() || index->snapshot_hash != snapshot.snapshot_hash ||
+        !snapshot.Matches(module)) {
+        SetLastError("artifact snapshot index header does not match the live app image");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+
+    std::unordered_map<uintptr_t, uint32_t> aliases;
+    for (auto& record : index->functions) {
+        if (record.entry_kind != DARTPLANT_ENTRY_DEFAULT || record.entry_va == 0 ||
+            record.code_size == 0 || record.code_size > UINT32_MAX || record.fingerprint.empty()) {
+            SetLastError("artifact snapshot index contains an unsupported or incomplete record");
+            return DARTPLANT_METADATA_INVALID;
+        }
+        const auto runtime_entry = snapshot.ResolveInstructionVa(module, record.entry_va);
+        if (!runtime_entry.has_value() ||
+            !module.ContainsExecutable(*runtime_entry, static_cast<size_t>(record.code_size))) {
+            SetLastError("artifact snapshot index entry cannot be mapped into the live image");
+            return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
+        }
+        if (FingerprintCode(reinterpret_cast<const void*>(*runtime_entry), record.code_size) !=
+            record.fingerprint) {
+            SetLastError("artifact snapshot index code fingerprint does not match the live image");
+            return DARTPLANT_FINGERPRINT_MISMATCH;
+        }
+        record.runtime_entry = *runtime_entry;
+        record.code_entry = *runtime_entry;
+        ++aliases[*runtime_entry];
+    }
+    for (auto& record : index->functions) {
+        record.entry_alias_count = aliases[record.runtime_entry];
+    }
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
 }  // namespace
 
 bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right) {
@@ -332,12 +430,14 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
             invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         }
         runtime->code_targets.Clear();
+        runtime->abi_evidence.clear();
         runtime->snapshot.reset();
         runtime->live_vm_context.reset();
         runtime->live_vm_null_value = 0;
         runtime->live_vm_bool_true_value = 0;
         runtime->live_vm_bool_false_value = 0;
         runtime->live_snapshot_index.reset();
+        runtime->artifact_snapshot_index.reset();
         runtime->live_function_index_info = {};
         runtime->modules = modules;
         runtime->selected_app_module.reset();
@@ -380,12 +480,14 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
             hook_invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         }
         runtime->code_targets.Clear();
+        runtime->abi_evidence.clear();
         runtime->snapshot = std::move(snapshot);
         runtime->live_vm_context.reset();
         runtime->live_vm_null_value = 0;
         runtime->live_vm_bool_true_value = 0;
         runtime->live_vm_bool_false_value = 0;
         runtime->live_snapshot_index.reset();
+        runtime->artifact_snapshot_index.reset();
         runtime->live_function_index_info = {};
     }
 
@@ -518,6 +620,7 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
         const DartPlantStatus invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         runtime->code_targets.Clear();
+        runtime->abi_evidence.clear();
         if (invalidation_status != DARTPLANT_OK) {
             runtime->state = DARTPLANT_RUNTIME_FAILED;
             return invalidation_status;
@@ -917,6 +1020,44 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
     return DARTPLANT_OK;
 }
 
+DartPlantStatus dartplant_runtime_register_snapshot_index(
+    DartPlantRuntime* runtime, const DartPlantSnapshotIndexInfo* source) {
+    if (runtime == nullptr || source == nullptr || source->struct_size < sizeof(*source)) {
+        dartplant::SetLastError("runtime snapshot index arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+
+    std::string error;
+    auto index = dartplant::BuildSnapshotIndex(*source, &error);
+    if (!index.has_value()) {
+        dartplant::SetLastError(error.empty() ? "snapshot index is invalid" : error);
+        return DARTPLANT_METADATA_INVALID;
+    }
+
+    std::lock_guard lock(runtime->mutex);
+    if (!runtime->profile_matched || !runtime->snapshot.has_value() ||
+        !runtime->selected_app_module.has_value()) {
+        dartplant::SetLastError("runtime image is not ready for snapshot index binding");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    if (runtime->artifact_snapshot_index.has_value()) {
+        dartplant::SetLastError(
+            "an artifact snapshot index is already bound to this app incarnation");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const DartPlantStatus status = dartplant::BindArtifactSnapshotIndex(
+        &*index, *runtime->snapshot, *runtime->selected_app_module);
+    if (status != DARTPLANT_OK) return status;
+    runtime->artifact_snapshot_index = std::move(index);
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus dartplant_runtime_get_method_signature(
     const DartPlantRuntime* runtime, const DartPlantMethod* method,
     DartPlantDartFunctionSignatureInfo* out_signature) {
@@ -1042,9 +1183,17 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime app module identity is not selected");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    return dartplant::ResolveLiveIndexedRuntimeMethod(
+    const DartPlantStatus live_status = dartplant::ResolveLiveIndexedRuntimeMethod(
         *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->code_targets, *query,
         runtime->generation, runtime->generation->load(std::memory_order_acquire), out_method);
+    if (live_status != DARTPLANT_METHOD_NOT_FOUND ||
+        !runtime->artifact_snapshot_index.has_value()) {
+        return live_status;
+    }
+    return dartplant::ResolveArtifactIndexedRuntimeMethod(
+        *runtime->artifact_snapshot_index, *runtime->snapshot, *runtime->selected_app_module,
+        runtime->code_targets, *query, runtime->generation,
+        runtime->generation->load(std::memory_order_acquire), out_method);
 }
 
 }  // extern "C"

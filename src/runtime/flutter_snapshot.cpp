@@ -117,6 +117,21 @@ std::optional<std::string> SelectFlutterSnapshotProfile(std::string_view feature
     return "flutter-arm64-profile-uncompressed";
 }
 
+void FillSnapshotInfo(const FlutterSnapshotSource& snapshot, DartPlantFlutterSnapshotInfo* info) {
+    if (info == nullptr) return;
+    info->module_name = snapshot.module_name.c_str();
+    info->module_path = snapshot.module_path.c_str();
+    info->module_build_id = snapshot.module_build_id.c_str();
+    info->snapshot_hash = snapshot.snapshot_hash.c_str();
+    info->snapshot_features = snapshot.snapshot_features.c_str();
+    info->profile_name = snapshot.profile_name.c_str();
+    info->load_bias = snapshot.isolate_instructions_runtime - snapshot.isolate_instructions_va;
+    info->isolate_instructions_va = snapshot.isolate_instructions_va;
+    info->isolate_instructions_size = snapshot.isolate_instructions_size;
+    info->isolate_instructions_runtime = snapshot.isolate_instructions_runtime;
+    info->compressed_pointers = snapshot.compressed_pointers ? 1 : 0;
+}
+
 bool FlutterSnapshotSource::Matches(const ModuleImage& module) const {
     return module.name == module_name && module.path == module_path &&
            EqualsIgnoreCaseAscii(module.build_id, module_build_id);

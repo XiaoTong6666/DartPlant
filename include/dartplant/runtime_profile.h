@@ -59,6 +59,10 @@ typedef struct DartPlantRuntimeProfile {
     const char* runtime_module_name;
     const char* runtime_build_id;
 
+    // Legacy/manual callback mapping. These fields are an explicit raw escape
+    // hatch and compatibility surface, not the source of truth for future
+    // typed Dart invocation. Verified per-Function DartCallLayout is computed
+    // internally from exact ABI evidence + the Dart calling convention.
     uint32_t argument_count;
     DartPlantAbiLocation argument_locations[8];
     DartPlantAbiLocation result_location;
@@ -67,8 +71,8 @@ typedef struct DartPlantRuntimeProfile {
     uint8_t reserved[3];
 } DartPlantRuntimeProfile;
 
-// Dart's ARM64 AOT convention uses GP argument registers x1, x2, x3, x5, x6,
-// x7 and FP argument registers v0-v7. x16/x17 are veneer scratch registers
+// Dart's ARM64 AOT register convention uses GP argument registers
+// x1, x2, x3, x5, x6, x7 and FP argument registers v0-v5. x16/x17 are veneer scratch registers
 // and x30 is the continuation link. The result location is profile-specific.
 
 // Initializes a conservative ARM64 AOT profile. It identifies the modules and

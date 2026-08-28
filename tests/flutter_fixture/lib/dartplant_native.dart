@@ -22,6 +22,10 @@ typedef _ResetBoolSemanticProbeNative = Void Function();
 typedef _ResetBoolSemanticProbeDart = void Function();
 typedef _BoolSemanticProbeNative = Uint64 Function();
 typedef _BoolSemanticProbeDart = int Function();
+typedef _ResetVerifiedAbiDoubleProbeNative = Void Function();
+typedef _ResetVerifiedAbiDoubleProbeDart = void Function();
+typedef _VerifiedAbiDoubleProbeNative = Uint64 Function();
+typedef _VerifiedAbiDoubleProbeDart = int Function();
 
 final class DartPlantNative {
   DartPlantNative._();
@@ -82,6 +86,17 @@ final class DartPlantNative {
         'dartplant_fixture_bool_semantic_probe',
       )
       .asFunction();
+  static final _ResetVerifiedAbiDoubleProbeDart _resetVerifiedAbiDoubleProbe =
+      _library
+          .lookup<NativeFunction<_ResetVerifiedAbiDoubleProbeNative>>(
+            'dartplant_fixture_reset_verified_abi_double_probe',
+          )
+          .asFunction();
+  static final _VerifiedAbiDoubleProbeDart _verifiedAbiDoubleProbe = _library
+      .lookup<NativeFunction<_VerifiedAbiDoubleProbeNative>>(
+        'dartplant_fixture_verified_abi_double_probe',
+      )
+      .asFunction();
 
   static int startInitialize() => _initialize(NativeApi.initializeApiDLData);
 
@@ -132,4 +147,8 @@ final class DartPlantNative {
   static void resetBoolSemanticProbe() => _resetBoolSemanticProbe();
 
   static int boolSemanticProbe() => _boolSemanticProbe();
+
+  static void resetVerifiedAbiDoubleProbe() => _resetVerifiedAbiDoubleProbe();
+
+  static int verifiedAbiDoubleProbe() => _verifiedAbiDoubleProbe();
 }

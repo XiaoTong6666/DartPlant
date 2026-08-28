@@ -4,20 +4,23 @@
 #ifndef DARTPLANT_NATIVE_API_H_
 #define DARTPLANT_NATIVE_API_H_
 
-#include <stdint.h>
+#include "dartplant/host_api.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef int (*DartPlantHostHook)(void* target, void* replacement, void** backup);
-typedef int (*DartPlantHostUnhook)(void* target);
 typedef void (*DartPlantNativeOnModuleLoaded)(const char* name, void* handle);
+typedef int (*DartPlantNativeHook)(void* target, void* replacement, void** backup);
+typedef int (*DartPlantNativeUnhook)(void* target);
 
+// Compatibility ABI used by LSPosed/Vector native_init hosts. DartPlant core
+// itself consumes DartPlantHostApi; this adapter type intentionally preserves
+// the established field names and version=2 contract.
 typedef struct DartPlantNativeApiEntries {
     uint32_t version;
-    DartPlantHostHook hook_func;
-    DartPlantHostUnhook unhook_func;
+    DartPlantNativeHook hook_func;
+    DartPlantNativeUnhook unhook_func;
 } DartPlantNativeApiEntries;
 
 typedef DartPlantNativeOnModuleLoaded (*DartPlantNativeInit)(

@@ -1,10 +1,11 @@
 // Copyright (C) 2026 XiaoTong6666
 // SPDX-License-Identifier: Apache-2.0
 
+#include "vm/object_bridge.h"
+
 #include <utility>
 
 #include "core/internal.h"
-#include "runtime/vm_adapter_internal.h"
 
 namespace {
 

@@ -41,15 +41,22 @@ typedef enum DartPlantValueKind {
     DARTPLANT_VALUE_SMI,
     DARTPLANT_VALUE_DOUBLE,
     DARTPLANT_VALUE_HEAP_OBJECT,  // Opaque tagged heap reference for callback lifetime only.
+    DARTPLANT_VALUE_INT64,
 } DartPlantValueKind;
 
 typedef struct DartPlantValue {
     DartPlantValueKind kind;
     uint32_t reserved;
     // Kind-dependent payload. RAW_WORD/SMI/HEAP_OBJECT keep the VM word,
-    // DOUBLE keeps the IEEE-754 bits, and BOOL uses the semantic value 0 or 1.
+    // INT64 keeps the two's-complement integer bits, DOUBLE keeps IEEE-754
+    // bits, and BOOL uses the semantic value 0 or 1.
     uint64_t raw;
 } DartPlantValue;
+
+typedef struct DartPlantValuePair {
+    DartPlantValue first;
+    DartPlantValue second;
+} DartPlantValuePair;
 
 typedef struct DartPlantArm64Context {
     uint64_t x[31];
@@ -103,6 +110,11 @@ DARTPLANT_EXPORT DartPlantInvocationPhase
 dartplant_invocation_phase(const DartPlantInvocation* invocation);
 DARTPLANT_EXPORT uint32_t dartplant_invocation_depth(const DartPlantInvocation* invocation);
 
+// True only when this physical invocation has a verified per-Function
+// DartCallLayout. Raw GP/FP context access remains available when this is false.
+DARTPLANT_EXPORT uint8_t
+dartplant_invocation_has_verified_abi(const DartPlantInvocation* invocation);
+
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_gp_register(
     const DartPlantInvocation* invocation, uint32_t register_index, uint64_t* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_gp_register(
@@ -128,6 +140,10 @@ DARTPLANT_EXPORT DartPlantStatus
 dartplant_invocation_get_result(const DartPlantInvocation* invocation, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_result(DartPlantInvocation* invocation,
                                                                  const DartPlantValue* value);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_result_pair(
+    const DartPlantInvocation* invocation, DartPlantValuePair* out_value);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_result_pair(
+    DartPlantInvocation* invocation, const DartPlantValuePair* value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_retain_result_object(
     DartPlantInvocation* invocation, DartPlantObjectStrength strength,
     DartPlantObjectHandle** out_handle);

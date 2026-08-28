@@ -54,6 +54,17 @@ const char* LastError() { return g_last_error.c_str(); }
 
 extern "C" {
 
+DartPlantStatus dartplant_install_host_api(const DartPlantHostApi* api) {
+    if (api == nullptr || api->struct_size < sizeof(DartPlantHostApi) ||
+        api->version < DARTPLANT_HOST_API_VERSION || api->hook == nullptr ||
+        api->unhook == nullptr) {
+        dartplant::SetLastError("host API version or function pointers are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    dartplant::InstallHostApi(api);
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus dartplant_initialize_from_json(const char* metadata_json) {
     std::string error;
     auto metadata = dartplant::ParseMetadata(metadata_json, &error);

@@ -28,6 +28,14 @@ bool negateBool(bool value) => !value;
 @pragma('vm:never-inline')
 T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
 
+// Keep both a normal optimized AOT body and an implicit closure. PRODUCT AOT
+// deliberately drops the parent RegularFunction identity from the live heap;
+// DartPlant binds the compiler sidecar to the final libapp.so before hooking it.
+@pragma('vm:never-inline')
+double verifiedAbiDouble(double left, double right) => left + right;
+
+final verifiedAbiDoubleTearOff = verifiedAbiDouble;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final initializeStartStatus = DartPlantNative.startInitialize();
@@ -63,6 +71,16 @@ Future<void> main() async {
     }
     final startupProbe = DartPlantNative.instrumentedAddProbe();
     debugPrint('DartPlant live VM startup probe: $startupProbe');
+    DartPlantNative.resetVerifiedAbiDoubleProbe();
+    final ordinaryDirect = verifiedAbiDouble(1.25, 2.5);
+    final ordinaryTearOff = verifiedAbiDoubleTearOff(2.0, 3.0);
+    final ordinaryProbe = DartPlantNative.verifiedAbiDoubleProbe();
+    debugPrint(
+      'DartPlant ordinary AOT calls: direct=$ordinaryDirect tearOff=$ordinaryTearOff',
+    );
+    debugPrint(
+      'DartPlant ordinary AOT typed probe: $ordinaryProbe values=$ordinaryDirect/$ordinaryTearOff',
+    );
   });
 }
 

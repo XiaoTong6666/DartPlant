@@ -12,13 +12,15 @@
 #include <string>
 #include <vector>
 
+#include "abi/call_layout.h"
+#include "abi/evidence.h"
 #include "core/internal.h"
 #include "dartplant/invocation.h"
 #include "dartplant/live_vm.h"
 #include "dartplant/runtime.h"
 #include "runtime/flutter_snapshot_internal.h"
 #include "runtime/snapshot_index.h"
-#include "runtime/vm_adapter_internal.h"
+#include "vm/object_bridge.h"
 
 namespace dartplant {
 
@@ -36,6 +38,16 @@ struct RuntimeProfileStorage {
 };
 
 struct RuntimeRegistration;
+
+struct RuntimeAbiEvidenceEntry {
+    DartMethodIdentity identity;
+    uintptr_t code_target = 0;
+    uint64_t generation = 0;
+    std::vector<abi::DartFunctionAbiEvidence> providers;
+    abi::DartFunctionAbiResolution resolution;
+    abi::DartCallLayoutStatus layout_status = abi::DartCallLayoutStatus::kIncompleteEvidence;
+    std::shared_ptr<const abi::DartCallLayout> call_layout;
+};
 
 using RuntimeModuleRefreshReporter = void (*)(DartPlantStatus status, const char* error);
 
@@ -63,6 +75,8 @@ DartPlantStatus WaitForRuntimeModuleRefresh(uint64_t epoch);
 DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& context,
                                                 const DartPlantLiveVmProfile& profile,
                                                 uint64_t* out_true, uint64_t* out_false);
+std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
+    const DartPlantRuntime* runtime, const DartPlantMethod* method);
 
 }  // namespace dartplant
 
@@ -84,8 +98,11 @@ struct DartPlantRuntime {
     std::optional<dartplant::ModuleImage> selected_runtime_module;
     std::optional<dartplant::FlutterSnapshotSource> snapshot;
     // Built automatically from live Class.functions/Library.toplevel_class.
-    // Runtime method resolution never consumes a precomputed metadata/index file.
     std::optional<dartplant::SnapshotIndex> live_snapshot_index;
+    // Optional exact compiler/artifact sidecar for Functions deliberately
+    // dropped from the PRODUCT object graph. Bound to one app/snapshot
+    // incarnation and cleared when that artifact identity changes.
+    std::optional<dartplant::SnapshotIndex> artifact_snapshot_index;
     DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
     std::optional<DartPlantLiveVmContext> live_vm_context;
     // Canonical semantic roots are captured only from an exact, validated live
@@ -95,6 +112,7 @@ struct DartPlantRuntime {
     uint64_t live_vm_bool_false_value = 0;
     std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
     dartplant::DartCodeTargetRegistry code_targets;
+    std::vector<dartplant::RuntimeAbiEvidenceEntry> abi_evidence;
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
     bool profile_matched = false;
 };
@@ -105,6 +123,7 @@ struct DartPlantInvocation {
     std::shared_ptr<dartplant::DartCodeTarget> code_target;
     std::vector<dartplant::DartMethodIdentity> code_alias_snapshot;
     const DartPlantRuntimeProfile* profile = nullptr;
+    const dartplant::abi::DartCallLayout* call_layout = nullptr;
     DartPlantArm64Context* context = nullptr;
     DartPlantInvocationPhase phase = DARTPLANT_INVOCATION_ENTER;
     uint32_t depth = 0;
@@ -125,6 +144,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
 
 extern "C" uint64_t dartplant_arm64_invoke_original(DartPlantArm64Context* context, void* original);
 
-extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(uint64_t result);
+extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(
+    uint64_t result0, uint64_t result1, uint64_t fp_result_bits);
 
 #endif  // DARTPLANT_RUNTIME_RUNTIME_INTERNAL_H_

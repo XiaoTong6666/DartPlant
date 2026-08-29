@@ -7,7 +7,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_snapshot_sidecar import _extract_code_identity_profile, _load_abi_oracle, _write_header
+from build_snapshot_sidecar import (
+    AbiEvidence,
+    ElfIdentity,
+    LoadSegment,
+    _extract_code_identity_profile,
+    _find_unique_executable_code,
+    _load_abi_oracle,
+    _normalize_aarch64_direct_branches,
+    _validate_cfg_cross_check,
+    _write_header,
+)
 from run_abi_oracle import _package_language_version
 
 
@@ -216,6 +226,126 @@ class GeneratedBundleTest(unittest.TestCase):
             self.assertIn('#include "dartplant/advanced/artifact.h"', text)
             self.assertIn("DartPlantArtifactBundle", text)
             self.assertIn("dartplant_register_embedded_artifact_bundle", text)
+
+    def test_generated_header_supports_unique_symbol_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            header = Path(temp) / "sidecar.h"
+            _write_header(
+                header,
+                {
+                    "library_uri": "package:fixture/main.dart",
+                    "class_name": "Global",
+                    "function_name": "target",
+                    "entry_va": 0x1234,
+                    "code_size": 16,
+                    "fingerprint": "0123456789abcdef",
+                    "build_id": "00112233",
+                    "snapshot_hash": "0123456789abcdef0123456789abcdef",
+                    "code_identity_proof": "unique",
+                    "physical_entry_alias_count": 1,
+                    "abi_parameters": ["unboxed-int64"],
+                    "abi_result": "unboxed-int64",
+                    "max_parameters_in_registers": 1,
+                    "must_use_stack_calling_convention": False,
+                    "has_optional_parameters": False,
+                    "has_overrides_with_less_direct_parameters": False,
+                },
+                "DartPlantP6Int64",
+            )
+            text = header.read_text()
+            self.assertIn("kDartPlantP6Int64ArtifactBundle", text)
+            self.assertIn("DartPlantP6Int64ArtifactRegistrar", text)
+            self.assertNotIn("kDartPlantOrdinaryAotArtifactBundle", text)
+
+
+class CfgCrossCheckTest(unittest.TestCase):
+    def test_unknown_cfg_result_does_not_override_metadata_truth(self) -> None:
+        oracle = AbiEvidence(
+            parameters=("tagged", "tagged"),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        cfg = AbiEvidence(
+            parameters=("tagged", "tagged"),
+            result="unknown",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        _validate_cfg_cross_check(oracle, cfg)
+
+    def test_known_cfg_conflict_still_fails_closed(self) -> None:
+        oracle = AbiEvidence(
+            parameters=("unboxed-int64",),
+            result="unboxed-int64",
+            max_parameters_in_registers=1,
+            must_use_stack_calling_convention=False,
+        )
+        cfg = AbiEvidence(
+            parameters=("unboxed-double",),
+            result="unboxed-int64",
+            max_parameters_in_registers=1,
+            must_use_stack_calling_convention=False,
+        )
+        with self.assertRaises(ValueError):
+            _validate_cfg_cross_check(oracle, cfg)
+
+
+class ExecutableCodeLocatorTest(unittest.TestCase):
+    def test_exact_match_preserves_target_bytes(self) -> None:
+        code = bytes.fromhex("fd7bbfa9fd030091c0035fd6")
+        data = b"\0" * 16 + code + b"\0" * 16
+        identity = ElfIdentity(
+            build_id="test",
+            snapshot_hash="test",
+            load_segments=(LoadSegment(0, 0x1000, len(data), 0x1),),
+        )
+        va, actual, mode = _find_unique_executable_code(data, identity, code)
+        self.assertEqual(0x1010, va)
+        self.assertEqual(code, actual)
+        self.assertEqual("exact", mode)
+
+    def test_branch_immediate_fallback_uses_actual_target_bytes(self) -> None:
+        # Same Function shape with only a BL imm26 displacement changed by the
+        # diagnostic gen_snapshot layout. Offline matching may mask that field,
+        # but the returned fingerprint source must be the exact target bytes.
+        oracle = bytes.fromhex("fd7bbfa900010094c0035fd6")
+        actual = bytes.fromhex("fd7bbfa923010094c0035fd6")
+        data = b"\0" * 32 + actual + b"\0" * 32
+        identity = ElfIdentity(
+            build_id="test",
+            snapshot_hash="test",
+            load_segments=(LoadSegment(0, 0x2000, len(data), 0x1),),
+        )
+        va, matched, mode = _find_unique_executable_code(data, identity, oracle)
+        self.assertEqual(0x2020, va)
+        self.assertEqual(actual, matched)
+        self.assertEqual("branch-relocation-normalized", mode)
+
+    def test_branch_immediate_fallback_rejects_ambiguous_matches(self) -> None:
+        oracle = bytes.fromhex("fd7bbfa900010094c0035fd6")
+        first = bytes.fromhex("fd7bbfa923010094c0035fd6")
+        second = bytes.fromhex("fd7bbfa945020094c0035fd6")
+        data = b"\0" * 16 + first + b"\0" * 16 + second + b"\0" * 16
+        identity = ElfIdentity(
+            build_id="test",
+            snapshot_hash="test",
+            load_segments=(LoadSegment(0, 0x3000, len(data), 0x1),),
+        )
+        with self.assertRaises(ValueError):
+            _find_unique_executable_code(data, identity, oracle)
+
+    def test_branch_normalization_preserves_intra_function_targets(self) -> None:
+        # At offset 4, B +4 targets offset 8 and B -4 targets offset 0. Both
+        # remain inside the Function and therefore must stay identity-bearing.
+        first = bytes.fromhex("fd7bbfa901000014c0035fd6")
+        second = bytes.fromhex("fd7bbfa9ffffff17c0035fd6")
+        self.assertEqual(first, _normalize_aarch64_direct_branches(first))
+        self.assertEqual(second, _normalize_aarch64_direct_branches(second))
+        self.assertNotEqual(
+            _normalize_aarch64_direct_branches(first),
+            _normalize_aarch64_direct_branches(second),
+        )
 
 
 if __name__ == "__main__":

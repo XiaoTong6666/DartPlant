@@ -22,6 +22,7 @@ add_library(
     SHARED
     fixture_bridge.cpp
     simple_facade_consumer.cpp
+    p6_abi_probe.cpp
     dart_api_adapter.cpp
     dart_raw_bridge.cpp
     "${DART_SDK_ROOT}/runtime/include/dart_api_dl.c"

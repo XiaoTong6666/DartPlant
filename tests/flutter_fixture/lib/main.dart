@@ -36,6 +36,84 @@ double verifiedAbiDouble(double left, double right) {
   return (left * 1.5) + right + 0.25;
 }
 
+// P6 compiler-produced ABI corpus. Keep these ordinary direct calls free of
+// tear-offs so vm.unboxing-info.metadata is the source of truth for the
+// optimized PRODUCT calling convention.
+@pragma('vm:never-inline')
+int verifiedAbiInt64(int left, int right) {
+  return (left * 10000000000) + right;
+}
+
+@pragma('vm:never-inline')
+double verifiedAbiEntryStack(
+  double a0,
+  double a1,
+  double a2,
+  double a3,
+  double a4,
+  double a5,
+  double a6,
+  double a7,
+) {
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + (a7 * 10.0);
+}
+
+// Seven unboxed doubles consume V0-V5 plus one Dart stack slot. The exact x15
+// parity belongs to the caller frame layout and is intentionally not part of
+// this ABI assertion.
+@pragma('vm:never-inline')
+double verifiedAbiOddStack(
+  double a0,
+  double a1,
+  double a2,
+  double a3,
+  double a4,
+  double a5,
+  double a6,
+) {
+  return a0 + a1 + a2 + a3 + a4 + a5 + (a6 * 10.0);
+}
+
+// vm:entry-point makes this callable from native code, which forces the
+// compiler's boxed stack calling convention instead of register-CC.
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+int verifiedAbiForcedStack(int left, int right) {
+  return (left * 10) + right;
+}
+
+@pragma('vm:never-inline')
+(Object?, Object?) verifiedAbiPair(Object? left, Object? right) {
+  return (left, right);
+}
+
+@pragma('vm:never-inline')
+double verifiedAbiThrowingStack(
+  double a0,
+  double a1,
+  double a2,
+  double a3,
+  double a4,
+  double a5,
+  double a6,
+  double a7,
+) {
+  if (a0 == 99.0) {
+    throw StateError('dartplant-p6-throw');
+  }
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + (a7 * 10.0);
+}
+
+@pragma('vm:never-inline')
+int verifiedAbiImmediateCatchProbe() {
+  try {
+    verifiedAbiThrowingStack(99, 2, 3, 4, 5, 6, 7, 8);
+    return 1;
+  } catch (_) {
+    return 2;
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final initializeStartStatus = DartPlantNative.startInitialize();
@@ -71,9 +149,74 @@ Future<void> main() async {
       'DartPlant simple facade typed hook: ${simpleFacadePassed ? 1 : 0} values=$simpleFacadeFirst/$simpleFacadeSecond stages=$simpleFacadeStage1/$simpleFacadeStage2',
     );
 
+    final p6BaselineInt64 = verifiedAbiInt64(100000000, 7);
+    final p6BaselineStack = verifiedAbiEntryStack(1, 2, 3, 4, 5, 6, 7, 8);
+    final p6BaselineOdd = verifiedAbiOddStack(1, 2, 3, 4, 5, 6, 7);
+    final p6BaselineThrow = verifiedAbiThrowingStack(1, 2, 3, 4, 5, 6, 7, 8);
+    final p6BaselineForced = verifiedAbiForcedStack(3, 4);
+    final p6BaselinePair = verifiedAbiPair(21, 22);
+    final p6Install = DartPlantNative.p6AbiInstall();
+    final p6HookedInt64 = verifiedAbiInt64(300000000, 13);
+    final p6HookedStack = verifiedAbiEntryStack(2, 3, 4, 5, 6, 7, 8, 9);
+    final p6HookedOdd = verifiedAbiOddStack(2, 3, 4, 5, 6, 7, 8);
+    var p6ThrowPath = 0;
+    try {
+      p6ThrowPath = verifiedAbiImmediateCatchProbe();
+    } catch (_) {
+      p6ThrowPath = 3;
+    }
+    final p6HookedThrow = verifiedAbiThrowingStack(2, 3, 4, 5, 6, 7, 8, 9);
+    debugPrint(
+        'DartPlant P6 throw path: $p6ThrowPath normal=$p6BaselineThrow/$p6HookedThrow');
+    final p6HookedForced = verifiedAbiForcedStack(5, 6);
+    final p6HookedPair = verifiedAbiPair(31, 32);
+    final p6Probe = DartPlantNative.p6AbiProbe();
+    final p6Passed = p6Install == 0 &&
+        p6Probe == 1 &&
+        p6BaselineInt64 == 1000000000000000007 &&
+        p6HookedInt64 == 3000000010000000113 &&
+        p6BaselineStack == 108.0 &&
+        p6HookedStack == 1146.0 &&
+        p6BaselineOdd == 91.0 &&
+        p6HookedOdd == 217.0 &&
+        p6ThrowPath == 2 &&
+        p6BaselineThrow == 108.0 &&
+        p6HookedThrow == 125.0 &&
+        p6BaselineForced == 34 &&
+        p6HookedForced == 65 &&
+        p6BaselinePair.$1 == 21 &&
+        p6BaselinePair.$2 == 22 &&
+        p6HookedPair.$1 == 32 &&
+        p6HookedPair.$2 == 31;
+    debugPrint(
+      'DartPlant P6 ABI corpus: ${p6Passed ? 1 : 0} install=$p6Install probe=$p6Probe int64=$p6BaselineInt64/$p6HookedInt64 stack=$p6BaselineStack/$p6HookedStack odd=$p6BaselineOdd/$p6HookedOdd forced=$p6BaselineForced/$p6HookedForced pair=${p6BaselinePair.$1},${p6BaselinePair.$2}/${p6HookedPair.$1},${p6HookedPair.$2}',
+    );
+
+    // Run the exception-bridge lifetime race with exactly one real-Dart hook
+    // consumer. Its enter callback requests unhook while in flight, then the
+    // Dart body throws. The immediate caller must still catch it and the
+    // process-global JumpToFrame backup must remain valid through cleanup.
+    final exceptionLifetimeInstall =
+        DartPlantNative.exceptionBridgeLifetimeInstall();
+    var exceptionLifetimeCatch = 0;
+    try {
+      exceptionLifetimeCatch = verifiedAbiImmediateCatchProbe();
+    } catch (_) {
+      exceptionLifetimeCatch = 3;
+    }
+    final exceptionLifetimeProbe =
+        DartPlantNative.exceptionBridgeLifetimeProbe();
+    final exceptionLifetimePassed = exceptionLifetimeInstall == 0 &&
+        exceptionLifetimeCatch == 2 &&
+        exceptionLifetimeProbe == 1;
+    debugPrint(
+      'DartPlant exception bridge lifetime: ${exceptionLifetimePassed ? 1 : 0} install=$exceptionLifetimeInstall catch=$exceptionLifetimeCatch probe=$exceptionLifetimeProbe',
+    );
+
     // Only after the simple consumer has removed its final subscription and
-    // shut down the default runtime may the advanced fixture reuse this exact
-    // physical CodeTarget for its ABI/late-shared diagnostics.
+    // the P6 corpus has removed all of its artifact-first hooks and shut down
+    // the default runtime may the advanced fixture reuse physical CodeTargets
+    // for its ABI/late-shared diagnostics.
     final advancedOrdinaryHook = DartPlantNative.enableAdvancedOrdinaryHook();
     debugPrint(
         'DartPlant advanced ordinary hook enable: $advancedOrdinaryHook');

@@ -18,7 +18,9 @@ std::vector<std::unique_ptr<DartPlantHook>>& Hooks() {
 }
 
 bool IsSupportedArgumentRegister(uint8_t reg) {
-    // x16/x17 are veneer scratch registers and x30 carries the continuation.
+    // x16/x17 are veneer scratch registers. x30 is the architectural Dart
+    // caller LR and remains untouched by real-Dart entry hooks so exception
+    // stack walking continues to see the original caller PC.
     return reg < 30 && reg != 16 && reg != 17;
 }
 
@@ -121,6 +123,13 @@ DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
         SetLastError("host unhook function failed");
         return DARTPLANT_UNHOOK_FAILED;
     }
+    if (!RestoreArm64ReturnInterception(hook)) {
+        std::lock_guard hook_lock(hook->mutex);
+        hook->state = HookRecordState::kFailed;
+        SetLastError("failed to restore Dart return interception");
+        return DARTPLANT_UNHOOK_FAILED;
+    }
+    ReleaseArm64ExceptionBridgeConsumer(hook);
     if (hook->code_target != nullptr) hook->code_target->UnbindHookRecord(hook);
     std::lock_guard hook_lock(hook->mutex);
     hook->state = HookRecordState::kUnhooked;
@@ -221,6 +230,7 @@ void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_gen
         }
         hook->listeners.clear();
         hook->state = HookRecordState::kRetired;
+        ReleaseArm64ExceptionBridgeConsumer(hook.get());
     }
 }
 
@@ -322,7 +332,8 @@ bool BeginInvocation(DartPlantHook* hook,
     if (hook == nullptr || listeners == nullptr) return false;
     std::lock_guard lock(hook->mutex);
     if (!hook->has_method || hook->state == HookRecordState::kFailed ||
-        hook->state == HookRecordState::kRetired) {
+        hook->state == HookRecordState::kRetired || hook->state == HookRecordState::kUnhooking ||
+        hook->state == HookRecordState::kUnhooked) {
         return false;
     }
     if (hook->runtime_generation != nullptr &&
@@ -393,6 +404,23 @@ DartPlantStatus InstallCallbackHook(
         SetLastError("verified DartCallLayout has an invalid Dart SP register");
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    if (options.vm_adapter != nullptr &&
+        method->function->source != DartFunctionSource::kSynthetic) {
+        // Direct ARM64 Dart entry hooks currently dispatch as leaf-like native
+        // calls. Entering a VM/API scope would require a real
+        // Generated->Native safepoint transition plus VM-visible roots for
+        // tagged arguments that are live only in Dart registers. The bridge's
+        // TLS context is not scanned by Dart GC, so pretending this is a
+        // non-leaf native transition would make those ObjectPtrs unsafe.
+        SetLastError(
+            "VM-adapter callbacks on Dart code require a GC-safe generated-to-native transition");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (method->function->source != DartFunctionSource::kSynthetic &&
+        method->function->thread_jump_to_frame_entry_point_offset == 0) {
+        SetLastError("Dart callback hook requires an exact exception-unwind Thread profile");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
     if (method->function->code_target->IsShared() && !AllowsSharedCode(options)) {
         SetLastError(
             "method callback target is shared by multiple Dart Functions; explicit shared-code opt-in is required");
@@ -435,21 +463,36 @@ DartPlantStatus InstallCallbackHook(
     hook->state = HookRecordState::kInstalling;
     auto first_listener = MakeListenerLocked(hook.get(), method, options, priority);
     InsertListenerLocked(hook.get(), first_listener);
-    hook->replacement_entry = CreateArm64CallbackStub(hook.get(), &hook->replacement_entry_size);
+    hook->replacement_entry =
+        CreateArm64CallbackStub(hook.get(), target, &hook->replacement_entry_size);
     if (hook->replacement_entry == nullptr) {
         SetLastError("failed to allocate ARM64 callback stub");
         return DARTPLANT_HOOK_FAILED;
+    }
+
+    if (method->function->source != DartFunctionSource::kSynthetic) {
+        const DartPlantStatus return_status = InstallArm64ReturnInterception(hook.get());
+        if (return_status != DARTPLANT_OK) {
+            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+            hook->replacement_entry = nullptr;
+            hook->replacement_entry_size = 0;
+            return return_status;
+        }
     }
 
     void* original = nullptr;
     if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target),
                            hook->replacement_entry, &original) != 0 ||
         original == nullptr) {
+        (void) RestoreArm64ReturnInterception(hook.get());
         DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
         SetLastError("host hook function failed");
         return DARTPLANT_HOOK_FAILED;
     }
     hook->backup = original;
+    if (method->function->source != DartFunctionSource::kSynthetic) {
+        RegisterArm64ExceptionBridgeConsumer(hook.get());
+    }
     hook->active.store(true, std::memory_order_release);
     hook->state = HookRecordState::kInstalled;
     hook->code_target->BindHookRecord(hook.get());

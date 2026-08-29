@@ -7,8 +7,12 @@
 .align 2
 .global dartplant_arm64_callback_entry
 .type dartplant_arm64_callback_entry, %function
-.global dartplant_arm64_continuation
-.type dartplant_arm64_continuation, %function
+.global dartplant_arm64_native_callback_entry
+.type dartplant_arm64_native_callback_entry, %function
+.global dartplant_arm64_native_continuation
+.type dartplant_arm64_native_continuation, %function
+.global dartplant_arm64_return_entry
+.type dartplant_arm64_return_entry, %function
 .global dartplant_arm64_invoke_original
 .type dartplant_arm64_invoke_original, %function
 
@@ -19,16 +23,49 @@
 //   [264, 272) PSTATE placeholder
 //   [272, 784) SIMD registers q0..q31
 //   frame size: 816 bytes
+//
+// Dart AOT uses x15 (SPREG) as its logical stack pointer and keeps the
+// architectural SP (CSP) parked near the stack limit while generated Dart
+// code is running. Native calls must instead run on a C-ABI stack derived from
+// the active Dart stack. The bridge therefore reserves this save frame below
+// x15, with an extra 8-byte alignment pad when x15 is only word-aligned.
 
 dartplant_arm64_callback_entry:
   // The generated veneer puts the Hook pointer in x17 and uses x16 as IP0.
   // Both are AArch64 scratch registers and are intentionally not preserved.
+  // Preserve the parked architectural CSP before switching to the active Dart
+  // stack, matching the Dart VM's generated-code -> runtime transition.
+  mov x16, sp
+  mov sp, x15
   sub sp, sp, #816
+  // Dart SPREG is word-aligned but is not required to stay 16-byte aligned.
+  // AAPCS64 requires architectural SP to be 16-byte aligned at a C call.
+  tbz x15, #3, .Ldartplant_entry_stack_aligned
+  sub sp, sp, #8
+.Ldartplant_entry_stack_aligned:
+  str x9, [sp, #72]
+  mov w9, #0
+  b .Ldartplant_callback_common
+
+.size dartplant_arm64_callback_entry, .-dartplant_arm64_callback_entry
+
+// Synthetic native fixtures do not run inside Dart generated code and x15 is
+// not SPREG there. Keep their callback bridge on the ordinary AAPCS64 stack;
+// real runtime-resolved Dart methods always use dartplant_arm64_callback_entry.
+dartplant_arm64_native_callback_entry:
+  mov x16, sp
+  sub sp, sp, #816
+  str x9, [sp, #72]
+  mov w9, #1
+
+.size dartplant_arm64_native_callback_entry, .-dartplant_arm64_native_callback_entry
+
+.Ldartplant_callback_common:
   stp x0, x1, [sp, #0]
   stp x2, x3, [sp, #16]
   stp x4, x5, [sp, #32]
   stp x6, x7, [sp, #48]
-  stp x8, x9, [sp, #64]
+  str x8, [sp, #64]
   stp x10, x11, [sp, #80]
   stp x12, x13, [sp, #96]
   stp x14, x15, [sp, #112]
@@ -40,10 +77,14 @@ dartplant_arm64_callback_entry:
   stp x26, x27, [sp, #208]
   stp x28, x29, [sp, #224]
   str x30, [sp, #240]
-  add x9, sp, #816
-  str x9, [sp, #248]
-  adr x9, .Ldartplant_continuation
+  str x16, [sp, #248]
+  cbz w9, .Ldartplant_no_continuation
+  adr x9, .Ldartplant_native_continuation
   str x9, [sp, #256]
+  b .Ldartplant_continuation_stored
+.Ldartplant_no_continuation:
+  str xzr, [sp, #256]
+.Ldartplant_continuation_stored:
   str xzr, [sp, #264]
   stp q0, q1, [sp, #272]
   stp q2, q3, [sp, #304]
@@ -99,23 +140,79 @@ dartplant_arm64_callback_entry:
   ldp q26, q27, [x14, #688]
   ldp q28, q29, [x14, #720]
   ldp q30, q31, [x14, #752]
-  ldr x30, [x14, #256]
   ldr x17, [x14, #264]
+  // Restore the parked architectural CSP before tail-branching to generated
+  // Dart code. Dart stack parameters and frame setup use SPREG=x15; restoring
+  // CSP here preserves the auxiliary C-stack state that the VM keeps parked
+  // while Dart code executes.
+  ldr x16, [x14, #248]
+  ldr x30, [x14, #256]
+  cbnz x30, .Ldartplant_original_lr_ready
+  // Real Dart code must retain the true Dart caller PC in LR. Normal returns
+  // are intercepted at RET sites, so there is no bridge continuation hidden
+  // in the Dart frame and exception stack walking remains transparent.
+  ldr x30, [x14, #240]
+.Ldartplant_original_lr_ready:
   ldp x14, x15, [x14, #112]
+  mov sp, x16
   br x17
 
 .Ldartplant_skip:
   mov x14, x0
   b .Ldartplant_restore_and_return
 
-dartplant_arm64_continuation:
-.Ldartplant_continuation:
-  // Preserve every currently supported Dart AOT return channel across the C
-  // dispatcher call: tagged/int64 use x0, pair-of-tagged uses x0+x1, and
-  // unboxed double uses v0. Pass the low 64 bits of v0 through C ABI x2.
+dartplant_arm64_native_continuation:
+.Ldartplant_native_continuation:
+  // Synthetic native targets return with their original architectural SP.
+  // Their callback entry always reserves exactly 816 bytes with no Dart-SP
+  // alignment pad, so the abandoned bridge frame is directly recoverable.
+  sub sp, sp, #816
   fmov x2, d0
   bl dartplant_arm64_dispatch_leave_from_tls
   mov x14, x0
+  b .Ldartplant_restore_and_return
+
+.size dartplant_arm64_native_continuation, .-dartplant_arm64_native_continuation
+
+// Each real Dart RET is replaced with a direct B to a per-hook veneer. The
+// veneer reloads DartPlantHook* into x17 and branches here. Because the real
+// Dart LR was never replaced, x30 is still the true caller PC and exception
+// unwinding sees exactly the same Dart frame chain as the unhooked function.
+dartplant_arm64_return_entry:
+  mov x16, sp
+  mov sp, x15
+  sub sp, sp, #64
+  tbz x15, #3, .Ldartplant_return_stack_aligned
+  sub sp, sp, #8
+.Ldartplant_return_stack_aligned:
+  stp x0, x1, [sp, #0]
+  stp q0, q1, [sp, #16]
+  str x30, [sp, #48]
+  str x16, [sp, #56]
+  mov x0, x17
+  ldr x1, [sp, #0]
+  ldr x2, [sp, #8]
+  ldr x3, [sp, #16]
+  bl dartplant_arm64_dispatch_return_from_hook
+  // x0 = TLS context (or null for passthrough), x1 = synchronous
+  // invoke-original native-frame SP (or zero for an automatic return).
+  cbnz x1, .Ldartplant_resume_synchronous_original
+  cbnz x0, .Ldartplant_return_has_context
+  ldp x0, x1, [sp, #0]
+  ldp q0, q1, [sp, #16]
+  ldr x30, [sp, #48]
+  ldr x16, [sp, #56]
+  mov sp, x16
+  ret
+.Ldartplant_return_has_context:
+  mov x14, x0
+  b .Ldartplant_restore_and_return
+.Ldartplant_resume_synchronous_original:
+  mov sp, x1
+  b .Ldartplant_invoke_original_resumed
+
+.size dartplant_arm64_return_entry, .-dartplant_arm64_return_entry
+
 .Ldartplant_restore_and_return:
   ldp x0, x1, [x14, #0]
   ldp x2, x3, [x14, #16]
@@ -148,12 +245,13 @@ dartplant_arm64_continuation:
   ldp q28, q29, [x14, #720]
   ldp q30, q31, [x14, #752]
   ldr x30, [x14, #240]
+  // Do not leave architectural SP on the temporary C frame below SPREG.
+  // Return to the intercepted Dart caller with the parked CSP observed at the
+  // original hook entry.
+  ldr x16, [x14, #248]
   ldp x14, x15, [x14, #112]
-  add sp, sp, #816
+  mov sp, x16
   ret
-
-.size dartplant_arm64_callback_entry, .-dartplant_arm64_callback_entry
-.size dartplant_arm64_continuation, .-dartplant_arm64_continuation
 
 // Called from a native enter callback. It invokes the original Dart entry
 // synchronously, but keeps the native C ABI callee-saved registers intact.
@@ -173,7 +271,14 @@ dartplant_arm64_invoke_original:
   str x0, [sp, #224]
   str x1, [sp, #232]
 
-  mov x19, x0
+  // Associate this native caller frame with the active DispatchFrame. The
+  // original keeps its real Dart LR; normal completion reaches the patched RET
+  // return veneer, while an exception is retired by JumpToFrame cleanup.
+  mov x0, sp
+  bl dartplant_arm64_prepare_invoke_original_frame
+  cbz w0, .Ldartplant_original_push_failed
+
+  ldr x19, [sp, #224]
   ldp x0, x1, [x19, #0]
   ldp x2, x3, [x19, #16]
   ldp x4, x5, [x19, #32]
@@ -205,15 +310,14 @@ dartplant_arm64_invoke_original:
   ldp q26, q27, [x19, #688]
   ldp q28, q29, [x19, #720]
   ldp q30, q31, [x19, #752]
+  ldr x17, [x19, #248]
+  ldr x30, [x19, #240]
   ldr x19, [x19, #152]
-  adr x30, .Ldartplant_original_return
   ldr x16, [sp, #232]
+  mov sp, x17
   br x16
 
-.Ldartplant_original_return:
-  ldr x19, [sp, #224]
-  stp x0, x1, [x19, #0]
-  stp q0, q1, [x19, #272]
+.Ldartplant_invoke_original_resumed:
   ldp x19, x20, [sp, #0]
   ldp x21, x22, [sp, #16]
   ldp x23, x24, [sp, #32]
@@ -225,6 +329,24 @@ dartplant_arm64_invoke_original:
   ldp q12, q13, [sp, #160]
   ldp q14, q15, [sp, #192]
   add sp, sp, #256
+  mov w0, #1
   ret
+
+.Ldartplant_original_push_failed:
+  ldp x19, x20, [sp, #0]
+  ldp x21, x22, [sp, #16]
+  ldp x23, x24, [sp, #32]
+  ldp x25, x26, [sp, #48]
+  ldp x27, x28, [sp, #64]
+  ldp x29, x30, [sp, #80]
+  ldp q8, q9, [sp, #96]
+  ldp q10, q11, [sp, #128]
+  ldp q12, q13, [sp, #160]
+  ldp q14, q15, [sp, #192]
+  add sp, sp, #256
+  mov w0, #0
+  ret
+
+.size dartplant_arm64_invoke_original, .-dartplant_arm64_invoke_original
 
 #endif

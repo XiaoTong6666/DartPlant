@@ -170,6 +170,11 @@ bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
             location.stack_offset < 0) {
             return false;
         }
+        // Dart AOT stack parameter locations are relative to the VM's Dart
+        // stack register (SPREG=x15 on ARM64), not the architectural SP used
+        // by the native bridge's own save frame. PRODUCT code confirms this
+        // directly with x15-relative loads and with framed callees that set
+        // FPREG from SPREG before reading fp-relative parameters.
         const uintptr_t base = invocation->context->x[invocation->call_layout->dart_sp_register];
         if (base == 0) return false;
         std::memcpy(out_value, reinterpret_cast<const void*>(base + location.stack_offset),
@@ -802,7 +807,12 @@ DartPlantStatus dartplant_invocation_call_original(DartPlantInvocation* invocati
         dartplant::SetLastError("original entry is unavailable");
         return DARTPLANT_HOOK_FAILED;
     }
-    dartplant_arm64_invoke_original(invocation->context, invocation->hook->backup);
+    if (dartplant_arm64_invoke_original(invocation->context, invocation->hook->backup) == 0) {
+        if (dartplant_last_error()[0] == '\0') {
+            dartplant::SetLastError("synchronous original invocation bridge failed");
+        }
+        return DARTPLANT_HOOK_FAILED;
+    }
     invocation->original_called = true;
     invocation->skip_original = false;
     invocation->call_original = true;

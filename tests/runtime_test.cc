@@ -49,6 +49,7 @@ int g_backend_b_unhook_calls = 0;
 DartPlantObjectHandle* g_object_argument_handle = nullptr;
 uint64_t g_leave_x1 = 0;
 uint64_t g_leave_v0 = 0;
+DartPlantStatus g_callback_status = DARTPLANT_OK;
 int g_late_shared_enter_calls = 0;
 int g_late_shared_leave_calls = 0;
 uint8_t g_late_shared_identity_ambiguous = 0;
@@ -158,7 +159,7 @@ void SkipWithResult(DartPlantInvocation* invocation, void*) {
 
 void CallOriginal(DartPlantInvocation* invocation, void*) {
     g_last_invocation = invocation;
-    dartplant_invocation_call_original(invocation);
+    g_callback_status = dartplant_invocation_call_original(invocation);
 }
 
 void RetainObjectAndSkip(DartPlantInvocation* invocation, void* user_data) {
@@ -418,6 +419,7 @@ TEST_CASE(SharedCodeCallbacksFailClosedAndExposeRequestedIdentity) {
         .signature = "",
         .entry_kind = DARTPLANT_ENTRY_DEFAULT,
     };
+    first_function->source = dartplant::DartFunctionSource::kSynthetic;
     first_function->code_target = target;
     auto second_function = std::make_shared<dartplant::DartFunctionHandle>();
     second_function->identity = {
@@ -427,6 +429,7 @@ TEST_CASE(SharedCodeCallbacksFailClosedAndExposeRequestedIdentity) {
         .signature = "",
         .entry_kind = DARTPLANT_ENTRY_DEFAULT,
     };
+    second_function->source = dartplant::DartFunctionSource::kSynthetic;
     second_function->code_target = target;
     target->AddAlias(first_function->identity);
     target->AddAlias(second_function->identity);
@@ -670,6 +673,35 @@ TEST_CASE(InvocationObjectBridgeUsesActiveVmScope) {
     dartplant_release_listener(listener);
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter, &isolate));
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
+TEST_CASE(DartCallbackHookRejectsVmAdapterWithoutGcSafeNativeTransition) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->id = reinterpret_cast<uintptr_t>(Replacement);
+    target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    auto function = std::make_shared<dartplant::DartFunctionHandle>();
+    function->source = dartplant::DartFunctionSource::kLiveVm;
+    function->code_target = std::move(target);
+    DartPlantMethod method{};
+    method.function = std::move(function);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        // The guard is checked before the adapter can be retained or called.
+        .vm_adapter = reinterpret_cast<DartPlantVmAdapter*>(uintptr_t{1}),
+    };
+    DartPlantHook* hook = nullptr;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant::InstallCallbackHook(&method, profile, options, 0, &hook, nullptr));
+    EXPECT_EQ(nullptr, hook);
 }
 
 TEST_CASE(RuntimeRequiresMatchingAotModules) {
@@ -1731,6 +1763,9 @@ TEST_CASE(VerifiedCallLayoutOverridesLegacyProfileWithTypedArm64Locations) {
     DartPlantArm64Context context{};
     context.x[1] = static_cast<uint64_t>(-7LL);
     context.x[15] = reinterpret_cast<uintptr_t>(entry_stack);
+    // Architectural SP is deliberately unrelated: verified Dart stack slots
+    // use SPREG=x15, matching the compiler's x15/fp-relative locations.
+    context.sp = 0x12345678;
     std::memcpy(context.v[0], &kDoubleBits, sizeof(kDoubleBits));
 
     DartPlantRuntimeProfile legacy_profile{};
@@ -1963,10 +1998,16 @@ TEST_CASE(InvocationDispatchRunsEnterLeaveAndOriginalPolicy) {
     EXPECT_EQ(77, static_cast<int>(skipped.context->x[0]));
 
     listener->record->options.on_enter = CallOriginal;
+    g_callback_status = DARTPLANT_OK;
     const auto explicit_original = dartplant_arm64_dispatch_enter(&context, &hook);
-    EXPECT_EQ(nullptr, explicit_original.original);
+    // Host builds have no ARM64 synchronous-original bridge. A failed explicit
+    // call must leave the invocation eligible for the normal automatic
+    // original path instead of falsely marking it as already executed.
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED, g_callback_status);
+    EXPECT_EQ(reinterpret_cast<void*>(Replacement), explicit_original.original);
     EXPECT_TRUE(g_last_invocation != nullptr);
-    EXPECT_TRUE(dartplant_invocation_is_original_skipped(g_last_invocation));
+    EXPECT_FALSE(dartplant_invocation_is_original_skipped(g_last_invocation));
+    (void) dartplant_arm64_dispatch_leave_from_tls(15, 0, 0);
     EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
     dartplant_release_listener(listener);
 }
@@ -2099,6 +2140,7 @@ TEST_CASE(LateSharedCodeWithoutOptInBypassesCallbacksAndVerifiedAbi) {
     DartPlantMethod method{};
     method.function = std::make_shared<dartplant::DartFunctionHandle>();
     method.function->identity = first_identity;
+    method.function->source = dartplant::DartFunctionSource::kSynthetic;
     method.function->code_target = target;
 
     DartPlantHook hook{};
@@ -2172,6 +2214,7 @@ TEST_CASE(LateSharedCodeWithOptInKeepsRawCallbackButDropsVerifiedAbi) {
     DartPlantMethod method{};
     method.function = std::make_shared<dartplant::DartFunctionHandle>();
     method.function->identity = first_identity;
+    method.function->source = dartplant::DartFunctionSource::kSynthetic;
     method.function->code_target = target;
 
     DartPlantHook hook{};

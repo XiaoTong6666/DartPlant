@@ -135,6 +135,7 @@ struct DartFunctionHandle {
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     DartFunctionSource source = DartFunctionSource::kLegacyMetadata;
+    uint32_t thread_jump_to_frame_entry_point_offset = 0;
     std::shared_ptr<DartCodeTarget> code_target;
 
     DartCodeTarget::Id CodeTargetId() const { return code_target == nullptr ? 0 : code_target->id; }

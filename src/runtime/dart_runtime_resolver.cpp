@@ -25,6 +25,16 @@ struct RuntimeRegistration {
 
 namespace {
 
+uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash) {
+    // Exact PRODUCT + ARM64 + compressed Thread layouts matching the live VM
+    // profiles supported by DartPlant. The exception bridge consumes this
+    // offset internally; it is intentionally not part of the public C ABI.
+    if (snapshot_hash == "d20a1be77c3d3c41b2a5accaee1ce549") return 0x268;
+    if (snapshot_hash == "80a49c7111088100a233b2ae788e1f48") return 0x270;
+    if (snapshot_hash == "ace654289f5abc240509fc941453ebc5") return 0x278;
+    return 0;
+}
+
 bool BuildIdMatches(const ModuleImage& module, const std::string& expected) {
     return expected.empty() || EqualsIgnoreCaseAscii(module.build_id, expected);
 }
@@ -240,6 +250,8 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     function->function_object = record->function_object;
     function->code_object = record->code_object;
     function->source = DartFunctionSource::kLiveVm;
+    function->thread_jump_to_frame_entry_point_offset =
+        ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
     function->code_target = code_target;
     code_target->AddAlias(function->identity);
 
@@ -312,6 +324,8 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
     function->source = DartFunctionSource::kOfflineSnapshotIndex;
+    function->thread_jump_to_frame_entry_point_offset =
+        ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
     function->code_target = code_target;
     code_target->AddAlias(function->identity);
 

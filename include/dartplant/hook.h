@@ -32,7 +32,10 @@ typedef struct DartPlantHookOptions {
     DartPlantInvocationCallback on_enter;
     DartPlantInvocationCallback on_leave;
     void* user_data;
-    // Advanced/optional VM object bridge. Normal consumers leave this null.
+    // Advanced/optional VM object bridge. Direct ARM64 Dart-entry callbacks
+    // currently reject a non-null adapter: VM API access needs a GC-safe
+    // Generated<->Native transition and VM-visible roots for register-only
+    // tagged arguments. Normal consumers leave this null.
     DartPlantVmAdapter* vm_adapter;
 } DartPlantHookOptions;
 

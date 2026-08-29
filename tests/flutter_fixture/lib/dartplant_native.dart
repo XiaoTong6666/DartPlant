@@ -10,6 +10,14 @@ typedef _SimpleFacadeStageNative = Uint64 Function();
 typedef _SimpleFacadeStageDart = int Function();
 typedef _EnableAdvancedOrdinaryHookNative = Int32 Function();
 typedef _EnableAdvancedOrdinaryHookDart = int Function();
+typedef _P6AbiInstallNative = Int32 Function();
+typedef _P6AbiInstallDart = int Function();
+typedef _P6AbiProbeNative = Uint64 Function();
+typedef _P6AbiProbeDart = int Function();
+typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
+typedef _ExceptionBridgeLifetimeInstallDart = int Function();
+typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
+typedef _ExceptionBridgeLifetimeProbeDart = int Function();
 typedef _ShutdownNative = Void Function();
 typedef _ShutdownDart = void Function();
 typedef _BeginObjectProbeNative = Void Function();
@@ -69,6 +77,28 @@ final class DartPlantNative {
       _library
           .lookup<NativeFunction<_EnableAdvancedOrdinaryHookNative>>(
             'dartplant_fixture_enable_advanced_ordinary_hook',
+          )
+          .asFunction();
+  static final _P6AbiInstallDart _p6AbiInstall = _library
+      .lookup<NativeFunction<_P6AbiInstallNative>>(
+        'dartplant_fixture_p6_abi_install',
+      )
+      .asFunction();
+  static final _P6AbiProbeDart _p6AbiProbe = _library
+      .lookup<NativeFunction<_P6AbiProbeNative>>(
+        'dartplant_fixture_p6_abi_probe',
+      )
+      .asFunction();
+  static final _ExceptionBridgeLifetimeInstallDart
+      _exceptionBridgeLifetimeInstall = _library
+          .lookup<NativeFunction<_ExceptionBridgeLifetimeInstallNative>>(
+            'dartplant_fixture_exception_bridge_lifetime_install',
+          )
+          .asFunction();
+  static final _ExceptionBridgeLifetimeProbeDart _exceptionBridgeLifetimeProbe =
+      _library
+          .lookup<NativeFunction<_ExceptionBridgeLifetimeProbeNative>>(
+            'dartplant_fixture_exception_bridge_lifetime_probe',
           )
           .asFunction();
   static final _ShutdownDart _shutdown = _library
@@ -182,6 +212,15 @@ final class DartPlantNative {
   static int simpleFacadeStage2() => _simpleFacadeStage2();
 
   static int enableAdvancedOrdinaryHook() => _enableAdvancedOrdinaryHook();
+
+  static int p6AbiInstall() => _p6AbiInstall();
+
+  static int p6AbiProbe() => _p6AbiProbe();
+
+  static int exceptionBridgeLifetimeInstall() =>
+      _exceptionBridgeLifetimeInstall();
+
+  static int exceptionBridgeLifetimeProbe() => _exceptionBridgeLifetimeProbe();
 
   static void resetNullSemanticProbe() => _resetNullSemanticProbe();
 

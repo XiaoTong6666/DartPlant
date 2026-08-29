@@ -70,6 +70,11 @@ struct HostApiBinding {
     DartPlantHostUnhookCallback unhook = nullptr;
 };
 
+struct Arm64ReturnPatch {
+    uintptr_t address = 0;
+    uint32_t original_instruction = 0;
+};
+
 struct HostApi {
     // Individual bindings are immutable/process-lifetime, while the current
     // default pointer may be replaced or cleared. Physical hooks retain the
@@ -154,8 +159,13 @@ DartPlantStatus AddCallbackListenerForMethod(
     uint64_t expected_runtime_generation = 0);
 bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners);
-void* CreateArm64CallbackStub(DartPlantHook* hook, size_t* out_size);
+void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out_size);
 void DestroyArm64CallbackStub(void* entry, size_t size);
+DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook);
+bool RestoreArm64ReturnInterception(DartPlantHook* hook);
+void RegisterArm64ExceptionBridgeConsumer(DartPlantHook* hook);
+void ReleaseArm64ExceptionBridgeConsumer(DartPlantHook* hook);
+bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context& context);
 DartPlantStatus RemoveHook(DartPlantHook* hook);
 bool IsTargetHooked(uintptr_t target);
 void ResetHooks();
@@ -227,6 +237,9 @@ struct DartPlantHook {
     uint64_t expected_runtime_generation = 0;
     void* replacement_entry = nullptr;
     size_t replacement_entry_size = 0;
+    void* replacement_return_entry = nullptr;
+    std::vector<dartplant::Arm64ReturnPatch> return_patches;
+    bool exception_bridge_consumer = false;
 };
 
 struct DartPlantListener {

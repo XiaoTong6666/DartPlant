@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <string>
@@ -23,6 +25,7 @@ int g_leave_calls = 0;
 int g_listener_calls = 0;
 bool g_null_semantic_callback_ok = false;
 bool g_raw_context_callback_ok = false;
+bool g_dart_pad_branch_ok = false;
 
 void OnEnter(DartPlantInvocation* invocation, void*) {
     ++g_enter_calls;
@@ -62,6 +65,94 @@ void SkipWithValidatedNull(DartPlantInvocation* invocation, void*) {
 
 void ObserveEnter(DartPlantInvocation*, void*) { ++g_listener_calls; }
 
+void VerifyDartPadBranch(DartPlantInvocation* invocation, void*) {
+    uint64_t spreg = 0;
+    uintptr_t csp = 0;
+#if defined(__aarch64__)
+    asm volatile("mov %0, sp" : "=r"(csp));
+#endif
+    uint64_t argument = 0;
+    g_dart_pad_branch_ok =
+        dartplant_invocation_get_gp_register(invocation, 15, &spreg) == DARTPLANT_OK &&
+        dartplant_invocation_get_gp_register(invocation, 0, &argument) == DARTPLANT_OK &&
+        (spreg & 0xfU) == 8 && (csp & 0xfU) == 0 && argument == 5;
+    if (dartplant_invocation_set_gp_register(invocation, 0, 77) != DARTPLANT_OK ||
+        dartplant_invocation_skip_original(invocation) != DARTPLANT_OK) {
+        g_dart_pad_branch_ok = false;
+    }
+}
+
+extern "C" uint64_t DartPlantDeviceInvokeDartCallbackWithOddSp(DartPlantHook* hook,
+                                                               uintptr_t dart_spreg,
+                                                               uint64_t argument);
+extern "C" int DartPlantFixtureAdd(int left, int right);
+
+int Fail(const char* message);
+
+int ExerciseDartPadBranch() {
+    constexpr size_t kFakeStackSize = 1U << 20;
+    void* mapping =
+        mmap(nullptr, kFakeStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return Fail("map deterministic Dart pad stack");
+
+    const uintptr_t end = reinterpret_cast<uintptr_t>(mapping) + kFakeStackSize;
+    const uintptr_t dart_spreg = ((end - (64U << 10)) & ~uintptr_t{0xf}) + 8;
+
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->id = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
+    target->entry = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
+    target->code_size = 4;
+    auto function = std::make_shared<dartplant::DartFunctionHandle>();
+    function->identity = {
+        .library_uri = "package:fixture/pad.dart",
+        .class_name = "Fixture",
+        .function_name = "padProbe",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    function->source = dartplant::DartFunctionSource::kSynthetic;
+    function->code_target = target;
+    target->AddAlias(function->identity);
+
+    DartPlantMethod method{};
+    method.record.function_name = "padProbe";
+    method.function = function;
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(method);
+    hook.backup = reinterpret_cast<void*>(DartPlantFixtureAdd);
+    dartplant_runtime_profile_init_arm64_aot(&hook.profile);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = VerifyDartPadBranch,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* listener = nullptr;
+    const DartPlantStatus add_status =
+        dartplant::AddCallbackListener(&hook, &method, options, 0, &listener);
+    g_dart_pad_branch_ok = false;
+    const uint64_t result = add_status == DARTPLANT_OK
+                                ? DartPlantDeviceInvokeDartCallbackWithOddSp(&hook, dart_spreg, 5)
+                                : 0;
+    const bool idle = listener != nullptr && dartplant_listener_is_idle(listener) != 0;
+    if (listener != nullptr) {
+        (void) dartplant_remove_listener(listener);
+        dartplant_release_listener(listener);
+    }
+    munmap(mapping, kFakeStackSize);
+    if (add_status != DARTPLANT_OK || result != 77 || !g_dart_pad_branch_ok || !idle) {
+        return Fail("deterministic Dart x15 alignment pad");
+    }
+    return 0;
+}
+
 void ObserveRawContext(DartPlantInvocation* invocation, void*) {
     uint64_t x0 = 0;
     DartPlantValue typed{};
@@ -70,8 +161,6 @@ void ObserveRawContext(DartPlantInvocation* invocation, void*) {
         dartplant_invocation_get_gp_register(invocation, 0, &x0) == DARTPLANT_OK && x0 == 2 &&
         dartplant_invocation_get_argument(invocation, 0, &typed) == DARTPLANT_UNSUPPORTED_ABI;
 }
-
-extern "C" int DartPlantFixtureAdd(int left, int right);
 
 __attribute__((noinline)) int HookedAdd(int left, int right) {
     return g_original_add(left, right) + 100;
@@ -120,6 +209,7 @@ int main() {
     if (dartplant_install_host_api(dartplant_dobby_host_api()) != DARTPLANT_OK) {
         return Fail("generic host API install");
     }
+    if (ExerciseDartPadBranch() != 0) return 1;
     dartplant::RefreshModules();
 
     Dl_info info{};
@@ -289,6 +379,7 @@ int main() {
         return Fail("non-executable address rejection");
     }
 
+    std::printf("[PASS] ARM64 deterministic Dart x15 alignment pad\n");
     std::printf("[PASS] ARM64 Dobby hook/original/unhook\n");
     std::printf("[PASS] ARM64 callback enter/leave/result mutation\n");
     std::printf("[PASS] ARM64 raw callback without ABI mapping\n");

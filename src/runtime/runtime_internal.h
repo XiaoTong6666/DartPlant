@@ -93,6 +93,11 @@ typedef struct DartPlantArm64LeaveResult {
     uint64_t result;
 } DartPlantArm64LeaveResult;
 
+typedef struct DartPlantArm64ReturnDispatchResult {
+    DartPlantArm64Context* context;
+    uintptr_t resume_native_sp;
+} DartPlantArm64ReturnDispatchResult;
+
 struct DartPlantRuntime {
     mutable std::recursive_mutex mutex;
     dartplant::RuntimeProfileStorage profile;
@@ -166,7 +171,15 @@ struct DartPlantInvocation {
 extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     DartPlantArm64Context* context, DartPlantHook* hook);
 
-extern "C" uint64_t dartplant_arm64_invoke_original(DartPlantArm64Context* context, void* original);
+extern "C" uint8_t dartplant_arm64_invoke_original(DartPlantArm64Context* context, void* original);
+
+extern "C" uint8_t dartplant_arm64_prepare_invoke_original_frame(uintptr_t native_frame_sp);
+
+extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_hook(
+    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits);
+
+extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
+                                                          uintptr_t target_fp);
 
 extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(
     uint64_t result0, uint64_t result1, uint64_t fp_result_bits);

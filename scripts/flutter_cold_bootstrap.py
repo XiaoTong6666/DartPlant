@@ -18,6 +18,30 @@ APK_PATH = FIXTURE_DIR / "build" / "app" / "outputs" / "flutter-apk" / "app-rele
 GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
 SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
+P6_SIDECARS = (
+    ("verifiedAbiInt64", "DartPlantP6Int64", GENERATED_DIR / "p6_int64_sidecar.h"),
+    (
+        "verifiedAbiEntryStack",
+        "DartPlantP6EntryStack",
+        GENERATED_DIR / "p6_entry_stack_sidecar.h",
+    ),
+    (
+        "verifiedAbiOddStack",
+        "DartPlantP6OddStack",
+        GENERATED_DIR / "p6_odd_stack_sidecar.h",
+    ),
+    (
+        "verifiedAbiThrowingStack",
+        "DartPlantP6ThrowingStack",
+        GENERATED_DIR / "p6_throwing_stack_sidecar.h",
+    ),
+    (
+        "verifiedAbiForcedStack",
+        "DartPlantP6ForcedStack",
+        GENERATED_DIR / "p6_forced_stack_sidecar.h",
+    ),
+    ("verifiedAbiPair", "DartPlantP6Pair", GENERATED_DIR / "p6_pair_sidecar.h"),
+)
 PACKAGE = "dev.dartplant.dartplant_fixture"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 
@@ -70,6 +94,11 @@ def _build_fixture(flutter: str) -> None:
         "#pragma once\n"
         "#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 0\n"
     )
+    for _, _, header in P6_SIDECARS:
+        header.write_text(
+            "// Generated placeholder; replaced after the first AOT build.\n"
+            "#pragma once\n"
+        )
     run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=os.environ.copy())
     build_command = [
         flutter,
@@ -136,6 +165,33 @@ def _build_fixture(flutter: str) -> None:
         cwd=ROOT_DIR,
         env=os.environ.copy(),
     )
+    for function_name, symbol_prefix, output_header in P6_SIDECARS:
+        run(
+            [
+                sys.executable,
+                str(ROOT_DIR / "tools" / "compiler-oracle" / "build_snapshot_sidecar.py"),
+                "--gen-snapshot",
+                str(gen_snapshot),
+                "--dill",
+                str(dill),
+                "--libapp",
+                str(libapp),
+                "--library-uri",
+                "package:dartplant_fixture/main.dart",
+                "--class-name",
+                "Global",
+                "--function-name",
+                function_name,
+                "--abi-oracle-json",
+                str(ABI_ORACLE_JSON),
+                "--symbol-prefix",
+                symbol_prefix,
+                "--output-header",
+                str(output_header),
+            ],
+            cwd=ROOT_DIR,
+            env=os.environ.copy(),
+        )
     run(
         [
             sys.executable,
@@ -215,6 +271,7 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             and "DartPlant FunctionType named semantic probe:" in latest
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
+            and "DartPlant P6 ABI corpus:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
             and "DartPlant late shared typed fail-close:" in latest
         ):
@@ -269,6 +326,37 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     if "simple facade typed stage2 enter=2 leave=2 observer=1 failures=0" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: final logical HookHandle removal failed\n{logs}"
+        )
+    if "P6 ABI install ready=1 status=0" not in logs:
+        raise RuntimeError(f"cold start {round_index}: P6 artifact hook install failed\n{logs}")
+    if (
+        "P6 ABI probe int64=1 entry_stack=1 odd_stack=1 throw=1 forced_stack=1 pair=1 failures=0 "
+        "cleanup=1 shutdown=1 passed=1"
+        not in logs
+    ):
+        raise RuntimeError(f"cold start {round_index}: P6 native ABI probe failed\n{logs}")
+    if "DartPlant P6 throw path: 2 normal=108.0/125.0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: Dart exception unwind/catch probe failed\n{logs}"
+        )
+    if (
+        "DartPlant P6 ABI corpus: 1 install=0 probe=1 "
+        "int64=1000000000000000007/3000000010000000113 "
+        "stack=108.0/1146.0 odd=91.0/217.0 forced=34/65 pair=21,22/32,31"
+        not in logs
+    ):
+        raise RuntimeError(f"cold start {round_index}: P6 Dart result corpus failed\n{logs}")
+    if (
+        "exception bridge lifetime probe enter=1 leave=0 unhook=1 idle=1 inactive=1 "
+        "failures=0 shutdown=1 passed=1"
+        not in logs
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: exception bridge self-unhook lifetime failed\n{logs}"
+        )
+    if "DartPlant exception bridge lifetime: 1 install=0 catch=2 probe=1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: Dart exception bridge lifetime result failed\n{logs}"
         )
     if "DartPlant advanced ordinary hook enable: 0" not in logs:
         raise RuntimeError(

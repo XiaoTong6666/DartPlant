@@ -13,6 +13,9 @@ constexpr uint32_t kMaxInvocationDepth = 64;
 struct DispatchFrame {
     DartPlantArm64Context context{};
     DartPlantInvocation invocation{};
+    uintptr_t entry_spreg = 0;
+    uintptr_t entry_caller_fp = 0;
+    uintptr_t invoke_original_native_frame = 0;
 };
 
 thread_local std::array<DispatchFrame, kMaxInvocationDepth> g_frames;
@@ -74,6 +77,19 @@ void ReleaseSnapshot(DartPlantInvocation* invocation) {
     dartplant::InvocationExited(invocation->hook);
 }
 
+void AbandonFrame(DispatchFrame* frame) {
+    if (frame == nullptr) return;
+    if (frame->invocation.vm_scope_entered) {
+        dartplant_vm_leave_scope(frame->invocation.vm_adapter);
+        frame->invocation.vm_scope_entered = false;
+    }
+    frame->invoke_original_native_frame = 0;
+    ReleaseSnapshot(&frame->invocation);
+    frame->invocation = {};
+    frame->entry_spreg = 0;
+    frame->entry_caller_fp = 0;
+}
+
 uint64_t ReadV0Bits(const DartPlantArm64Context& context) {
     uint64_t bits = 0;
     static_assert(sizeof(bits) <= sizeof(context.v[0]));
@@ -81,12 +97,18 @@ uint64_t ReadV0Bits(const DartPlantArm64Context& context) {
     return bits;
 }
 
-void FinishFrame(DispatchFrame* frame, uint64_t result0, uint64_t result1,
-                 uint64_t fp_result_bits) {
-    if (frame == nullptr) return;
+void CaptureReturnChannels(DispatchFrame* frame, uint64_t result0, uint64_t result1,
+                           uint64_t fp_result_bits) {
+    if (frame == nullptr || frame->invocation.context == nullptr) return;
     frame->invocation.context->x[0] = result0;
     frame->invocation.context->x[1] = result1;
     std::memcpy(frame->invocation.context->v[0], &fp_result_bits, sizeof(fp_result_bits));
+}
+
+void FinishFrame(DispatchFrame* frame, uint64_t result0, uint64_t result1,
+                 uint64_t fp_result_bits) {
+    if (frame == nullptr) return;
+    CaptureReturnChannels(frame, result0, result1, fp_result_bits);
     frame->invocation.phase = DARTPLANT_INVOCATION_LEAVE;
 
     // Pine-style pairing: callbacks that entered are left in reverse order,
@@ -112,6 +134,17 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         dartplant::SetLastError("invalid callback dispatch state");
         return result;
     }
+    const bool real_dart =
+        hook->method_storage != nullptr && hook->method_storage->function != nullptr &&
+        hook->method_storage->function->source != dartplant::DartFunctionSource::kSynthetic;
+    if (real_dart && !dartplant::EnsureArm64ExceptionBridge(hook, *context)) {
+        // The physical entry/RET patches remain safe passthrough instrumentation,
+        // but callbacks must not start unless Dart non-local unwinds can retire
+        // their pending invocation state.
+        result.context = context;
+        result.original = hook->backup;
+        return result;
+    }
     if (g_depth >= kMaxInvocationDepth) {
         dartplant::SetLastError("DartPlant invocation depth limit exceeded");
         result.context = context;
@@ -122,6 +155,9 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     DispatchFrame& frame = g_frames[g_depth++];
     frame.context = *context;
     frame.invocation = {};
+    frame.entry_spreg = static_cast<uintptr_t>(context->x[15]);
+    frame.entry_caller_fp = static_cast<uintptr_t>(context->x[29]);
+    frame.invoke_original_native_frame = 0;
     frame.invocation.hook = hook;
     frame.invocation.requested_method = hook->method_storage.get();
     frame.invocation.code_target = hook->code_target;
@@ -157,12 +193,17 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
             dartplant_vm_leave_scope(frame.invocation.vm_adapter);
             frame.invocation.vm_scope_entered = false;
         }
-        // The trampoline will still execute the original through the common
-        // continuation path. Keep a passthrough frame for that leave and make
-        // sure it cannot decrement a hook invocation that was never pinned.
-        frame.invocation.hook = nullptr;
         result.context = &frame.context;
         result.original = hook->backup;
+        if (real_dart) {
+            // Real Dart returns are intercepted at RET sites. If no invocation
+            // pin was acquired (for example during unhook), do not leave a TLS
+            // frame behind for the passthrough return veneer.
+            --g_depth;
+        } else {
+            // Synthetic native fixtures still use their LR continuation.
+            frame.invocation.hook = nullptr;
+        }
         return result;
     }
 
@@ -203,6 +244,60 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     result.context = &frame.context;
     result.original = hook->backup;
     return result;
+}
+
+extern "C" uint8_t dartplant_arm64_prepare_invoke_original_frame(uintptr_t native_frame_sp) {
+    DispatchFrame* frame = CurrentFrame();
+    if (frame == nullptr || frame->invocation.context == nullptr || native_frame_sp == 0 ||
+        frame->invoke_original_native_frame != 0) {
+        dartplant::SetLastError("invoke-original native frame has no active Dart invocation");
+        return 0;
+    }
+    frame->invoke_original_native_frame = native_frame_sp;
+    return 1;
+}
+
+extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_hook(
+    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits) {
+    DartPlantArm64ReturnDispatchResult output{};
+    DispatchFrame* frame = CurrentFrame();
+    if (frame == nullptr || frame->invocation.context == nullptr ||
+        frame->invocation.hook != hook) {
+        return output;
+    }
+
+    CaptureReturnChannels(frame, result0, result1, fp_result_bits);
+    output.context = frame->invocation.context;
+    if (frame->invoke_original_native_frame != 0) {
+        output.resume_native_sp = frame->invoke_original_native_frame;
+        frame->invoke_original_native_frame = 0;
+        return output;
+    }
+
+    FinishFrame(frame, result0, result1, fp_result_bits);
+    output.context = frame->invocation.context;
+    --g_depth;
+    return output;
+}
+
+extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
+                                                          uintptr_t target_fp) {
+    if (target_spreg == 0 && target_fp == 0) return;
+    while (g_depth != 0) {
+        DispatchFrame& frame = g_frames[g_depth - 1];
+        // Dart stacks grow downward. A handler in the hooked Function keeps a
+        // frame below its caller FP/SPREG, while unwinding out of that Function
+        // reaches its caller frame (or above). Prefer FP because it is stable
+        // across outgoing-argument layout changes; keep SPREG as the fallback
+        // for frameless/top-level cases.
+        const bool unwound_by_fp =
+            frame.entry_caller_fp != 0 && target_fp != 0 && target_fp >= frame.entry_caller_fp;
+        const bool unwound_by_sp =
+            frame.entry_spreg != 0 && target_spreg != 0 && target_spreg > frame.entry_spreg;
+        if (!unwound_by_fp && !unwound_by_sp) break;
+        AbandonFrame(&frame);
+        --g_depth;
+    }
 }
 
 extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(

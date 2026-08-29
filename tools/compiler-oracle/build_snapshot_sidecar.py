@@ -280,11 +280,6 @@ def _extract_abi(log: str, function_name: str) -> AbiEvidence:
     if ordered_indexes != list(range(len(ordered_indexes))):
         raise ValueError(f"non-contiguous formal parameter indexes: {ordered_indexes}")
     representations = tuple(parameters[index][0] for index in ordered_indexes)
-    if "unknown" in representations or result == "unknown":
-        raise ValueError(
-            f"compiler CFG did not prove a complete ABI for {function_name!r}: "
-            f"parameters={representations} result={result}"
-        )
     locations = [parameters[index][1] for index in ordered_indexes]
     must_use_stack = bool(locations) and all(location.startswith("fp[") for location in locations)
     max_in_registers = 0 if must_use_stack else len(representations)
@@ -296,7 +291,75 @@ def _extract_abi(log: str, function_name: str) -> AbiEvidence:
     )
 
 
-def _find_unique_executable_va(data: bytes, identity: ElfIdentity, code: bytes) -> int:
+def _validate_cfg_cross_check(oracle: AbiEvidence, cfg: AbiEvidence) -> None:
+    """Reject CFG facts that contradict compiler metadata.
+
+    vm.unboxing-info.metadata is the exact compiler-side ABI source of truth.
+    The optimized CFG printer is only an independent cross-check and is not
+    guaranteed to print a machine representation for every boxed/record return.
+    Unknown CFG slots therefore carry no proof; any slot it *does* prove must
+    agree exactly with the metadata oracle.
+    """
+    if len(cfg.parameters) != len(oracle.parameters):
+        raise ValueError(
+            "compiler ABI oracle disagrees with optimized CFG parameter count: "
+            f"oracle={len(oracle.parameters)} cfg={len(cfg.parameters)}"
+        )
+    for index, (oracle_rep, cfg_rep) in enumerate(zip(oracle.parameters, cfg.parameters)):
+        if cfg_rep != "unknown" and cfg_rep != oracle_rep:
+            raise ValueError(
+                "compiler ABI oracle disagrees with optimized CFG parameter "
+                f"{index}: oracle={oracle_rep} cfg={cfg_rep}"
+            )
+    if cfg.result != "unknown" and cfg.result != oracle.result:
+        raise ValueError(
+            "compiler ABI oracle disagrees with optimized CFG result: "
+            f"oracle={oracle.result} cfg={cfg.result}"
+        )
+    if cfg.must_use_stack_calling_convention != oracle.must_use_stack_calling_convention:
+        raise ValueError(
+            "compiler ABI oracle disagrees with optimized CFG calling convention: "
+            f"oracle_stack={oracle.must_use_stack_calling_convention} "
+            f"cfg_stack={cfg.must_use_stack_calling_convention}"
+        )
+    if cfg.max_parameters_in_registers != oracle.max_parameters_in_registers:
+        raise ValueError(
+            "compiler ABI oracle disagrees with optimized CFG register parameter limit: "
+            f"oracle={oracle.max_parameters_in_registers} "
+            f"cfg={cfg.max_parameters_in_registers}"
+        )
+
+
+def _normalize_aarch64_direct_branches(code: bytes) -> bytes:
+    if len(code) % 4 != 0:
+        raise ValueError("AArch64 compiler code size is not instruction aligned")
+    normalized = bytearray(code)
+    for offset in range(0, len(code), 4):
+        word = struct.unpack_from("<I", code, offset)[0]
+        opcode = word & 0xFC000000
+        # AArch64 B/BL encode a signed imm26 PC-relative displacement. The
+        # displacement to an out-of-line VM stub can legitimately change when
+        # gen_snapshot is re-run with diagnostic flags even though the target
+        # Function body and calling convention are identical. A branch whose
+        # decoded target remains inside this Function is real intra-Function
+        # control flow and must stay part of the machine-code identity. Mask
+        # only branches whose target is outside [0, len(code)); those are the
+        # relocation-like calls/jumps this fallback is intended to tolerate.
+        # The emitted runtime fingerprint is still taken from the exact bytes
+        # in the target Flutter libapp.so.
+        if opcode in (0x14000000, 0x94000000):
+            imm26 = word & 0x03FFFFFF
+            if imm26 & 0x02000000:
+                imm26 -= 1 << 26
+            target_offset = offset + (imm26 << 2)
+            if target_offset < 0 or target_offset >= len(code):
+                struct.pack_into("<I", normalized, offset, opcode)
+    return bytes(normalized)
+
+
+def _find_unique_executable_code(
+    data: bytes, identity: ElfIdentity, code: bytes
+) -> tuple[int, bytes, str]:
     matches: list[int] = []
     for segment in identity.load_segments:
         if segment.flags & 0x1 == 0:  # PF_X
@@ -310,12 +373,40 @@ def _find_unique_executable_va(data: bytes, identity: ElfIdentity, code: bytes) 
                 break
             matches.append(segment.virtual_address + (found - segment.file_offset))
             cursor = found + 1
-    if len(matches) != 1:
+    if len(matches) == 1:
+        entry_va = matches[0]
+        for segment in identity.load_segments:
+            if segment.virtual_address <= entry_va < segment.virtual_address + segment.file_size:
+                file_offset = segment.file_offset + (entry_va - segment.virtual_address)
+                return entry_va, data[file_offset : file_offset + len(code)], "exact"
+        raise ValueError("exact executable code match could not be mapped back to file bytes")
+    if len(matches) > 1:
         raise ValueError(
             f"expected one executable match for compiler code bytes, found "
             f"{[hex(value) for value in matches]}"
         )
-    return matches[0]
+
+    normalized_code = _normalize_aarch64_direct_branches(code)
+    normalized_matches: list[tuple[int, bytes]] = []
+    for segment in identity.load_segments:
+        if segment.flags & 0x1 == 0:  # PF_X
+            continue
+        start = segment.file_offset
+        end = min(len(data), start + segment.file_size)
+        limit = end - len(code)
+        for file_offset in range(start, limit + 1, 4):
+            candidate = data[file_offset : file_offset + len(code)]
+            if _normalize_aarch64_direct_branches(candidate) != normalized_code:
+                continue
+            entry_va = segment.virtual_address + (file_offset - segment.file_offset)
+            normalized_matches.append((entry_va, candidate))
+    if len(normalized_matches) != 1:
+        raise ValueError(
+            "expected one executable match after masking only AArch64 B/BL imm26 fields, found "
+            f"{[hex(value) for value, _ in normalized_matches]}"
+        )
+    entry_va, actual_code = normalized_matches[0]
+    return entry_va, actual_code, "branch-relocation-normalized"
 
 
 def _fnv1a64(data: bytes) -> str:
@@ -444,16 +535,32 @@ def _run_gen_snapshot(
         )
 
 
-def _write_header(path: Path, record: dict[str, object]) -> None:
+def _write_header(
+    path: Path, record: dict[str, object], symbol_prefix: str = "DartPlantOrdinaryAot"
+) -> None:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol_prefix) is None:
+        raise ValueError(f"invalid generated C++ symbol prefix: {symbol_prefix!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
+    functions_symbol = f"k{symbol_prefix}Functions"
+    snapshot_symbol = f"k{symbol_prefix}SnapshotIndex"
+    parameters_symbol = f"k{symbol_prefix}Parameters"
+    evidence_symbol = f"k{symbol_prefix}AbiEvidence"
+    bundle_symbol = f"k{symbol_prefix}ArtifactBundle"
+    registrar_symbol = f"{symbol_prefix}ArtifactRegistrar"
+    registrar_instance = f"k{symbol_prefix}ArtifactRegistrar"
+    compatibility_macro = (
+        "#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 1\n"
+        if symbol_prefix == "DartPlantOrdinaryAot"
+        else ""
+    )
     text = f"""// Generated by tools/compiler-oracle/build_snapshot_sidecar.py.
 #pragma once
 
 #include \"dartplant/advanced/artifact.h\"
 
-#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 1
+{compatibility_macro}
 
-inline constexpr DartPlantSnapshotFunctionInfo kDartPlantOrdinaryAotFunctions[] = {{{{
+inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
     .struct_size = sizeof(DartPlantSnapshotFunctionInfo),
     .library_uri = {json.dumps(record['library_uri'])},
     .class_name = {json.dumps(record['class_name'])},
@@ -468,27 +575,27 @@ inline constexpr DartPlantSnapshotFunctionInfo kDartPlantOrdinaryAotFunctions[] 
     .physical_entry_alias_count = {record['physical_entry_alias_count']},
 }}}};
 
-inline constexpr DartPlantSnapshotIndexInfo kDartPlantOrdinaryAotSnapshotIndex = {{
+inline constexpr DartPlantSnapshotIndexInfo {snapshot_symbol} = {{
     .struct_size = sizeof(DartPlantSnapshotIndexInfo),
     .module_name = \"libapp.so\",
     .module_build_id = {json.dumps(record['build_id'])},
     .snapshot_hash = {json.dumps(record['snapshot_hash'])},
     .dart_version = \"compiler-oracle\",
     .profile_version = \"compiler-oracle-v1\",
-    .functions = kDartPlantOrdinaryAotFunctions,
+    .functions = {functions_symbol},
     .function_count = 1,
 }};
 
-inline constexpr DartPlantAbiRepresentation kDartPlantOrdinaryAotParameters[] = {{
+inline constexpr DartPlantAbiRepresentation {parameters_symbol}[] = {{
 {chr(10).join(f'    DARTPLANT_ABI_REPRESENTATION_{str(value).upper().replace("-", "_")},' for value in record['abi_parameters'])}
 }};
 
-inline constexpr DartPlantCompilerAbiEvidence kDartPlantOrdinaryAotAbiEvidence = {{
+inline constexpr DartPlantCompilerAbiEvidence {evidence_symbol} = {{
     .struct_size = sizeof(DartPlantCompilerAbiEvidence),
     .snapshot_hash = {json.dumps(record['snapshot_hash'])},
     .app_build_id = {json.dumps(record['build_id'])},
     .code_fingerprint = {json.dumps(record['fingerprint'])},
-    .parameter_representations = kDartPlantOrdinaryAotParameters,
+    .parameter_representations = {parameters_symbol},
     .parameter_count = {len(record['abi_parameters'])},
     .result_representation = DARTPLANT_ABI_REPRESENTATION_{str(record['abi_result']).upper().replace('-', '_')},
     .max_parameters_in_registers = {record['max_parameters_in_registers']},
@@ -504,22 +611,22 @@ inline constexpr DartPlantCompilerAbiEvidence kDartPlantOrdinaryAotAbiEvidence =
     .code_size = {record['code_size']}ULL,
 }};
 
-inline constexpr DartPlantArtifactBundle kDartPlantOrdinaryAotArtifactBundle = {{
+inline constexpr DartPlantArtifactBundle {bundle_symbol} = {{
     .struct_size = sizeof(DartPlantArtifactBundle),
     .version = DARTPLANT_ARTIFACT_BUNDLE_VERSION,
-    .snapshot_index = &kDartPlantOrdinaryAotSnapshotIndex,
-    .compiler_abi_evidence = &kDartPlantOrdinaryAotAbiEvidence,
+    .snapshot_index = &{snapshot_symbol},
+    .compiler_abi_evidence = &{evidence_symbol},
     .compiler_abi_evidence_count = 1,
 }};
 
 #if defined(__cplusplus)
 namespace dartplant_generated {{
-struct OrdinaryAotArtifactRegistrar {{
-    OrdinaryAotArtifactRegistrar() {{
-        (void)dartplant_register_embedded_artifact_bundle(&kDartPlantOrdinaryAotArtifactBundle);
+struct {registrar_symbol} {{
+    {registrar_symbol}() {{
+        (void)dartplant_register_embedded_artifact_bundle(&{bundle_symbol});
     }}
 }};
-inline const OrdinaryAotArtifactRegistrar kOrdinaryAotArtifactRegistrar{{}};
+inline const {registrar_symbol} {registrar_instance}{{}};
 }}  // namespace dartplant_generated
 #endif
 """
@@ -539,6 +646,11 @@ def main() -> int:
     parser.add_argument("--abi-oracle-json", type=Path, required=True)
     parser.add_argument("--output-header", type=Path, required=True)
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--symbol-prefix",
+        default="DartPlantOrdinaryAot",
+        help="unique C++ symbol prefix when multiple generated sidecars share one binary",
+    )
     args = parser.parse_args()
 
     libapp = args.libapp.read_bytes()
@@ -561,20 +673,15 @@ def main() -> int:
     # cross-check. Runtime ABI evidence is emitted from vm.unboxing-info.metadata
     # above; changing printer text cannot silently become compiler truth.
     cfg_abi = _extract_abi(log, args.function_name)
-    if cfg_abi.parameters != abi.parameters or cfg_abi.result != abi.result:
-        raise ValueError(
-            "compiler ABI oracle disagrees with optimized CFG cross-check: "
-            f"oracle={abi.parameters}->{abi.result} "
-            f"cfg={cfg_abi.parameters}->{cfg_abi.result}"
-        )
-    entry_va = _find_unique_executable_va(libapp, identity, code)
+    _validate_cfg_cross_check(abi, cfg_abi)
+    entry_va, actual_code, location_mode = _find_unique_executable_code(libapp, identity, code)
     record: dict[str, object] = {
         "library_uri": args.library_uri,
         "class_name": args.class_name,
         "function_name": args.function_name,
         "entry_va": entry_va,
-        "code_size": len(code),
-        "fingerprint": _fnv1a64(code),
+        "code_size": len(actual_code),
+        "fingerprint": _fnv1a64(actual_code),
         "build_id": identity.build_id,
         "snapshot_hash": identity.snapshot_hash,
         "code_identity_proof": code_identity.proof,
@@ -588,13 +695,14 @@ def main() -> int:
             abi.has_overrides_with_less_direct_parameters
         ),
     }
-    _write_header(args.output_header, record)
+    _write_header(args.output_header, record, args.symbol_prefix)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(record, indent=2) + "\n")
     print(
         f"compiler sidecar: {args.library_uri}/{args.class_name}/{args.function_name} "
-        f"entry_va=0x{entry_va:x} size={len(code)} fingerprint={record['fingerprint']} "
+        f"entry_va=0x{entry_va:x} size={len(actual_code)} fingerprint={record['fingerprint']} "
+        f"locator={location_mode} "
         f"identity={code_identity.proof}/{code_identity.physical_entry_alias_count} "
         f"abi={abi.parameters}->{abi.result}"
     )

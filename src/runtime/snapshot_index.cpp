@@ -4,44 +4,107 @@
 #include <cstddef>
 
 #include "core/internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 namespace {
 
 struct LiveSnapshotBuildState {
     SnapshotIndex* index = nullptr;
+    uint32_t profile_version = 0;
+    bool failed = false;
 };
+
+uint64_t RuntimeEntryForKind(const DartPlantLiveVmFunctionInfo& function, DartPlantEntryKind kind) {
+    switch (kind) {
+    case DARTPLANT_ENTRY_DEFAULT:
+        return function.code_entry_point;
+    case DARTPLANT_ENTRY_UNCHECKED:
+        return function.code_unchecked_entry_point;
+    case DARTPLANT_ENTRY_MONOMORPHIC:
+        return function.code_monomorphic_entry_point;
+    case DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED:
+        return function.code_monomorphic_unchecked_entry_point;
+    }
+    return 0;
+}
+
+uint64_t EntryVaForKind(const DartPlantLiveVmFunctionInfo& function, DartPlantEntryKind kind) {
+    switch (kind) {
+    case DARTPLANT_ENTRY_DEFAULT:
+        return function.entry_va;
+    case DARTPLANT_ENTRY_UNCHECKED:
+        return function.unchecked_entry_va;
+    case DARTPLANT_ENTRY_MONOMORPHIC:
+        return function.monomorphic_entry_va;
+    case DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED:
+        return function.monomorphic_unchecked_entry_va;
+    }
+    return 0;
+}
 
 uint8_t AppendLiveSnapshotFunction(const DartPlantLiveVmFunctionInfo* function, void* user_data) {
     auto* state = static_cast<LiveSnapshotBuildState*>(user_data);
     if (function == nullptr || state == nullptr || state->index == nullptr) return 0;
-    state->index->functions.push_back({
-        .library_uri = function->library_uri,
-        .class_name = function->class_name,
-        .function_name = function->function_name,
-        .signature = "",
-        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
-        .entry_va = function->entry_va,
-        .code_size = function->code_size,
-        .code_section_va = function->code_section_va,
-        .fingerprint = "",
-        .function_object = function->function,
-        .code_object = function->code,
-        .code_object_pool = function->code_object_pool,
-        .runtime_entry = static_cast<uintptr_t>(function->function_entry_point),
-        .code_entry = static_cast<uintptr_t>(function->code_entry_point),
-        .owner_class = function->owner_class,
-        .library = function->library,
-        .entry_alias_count = function->entry_alias_count,
-        .function_kind = function->function_kind,
-        .owner_is_toplevel_class = function->owner_is_toplevel_class != 0,
-        .code_owner_matches_function = function->code_owner_matches_function != 0,
-        .live = true,
-    });
+    if (!AppendLiveSnapshotFunctionRecord(*function, state->profile_version, state->index)) {
+        state->failed = true;
+        return 0;
+    }
     return 1;
 }
 
 }  // namespace
+
+bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& function,
+                                      uint32_t profile_version, SnapshotIndex* index) {
+    if (index == nullptr || function.entry_kind_mask == 0 || function.code_size == 0) return false;
+    AotCodePayloadRange payload_range{};
+    if (!ComputeAotCodePayloadRange(profile_version, function.code_entry_point,
+                                    function.code_monomorphic_entry_point, function.code_size,
+                                    &payload_range)) {
+        return false;
+    }
+    for (uint32_t raw_kind = 0; raw_kind < 4; ++raw_kind) {
+        if ((function.entry_kind_mask & (1u << raw_kind)) == 0) continue;
+        const auto kind = static_cast<DartPlantEntryKind>(raw_kind);
+        const uint64_t runtime_entry = RuntimeEntryForKind(function, kind);
+        if (runtime_entry == 0 || EntryVaForKind(function, kind) == 0) return false;
+        if (runtime_entry < payload_range.start || runtime_entry >= payload_range.end) return false;
+    }
+    for (uint32_t raw_kind = 0; raw_kind < 4; ++raw_kind) {
+        if ((function.entry_kind_mask & (1u << raw_kind)) == 0) continue;
+        const auto kind = static_cast<DartPlantEntryKind>(raw_kind);
+        const uint64_t runtime_entry = RuntimeEntryForKind(function, kind);
+        const uint64_t entry_va = EntryVaForKind(function, kind);
+        index->functions.push_back({
+            .library_uri = function.library_uri,
+            .class_name = function.class_name,
+            .function_name = function.function_name,
+            .signature = "",
+            .entry_kind = kind,
+            .entry_va = entry_va,
+            .code_size = payload_range.end - runtime_entry,
+            .code_section_va = function.code_section_va,
+            .fingerprint = "",
+            .function_object = function.function,
+            .code_object = function.code,
+            .code_object_pool = function.code_object_pool,
+            .code_payload_start = payload_range.start,
+            .code_instructions_length = function.code_size,
+            .runtime_entry = static_cast<uintptr_t>(runtime_entry),
+            .code_entry = static_cast<uintptr_t>(runtime_entry),
+            .owner_class = function.owner_class,
+            .library = function.library,
+            .entry_alias_count = function.entry_alias_counts[raw_kind],
+            .function_kind = function.function_kind,
+            .closure_call_entry_only = function.closure_call_entry_only != 0,
+            .owner_is_toplevel_class = function.owner_is_toplevel_class != 0,
+            .code_owner_matches_function = function.code_owner_matches_function != 0,
+            .live = true,
+        });
+    }
+    return true;
+}
 
 const SnapshotFunction* SnapshotIndex::FindSnapshotFunction(
     std::string_view library_uri, std::string_view class_name, std::string_view function_name,
@@ -108,6 +171,8 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
         const DartPlantSnapshotFunctionInfo& function = source.functions[position];
         constexpr size_t kSnapshotFunctionV1Size =
             offsetof(DartPlantSnapshotFunctionInfo, code_identity_proof);
+        constexpr size_t kSnapshotFunctionV2Size =
+            offsetof(DartPlantSnapshotFunctionInfo, function_kind);
         if (function.struct_size < kSnapshotFunctionV1Size || function.library_uri == nullptr ||
             function.function_name == nullptr || function.entry_va == 0 ||
             function.code_size == 0 || function.code_section_va > function.entry_va) {
@@ -116,9 +181,15 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
         }
         DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
         uint32_t physical_entry_alias_count = 0;
-        if (function.struct_size >= sizeof(function)) {
+        if (function.struct_size >= kSnapshotFunctionV2Size) {
             identity_proof = function.code_identity_proof;
             physical_entry_alias_count = function.physical_entry_alias_count;
+        }
+        uint32_t function_kind = 0;
+        bool closure_call_entry_only = false;
+        if (function.struct_size >= sizeof(function)) {
+            function_kind = function.function_kind;
+            closure_call_entry_only = function.closure_call_entry_only != 0;
         }
         if ((identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE && physical_entry_alias_count != 1) ||
             (identity_proof == DARTPLANT_CODE_IDENTITY_SHARED && physical_entry_alias_count < 2) ||
@@ -140,6 +211,8 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
             .fingerprint = function.fingerprint == nullptr ? "" : function.fingerprint,
             .physical_entry_alias_count = physical_entry_alias_count,
             .code_identity_proof = identity_proof,
+            .function_kind = function_kind,
+            .closure_call_entry_only = closure_call_entry_only,
         });
     }
     return index;
@@ -164,15 +237,16 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
     index.dart_version = profile.dart_version == nullptr ? "" : profile.dart_version;
     index.profile_version = profile.name == nullptr ? "" : profile.name;
 
-    LiveSnapshotBuildState state{.index = &index};
+    LiveSnapshotBuildState state{.index = &index, .profile_version = profile.profile_version};
     DartPlantLiveVmFunctionIndexInfo local_info{};
     local_info.struct_size = sizeof(local_info);
     const DartPlantStatus status = dartplant_live_vm_visit_functions(
         &context, &snapshot, AppendLiveSnapshotFunction, &state, &local_info);
-    if (status != DARTPLANT_OK || index.functions.empty()) {
+    if (status != DARTPLANT_OK || state.failed || index.functions.empty()) {
         if (error != nullptr) {
-            *error =
-                status == DARTPLANT_OK ? "live VM Function index is empty" : dartplant_last_error();
+            *error = status != DARTPLANT_OK ? dartplant_last_error()
+                     : state.failed ? "live VM Function index visitor rejected an entry family"
+                                    : "live VM Function index is empty";
         }
         return std::nullopt;
     }

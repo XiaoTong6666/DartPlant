@@ -4,12 +4,18 @@ import argparse
 import re
 from pathlib import Path
 
+import generate_vm_profiles as vm_profiles
+
 from source_tree import iter_text_files
 from util import CONFIG_PATH, ROOT_DIR, load_config
 
 
 def run_audit() -> None:
     issues: list[str] = []
+    try:
+        vm_profiles.run(check=True)
+    except (RuntimeError, ValueError) as error:
+        issues.append(str(error))
     config = load_config()
     if config.abi != "arm64-v8a":
         issues.append("project-config.json: abi must be arm64-v8a")
@@ -21,6 +27,8 @@ def run_audit() -> None:
         ROOT_DIR / "include/dartplant/hook.h",
         ROOT_DIR / "include/dartplant/runtime.h",
         ROOT_DIR / "include/dartplant/runtime_profile.h",
+        ROOT_DIR / "include/dartplant/advanced/diagnostics.h",
+        ROOT_DIR / "include/dartplant/advanced/loader.h",
         ROOT_DIR / "include/dartplant/advanced/runtime_profile.h",
         ROOT_DIR / "include/dartplant/adapters/dobby.h",
         ROOT_DIR / "include/dartplant/adapters/shadowhook.h",
@@ -29,8 +37,16 @@ def run_audit() -> None:
         ROOT_DIR / "adapters/shadowhook/shadowhook_host.cpp",
         ROOT_DIR / "src/runtime/dart_runtime_resolver.cpp",
         ROOT_DIR / "src/runtime/default_runtime.cpp",
+        ROOT_DIR / "src/host/loader_contract.cpp",
+        ROOT_DIR / "src/host/signal_lease.cpp",
+        ROOT_DIR / "src/vm/runtime_profiles.cpp",
+        ROOT_DIR / "src/vm/runtime_profiles.h",
+        ROOT_DIR / "src/vm/generated/runtime_profiles.generated.h",
         ROOT_DIR / "scripts/main.py",
         ROOT_DIR / "scripts/metadata.py",
+        ROOT_DIR / "scripts/generate_vm_profiles.py",
+        ROOT_DIR / "scripts/data/dart_vm_profiles.json",
+        ROOT_DIR / "scripts/check_loader_compat.py",
         ROOT_DIR / "tools/dartplant-indexer/Cargo.toml",
         ROOT_DIR / "third_party/flutterdec/Cargo.toml",
         ROOT_DIR / "third_party/blutter/blutter.py",

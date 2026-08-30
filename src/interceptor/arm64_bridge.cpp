@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <vector>
 
 #include "core/internal.h"
 
@@ -27,6 +28,56 @@ extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg
 namespace dartplant {
 
 namespace {
+
+bool IsDartReturn(uint32_t instruction) { return instruction == 0xd65f03c0U; }
+
+bool IsTerminalTrap(uint32_t instruction) {
+    // Dart emits BRK after calls that are semantically noreturn (for example a
+    // throwing runtime stub). If such a call unexpectedly returns, BRK ends
+    // control flow rather than falling into adjacent Code. Treat the trap as a
+    // terminal edge; a separate reachable normal path must still provide RET.
+    return (instruction & 0xffe0001fU) == 0xd4200000U;  // BRK #imm16.
+}
+
+int64_t SignExtend(uint64_t value, unsigned bits) {
+    const uint64_t sign = uint64_t{1} << (bits - 1);
+    return static_cast<int64_t>((value ^ sign) - sign);
+}
+
+bool IsIndirectBranch(uint32_t instruction) {
+    // A64 unconditional branch-register family. BLR/BLRA* are returning calls
+    // (bit 21) and therefore fall through; plain RET x30 is handled before
+    // this check. BR/BRA*, RETAA/RETAB, ERET-like or otherwise unsupported
+    // register transfers fail closed instead of being mistaken for fallthrough.
+    if ((instruction & 0xfe000000U) != 0xd6000000U) return false;
+    const bool returning_call = (instruction & (1U << 21)) != 0 && (instruction & (1U << 22)) == 0;
+    return !returning_call;
+}
+
+bool DecodeDirectBranch(uint32_t instruction, int64_t* out_delta, bool* out_conditional) {
+    if (out_delta == nullptr || out_conditional == nullptr) return false;
+    if ((instruction & 0xfc000000U) == 0x14000000U) {  // B imm26 (not BL).
+        *out_delta = SignExtend(instruction & 0x03ffffffU, 26) << 2;
+        *out_conditional = false;
+        return true;
+    }
+    if ((instruction & 0xff000010U) == 0x54000000U) {  // B.cond imm19.
+        *out_delta = SignExtend((instruction >> 5) & 0x7ffffU, 19) << 2;
+        *out_conditional = true;
+        return true;
+    }
+    if ((instruction & 0x7e000000U) == 0x34000000U) {  // CBZ/CBNZ imm19.
+        *out_delta = SignExtend((instruction >> 5) & 0x7ffffU, 19) << 2;
+        *out_conditional = true;
+        return true;
+    }
+    if ((instruction & 0x7e000000U) == 0x36000000U) {  // TBZ/TBNZ imm14.
+        *out_delta = SignExtend((instruction >> 5) & 0x3fffU, 14) << 2;
+        *out_conditional = true;
+        return true;
+    }
+    return false;
+}
 
 #if defined(__aarch64__)
 constexpr uintptr_t kArm64AdrpReach = uintptr_t{1} << 32;
@@ -124,34 +175,6 @@ void* AllocateCallbackStub(size_t allocation_size, uintptr_t target, uintptr_t r
     void* mapped =
         mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return mapped == MAP_FAILED ? nullptr : mapped;
-}
-
-bool IsDartReturn(uint32_t instruction) { return instruction == 0xd65f03c0U; }
-
-int64_t SignExtend(uint64_t value, unsigned bits) {
-    const uint64_t sign = uint64_t{1} << (bits - 1);
-    return static_cast<int64_t>((value ^ sign) - sign);
-}
-
-bool BranchTargetOutsideCode(uintptr_t pc, uintptr_t start, uintptr_t end, uint32_t instruction) {
-    int64_t delta = 0;
-    if ((instruction & 0xfc000000U) == 0x14000000U) {  // B imm26 (not BL).
-        delta = SignExtend(instruction & 0x03ffffffU, 26) << 2;
-    } else if ((instruction & 0xff000010U) == 0x54000000U) {  // B.cond imm19.
-        delta = SignExtend((instruction >> 5) & 0x7ffffU, 19) << 2;
-    } else if ((instruction & 0x7e000000U) == 0x34000000U) {  // CBZ/CBNZ imm19.
-        delta = SignExtend((instruction >> 5) & 0x7ffffU, 19) << 2;
-    } else if ((instruction & 0x7e000000U) == 0x36000000U) {  // TBZ/TBNZ imm14.
-        delta = SignExtend((instruction >> 5) & 0x3fffU, 14) << 2;
-    } else {
-        return false;
-    }
-    const uintptr_t target = static_cast<uintptr_t>(static_cast<int64_t>(pc) + delta);
-    return target < start || target >= end;
-}
-
-bool IsIndirectBranch(uint32_t instruction) {
-    return (instruction & 0xfffffc1fU) == 0xd61f0000U;  // BR Xn.
 }
 
 bool EncodeDirectBranch(uintptr_t from, uintptr_t to, uint32_t* out_instruction) {
@@ -360,6 +383,71 @@ void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out
 #endif
 }
 
+bool CollectReachableArm64Returns(const uint8_t* code, size_t size, uintptr_t logical_start,
+                                  std::vector<Arm64ReturnPatch>* out_returns) {
+    if (code == nullptr || out_returns == nullptr || size < sizeof(uint32_t) ||
+        (logical_start & 3U) != 0 || (size & 3U) != 0 || logical_start > UINTPTR_MAX - size) {
+        return false;
+    }
+    out_returns->clear();
+    const size_t instruction_count = size / sizeof(uint32_t);
+    std::vector<uint8_t> visited(instruction_count, 0);
+    std::vector<size_t> pending{0};
+    const uintptr_t logical_end = logical_start + size;
+
+    const auto enqueue = [&](uintptr_t target, std::vector<size_t>* worklist) -> bool {
+        if (target < logical_start || target >= logical_end || (target & 3U) != 0) return false;
+        const size_t index = static_cast<size_t>((target - logical_start) / sizeof(uint32_t));
+        if (index >= instruction_count) return false;
+        worklist->push_back(index);
+        return true;
+    };
+
+    while (!pending.empty()) {
+        const size_t index = pending.back();
+        pending.pop_back();
+        if (visited[index] != 0) continue;
+        visited[index] = 1;
+        uint32_t instruction = 0;
+        std::memcpy(&instruction, code + index * sizeof(uint32_t), sizeof(instruction));
+        const uintptr_t pc = logical_start + index * sizeof(uint32_t);
+        if (IsDartReturn(instruction)) {
+            out_returns->push_back({.address = pc, .original_instruction = instruction});
+            continue;
+        }
+        if (IsTerminalTrap(instruction)) continue;
+        if (IsIndirectBranch(instruction)) return false;
+
+        int64_t branch_delta = 0;
+        bool conditional = false;
+        if (DecodeDirectBranch(instruction, &branch_delta, &conditional)) {
+            const int64_t signed_pc = static_cast<int64_t>(pc);
+            const int64_t signed_target = signed_pc + branch_delta;
+            if (signed_target < 0 || !enqueue(static_cast<uintptr_t>(signed_target), &pending)) {
+                return false;
+            }
+            if (!conditional) continue;
+        }
+
+        // BL/BLR are returning calls, so their only intra-Function successor is
+        // the fallthrough instruction. All ordinary instructions fall through
+        // as well. Reaching the end without a RET/taken B is an unsupported
+        // tail exit rather than permission to scan into an adjacent Code body.
+        if (index + 1 >= instruction_count) return false;
+        pending.push_back(index + 1);
+    }
+    std::sort(out_returns->begin(), out_returns->end(),
+              [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
+                  return left.address < right.address;
+              });
+    out_returns->erase(std::unique(out_returns->begin(), out_returns->end(),
+                                   [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
+                                       return left.address == right.address;
+                                   }),
+                       out_returns->end());
+    return !out_returns->empty();
+}
+
 DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook) {
 #if defined(__aarch64__)
     if (hook == nullptr || hook->code_target == nullptr ||
@@ -376,29 +464,21 @@ DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook) {
     }
 
     std::vector<Arm64ReturnPatch> candidates;
-    for (uintptr_t pc = start; pc + sizeof(uint32_t) <= end; pc += sizeof(uint32_t)) {
-        uint32_t instruction = 0;
-        std::memcpy(&instruction, reinterpret_cast<const void*>(pc), sizeof(instruction));
-        if (IsDartReturn(instruction)) {
-            candidates.push_back({pc, instruction});
-            continue;
-        }
-        if (IsIndirectBranch(instruction) || BranchTargetOutsideCode(pc, start, end, instruction)) {
-            SetLastError(
-                "Dart callback Code has an unsupported non-RET/tail exit; leave interception would be incomplete");
-            return DARTPLANT_UNSUPPORTED_ABI;
-        }
-    }
-    if (candidates.empty()) {
-        SetLastError("Dart callback Code has no interceptable ARM64 RET");
+    if (!CollectReachableArm64Returns(reinterpret_cast<const uint8_t*>(start), end - start, start,
+                                      &candidates)) {
+        SetLastError(
+            "Dart callback entry has no complete reachable ARM64 RET graph; indirect/tail exits fail closed");
         return DARTPLANT_UNSUPPORTED_ABI;
     }
 
     const uintptr_t return_entry = reinterpret_cast<uintptr_t>(hook->replacement_return_entry);
     hook->return_patches.clear();
     for (const auto& candidate : candidates) {
+        uint32_t current = 0;
+        std::memcpy(&current, reinterpret_cast<const void*>(candidate.address), sizeof(current));
         uint32_t branch = 0;
-        if (!EncodeDirectBranch(candidate.address, return_entry, &branch) ||
+        if (current != candidate.original_instruction ||
+            !EncodeDirectBranch(candidate.address, return_entry, &branch) ||
             !WriteExecutableInstruction(candidate.address, branch)) {
             for (auto it = hook->return_patches.rbegin(); it != hook->return_patches.rend(); ++it) {
                 (void) WriteExecutableInstruction(it->address, it->original_instruction);
@@ -407,7 +487,9 @@ DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook) {
             SetLastError("failed to install ARM64 Dart return interception");
             return DARTPLANT_HOOK_FAILED;
         }
-        hook->return_patches.push_back(candidate);
+        Arm64ReturnPatch installed = candidate;
+        installed.patched_instruction = branch;
+        hook->return_patches.push_back(installed);
     }
     return DARTPLANT_OK;
 #else

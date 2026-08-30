@@ -113,6 +113,18 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_fp_register(
 
 DARTPLANT_EXPORT uint32_t
 dartplant_invocation_argument_count(const DartPlantInvocation* invocation);
+// PRODUCT ARM64 AOT closure calls carry the Closure object itself in x0. It is
+// a hidden receiver and is deliberately not counted as a FunctionType formal.
+// These helpers are available only when DartPlant has exact default-entry
+// closure-call evidence (live VM or compiler artifact + SDK contract); a typed
+// DartCallLayout is not required. Access is enter-only, before x0 is repurposed
+// as the result register. Retaining the receiver as a GC-safe Dart object is
+// intentionally not exposed until real Dart hooks have a generated-to-native
+// transition whose register roots are visible to the VM.
+DARTPLANT_EXPORT uint8_t
+dartplant_invocation_has_closure_receiver(const DartPlantInvocation* invocation);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_receiver(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_argument(
     const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocation,

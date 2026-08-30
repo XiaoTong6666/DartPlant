@@ -7,6 +7,19 @@ option(DARTPLANT_BUILD_ANDROID_TESTS "Build DartPlant Android device tests" OFF)
 option(DARTPLANT_BUILD_ANDROID_MODULE "Build the optional LSPosed Native API shared module" OFF)
 option(DARTPLANT_BUILD_DOBBY_ADAPTER "Build the optional Dobby HostApi adapter" OFF)
 option(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER "Build the optional ShadowHook HostApi adapter" OFF)
+option(
+    DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT
+    "Use pthread TLS and audit the final Android shared module for minimal/custom loader compatibility"
+    OFF
+)
+option(
+    DARTPLANT_USE_PTHREAD_TLS
+    "Use pthread keys instead of ELF dynamic TLS for DartPlant per-thread state"
+    OFF
+)
+if(DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT)
+    set(DARTPLANT_USE_PTHREAD_TLS ON)
+endif()
 set(
     DARTPLANT_DOBBY_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dobby"
@@ -38,6 +51,8 @@ add_library(
     src/core/dartplant.cpp
     src/core/hook_registry.cpp
     src/elf/module_image.cpp
+    src/host/loader_contract.cpp
+    src/host/signal_lease.cpp
     src/metadata/metadata.cpp
     src/abi/runtime_evidence.cpp
     src/abi/value_codec.cpp
@@ -46,6 +61,7 @@ add_library(
     src/runtime/dart_runtime_resolver.cpp
     src/runtime/default_runtime.cpp
     src/vm/profiles.cpp
+    src/vm/runtime_profiles.cpp
     src/vm/live_vm.cpp
     src/vm/live_vm_bootstrap.cpp
     src/vm/object_bridge.cpp
@@ -65,6 +81,12 @@ target_compile_options(
     -Werror
     -fvisibility=hidden
 )
+if(DARTPLANT_USE_PTHREAD_TLS)
+    target_compile_definitions(dartplant_core PRIVATE DARTPLANT_USE_PTHREAD_TLS=1)
+endif()
+if(DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT)
+    target_compile_definitions(dartplant_core PRIVATE DARTPLANT_MINIMAL_LINKER_COMPAT=1)
+endif()
 target_include_directories(
     dartplant_core
     PUBLIC
@@ -168,6 +190,20 @@ if(ANDROID)
         # Vector stores NativeOnModuleLoaded without an unregister API. Keep the
         # callback and its refresh worker code resident for process lifetime.
         target_link_options(dartplant PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,nodelete)
+        if(DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT)
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            add_custom_command(
+                TARGET dartplant
+                POST_BUILD
+                COMMAND
+                    ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_loader_compat.py
+                    --readelf
+                    ${CMAKE_READELF}
+                    $<TARGET_FILE:dartplant>
+                VERBATIM
+            )
+        endif()
     endif()
 
     if(DARTPLANT_BUILD_ANDROID_TESTS)
@@ -287,6 +323,14 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
     )
     target_link_libraries(dartplant_aot_abi_analyzer PUBLIC dartplant_abi capstone)
 
+    add_executable(
+        dartplant_aot_abi_analyzer_cli
+        tools/aot-abi-analyzer/main.cpp
+    )
+    target_compile_features(dartplant_aot_abi_analyzer_cli PRIVATE cxx_std_20)
+    target_compile_options(dartplant_aot_abi_analyzer_cli PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(dartplant_aot_abi_analyzer_cli PRIVATE dartplant_aot_abi_analyzer)
+
     add_library(dartplant_fixture SHARED tests/fixtures/hook_fixture.cc)
     target_compile_features(dartplant_fixture PRIVATE cxx_std_20)
     target_compile_options(dartplant_fixture PRIVATE -Wall -Wextra -Werror)
@@ -295,6 +339,8 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         dartplant_tests
         tests/test_main.cc
         tests/elf_resolver_test.cc
+        tests/loader_contract_test.cc
+        tests/signal_lease_test.cc
         tests/metadata_test.cc
         tests/hook_registry_test.cc
         tests/runtime_test.cc
@@ -304,6 +350,7 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         tests/abi_contract_test.cc
         tests/calling_convention_test.cc
         tests/aot_abi_analyzer_test.cc
+        tests/runtime_profiles_test.cc
         tests/shadowhook_adapter_test.cc
         adapters/shadowhook/shadowhook_host.cpp
     )

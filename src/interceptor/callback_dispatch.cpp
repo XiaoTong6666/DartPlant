@@ -3,6 +3,11 @@
 
 #include <array>
 #include <cstring>
+#include <new>
+
+#if defined(DARTPLANT_USE_PTHREAD_TLS)
+#include <pthread.h>
+#endif
 
 #include "runtime/runtime_internal.h"
 
@@ -18,8 +23,41 @@ struct DispatchFrame {
     uintptr_t invoke_original_native_frame = 0;
 };
 
-thread_local std::array<DispatchFrame, kMaxInvocationDepth> g_frames;
-thread_local uint32_t g_depth = 0;
+struct DispatchStack {
+    std::array<DispatchFrame, kMaxInvocationDepth> frames{};
+    uint32_t depth = 0;
+};
+
+#if defined(DARTPLANT_USE_PTHREAD_TLS)
+pthread_key_t g_dispatch_stack_key;
+pthread_once_t g_dispatch_stack_key_once = PTHREAD_ONCE_INIT;
+bool g_dispatch_stack_key_ready = false;
+
+void DestroyDispatchStack(void* value) { delete static_cast<DispatchStack*>(value); }
+
+void CreateDispatchStackKey() {
+    if (pthread_key_create(&g_dispatch_stack_key, DestroyDispatchStack) == 0) {
+        g_dispatch_stack_key_ready = true;
+    }
+}
+
+DispatchStack* CurrentDispatchStack() {
+    pthread_once(&g_dispatch_stack_key_once, CreateDispatchStackKey);
+    if (!g_dispatch_stack_key_ready) return nullptr;
+    auto* stack = static_cast<DispatchStack*>(pthread_getspecific(g_dispatch_stack_key));
+    if (stack != nullptr) return stack;
+    stack = new (std::nothrow) DispatchStack();
+    if (stack == nullptr || pthread_setspecific(g_dispatch_stack_key, stack) != 0) {
+        delete stack;
+        return nullptr;
+    }
+    return stack;
+}
+#else
+thread_local DispatchStack g_dispatch_stack;
+
+DispatchStack* CurrentDispatchStack() { return &g_dispatch_stack; }
+#endif
 
 bool InvokeCallback(DartPlantInvocationCallback callback, DartPlantInvocation* invocation,
                     void* user_data) {
@@ -41,17 +79,26 @@ bool InvokeCallback(DartPlantInvocationCallback callback, DartPlantInvocation* i
     }
 }
 
-DispatchFrame* CurrentFrame() { return g_depth == 0 ? nullptr : &g_frames[g_depth - 1]; }
+DispatchFrame* CurrentFrame() {
+    DispatchStack* stack = CurrentDispatchStack();
+    return stack == nullptr || stack->depth == 0 ? nullptr : &stack->frames[stack->depth - 1];
+}
 
 void RefreshIdentityState(DartPlantInvocation* invocation) {
     if (invocation == nullptr) return;
     invocation->identity_ambiguous =
         invocation->code_target != nullptr && invocation->code_target->IsShared();
+    invocation->closure_receiver_in_x0 =
+        !invocation->identity_ambiguous && invocation->requested_method != nullptr &&
+        invocation->requested_method->function != nullptr &&
+        invocation->requested_method->function->closure_call_entry_only &&
+        invocation->requested_method->record.entry_kind == DARTPLANT_ENTRY_DEFAULT;
     if (invocation->identity_ambiguous) {
-        // A verified ABI belongs to one logical Function. Once the physical
-        // CodeTarget is known to be shared, typed interpretation must stop even
-        // when the hook was installed while the target still looked unique.
+        // A verified ABI or hidden closure-receiver contract belongs to one
+        // logical Function. Once the physical CodeTarget is shared, semantic
+        // interpretation must stop even when installation happened earlier.
         invocation->call_layout = nullptr;
+        invocation->closure_receiver_in_x0 = false;
     }
 }
 
@@ -145,14 +192,21 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         result.original = hook->backup;
         return result;
     }
-    if (g_depth >= kMaxInvocationDepth) {
+    DispatchStack* stack = CurrentDispatchStack();
+    if (stack == nullptr) {
+        dartplant::SetLastError("DartPlant per-thread callback storage is unavailable");
+        result.context = context;
+        result.original = hook->backup;
+        return result;
+    }
+    if (stack->depth >= kMaxInvocationDepth) {
         dartplant::SetLastError("DartPlant invocation depth limit exceeded");
         result.context = context;
         result.original = hook->backup;
         return result;
     }
 
-    DispatchFrame& frame = g_frames[g_depth++];
+    DispatchFrame& frame = stack->frames[stack->depth++];
     frame.context = *context;
     frame.invocation = {};
     frame.entry_spreg = static_cast<uintptr_t>(context->x[15]);
@@ -169,7 +223,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     RefreshIdentityState(&frame.invocation);
     frame.invocation.context = &frame.context;
     frame.invocation.phase = DARTPLANT_INVOCATION_ENTER;
-    frame.invocation.depth = g_depth;
+    frame.invocation.depth = stack->depth;
     frame.invocation.vm_adapter = hook->vm_adapter;
     frame.invocation.validated_null_value = hook->validated_null_value;
     frame.invocation.validated_bool_true_value = hook->validated_bool_true_value;
@@ -180,7 +234,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
 
     if (!late_shared_fail_closed && frame.invocation.vm_adapter != nullptr) {
         if (dartplant_vm_enter_scope(frame.invocation.vm_adapter) != DARTPLANT_OK) {
-            --g_depth;
+            --stack->depth;
             result.context = &frame.context;
             result.original = hook->backup;
             return result;
@@ -199,7 +253,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
             // Real Dart returns are intercepted at RET sites. If no invocation
             // pin was acquired (for example during unhook), do not leave a TLS
             // frame behind for the passthrough return veneer.
-            --g_depth;
+            --stack->depth;
         } else {
             // Synthetic native fixtures still use their LR continuation.
             frame.invocation.hook = nullptr;
@@ -236,7 +290,7 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
 
     if (frame.invocation.skip_original) {
         FinishFrame(&frame, frame.context.x[0], frame.context.x[1], ReadV0Bits(frame.context));
-        --g_depth;
+        --stack->depth;
         result.context = &frame.context;
         return result;
     }
@@ -258,11 +312,12 @@ extern "C" uint8_t dartplant_arm64_prepare_invoke_original_frame(uintptr_t nativ
 }
 
 extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_hook(
-    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits) {
+    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits,
+    uintptr_t return_lr) {
     DartPlantArm64ReturnDispatchResult output{};
     DispatchFrame* frame = CurrentFrame();
     if (frame == nullptr || frame->invocation.context == nullptr ||
-        frame->invocation.hook != hook) {
+        frame->invocation.hook != hook || frame->invocation.context->x[30] != return_lr) {
         return output;
     }
 
@@ -276,15 +331,19 @@ extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_fr
 
     FinishFrame(frame, result0, result1, fp_result_bits);
     output.context = frame->invocation.context;
-    --g_depth;
+    if (DispatchStack* stack = CurrentDispatchStack(); stack != nullptr && stack->depth != 0) {
+        --stack->depth;
+    }
     return output;
 }
 
 extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
                                                           uintptr_t target_fp) {
     if (target_spreg == 0 && target_fp == 0) return;
-    while (g_depth != 0) {
-        DispatchFrame& frame = g_frames[g_depth - 1];
+    DispatchStack* stack = CurrentDispatchStack();
+    if (stack == nullptr) return;
+    while (stack->depth != 0) {
+        DispatchFrame& frame = stack->frames[stack->depth - 1];
         // Dart stacks grow downward. A handler in the hooked Function keeps a
         // frame below its caller FP/SPREG, while unwinding out of that Function
         // reaches its caller frame (or above). Prefer FP because it is stable
@@ -296,7 +355,7 @@ extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg
             frame.entry_spreg != 0 && target_spreg != 0 && target_spreg > frame.entry_spreg;
         if (!unwound_by_fp && !unwound_by_sp) break;
         AbandonFrame(&frame);
-        --g_depth;
+        --stack->depth;
     }
 }
 
@@ -312,6 +371,8 @@ extern "C" DartPlantArm64LeaveResult dartplant_arm64_dispatch_leave_from_tls(
     FinishFrame(frame, result0, result1, fp_result_bits);
     output.context = frame->invocation.context;
     output.result = output.context->x[0];
-    --g_depth;
+    if (DispatchStack* stack = CurrentDispatchStack(); stack != nullptr && stack->depth != 0) {
+        --stack->depth;
+    }
     return output;
 }

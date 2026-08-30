@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <thread>
 #include <type_traits>
 
@@ -27,6 +31,11 @@ struct ContextHostState {
     int hook_calls = 0;
     int unhook_calls = 0;
     void* last_target = nullptr;
+};
+
+struct MutatingHostState {
+    std::array<uint8_t, 4> original{};
+    bool installed = false;
 };
 
 int FakeHook(void* target, void*, void** backup) {
@@ -65,6 +74,25 @@ int ContextUnhook(void* user_data, void* target) {
     return 0;
 }
 
+int MutatingHook(void* user_data, void* target, void*, void** backup) {
+    auto* state = static_cast<MutatingHostState*>(user_data);
+    if (state == nullptr || target == nullptr || backup == nullptr) return -1;
+    std::memcpy(state->original.data(), target, state->original.size());
+    const std::array<uint8_t, 4> patch = {0xde, 0xad, 0xbe, 0xef};
+    std::memcpy(target, patch.data(), patch.size());
+    state->installed = true;
+    *backup = target;
+    return 0;
+}
+
+int MutatingUnhook(void* user_data, void* target) {
+    auto* state = static_cast<MutatingHostState*>(user_data);
+    if (state == nullptr || target == nullptr || !state->installed) return -1;
+    std::memcpy(target, state->original.data(), state->original.size());
+    state->installed = false;
+    return 0;
+}
+
 int Replacement(int, int) { return 42; }
 
 void ResetFakeHost() {
@@ -84,6 +112,213 @@ void ResetFakeHost() {
 }
 
 }  // namespace
+
+TEST_CASE(Arm64ReturnGraphDoesNotClaimUnreachableSiblingRet) {
+    // entry+0 branches over a sibling entry at +4. Linear scanning used to
+    // claim both RETs; entry-reachable CFG ownership must claim only +12.
+    const std::array<uint32_t, 4> code = {
+        0x14000002U,  // b +8 -> logical +8
+        0xd65f03c0U,  // sibling-only RET at +4
+        0xd503201fU,  // nop
+        0xd65f03c0U,  // current entry RET at +12
+    };
+    std::vector<dartplant::Arm64ReturnPatch> returns;
+    EXPECT_TRUE(dartplant::CollectReachableArm64Returns(
+        reinterpret_cast<const uint8_t*>(code.data()), sizeof(code), 0x1000, &returns));
+    EXPECT_EQ(1U, returns.size());
+    EXPECT_EQ(0x100cULL, static_cast<unsigned long long>(returns[0].address));
+}
+
+TEST_CASE(Arm64ReturnGraphKeepsSharedBodyRetWhenReachable) {
+    // A conditional entry can legitimately converge with another entry/body.
+    // Both reachable return paths belong to this invocation and must be patched.
+    const std::array<uint32_t, 4> code = {
+        0x54000040U,  // b.eq +8
+        0xd65f03c0U,  // fallthrough RET
+        0xd503201fU,  // nop
+        0xd65f03c0U,  // taken-path RET
+    };
+    std::vector<dartplant::Arm64ReturnPatch> returns;
+    EXPECT_TRUE(dartplant::CollectReachableArm64Returns(
+        reinterpret_cast<const uint8_t*>(code.data()), sizeof(code), 0x2000, &returns));
+    EXPECT_EQ(2U, returns.size());
+    EXPECT_EQ(0x2004ULL, static_cast<unsigned long long>(returns[0].address));
+    EXPECT_EQ(0x200cULL, static_cast<unsigned long long>(returns[1].address));
+}
+
+TEST_CASE(Arm64ReturnGraphAcceptsDartNoreturnTrapBranch) {
+    // Mirrors the shape emitted for the real throwing P6 fixture: a normal
+    // return path and an error path that calls a noreturn stub then executes
+    // BRK if the stub ever returns. The trap is terminal and must not force a
+    // fallthrough into the next Code object.
+    const std::array<uint32_t, 5> code = {
+        0x54000060U,  // b.eq +12 -> error call
+        0xd503201fU,  // nop
+        0xd65f03c0U,  // normal RET
+        0x94000000U,  // bl (target value is irrelevant to intra-entry CFG)
+        0xd4200000U,  // brk #0
+    };
+    std::vector<dartplant::Arm64ReturnPatch> returns;
+    EXPECT_TRUE(dartplant::CollectReachableArm64Returns(
+        reinterpret_cast<const uint8_t*>(code.data()), sizeof(code), 0x2800, &returns));
+    EXPECT_EQ(1U, returns.size());
+    EXPECT_EQ(0x2808ULL, static_cast<unsigned long long>(returns[0].address));
+}
+
+TEST_CASE(Arm64ReturnGraphFailsClosedOnIndirectOrTailExit) {
+    const std::array<uint32_t, 2> indirect = {0xd61f0200U, 0xd65f03c0U};  // br x16
+    std::vector<dartplant::Arm64ReturnPatch> returns;
+    EXPECT_FALSE(dartplant::CollectReachableArm64Returns(
+        reinterpret_cast<const uint8_t*>(indirect.data()), sizeof(indirect), 0x3000, &returns));
+
+    const std::array<uint32_t, 2> tail = {0x14000002U, 0xd65f03c0U};  // b past range
+    EXPECT_FALSE(dartplant::CollectReachableArm64Returns(
+        reinterpret_cast<const uint8_t*>(tail.data()), sizeof(tail), 0x4000, &returns));
+}
+
+TEST_CASE(ManagedHookPatchFingerprintPreservesSiblingArtifactBytes) {
+    dartplant_reset();
+    const long page_size = sysconf(_SC_PAGESIZE);
+    EXPECT_TRUE(page_size > 0);
+    void* mapping = mmap(nullptr, static_cast<size_t>(page_size),
+                         PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    EXPECT_TRUE(mapping != MAP_FAILED);
+    auto* bytes = static_cast<uint8_t*>(mapping);
+    for (size_t index = 0; index < 32; ++index) bytes[index] = static_cast<uint8_t>(index + 1);
+    const std::string pristine = dartplant::FingerprintCode(bytes, 32);
+
+    MutatingHostState host;
+    const DartPlantHostApi api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &host,
+        .hook = MutatingHook,
+        .unhook = MutatingUnhook,
+    };
+    dartplant::InstallHostApi(&api);
+
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->id = reinterpret_cast<uintptr_t>(bytes + 16);
+    target->entry = target->id;
+    target->code_size = 16;
+    void* backup = nullptr;
+    DartPlantHook* hook = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(target, reinterpret_cast<void*>(Replacement), &backup, &hook));
+    EXPECT_TRUE(hook != nullptr);
+    EXPECT_TRUE(dartplant::FingerprintCode(bytes, 32) != pristine);
+    EXPECT_EQ(pristine, dartplant::FingerprintCodeWithManagedPatches(bytes, 32));
+
+    // Even at a managed patch site, normalize only the exact bytes DartPlant's
+    // backend installed. A third party taking over that byte must remain visible.
+    bytes[16] = 0xaaU;
+    EXPECT_TRUE(dartplant::FingerprintCodeWithManagedPatches(bytes, 32) != pristine);
+    bytes[16] = 0xdeU;
+    EXPECT_EQ(pristine, dartplant::FingerprintCodeWithManagedPatches(bytes, 32));
+
+    // Normalization may erase only bytes DartPlant actually changed. A foreign
+    // mutation elsewhere in the sibling span must still invalidate the hash.
+    bytes[4] ^= 0x80U;
+    EXPECT_TRUE(dartplant::FingerprintCodeWithManagedPatches(bytes, 32) != pristine);
+    bytes[4] ^= 0x80U;
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(hook));
+    dartplant::ReleaseHook(hook);
+    dartplant_reset();
+    EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size)));
+}
+
+TEST_CASE(ManagedHookPatchFingerprintUnwindsOverlappingSiblingHooksInReverseOrder) {
+    dartplant_reset();
+    const long page_size = sysconf(_SC_PAGESIZE);
+    EXPECT_TRUE(page_size > 0);
+    void* mapping = mmap(nullptr, static_cast<size_t>(page_size),
+                         PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    EXPECT_TRUE(mapping != MAP_FAILED);
+    auto* bytes = static_cast<uint8_t*>(mapping);
+    for (size_t index = 0; index < 32; ++index) bytes[index] = static_cast<uint8_t>(0x40 + index);
+    const std::string pristine = dartplant::FingerprintCode(bytes, 32);
+
+    MutatingHostState first_state;
+    MutatingHostState second_state;
+    DartPlantHostApi first_api = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = &first_state,
+        .hook = MutatingHook,
+        .unhook = MutatingUnhook,
+    };
+    DartPlantHostApi second_api = first_api;
+    second_api.user_data = &second_state;
+    dartplant::InstallHostApi(&first_api);
+
+    auto first_target = std::make_shared<dartplant::DartCodeTarget>();
+    first_target->id = reinterpret_cast<uintptr_t>(bytes + 16);
+    first_target->entry = first_target->id;
+    first_target->code_size = 16;
+    void* first_backup = nullptr;
+    DartPlantHook* first_hook = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(first_target, reinterpret_cast<void*>(Replacement),
+                                     &first_backup, &first_hook));
+
+    // The second sibling begins two bytes later, so its 4-byte fake backend
+    // patch overlaps the last two bytes of the first backend patch. Its saved
+    // "original" therefore contains the first hook's patched bytes.
+    dartplant::InstallHostApi(&second_api);
+    auto second_target = std::make_shared<dartplant::DartCodeTarget>();
+    second_target->id = reinterpret_cast<uintptr_t>(bytes + 18);
+    second_target->entry = second_target->id;
+    second_target->code_size = 14;
+    void* second_backup = nullptr;
+    DartPlantHook* second_hook = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(second_target, reinterpret_cast<void*>(Replacement),
+                                     &second_backup, &second_hook));
+
+    EXPECT_TRUE(dartplant::FingerprintCode(bytes, 32) != pristine);
+    EXPECT_EQ(pristine, dartplant::FingerprintCodeWithManagedPatches(bytes, 32));
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(second_hook));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(first_hook));
+    dartplant::ReleaseHook(second_hook);
+    dartplant::ReleaseHook(first_hook);
+    dartplant_reset();
+    EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size)));
+}
+
+TEST_CASE(CodeTargetEntryKindsDoNotCreateFalseSharedFunctionIdentity) {
+    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    target->entry = 0x1000;
+    target->id = 0x1000;
+    target->reported_alias_count = 1;
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+
+    dartplant::DartMethodIdentity normal = {
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "target",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    auto unchecked = normal;
+    unchecked.entry_kind = DARTPLANT_ENTRY_UNCHECKED;
+    auto monomorphic = normal;
+    monomorphic.entry_kind = DARTPLANT_ENTRY_MONOMORPHIC;
+    target->AddAlias(normal);
+    target->AddAlias(unchecked);
+    target->AddAlias(monomorphic);
+
+    EXPECT_EQ(3U, target->KnownAliasCount());
+    EXPECT_FALSE(target->IsShared());
+    EXPECT_TRUE(target->HasProvenUniqueIdentity());
+
+    auto other_function = normal;
+    other_function.function_name = "otherTarget";
+    target->AddAlias(other_function);
+    EXPECT_TRUE(target->IsShared());
+    EXPECT_FALSE(target->HasProvenUniqueIdentity());
+}
 
 TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
     dartplant_reset();

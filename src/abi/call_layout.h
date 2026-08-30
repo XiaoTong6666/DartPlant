@@ -52,6 +52,11 @@ struct DartCallLayout {
     DartParameterLayout result{};
     uint32_t stack_words = 0;
     uint8_t dart_sp_register = 0;
+    // PRODUCT AOT closure calls keep the Closure object itself in x0 while
+    // formal Dart parameters continue to use the normal GP/FPU/entry-stack
+    // allocators. This hidden receiver is not part of FunctionType formals.
+    bool has_closure_receiver = false;
+    DartAbiLocation closure_receiver_location{};
 };
 
 }  // namespace dartplant::abi

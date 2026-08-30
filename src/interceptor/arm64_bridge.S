@@ -193,6 +193,7 @@ dartplant_arm64_return_entry:
   ldr x1, [sp, #0]
   ldr x2, [sp, #8]
   ldr x3, [sp, #16]
+  ldr x4, [sp, #48]
   bl dartplant_arm64_dispatch_return_from_hook
   // x0 = TLS context (or null for passthrough), x1 = synchronous
   // invoke-original native-frame SP (or zero for an automatic return).

@@ -160,3 +160,91 @@ TEST_CASE(SnapshotIndexRejectsContradictoryIdentityProof) {
     std::string error;
     EXPECT_TRUE(!dartplant::BuildSnapshotIndex(source, &error).has_value());
 }
+
+TEST_CASE(LiveSnapshotAdapterAcceptsDefaultOnlyClosureEntryFamily) {
+    DartPlantLiveVmFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.function = 0x7100000011;
+    function.code = 0x7100001011;
+    function.code_entry_point = 0x7200001000;
+    function.code_monomorphic_entry_point = function.code_entry_point;
+    function.entry_va = 0x310000;
+    function.code_section_va = 0x300000;
+    function.code_size = 0x40;
+    function.function_kind = 2;
+    function.entry_kind_mask = 0x01;
+    function.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
+    function.closure_call_entry_only = 1;
+    std::snprintf(function.library_uri, sizeof(function.library_uri), "%s",
+                  "package:app/main.dart");
+    std::snprintf(function.class_name, sizeof(function.class_name), "%s", "Global");
+    std::snprintf(function.function_name, sizeof(function.function_name), "%s",
+                  "[tear-off] target");
+
+    dartplant::SnapshotIndex index;
+    EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
+    EXPECT_EQ(1U, index.functions.size());
+    EXPECT_EQ(DARTPLANT_ENTRY_DEFAULT, index.functions[0].entry_kind);
+    EXPECT_EQ(0x7200001000ULL, index.functions[0].runtime_entry);
+    EXPECT_EQ(0x40ULL, index.functions[0].code_size);
+    EXPECT_TRUE(index.functions[0].closure_call_entry_only);
+}
+
+TEST_CASE(LiveSnapshotAdapterRejectsIncompleteFamilyWithoutPartialPublish) {
+    DartPlantLiveVmFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.code_entry_point = 0x7200001000;
+    function.entry_va = 0x310000;
+    function.code_size = 0x40;
+    function.entry_kind_mask = 0x03;
+    function.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
+    function.entry_alias_counts[DARTPLANT_ENTRY_UNCHECKED] = 1;
+    std::snprintf(function.library_uri, sizeof(function.library_uri), "%s",
+                  "package:app/main.dart");
+    std::snprintf(function.class_name, sizeof(function.class_name), "%s", "Global");
+    std::snprintf(function.function_name, sizeof(function.function_name), "%s", "target");
+
+    dartplant::SnapshotIndex index;
+    EXPECT_TRUE(!dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
+    EXPECT_TRUE(index.functions.empty());
+}
+
+TEST_CASE(LiveSnapshotAdapterUsesDartPayloadStartForMonomorphicCode) {
+    constexpr uint64_t kPayload = 0x7200001000;
+    constexpr uint32_t kLength = 0x80;
+    DartPlantLiveVmFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.function = 0x7100000011;
+    function.code = 0x7100001011;
+    function.function_entry_point = kPayload + 24;
+    function.function_unchecked_entry_point = kPayload + 32;
+    function.code_entry_point = kPayload + 24;
+    function.code_unchecked_entry_point = kPayload + 32;
+    function.code_monomorphic_entry_point = kPayload + 8;
+    function.code_monomorphic_unchecked_entry_point = kPayload + 16;
+    function.entry_va = 0x310018;
+    function.unchecked_entry_va = 0x310020;
+    function.monomorphic_entry_va = 0x310008;
+    function.monomorphic_unchecked_entry_va = 0x310010;
+    function.code_section_va = 0x310000;
+    function.code_size = kLength;
+    function.entry_kind_mask = 0x0f;
+    for (auto& aliases : function.entry_alias_counts) aliases = 1;
+    std::snprintf(function.library_uri, sizeof(function.library_uri), "%s",
+                  "package:app/main.dart");
+    std::snprintf(function.class_name, sizeof(function.class_name), "%s", "Global");
+    std::snprintf(function.function_name, sizeof(function.function_name), "%s", "target");
+
+    dartplant::SnapshotIndex index;
+    EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
+    EXPECT_EQ(4U, index.functions.size());
+    EXPECT_EQ(kPayload, index.functions[0].code_payload_start);
+    EXPECT_EQ(kLength, index.functions[0].code_instructions_length);
+    EXPECT_EQ(kLength - 24U, index.functions[0].code_size);
+    EXPECT_EQ(DARTPLANT_ENTRY_UNCHECKED, index.functions[1].entry_kind);
+    EXPECT_EQ(kLength - 32U, index.functions[1].code_size);
+    EXPECT_EQ(DARTPLANT_ENTRY_MONOMORPHIC, index.functions[2].entry_kind);
+    EXPECT_EQ(kLength - 8U, index.functions[2].code_size);
+    EXPECT_EQ(DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED, index.functions[3].entry_kind);
+    EXPECT_EQ(kLength - 16U, index.functions[3].code_size);
+}

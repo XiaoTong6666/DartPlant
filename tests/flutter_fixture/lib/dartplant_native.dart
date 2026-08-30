@@ -10,10 +10,14 @@ typedef _SimpleFacadeStageNative = Uint64 Function();
 typedef _SimpleFacadeStageDart = int Function();
 typedef _EnableAdvancedOrdinaryHookNative = Int32 Function();
 typedef _EnableAdvancedOrdinaryHookDart = int Function();
+typedef _EnableForcedStackClosureHookNative = Int32 Function();
+typedef _EnableForcedStackClosureHookDart = int Function();
 typedef _P6AbiInstallNative = Int32 Function();
 typedef _P6AbiInstallDart = int Function();
 typedef _P6AbiProbeNative = Uint64 Function();
 typedef _P6AbiProbeDart = int Function();
+typedef _ForcedStackClosureProbeNative = Uint64 Function();
+typedef _ForcedStackClosureProbeDart = int Function();
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -79,6 +83,12 @@ final class DartPlantNative {
             'dartplant_fixture_enable_advanced_ordinary_hook',
           )
           .asFunction();
+  static final _EnableForcedStackClosureHookDart _enableForcedStackClosureHook =
+      _library
+          .lookup<NativeFunction<_EnableForcedStackClosureHookNative>>(
+            'dartplant_fixture_enable_forced_stack_closure_hook',
+          )
+          .asFunction();
   static final _P6AbiInstallDart _p6AbiInstall = _library
       .lookup<NativeFunction<_P6AbiInstallNative>>(
         'dartplant_fixture_p6_abi_install',
@@ -87,6 +97,11 @@ final class DartPlantNative {
   static final _P6AbiProbeDart _p6AbiProbe = _library
       .lookup<NativeFunction<_P6AbiProbeNative>>(
         'dartplant_fixture_p6_abi_probe',
+      )
+      .asFunction();
+  static final _ForcedStackClosureProbeDart _forcedStackClosureProbe = _library
+      .lookup<NativeFunction<_ForcedStackClosureProbeNative>>(
+        'dartplant_fixture_forced_stack_closure_probe',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -213,9 +228,13 @@ final class DartPlantNative {
 
   static int enableAdvancedOrdinaryHook() => _enableAdvancedOrdinaryHook();
 
+  static int enableForcedStackClosureHook() => _enableForcedStackClosureHook();
+
   static int p6AbiInstall() => _p6AbiInstall();
 
   static int p6AbiProbe() => _p6AbiProbe();
+
+  static int forcedStackClosureProbe() => _forcedStackClosureProbe();
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

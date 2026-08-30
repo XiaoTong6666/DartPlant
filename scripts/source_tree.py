@@ -42,6 +42,7 @@ IGNORED_PARTS = {
     "tests/flutter_fixture/build",
     "tests/flutter_fixture/.dart_tool",
     "tests/flutter_fixture/android/.gradle",
+    "src/vm/generated",
 }
 
 

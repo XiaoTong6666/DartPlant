@@ -1,0 +1,419 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "profile_version": 1,
+      "name": "dart-3.4.4-arm64-product-compressed",
+      "dart_version": "3.4.4",
+      "snapshot_hash": "d20a1be77c3d3c41b2a5accaee1ce549",
+      "snapshot_profile": "flutter-arm64-product-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 72,
+        "object_null": 112,
+        "global_object_pool": 1880,
+        "isolate": 1776,
+        "isolate_group": 1784,
+        "jump_to_frame_entry_point": 616
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 16
+      },
+      "object_store": {
+        "libraries": 936
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 116
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 48,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 12,
+        "library": 36
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 22,
+        "array": 89,
+        "immutable_array": 90,
+        "growable_object_array": 91,
+        "one_byte_string": 93,
+        "two_byte_string": 94
+      },
+      "canonical_bool": {
+        "thread_true": 120,
+        "thread_false": 128,
+        "value": 8,
+        "cid": 62
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 48,
+        "cid_function_type": 49,
+        "cid_record_type": 50,
+        "cid_type_parameter": 51,
+        "cid_null": 170,
+        "cid_dynamic": 171,
+        "cid_void": 172,
+        "cid_never": 173,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 2,
+        "type_class_id_shift": 4,
+        "type_parameter_function_bit": 4
+      }
+    },
+    {
+      "profile_version": 2,
+      "name": "dart-3.5.0-arm64-product-compressed",
+      "dart_version": "3.5.0",
+      "snapshot_hash": "80a49c7111088100a233b2ae788e1f48",
+      "snapshot_profile": "flutter-arm64-product-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 72,
+        "object_null": 120,
+        "global_object_pool": 1912,
+        "isolate": 1800,
+        "isolate_group": 1808,
+        "jump_to_frame_entry_point": 624
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 16
+      },
+      "object_store": {
+        "libraries": 896
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 116
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 48,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 12,
+        "library": 36
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 22,
+        "array": 89,
+        "immutable_array": 90,
+        "growable_object_array": 91,
+        "one_byte_string": 93,
+        "two_byte_string": 94
+      },
+      "canonical_bool": {
+        "thread_true": 128,
+        "thread_false": 136,
+        "value": 8,
+        "cid": 62
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 48,
+        "cid_function_type": 49,
+        "cid_record_type": 50,
+        "cid_type_parameter": 51,
+        "cid_null": 170,
+        "cid_dynamic": 171,
+        "cid_void": 172,
+        "cid_never": 173,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 1,
+        "type_class_id_shift": 3,
+        "type_parameter_function_bit": 3
+      }
+    },
+    {
+      "profile_version": 3,
+      "name": "dart-3.12.1-arm64-product-compressed",
+      "dart_version": "3.12.1",
+      "snapshot_hash": "ace654289f5abc240509fc941453ebc5",
+      "snapshot_profile": "flutter-arm64-product-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 88,
+        "object_null": 136,
+        "global_object_pool": 1760,
+        "isolate": 1664,
+        "isolate_group": 1672,
+        "jump_to_frame_entry_point": 632
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 16
+      },
+      "object_store": {
+        "libraries": 992
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 116
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 48,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 12,
+        "library": 36
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 23,
+        "array": 90,
+        "immutable_array": 91,
+        "growable_object_array": 92,
+        "one_byte_string": 94,
+        "two_byte_string": 95
+      },
+      "canonical_bool": {
+        "thread_true": 152,
+        "thread_false": 160,
+        "value": 8,
+        "cid": 63
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 49,
+        "cid_function_type": 50,
+        "cid_record_type": 51,
+        "cid_type_parameter": 52,
+        "cid_null": 171,
+        "cid_dynamic": 172,
+        "cid_void": 173,
+        "cid_never": 174,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 1,
+        "type_class_id_shift": 3,
+        "type_parameter_function_bit": 3
+      }
+    }
+  ]
+}

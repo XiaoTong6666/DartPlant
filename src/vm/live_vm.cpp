@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include "runtime/runtime_internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 namespace {
@@ -30,271 +32,26 @@ constexpr uint32_t kClassIdTagShift = 12;
 constexpr uint64_t kClassIdTagMask = (1ULL << 20) - 1;
 constexpr uint64_t kMaxObjectPoolEntries = 1ULL << 24;
 constexpr uint64_t kMaxClassFunctions = 1ULL << 20;
+constexpr size_t kLiveVmProfileV1Size =
+    offsetof(DartPlantLiveVmProfile, code_unchecked_entry_point_offset);
+constexpr size_t kLiveVmProbeInfoV1Size = offsetof(DartPlantLiveVmProbeInfo, requested_entry_kind);
 
-// Dart 3.4.4 / Flutter 3.22.x ARM64 PRODUCT + compressed pointers.
-//
-// Register assignments come from the vendored Dart SDK constants_arm64.h.
-// Thread/Code/Function/Array/String/IsolateGroup offsets come from the
-// PRODUCT + TARGET_ARCH_ARM64 + DART_COMPRESSED_POINTERS block in
-// runtime_offsets_extracted.h. Private heap-object fields not emitted by the
-// compiler offset extractor are data-only offsets derived from raw_object.h for
-// the same build profile. DartPlant never includes or links these private VM
-// headers at runtime.
-constexpr DartPlantLiveVmProfile kDart344Arm64ProductCompressed = {
-    .struct_size = sizeof(DartPlantLiveVmProfile),
-    .profile_version = 1,
-    .name = "dart-3.4.4-arm64-product-compressed",
-    .dart_version = "3.4.4",
-    .snapshot_hash = "d20a1be77c3d3c41b2a5accaee1ce549",
-    .snapshot_profile = "flutter-arm64-product-compressed",
-    .thr_register = 26,
-    .pp_register = 27,
-    .code_register = 24,
-    .heap_bits_register = 28,
-    .null_register = 22,
-    .reserved_registers = {0, 0, 0},
-    .thread_heap_base_offset = 0x48,
-    .thread_object_null_offset = 0x70,
-    .thread_global_object_pool_offset = 0x758,
-    .thread_isolate_offset = 0x6f0,
-    .thread_isolate_group_offset = 0x6f8,
-    .isolate_group_class_table_offset = 0x10,
-    .isolate_group_cached_class_table_table_offset = 0x18,
-    .isolate_group_object_store_offset = 0x20,
-    .class_table_num_cids_offset = 0x10,
-    .object_store_libraries_offset = 0x3a8,
-    .code_entry_point_offset = 0x8,
-    .code_object_pool_offset = 0x28,
-    .code_owner_offset = 0x38,
-    .code_instructions_length_offset = 0x74,
-    .function_entry_point_offset = 0x8,
-    .function_name_offset = 0x18,
-    .function_owner_offset = 0x1c,
-    .function_code_offset = 0x2c,
-    .function_kind_tag_offset = 0x30,
-    .class_name_offset = 0x8,
-    .class_functions_offset = 0xc,
-    .class_library_offset = 0x24,
-    .library_url_offset = 0xc,
-    .library_toplevel_class_offset = 0x1c,
-    .array_length_offset = 0xc,
-    .array_elements_offset = 0x10,
-    .growable_object_array_length_offset = 0xc,
-    .growable_object_array_data_offset = 0x10,
-    .string_length_offset = 0x8,
-    .string_data_offset = 0x10,
-    .object_pool_length_offset = 0x8,
-    .object_pool_elements_offset = 0x10,
-    .cid_class = 5,
-    .cid_function = 7,
-    .cid_library = 13,
-    .cid_code = 18,
-    .cid_object_pool = 22,
-    .cid_array = 89,
-    .cid_immutable_array = 90,
-    .cid_growable_object_array = 91,
-    .cid_one_byte_string = 93,
-    .cid_two_byte_string = 94,
-};
-
-// Dart 3.5.0 PRODUCT ARM64 compressed profile. Thread offsets come from the
-// exact 3.5.0 runtime_offsets_extracted.h block; ObjectStore.libraries is
-// derived from that tag's OBJECT_STORE_FIELD_LIST using ObjectStore.int_type as
-// the exported anchor (0x130 -> libraries 0x380). Heap-object layouts used here
-// are unchanged from the 3.4 AOT compressed layout.
-constexpr DartPlantLiveVmProfile kDart350Arm64ProductCompressed = {
-    .struct_size = sizeof(DartPlantLiveVmProfile),
-    .profile_version = 2,
-    .name = "dart-3.5.0-arm64-product-compressed",
-    .dart_version = "3.5.0",
-    .snapshot_hash = "80a49c7111088100a233b2ae788e1f48",
-    .snapshot_profile = "flutter-arm64-product-compressed",
-    .thr_register = 26,
-    .pp_register = 27,
-    .code_register = 24,
-    .heap_bits_register = 28,
-    .null_register = 22,
-    .reserved_registers = {0, 0, 0},
-    .thread_heap_base_offset = 0x48,
-    .thread_object_null_offset = 0x78,
-    .thread_global_object_pool_offset = 0x778,
-    .thread_isolate_offset = 0x708,
-    .thread_isolate_group_offset = 0x710,
-    .isolate_group_class_table_offset = 0x10,
-    .isolate_group_cached_class_table_table_offset = 0x18,
-    .isolate_group_object_store_offset = 0x20,
-    .class_table_num_cids_offset = 0x10,
-    .object_store_libraries_offset = 0x380,
-    .code_entry_point_offset = 0x8,
-    .code_object_pool_offset = 0x28,
-    .code_owner_offset = 0x38,
-    .code_instructions_length_offset = 0x74,
-    .function_entry_point_offset = 0x8,
-    .function_name_offset = 0x18,
-    .function_owner_offset = 0x1c,
-    .function_code_offset = 0x2c,
-    .function_kind_tag_offset = 0x30,
-    .class_name_offset = 0x8,
-    .class_functions_offset = 0xc,
-    .class_library_offset = 0x24,
-    .library_url_offset = 0xc,
-    .library_toplevel_class_offset = 0x1c,
-    .array_length_offset = 0xc,
-    .array_elements_offset = 0x10,
-    .growable_object_array_length_offset = 0xc,
-    .growable_object_array_data_offset = 0x10,
-    .string_length_offset = 0x8,
-    .string_data_offset = 0x10,
-    .object_pool_length_offset = 0x8,
-    .object_pool_elements_offset = 0x10,
-    .cid_class = 5,
-    .cid_function = 7,
-    .cid_library = 13,
-    .cid_code = 18,
-    .cid_object_pool = 22,
-    .cid_array = 89,
-    .cid_immutable_array = 90,
-    .cid_growable_object_array = 91,
-    .cid_one_byte_string = 93,
-    .cid_two_byte_string = 94,
-};
-
-// Dart 3.12.1 PRODUCT ARM64 compressed profile. Dart 3.12 inserts Bytecode
-// after Code in the predefined CID list, shifting ObjectPool and later CIDs by
-// one. ObjectStore.libraries is derived from the 3.12.1 field list using the
-// exported ObjectStore.int_type=0x168 anchor (result 0x3e0).
-constexpr DartPlantLiveVmProfile kDart3121Arm64ProductCompressed = {
-    .struct_size = sizeof(DartPlantLiveVmProfile),
-    .profile_version = 3,
-    .name = "dart-3.12.1-arm64-product-compressed",
-    .dart_version = "3.12.1",
-    .snapshot_hash = "ace654289f5abc240509fc941453ebc5",
-    .snapshot_profile = "flutter-arm64-product-compressed",
-    .thr_register = 26,
-    .pp_register = 27,
-    .code_register = 24,
-    .heap_bits_register = 28,
-    .null_register = 22,
-    .reserved_registers = {0, 0, 0},
-    .thread_heap_base_offset = 0x58,
-    .thread_object_null_offset = 0x88,
-    .thread_global_object_pool_offset = 0x6e0,
-    .thread_isolate_offset = 0x680,
-    .thread_isolate_group_offset = 0x688,
-    .isolate_group_class_table_offset = 0x10,
-    .isolate_group_cached_class_table_table_offset = 0x18,
-    .isolate_group_object_store_offset = 0x20,
-    .class_table_num_cids_offset = 0x10,
-    .object_store_libraries_offset = 0x3e0,
-    .code_entry_point_offset = 0x8,
-    .code_object_pool_offset = 0x28,
-    .code_owner_offset = 0x38,
-    .code_instructions_length_offset = 0x74,
-    .function_entry_point_offset = 0x8,
-    .function_name_offset = 0x18,
-    .function_owner_offset = 0x1c,
-    .function_code_offset = 0x2c,
-    .function_kind_tag_offset = 0x30,
-    .class_name_offset = 0x8,
-    .class_functions_offset = 0xc,
-    .class_library_offset = 0x24,
-    .library_url_offset = 0xc,
-    .library_toplevel_class_offset = 0x1c,
-    .array_length_offset = 0xc,
-    .array_elements_offset = 0x10,
-    .growable_object_array_length_offset = 0xc,
-    .growable_object_array_data_offset = 0x10,
-    .string_length_offset = 0x8,
-    .string_data_offset = 0x10,
-    .object_pool_length_offset = 0x8,
-    .object_pool_elements_offset = 0x10,
-    .cid_class = 5,
-    .cid_function = 7,
-    .cid_library = 13,
-    .cid_code = 18,
-    .cid_object_pool = 23,
-    .cid_array = 90,
-    .cid_immutable_array = 91,
-    .cid_growable_object_array = 92,
-    .cid_one_byte_string = 94,
-    .cid_two_byte_string = 95,
-};
-
-constexpr std::array<const DartPlantLiveVmProfile*, 3> kLiveVmProfiles = {
-    &kDart344Arm64ProductCompressed,
-    &kDart350Arm64ProductCompressed,
-    &kDart3121Arm64ProductCompressed,
-};
-
-struct CanonicalBoolLayout {
-    uint32_t profile_version;
-    uint32_t thread_true_offset;
-    uint32_t thread_false_offset;
-    uint32_t value_offset;
-    uint32_t cid;
-};
-
-// Dart SDK runtime_offsets_extracted.h, PRODUCT + TARGET_ARCH_ARM64 +
-// DART_COMPRESSED_POINTERS, plus raw_object.h's UntaggedBool::value_ layout.
-constexpr std::array<CanonicalBoolLayout, 3> kCanonicalBoolLayouts = {{
-    {1, 0x78, 0x80, 0x8, 62},  // Dart 3.4.4.
-    {2, 0x80, 0x88, 0x8, 62},  // Dart 3.5.0.
-    {3, 0x98, 0xa0, 0x8, 63},  // Dart 3.12.1.
-}};
-
-const CanonicalBoolLayout* FindCanonicalBoolLayout(uint32_t profile_version) {
-    const auto found = std::find_if(kCanonicalBoolLayouts.begin(), kCanonicalBoolLayouts.end(),
-                                    [profile_version](const CanonicalBoolLayout& layout) {
-                                        return layout.profile_version == profile_version;
-                                    });
-    return found == kCanonicalBoolLayouts.end() ? nullptr : &*found;
+template <typename T>
+void CopyOutputPrefix(const T& source, T* destination) {
+    const size_t caller_size = destination->struct_size;
+    const size_t written_size = std::min(caller_size, sizeof(T));
+    std::memcpy(destination, &source, written_size);
+    destination->struct_size = static_cast<uint32_t>(written_size);
 }
 
-struct FunctionTypeLayout {
-    uint32_t profile_version;
-    uint32_t function_signature_offset;
-    uint32_t abstract_type_flags_offset;
-    uint32_t type_parameters_offset;
-    uint32_t result_type_offset;
-    uint32_t parameter_types_offset;
-    uint32_t named_parameter_names_offset;
-    uint32_t packed_parameter_counts_offset;
-    uint32_t packed_type_parameter_counts_offset;
-    uint32_t cid_type;
-    uint32_t cid_function_type;
-    uint32_t cid_record_type;
-    uint32_t cid_type_parameter;
-    uint32_t cid_null;
-    uint32_t cid_dynamic;
-    uint32_t cid_void;
-    uint32_t cid_never;
-    uint32_t type_parameter_base_offset;
-    uint32_t type_parameter_index_offset;
-    uint8_t nullability_bits;
-    uint8_t type_class_id_shift;
-    uint8_t type_parameter_function_bit;
-};
-
-// Dart SDK raw_object.h + runtime_offsets_extracted.h for PRODUCT ARM64 with
-// compressed pointers. FunctionType.result_type is the compressed field between
-// type_parameters (0x20) and parameter_types (0x28); it is not emitted by the
-// compiler offset extractor because generated code does not address it directly.
-constexpr std::array<FunctionTypeLayout, 3> kFunctionTypeLayouts = {{
-    {1,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 48, 49,
-     50, 51,   170,  171,  172,  173,  0x24, 0x26, 2,    4,  4},  // Dart 3.4.4.
-    {2,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 48, 49,
-     50, 51,   170,  171,  172,  173,  0x24, 0x26, 1,    3,  3},  // Dart 3.5.0.
-    {3,  0x20, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 49, 50, 51,
-     52, 171,  172,  173,  174,  0x24, 0x26, 1,    3,    3},  // Dart 3.12.1; Bytecode shifts later
-                                                              // predefined CIDs.
-}};
+const CanonicalBoolLayout* FindCanonicalBoolLayout(uint32_t profile_version) {
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
+    return profile == nullptr ? nullptr : &profile->canonical_bool;
+}
 
 const FunctionTypeLayout* FindFunctionTypeLayout(uint32_t profile_version) {
-    const auto found = std::find_if(kFunctionTypeLayouts.begin(), kFunctionTypeLayouts.end(),
-                                    [profile_version](const FunctionTypeLayout& layout) {
-                                        return layout.profile_version == profile_version;
-                                    });
-    return found == kFunctionTypeLayouts.end() ? nullptr : &*found;
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
+    return profile == nullptr ? nullptr : &profile->function_type;
 }
 
 // compiler::target::kNumParameterFlagsPerElement for ARM64. Each named parameter
@@ -784,11 +541,45 @@ bool FindFunctionByIdentity(const ProcessMemoryReader& reader,
     return false;
 }
 
+bool ReadFunctionEntryForKind(const ProcessMemoryReader& reader,
+                              const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+                              uint64_t function, DartPlantEntryKind entry_kind,
+                              uint64_t* out_entry) {
+    if (out_entry == nullptr || !RequireCid(reader, function, profile.cid_function)) return false;
+    const uintptr_t function_address = Untag(function);
+    if (entry_kind == DARTPLANT_ENTRY_DEFAULT) {
+        return reader.Read(function_address + profile.function_entry_point_offset, out_entry) &&
+               *out_entry != 0;
+    }
+    if (entry_kind == DARTPLANT_ENTRY_UNCHECKED) {
+        return reader.Read(function_address + profile.function_unchecked_entry_point_offset,
+                           out_entry) &&
+               *out_entry != 0;
+    }
+    if (IsClosureFunction(reader, profile, function)) return false;
+    uint64_t code = 0;
+    if (!ReadCompressedObject(reader, function_address, profile.function_code_offset, heap_base,
+                              &code) ||
+        !RequireCid(reader, code, profile.cid_code)) {
+        return false;
+    }
+    uint32_t offset = 0;
+    if (entry_kind == DARTPLANT_ENTRY_MONOMORPHIC) {
+        offset = profile.code_monomorphic_entry_point_offset;
+    } else if (entry_kind == DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED) {
+        offset = profile.code_monomorphic_unchecked_entry_point_offset;
+    } else {
+        return false;
+    }
+    return reader.Read(Untag(code) + offset, out_entry) && *out_entry != 0;
+}
+
 bool ScanFunctionsByEntryInClass(const ProcessMemoryReader& reader,
                                  const DartPlantLiveVmProfile& profile, uint64_t heap_base,
                                  uint64_t tagged_class, bool is_top_level, uintptr_t target_entry,
-                                 const char* expected_function, const char* expected_class,
-                                 uint64_t* selected_function, uint32_t* alias_count) {
+                                 DartPlantEntryKind entry_kind, const char* expected_function,
+                                 const char* expected_class, uint64_t* selected_function,
+                                 uint32_t* alias_count) {
     if (selected_function == nullptr || alias_count == nullptr ||
         !RequireCid(reader, tagged_class, profile.cid_class)) {
         return false;
@@ -816,12 +607,12 @@ bool ScanFunctionsByEntryInClass(const ProcessMemoryReader& reader,
             continue;
         }
         uint64_t entry = 0;
-        if (!reader.Read(Untag(function) + profile.function_entry_point_offset, &entry) ||
+        if (!ReadFunctionEntryForKind(reader, profile, heap_base, function, entry_kind, &entry) ||
             entry != target_entry) {
             continue;
         }
         if (*alias_count != std::numeric_limits<uint32_t>::max()) ++*alias_count;
-        if (*selected_function == 0 && !IsClosureFunction(reader, profile, function) &&
+        if (*selected_function == 0 &&
             FunctionNameMatches(reader, profile, heap_base, function, expected_function) &&
             ClassIdentityMatches(reader, profile, heap_base, tagged_class, is_top_level,
                                  expected_class)) {
@@ -835,8 +626,9 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
                                  const DartPlantLiveVmProfile& profile, uint64_t heap_base,
                                  uintptr_t class_table, uintptr_t cached_class_table_table,
                                  uintptr_t object_store, uintptr_t target_entry,
-                                 const char* expected_function, const char* expected_class,
-                                 uint64_t* out_function, uint32_t* out_alias_count) {
+                                 DartPlantEntryKind entry_kind, const char* expected_function,
+                                 const char* expected_class, uint64_t* out_function,
+                                 uint32_t* out_alias_count) {
     if (out_function == nullptr || out_alias_count == nullptr || target_entry == 0) return false;
     *out_function = 0;
     *out_alias_count = 0;
@@ -854,7 +646,7 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
                 continue;
             }
             ScanFunctionsByEntryInClass(reader, profile, heap_base, tagged_class, false,
-                                        target_entry, expected_function, expected_class,
+                                        target_entry, entry_kind, expected_function, expected_class,
                                         out_function, out_alias_count);
         }
     }
@@ -890,7 +682,7 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
             continue;
         }
         ScanFunctionsByEntryInClass(reader, profile, heap_base, top_level_class, true, target_entry,
-                                    expected_function, expected_class, out_function,
+                                    entry_kind, expected_function, expected_class, out_function,
                                     out_alias_count);
     }
     return *out_function != 0;
@@ -899,6 +691,42 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
 struct CollectedLiveFunction {
     DartPlantLiveVmFunctionInfo info{};
 };
+
+constexpr uint32_t kClosureFunctionKind = 1;
+constexpr uint32_t kImplicitClosureFunctionKind = 2;
+
+bool IsClosureCallFunctionKind(uint32_t kind) {
+    return kind == kClosureFunctionKind || kind == kImplicitClosureFunctionKind;
+}
+
+uint64_t EntryForKind(const DartPlantLiveVmFunctionInfo& info, DartPlantEntryKind kind) {
+    switch (kind) {
+    case DARTPLANT_ENTRY_DEFAULT:
+        return info.code_entry_point;
+    case DARTPLANT_ENTRY_UNCHECKED:
+        return info.code_unchecked_entry_point;
+    case DARTPLANT_ENTRY_MONOMORPHIC:
+        return info.code_monomorphic_entry_point;
+    case DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED:
+        return info.code_monomorphic_unchecked_entry_point;
+    }
+    return 0;
+}
+
+bool RuntimeInstructionEntryToVa(const DartPlantFlutterSnapshotInfo& snapshot, uint64_t entry,
+                                 uint64_t* out_va) {
+    if (out_va == nullptr || snapshot.isolate_instructions_size == 0 ||
+        entry < snapshot.isolate_instructions_runtime) {
+        return false;
+    }
+    const uint64_t offset = entry - snapshot.isolate_instructions_runtime;
+    if (offset >= snapshot.isolate_instructions_size ||
+        snapshot.isolate_instructions_va > std::numeric_limits<uint64_t>::max() - offset) {
+        return false;
+    }
+    *out_va = snapshot.isolate_instructions_va + offset;
+    return true;
+}
 
 bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                          uint64_t heap_base, uint64_t tagged_function, uint32_t kind,
@@ -927,6 +755,8 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
     uint64_t function_owner = 0;
     if (!reader.Read(function_address + profile.function_entry_point_offset,
                      &collected.info.function_entry_point) ||
+        !reader.Read(function_address + profile.function_unchecked_entry_point_offset,
+                     &collected.info.function_unchecked_entry_point) ||
         !ReadCompressedObject(reader, function_address, profile.function_name_offset, heap_base,
                               &tagged_name) ||
         !ReadDartString(reader, profile, tagged_name, collected.info.function_name,
@@ -940,16 +770,37 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
         return false;
     }
 
+    const bool closure_call_entry_only = IsClosureCallFunctionKind(kind);
     uint64_t code_owner = 0;
     const uintptr_t code_address = Untag(collected.info.code);
     if (!reader.Read(code_address + profile.code_entry_point_offset,
                      &collected.info.code_entry_point) ||
+        !reader.Read(code_address + profile.code_unchecked_entry_point_offset,
+                     &collected.info.code_unchecked_entry_point) ||
+        !reader.Read(code_address + profile.code_monomorphic_entry_point_offset,
+                     &collected.info.code_monomorphic_entry_point) ||
+        !reader.Read(code_address + profile.code_monomorphic_unchecked_entry_point_offset,
+                     &collected.info.code_monomorphic_unchecked_entry_point) ||
         !reader.Read(code_address + profile.code_object_pool_offset,
                      &collected.info.code_object_pool) ||
         !reader.Read(code_address + profile.code_owner_offset, &code_owner) ||
         !reader.Read(code_address + profile.code_instructions_length_offset,
                      &collected.info.code_size) ||
-        collected.info.function_entry_point == 0 || collected.info.code_size == 0) {
+        collected.info.function_entry_point == 0 || collected.info.code_entry_point == 0 ||
+        collected.info.code_size == 0) {
+        return false;
+    }
+    // AOT closure invocation loads Closure.entry_point and calls only the
+    // Function normal entry. The remaining Function/Code caches are not part
+    // of that call contract and may legitimately be absent or aliased. Regular
+    // Functions expose all four CodeEntryKind caches and must agree exactly.
+    if (collected.info.function_entry_point != collected.info.code_entry_point ||
+        (!closure_call_entry_only && (collected.info.function_unchecked_entry_point == 0 ||
+                                      collected.info.code_unchecked_entry_point == 0 ||
+                                      collected.info.code_monomorphic_entry_point == 0 ||
+                                      collected.info.code_monomorphic_unchecked_entry_point == 0 ||
+                                      collected.info.function_unchecked_entry_point !=
+                                          collected.info.code_unchecked_entry_point))) {
         return false;
     }
     collected.info.code_owner_matches_function = code_owner == tagged_function ? 1 : 0;
@@ -959,18 +810,55 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
         return false;
     }
 
-    if (snapshot.isolate_instructions_size == 0 ||
-        collected.info.function_entry_point < snapshot.isolate_instructions_runtime) {
+    AotCodePayloadRange payload_range{};
+    if (!ComputeAotCodePayloadRange(profile.profile_version, collected.info.code_entry_point,
+                                    collected.info.code_monomorphic_entry_point,
+                                    collected.info.code_size, &payload_range)) {
         return false;
     }
-    const uint64_t instruction_offset =
-        collected.info.function_entry_point - snapshot.isolate_instructions_runtime;
-    if (instruction_offset >= snapshot.isolate_instructions_size ||
-        snapshot.isolate_instructions_va >
-            std::numeric_limits<uint64_t>::max() - instruction_offset) {
+    const uint64_t payload_start = payload_range.start;
+    const uint64_t payload_end = payload_range.end;
+    if (collected.info.code_unchecked_entry_point != 0 &&
+        (collected.info.code_unchecked_entry_point < payload_start ||
+         collected.info.code_unchecked_entry_point >= payload_end)) {
         return false;
     }
-    collected.info.entry_va = snapshot.isolate_instructions_va + instruction_offset;
+    if (collected.info.code_monomorphic_unchecked_entry_point != 0 &&
+        (collected.info.code_monomorphic_unchecked_entry_point < payload_start ||
+         collected.info.code_monomorphic_unchecked_entry_point >= payload_end)) {
+        return false;
+    }
+    if (collected.info.code_unchecked_entry_point != 0 &&
+        collected.info.code_monomorphic_unchecked_entry_point != 0) {
+        if (collected.info.code_unchecked_entry_point < collected.info.code_entry_point ||
+            collected.info.code_monomorphic_unchecked_entry_point <
+                collected.info.code_monomorphic_entry_point) {
+            return false;
+        }
+        const uint64_t unchecked_delta =
+            collected.info.code_unchecked_entry_point - collected.info.code_entry_point;
+        if (collected.info.code_monomorphic_unchecked_entry_point -
+                collected.info.code_monomorphic_entry_point !=
+            unchecked_delta) {
+            return false;
+        }
+    }
+    if (!RuntimeInstructionEntryToVa(snapshot, collected.info.function_entry_point,
+                                     &collected.info.entry_va)) {
+        return false;
+    }
+    if (!closure_call_entry_only &&
+        (!RuntimeInstructionEntryToVa(snapshot, collected.info.function_unchecked_entry_point,
+                                      &collected.info.unchecked_entry_va) ||
+         !RuntimeInstructionEntryToVa(snapshot, collected.info.code_monomorphic_entry_point,
+                                      &collected.info.monomorphic_entry_va) ||
+         !RuntimeInstructionEntryToVa(snapshot,
+                                      collected.info.code_monomorphic_unchecked_entry_point,
+                                      &collected.info.monomorphic_unchecked_entry_va))) {
+        return false;
+    }
+    collected.info.closure_call_entry_only = closure_call_entry_only ? 1 : 0;
+    collected.info.entry_kind_mask = closure_call_entry_only ? 0x1u : 0x0fu;
     collected.info.code_section_va = snapshot.isolate_instructions_va;
     functions->push_back(collected);
     return true;
@@ -1040,10 +928,6 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
             continue;
         }
         const uint32_t kind = kind_tag & 0x1f;
-        if (kind == 1 || kind == 2) {
-            ++*skipped_function_count;
-            continue;
-        }
         if (!CollectLiveFunction(reader, profile, heap_base, function, kind, tagged_class, library,
                                  is_top_level, library_uri, class_name, snapshot, functions)) {
             ++*skipped_function_count;
@@ -1114,23 +998,38 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
                                        snapshot, &seen_functions, functions, &skipped);
     }
 
-    std::unordered_map<uint64_t, uint32_t> aliases;
+    std::array<std::unordered_map<uint64_t, uint32_t>, 4> aliases_by_kind;
     for (const CollectedLiveFunction& function : *functions) {
-        uint32_t& count = aliases[function.info.function_entry_point];
-        if (count != std::numeric_limits<uint32_t>::max()) ++count;
+        for (uint32_t kind = 0; kind < 4; ++kind) {
+            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
+            const uint64_t entry =
+                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
+            uint32_t& count = aliases_by_kind[kind][entry];
+            if (count != std::numeric_limits<uint32_t>::max()) ++count;
+        }
     }
-    uint32_t shared_targets = 0;
     for (auto& function : *functions) {
-        function.info.entry_alias_count = aliases[function.info.function_entry_point];
+        for (uint32_t kind = 0; kind < 4; ++kind) {
+            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
+            const uint64_t entry =
+                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
+            function.info.entry_alias_counts[kind] = aliases_by_kind[kind][entry];
+        }
+        function.info.entry_alias_count = function.info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
         function.info.entry_is_shared = function.info.entry_alias_count > 1 ? 1 : 0;
     }
-    for (const auto& [entry, count] : aliases) {
+    // Keep the public aggregate index counters compatible with the original
+    // Function-index contract: they describe default Function entries. Exact
+    // per-entry-kind multiplicity is exposed on each FunctionInfo above.
+    uint32_t shared_targets = 0;
+    const auto& default_aliases = aliases_by_kind[DARTPLANT_ENTRY_DEFAULT];
+    for (const auto& [entry, count] : default_aliases) {
         (void) entry;
         if (count > 1) ++shared_targets;
     }
 
     out_info->function_count = static_cast<uint32_t>(functions->size());
-    out_info->code_target_count = static_cast<uint32_t>(aliases.size());
+    out_info->code_target_count = static_cast<uint32_t>(default_aliases.size());
     out_info->shared_code_target_count = shared_targets;
     out_info->skipped_function_count = skipped;
     return true;
@@ -1149,18 +1048,12 @@ DartPlantStatus SelectProfile(const DartPlantFlutterSnapshotInfo& snapshot,
     if (!snapshot.compressed_pointers) {
         return FailProbe("no exact live VM raw-layout profile for uncompressed pointers");
     }
-    const DartPlantLiveVmProfile* matched = nullptr;
-    for (const DartPlantLiveVmProfile* profile : kLiveVmProfiles) {
-        if (profile != nullptr && SameString(snapshot.snapshot_hash, profile->snapshot_hash) &&
-            SameString(snapshot.profile_name, profile->snapshot_profile)) {
-            matched = profile;
-            break;
-        }
-    }
+    const RuntimeProfileRecord* matched =
+        FindRuntimeProfileBySnapshot(snapshot.snapshot_hash, snapshot.profile_name);
     if (matched == nullptr) {
         return FailProbe("no exact live VM raw-layout profile for this Dart snapshot");
     }
-    *out_profile = *matched;
+    *out_profile = matched->live_vm;
     ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1431,11 +1324,16 @@ extern "C" DartPlantStatus dartplant_live_vm_select_profile(
     const DartPlantFlutterSnapshotInfo* snapshot, DartPlantLiveVmProfile* out_profile) {
     if (snapshot == nullptr || out_profile == nullptr ||
         snapshot->struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
-        out_profile->struct_size < sizeof(DartPlantLiveVmProfile)) {
+        out_profile->struct_size < dartplant::kLiveVmProfileV1Size) {
         dartplant::SetLastError("live VM profile selection arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    return dartplant::SelectProfile(*snapshot, out_profile);
+    DartPlantLiveVmProfile selected{};
+    selected.struct_size = sizeof(selected);
+    const DartPlantStatus status = dartplant::SelectProfile(*snapshot, &selected);
+    if (status != DARTPLANT_OK) return status;
+    dartplant::CopyOutputPrefix(selected, out_profile);
+    return DARTPLANT_OK;
 }
 
 extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
@@ -1601,7 +1499,7 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     if (invocation == nullptr || invocation->context == nullptr ||
         invocation->requested_method == nullptr || snapshot == nullptr || out_info == nullptr ||
         snapshot->struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
-        out_info->struct_size < sizeof(DartPlantLiveVmProbeInfo)) {
+        out_info->struct_size < dartplant::kLiveVmProbeInfoV1Size) {
         dartplant::SetLastError("live VM probe arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
@@ -1701,12 +1599,13 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
 
     const char* expected_function = invocation->requested_method->record.function_name.c_str();
     const char* expected_class = invocation->requested_method->record.class_name.c_str();
+    info.requested_entry_kind = invocation->requested_method->record.entry_kind;
     uint64_t indexed_function = 0;
     if (!dartplant::FindFunctionByEntryIdentity(
             reader, profile, info.heap_base, static_cast<uintptr_t>(info.class_table),
             static_cast<uintptr_t>(info.cached_class_table_table),
-            static_cast<uintptr_t>(info.object_store), target_entry, expected_function,
-            expected_class, &indexed_function, &info.entry_alias_count)) {
+            static_cast<uintptr_t>(info.object_store), target_entry, info.requested_entry_kind,
+            expected_function, expected_class, &indexed_function, &info.entry_alias_count)) {
         return dartplant::FailProbe(
             "ClassTable/ObjectStore live index could not resolve current method identity");
     }
@@ -1730,10 +1629,13 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
                                          info.heap_base, &function_code)) {
         return dartplant::FailProbe("failed to read Dart Function raw fields");
     }
-    if (info.function_entry_point != target_entry ||
+    if (!dartplant::ReadFunctionEntryForKind(reader, profile, info.heap_base, info.function,
+                                             info.requested_entry_kind,
+                                             &info.selected_entry_point) ||
+        info.selected_entry_point != target_entry ||
         !dartplant::ReadDartString(reader, profile, function_name, info.function_name,
                                    sizeof(info.function_name))) {
-        return dartplant::FailProbe("Function entry/name semantic validation failed");
+        return dartplant::FailProbe("Function selected-entry/name semantic validation failed");
     }
 
     info.code = function_code;
@@ -1818,7 +1720,7 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
         std::snprintf(info.class_name, sizeof(info.class_name), "%s", "Global");
     }
 
-    *out_info = info;
+    dartplant::CopyOutputPrefix(info, out_info);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1826,7 +1728,7 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
 extern "C" DartPlantStatus dartplant_live_vm_context_from_probe(
     const DartPlantLiveVmProbeInfo* probe, DartPlantLiveVmContext* out_context) {
     if (probe == nullptr || out_context == nullptr ||
-        probe->struct_size < sizeof(DartPlantLiveVmProbeInfo) ||
+        probe->struct_size < dartplant::kLiveVmProbeInfoV1Size ||
         out_context->struct_size < sizeof(DartPlantLiveVmContext)) {
         dartplant::SetLastError("live VM context arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -1999,8 +1901,8 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
             reader, profile, context->heap_base, static_cast<uintptr_t>(context->class_table),
             static_cast<uintptr_t>(context->cached_class_table_table),
             static_cast<uintptr_t>(context->object_store),
-            static_cast<uintptr_t>(method.function_entry_point), function_name, class_name,
-            &ignored_function, &method.entry_alias_count)) {
+            static_cast<uintptr_t>(method.function_entry_point), DARTPLANT_ENTRY_DEFAULT,
+            function_name, class_name, &ignored_function, &method.entry_alias_count)) {
         return dartplant::FailProbe("live VM entry alias scan failed");
     }
     method.entry_is_shared = method.entry_alias_count > 1 ? 1 : 0;

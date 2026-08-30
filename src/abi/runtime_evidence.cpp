@@ -94,6 +94,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     const DartPlantCompilerAbiEvidence* evidence) {
     constexpr size_t kCompilerAbiEvidenceV1Size =
         offsetof(DartPlantCompilerAbiEvidence, library_uri);
+    constexpr size_t kCompilerAbiEvidenceV2Size =
+        offsetof(DartPlantCompilerAbiEvidence, structural_schema_version);
     if (runtime == nullptr || method == nullptr || evidence == nullptr ||
         evidence->struct_size < kCompilerAbiEvidenceV1Size || evidence->snapshot_hash == nullptr ||
         evidence->snapshot_hash[0] == '\0' || evidence->app_build_id == nullptr ||
@@ -114,55 +116,58 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ABI_EVIDENCE,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
+    auto reject = [&](DartPlantStatus status, DartPlantResolveRejectReason reason,
+                      const char* message) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ABI_EVIDENCE,
+                                         DARTPLANT_RESOLVE_REJECTED, status, reason);
+        dartplant::SetLastError(message);
+        return status;
+    };
     if (!dartplant::RuntimeReadyForMethodOperation(runtime, method) ||
         !dartplant::IsCurrentRuntimeMethod(runtime, method)) {
-        dartplant::SetLastError("compiler ABI evidence targets a stale or unready runtime method");
-        return DARTPLANT_RUNTIME_NOT_READY;
-    }
-    if (method->record.entry_kind != DARTPLANT_ENTRY_DEFAULT) {
-        dartplant::SetLastError(
-            "typed ABI evidence currently supports only the default Dart entry");
-        return DARTPLANT_UNSUPPORTED_ABI;
+        return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                      "compiler ABI evidence targets a stale or unready runtime method");
     }
     if (method->function == nullptr || method->function->code_target == nullptr) {
-        dartplant::SetLastError("compiler ABI evidence method has no CodeTarget");
-        return DARTPLANT_INVALID_ARGUMENT;
+        return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS,
+                      "compiler ABI evidence method has no CodeTarget");
     }
     if (method->function->code_target->IsShared()) {
-        dartplant::SetLastError(
+        return reject(
+            DARTPLANT_SHARED_CODE_ENTRY, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS,
             "compiler ABI evidence cannot create a typed frame for an identity-ambiguous shared CodeTarget");
-        return DARTPLANT_SHARED_CODE_ENTRY;
     }
     if (!runtime->snapshot.has_value() || !runtime->selected_app_module.has_value()) {
-        dartplant::SetLastError("compiler ABI evidence cannot bind without the current AOT image");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE,
+                      "compiler ABI evidence cannot bind without the current AOT image");
     }
     if (runtime->snapshot->snapshot_hash != evidence->snapshot_hash) {
-        dartplant::SetLastError(
-            "compiler ABI evidence snapshot hash does not match the live runtime");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_SNAPSHOT_MISMATCH,
+                      "compiler ABI evidence snapshot hash does not match the live runtime");
     }
     if (!dartplant::EqualsIgnoreCaseAscii(runtime->selected_app_module->build_id,
                                           evidence->app_build_id)) {
-        dartplant::SetLastError(
-            "compiler ABI evidence app build-id does not match the live module");
-        return DARTPLANT_BUILD_ID_MISMATCH;
+        return reject(DARTPLANT_BUILD_ID_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
+                      "compiler ABI evidence app build-id does not match the live module");
     }
     const uint32_t code_size = dartplant::MethodCodeSize(method);
     const uintptr_t target = dartplant::MethodTarget(method);
     if (target == 0 || code_size == 0 ||
-        dartplant::FingerprintCode(reinterpret_cast<const void*>(target), code_size) !=
-            evidence->code_fingerprint) {
-        dartplant::SetLastError(
-            "compiler ABI evidence code fingerprint does not match the CodeTarget");
-        return DARTPLANT_FINGERPRINT_MISMATCH;
+        dartplant::FingerprintCodeWithManagedPatches(reinterpret_cast<const void*>(target),
+                                                     code_size) != evidence->code_fingerprint) {
+        return reject(DARTPLANT_FINGERPRINT_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
+                      "compiler ABI evidence code fingerprint does not match the CodeTarget");
     }
-    const bool has_function_binding = evidence->struct_size >= sizeof(*evidence);
+    const bool has_function_binding = evidence->struct_size >= kCompilerAbiEvidenceV2Size;
+    const bool has_structural_summary =
+        evidence->struct_size >= sizeof(*evidence) && evidence->structural_schema_version != 0;
     if (method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
         !has_function_binding) {
-        dartplant::SetLastError(
+        return reject(
+            DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
             "artifact compiler ABI evidence requires an exact Function identity/address binding");
-        return DARTPLANT_INVALID_ARGUMENT;
     }
     if (has_function_binding) {
         const std::string_view evidence_library =
@@ -176,33 +181,42 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             evidence_function != method->function->identity.function_name ||
             evidence->entry_kind != method->function->identity.entry_kind ||
             evidence->entry_va == 0 || evidence->code_size != code_size) {
-            dartplant::SetLastError(
+            return reject(
+                DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
                 "compiler ABI evidence Function identity does not match the runtime method");
-            return DARTPLANT_PROFILE_MISMATCH;
         }
         const auto evidence_target = runtime->snapshot->ResolveInstructionVa(
             *runtime->selected_app_module, evidence->entry_va);
         if (!evidence_target.has_value() || *evidence_target != target) {
-            dartplant::SetLastError(
+            return reject(
+                DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
                 "compiler ABI evidence entry VA does not resolve to the runtime CodeTarget");
-            return DARTPLANT_PROFILE_MISMATCH;
         }
     }
     if (evidence->must_use_stack_calling_convention != 0 &&
         evidence->max_parameters_in_registers != 0) {
-        dartplant::SetLastError(
+        return reject(
+            DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_ABI_CONFLICT,
             "compiler ABI evidence cannot combine forced stack calling convention with register parameters");
-        return DARTPLANT_INVALID_ARGUMENT;
     }
     if (evidence->max_parameters_in_registers > evidence->parameter_count) {
-        dartplant::SetLastError(
-            "compiler ABI evidence register parameter limit exceeds fixed formals");
-        return DARTPLANT_INVALID_ARGUMENT;
+        return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_ABI_CONFLICT,
+                      "compiler ABI evidence register parameter limit exceeds fixed formals");
     }
     if (method->function->code_target->HookRecord() != nullptr) {
-        dartplant::SetLastError(
-            "compiler ABI evidence must be registered before installing the hook");
-        return DARTPLANT_ALREADY_HOOKED;
+        return reject(DARTPLANT_ALREADY_HOOKED, DARTPLANT_REJECT_HOOK_FAILED,
+                      "compiler ABI evidence must be registered before installing the hook");
+    }
+    if (has_structural_summary) {
+        if (evidence->structural_schema_version != 1 || evidence->structural_verified > 1 ||
+            evidence->structural_has_unknown_control_flow > 1 ||
+            evidence->structural_uses_arguments_descriptor > 1 ||
+            evidence->structural_reached_return > 1 || evidence->structural_verified == 0 ||
+            evidence->structural_decoded_instructions == 0 ||
+            evidence->structural_basic_block_count == 0) {
+            return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_STRUCTURAL_CONFLICT,
+                          "compiler ABI structural evidence summary is invalid or unverified");
+        }
     }
 
     // A retained live Function gives us an independent FunctionType source for
@@ -214,8 +228,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     if (method->function->source == dartplant::DartFunctionSource::kLiveVm) {
         if (!runtime->live_vm_context.has_value() || !runtime->snapshot.has_value() ||
             method->function->function_object == 0) {
-            dartplant::SetLastError("live FunctionType is unavailable for ABI evidence validation");
-            return DARTPLANT_RUNTIME_NOT_READY;
+            return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                          "live FunctionType is unavailable for ABI evidence validation");
         }
         DartPlantFlutterSnapshotInfo snapshot_info{};
         snapshot_info.struct_size = sizeof(snapshot_info);
@@ -225,22 +239,25 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         const DartPlantStatus signature_status = dartplant_live_vm_read_function_signature(
             &*runtime->live_vm_context, &snapshot_info, method->function->function_object,
             &signature);
-        if (signature_status != DARTPLANT_OK) return signature_status;
+        if (signature_status != DARTPLANT_OK) {
+            return reject(signature_status, DARTPLANT_REJECT_ABI_INCOMPLETE,
+                          "live FunctionType could not validate compiler ABI evidence");
+        }
         if (signature.fixed_parameter_count != evidence->parameter_count) {
-            dartplant::SetLastError(
+            return reject(
+                DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_CONFLICT,
                 "compiler ABI evidence fixed-parameter count does not match FunctionType");
-            return DARTPLANT_PROFILE_MISMATCH;
         }
         const bool signature_has_optional = signature.optional_parameter_count != 0;
         if (signature_has_optional != (evidence->has_optional_parameters != 0)) {
-            dartplant::SetLastError(
+            return reject(
+                DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_CONFLICT,
                 "compiler ABI evidence optional-parameter flag does not match FunctionType");
-            return DARTPLANT_PROFILE_MISMATCH;
         }
     } else if (method->function->source != dartplant::DartFunctionSource::kOfflineSnapshotIndex) {
-        dartplant::SetLastError(
+        return reject(
+            DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_ABI_INCOMPLETE,
             "compiler ABI evidence requires a live Function or exact artifact-index method");
-        return DARTPLANT_RUNTIME_NOT_READY;
     }
 
     dartplant::abi::DartFunctionAbiEvidence provider;
@@ -249,17 +266,16 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         const auto representation =
             dartplant::ToInternalRepresentation(evidence->parameter_representations[index], false);
         if (!representation.has_value()) {
-            dartplant::SetLastError(
-                "compiler ABI evidence contains an invalid parameter representation");
-            return DARTPLANT_INVALID_ARGUMENT;
+            return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_ABI_CONFLICT,
+                          "compiler ABI evidence contains an invalid parameter representation");
         }
         provider.parameters.push_back(dartplant::CompilerSlot(*representation));
     }
     const auto result_representation =
         dartplant::ToInternalRepresentation(evidence->result_representation, true);
     if (!result_representation.has_value()) {
-        dartplant::SetLastError("compiler ABI evidence contains an invalid result representation");
-        return DARTPLANT_INVALID_ARGUMENT;
+        return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_ABI_CONFLICT,
+                      "compiler ABI evidence contains an invalid result representation");
     }
     provider.result = dartplant::CompilerSlot(*result_representation);
     provider.has_stack_calling_convention = true;
@@ -289,9 +305,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         existing->resolution.conflicting = true;
         existing->layout_status = dartplant::abi::DartCallLayoutStatus::kConflictingEvidence;
         existing->call_layout.reset();
-        dartplant::SetLastError(
-            "compiler ABI evidence changes the established formal parameter count");
-        return DARTPLANT_UNSUPPORTED_ABI;
+        return reject(DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_CONFLICT,
+                      "compiler ABI evidence changes the established formal parameter count");
     }
 
     existing->providers.push_back(std::move(provider));
@@ -300,6 +315,15 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     auto layout = std::make_shared<dartplant::abi::DartCallLayout>();
     existing->layout_status = dartplant::abi::ComputeDartCallLayout(
         existing->resolution, dartplant::abi::Arm64AotCallingConventionProfile(), layout.get());
+    if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
+        method->function->closure_call_entry_only &&
+        method->record.entry_kind == DARTPLANT_ENTRY_DEFAULT) {
+        layout->has_closure_receiver = true;
+        layout->closure_receiver_location = {
+            .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+            .register_index = 0,
+        };
+    }
     existing->call_layout = existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
                                     method->function->code_target->HasProvenUniqueIdentity()
                                 ? layout
@@ -307,14 +331,22 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
 
     if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kConflictingEvidence ||
         existing->resolution.conflicting) {
-        dartplant::SetLastError(
-            "compiler ABI evidence conflicts with previously registered exact evidence");
-        return DARTPLANT_UNSUPPORTED_ABI;
+        return reject(DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_CONFLICT,
+                      "compiler ABI evidence conflicts with previously registered exact evidence");
     }
     if (existing->layout_status != dartplant::abi::DartCallLayoutStatus::kOk) {
-        dartplant::SetLastError(
+        return reject(
+            DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_INCOMPLETE,
             "compiler ABI evidence was retained but is insufficient for a verified DartCallLayout");
-        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    runtime->diagnostics.abi_provider_count = static_cast<uint32_t>(existing->providers.size());
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ABI_EVIDENCE,
+                                     DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
+    if (has_structural_summary) {
+        runtime->diagnostics.structural_candidate_count = 1;
+        runtime->diagnostics.structural_relation_count = evidence->structural_relation_count;
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_STRUCTURAL_EVIDENCE,
+                                         DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
     }
     dartplant::ClearLastError();
     return DARTPLANT_OK;

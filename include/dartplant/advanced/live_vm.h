@@ -83,6 +83,14 @@ typedef struct DartPlantLiveVmProfile {
     uint32_t cid_growable_object_array;
     uint32_t cid_one_byte_string;
     uint32_t cid_two_byte_string;
+
+    // V2 append-only extension. Keep every field above byte-for-byte identical
+    // to the original public C ABI; callers compiled against the V1 prefix may
+    // continue to pass their smaller struct_size to profile-selection APIs.
+    uint32_t code_unchecked_entry_point_offset;
+    uint32_t code_monomorphic_entry_point_offset;
+    uint32_t code_monomorphic_unchecked_entry_point_offset;
+    uint32_t function_unchecked_entry_point_offset;
 } DartPlantLiveVmProfile;
 
 typedef struct DartPlantLiveVmArm64Registers {
@@ -196,6 +204,25 @@ typedef struct DartPlantLiveVmFunctionInfo {
     char function_name[DARTPLANT_LIVE_VM_FUNCTION_NAME_MAX];
     char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX];
     char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX];
+
+    // V2 append-only entry-family extension. The V1 prefix above is consumed
+    // directly by DartPlantLiveVmFunctionVisitor callbacks, so moving any of
+    // those fields would silently corrupt already-compiled visitors.
+    uint32_t entry_alias_counts[4];
+    uint64_t function_unchecked_entry_point;
+    uint64_t code_unchecked_entry_point;
+    uint64_t code_monomorphic_entry_point;
+    uint64_t code_monomorphic_unchecked_entry_point;
+    uint64_t unchecked_entry_va;
+    uint64_t monomorphic_entry_va;
+    uint64_t monomorphic_unchecked_entry_va;
+    // Bit N means DartPlant has exact live-VM evidence for
+    // DartPlantEntryKind(N). Closure calls in PRODUCT AOT enter through the
+    // cached Closure.entry_point, which mirrors Function.entry_point; such
+    // Functions therefore expose only the default entry as closure-call-safe.
+    uint8_t entry_kind_mask;
+    uint8_t closure_call_entry_only;
+    uint8_t reserved_entry_flags[6];
 } DartPlantLiveVmFunctionInfo;
 
 typedef struct DartPlantLiveVmFunctionIndexInfo {
@@ -283,6 +310,16 @@ typedef struct DartPlantLiveVmProbeInfo {
     char function_name[DARTPLANT_LIVE_VM_FUNCTION_NAME_MAX];
     char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX];
     char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX];
+
+    // V2 append-only probe data. requested_entry_kind previously reused the
+    // reserved_count slot, but keeping the old slot reserved preserves both
+    // layout and semantics for V1 binaries. The explicit four bytes preserve
+    // the V1 structure's implicit 8-byte-alignment tail padding so the first
+    // extension field begins at the old sizeof(DartPlantLiveVmProbeInfo).
+    uint8_t reserved_v1_tail_padding[4];
+    DartPlantEntryKind requested_entry_kind;
+    uint32_t reserved_entry_kind;
+    uint64_t selected_entry_point;
 } DartPlantLiveVmProbeInfo;
 
 // Selects a data-only layout profile from the exact snapshot identity. Unknown
@@ -340,7 +377,9 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_live_vm_read_function_parameter(
 // Enumerates the runtime Function graph reconstructed from Class.functions and
 // Library.toplevel_class. This is the production replacement for precomputed
 // method metadata: every emitted record carries the live Function*, Code*,
-// runtime entry and ELF entry_va. Closures are intentionally skipped.
+// runtime entry and ELF entry_va. Closure Functions may be enumerated, but only
+// the normal entry is exposed as closure-call-safe when exact SDK/profile
+// evidence proves PRODUCT AOT dispatches through cached Closure.entry_point.
 DARTPLANT_EXPORT DartPlantStatus dartplant_live_vm_visit_functions(
     const DartPlantLiveVmContext* context, const DartPlantFlutterSnapshotInfo* snapshot,
     DartPlantLiveVmFunctionVisitor visitor, void* user_data,

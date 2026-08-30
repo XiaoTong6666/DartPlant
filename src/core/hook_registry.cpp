@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 #include "core/internal.h"
 
@@ -69,6 +71,82 @@ void InsertListenerLocked(DartPlantHook* hook, std::shared_ptr<DartPlantListener
 
 uintptr_t HookTarget(const DartPlantHook* hook) {
     return hook == nullptr || hook->code_target == nullptr ? 0 : hook->code_target->entry;
+}
+
+bool SnapshotCodeTarget(const std::shared_ptr<DartCodeTarget>& code_target,
+                        std::vector<uint8_t>* out_bytes) {
+    if (out_bytes == nullptr) return false;
+    out_bytes->clear();
+    if (code_target == nullptr || code_target->entry == 0 || code_target->code_size == 0)
+        return true;
+    try {
+        out_bytes->resize(code_target->code_size);
+    } catch (...) {
+        return false;
+    }
+    std::memcpy(out_bytes->data(), reinterpret_cast<const void*>(code_target->entry),
+                code_target->code_size);
+    return true;
+}
+
+bool PrepareManagedPatchSnapshot(DartPlantHook* hook, const std::vector<uint8_t>& pristine) {
+    if (hook == nullptr || hook->code_target == nullptr ||
+        pristine.size() != hook->code_target->code_size) {
+        return false;
+    }
+    hook->managed_backend_patches.clear();
+    if (pristine.empty()) return true;
+    try {
+        ManagedCodePatch patch;
+        patch.address = hook->code_target->entry;
+        patch.original_bytes = pristine;
+        patch.patched_bytes.resize(pristine.size());
+        hook->managed_backend_patches.push_back(std::move(patch));
+    } catch (...) {
+        hook->managed_backend_patches.clear();
+        return false;
+    }
+    return true;
+}
+
+bool CaptureManagedPatchedBytes(DartPlantHook* hook) {
+    if (hook == nullptr || hook->code_target == nullptr) return false;
+    if (hook->code_target->code_size == 0) return hook->managed_backend_patches.empty();
+    if (hook->managed_backend_patches.size() != 1) return false;
+    ManagedCodePatch& patch = hook->managed_backend_patches[0];
+    if (patch.address != hook->code_target->entry ||
+        patch.original_bytes.size() != hook->code_target->code_size ||
+        patch.patched_bytes.size() != hook->code_target->code_size) {
+        return false;
+    }
+    std::memcpy(patch.patched_bytes.data(), reinterpret_cast<const void*>(patch.address),
+                patch.patched_bytes.size());
+    return true;
+}
+
+void OverlayOriginalBytes(uintptr_t start, uintptr_t end, const ManagedCodePatch& patch,
+                          std::vector<uint8_t>* bytes) {
+    if (bytes == nullptr || patch.address >= end || patch.original_bytes.empty() ||
+        patch.original_bytes.size() != patch.patched_bytes.size()) {
+        return;
+    }
+    const uintptr_t patch_end = patch.address > UINTPTR_MAX - patch.original_bytes.size()
+                                    ? UINTPTR_MAX
+                                    : patch.address + patch.original_bytes.size();
+    if (patch_end <= start) return;
+    const uintptr_t overlap_start = std::max(start, patch.address);
+    const uintptr_t overlap_end = std::min(end, patch_end);
+    if (overlap_start >= overlap_end) return;
+    const size_t destination = static_cast<size_t>(overlap_start - start);
+    const size_t source = static_cast<size_t>(overlap_start - patch.address);
+    const size_t count = static_cast<size_t>(overlap_end - overlap_start);
+    for (size_t index = 0; index < count; ++index) {
+        const size_t dst = destination + index;
+        const size_t src = source + index;
+        if ((*bytes)[dst] == patch.patched_bytes[src]) {
+            (*bytes)[dst] = patch.original_bytes[src];
+        }
+    }
 }
 
 DartPlantHook* FindHookLocked(uintptr_t target) {
@@ -200,6 +278,59 @@ void ReplaceModules(std::vector<ModuleImage> modules) {
     State().modules = std::move(modules);
 }
 
+std::string FingerprintCodeWithManagedPatches(const void* address, size_t size) {
+    if (address == nullptr || size == 0) return FingerprintCode(address, size);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    if (start > UINTPTR_MAX - size) return {};
+    const uintptr_t end = start + size;
+    std::vector<uint8_t> normalized;
+    try {
+        normalized.resize(size);
+    } catch (...) {
+        return {};
+    }
+
+    // Hook installation/unhook and the managed-patch registry are serialized by
+    // State().mutex. Copy the live bytes under the same lock so the snapshot and
+    // patch overlay describe one coherent DartPlant hook lifecycle state.
+    std::lock_guard state_lock(State().mutex);
+    std::memcpy(normalized.data(), address, size);
+    // Hook patches compose in installation order. Peel them in reverse so an
+    // overlapping sibling hook first restores the bytes it observed before its
+    // own installation, then the older hook can restore the true pristine
+    // image. Within one callback hook the host backend is installed after RET
+    // interception, so undo backend patches before RET patches.
+    for (auto hook_it = Hooks().rbegin(); hook_it != Hooks().rend(); ++hook_it) {
+        const auto& owned_hook = *hook_it;
+        std::lock_guard hook_lock(owned_hook->mutex);
+        if (owned_hook->state == HookRecordState::kUnhooked) continue;
+        for (const ManagedCodePatch& patch : owned_hook->managed_backend_patches) {
+            OverlayOriginalBytes(start, end, patch, &normalized);
+        }
+        for (const Arm64ReturnPatch& patch : owned_hook->return_patches) {
+            const ManagedCodePatch return_patch = {
+                .address = patch.address,
+                .original_bytes =
+                    {
+                        static_cast<uint8_t>(patch.original_instruction & 0xffU),
+                        static_cast<uint8_t>((patch.original_instruction >> 8) & 0xffU),
+                        static_cast<uint8_t>((patch.original_instruction >> 16) & 0xffU),
+                        static_cast<uint8_t>((patch.original_instruction >> 24) & 0xffU),
+                    },
+                .patched_bytes =
+                    {
+                        static_cast<uint8_t>(patch.patched_instruction & 0xffU),
+                        static_cast<uint8_t>((patch.patched_instruction >> 8) & 0xffU),
+                        static_cast<uint8_t>((patch.patched_instruction >> 16) & 0xffU),
+                        static_cast<uint8_t>((patch.patched_instruction >> 24) & 0xffU),
+                    },
+            };
+            OverlayOriginalBytes(start, end, return_patch, &normalized);
+        }
+    }
+    return FingerprintCode(normalized.data(), normalized.size());
+}
+
 DartPlantStatus InvalidateRuntimeHooks(
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation) {
     if (runtime_generation == nullptr) return DARTPLANT_OK;
@@ -257,6 +388,17 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
         SetLastError("target is already hooked");
         return DARTPLANT_ALREADY_HOOKED;
     }
+    std::vector<uint8_t> pristine;
+    if (!SnapshotCodeTarget(code_target, &pristine)) {
+        SetLastError("failed to snapshot hook target before installation");
+        return DARTPLANT_HOOK_FAILED;
+    }
+    auto hook = std::make_unique<DartPlantHook>();
+    hook->code_target = code_target;
+    if (!PrepareManagedPatchSnapshot(hook.get(), pristine)) {
+        SetLastError("failed to prepare hook patch integrity snapshot");
+        return DARTPLANT_HOOK_FAILED;
+    }
     void* original = nullptr;
     if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target), replacement,
                            &original) != 0 ||
@@ -264,8 +406,20 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, 
         SetLastError("host hook function failed");
         return DARTPLANT_HOOK_FAILED;
     }
-    auto hook = std::make_unique<DartPlantHook>();
-    hook->code_target = code_target;
+    if (!CaptureManagedPatchedBytes(hook.get())) {
+        // All buffers were allocated before calling the backend, so reaching
+        // this branch means an internal invariant failed rather than OOM. Keep
+        // ownership only if the backend cannot restore its own patch.
+        if (host_binding->unhook(host_binding->user_data, reinterpret_cast<void*>(target)) != 0) {
+            hook->backup = original;
+            hook->host_binding = host_binding;
+            hook->active.store(false, std::memory_order_release);
+            hook->state = HookRecordState::kFailed;
+            Hooks().push_back(std::move(hook));
+        }
+        SetLastError("failed to record hook backend code patches");
+        return DARTPLANT_HOOK_FAILED;
+    }
     hook->backup = original;
     hook->host_binding = host_binding;
     hook->active.store(true, std::memory_order_release);
@@ -463,6 +617,15 @@ DartPlantStatus InstallCallbackHook(
     hook->state = HookRecordState::kInstalling;
     auto first_listener = MakeListenerLocked(hook.get(), method, options, priority);
     InsertListenerLocked(hook.get(), first_listener);
+    std::vector<uint8_t> pristine;
+    if (!SnapshotCodeTarget(hook->code_target, &pristine)) {
+        SetLastError("failed to snapshot callback target before installation");
+        return DARTPLANT_HOOK_FAILED;
+    }
+    if (!PrepareManagedPatchSnapshot(hook.get(), pristine)) {
+        SetLastError("failed to prepare callback patch integrity snapshot");
+        return DARTPLANT_HOOK_FAILED;
+    }
     hook->replacement_entry =
         CreateArm64CallbackStub(hook.get(), target, &hook->replacement_entry_size);
     if (hook->replacement_entry == nullptr) {
@@ -487,6 +650,22 @@ DartPlantStatus InstallCallbackHook(
         (void) RestoreArm64ReturnInterception(hook.get());
         DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
         SetLastError("host hook function failed");
+        return DARTPLANT_HOOK_FAILED;
+    }
+    if (!CaptureManagedPatchedBytes(hook.get())) {
+        const bool backend_restored =
+            host_binding->unhook(host_binding->user_data, reinterpret_cast<void*>(target)) == 0;
+        const bool returns_restored = RestoreArm64ReturnInterception(hook.get());
+        if (backend_restored && returns_restored) {
+            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+        } else {
+            hook->backup = original;
+            hook->host_binding = host_binding;
+            hook->active.store(false, std::memory_order_release);
+            hook->state = HookRecordState::kFailed;
+            Hooks().push_back(std::move(hook));
+        }
+        SetLastError("failed to record callback backend code patches");
         return DARTPLANT_HOOK_FAILED;
     }
     hook->backup = original;

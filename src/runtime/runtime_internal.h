@@ -80,6 +80,9 @@ DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& co
                                                 uint64_t* out_true, uint64_t* out_false);
 std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
     const DartPlantRuntime* runtime, const DartPlantMethod* method);
+void SetRuntimeDiagnostics(DartPlantRuntime* runtime, DartPlantResolveStage stage,
+                           DartPlantResolveOutcome outcome, DartPlantStatus status,
+                           DartPlantResolveRejectReason reject_reason = DARTPLANT_REJECT_NONE);
 
 }  // namespace dartplant
 
@@ -122,6 +125,7 @@ struct DartPlantRuntime {
     std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
     dartplant::DartCodeTargetRegistry code_targets;
     std::vector<dartplant::RuntimeAbiEvidenceEntry> abi_evidence;
+    DartPlantResolutionDiagnostics diagnostics{};
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
     bool profile_matched = false;
 };
@@ -161,6 +165,7 @@ struct DartPlantInvocation {
     uint64_t validated_bool_true_value = 0;
     uint64_t validated_bool_false_value = 0;
     bool identity_ambiguous = false;
+    bool closure_receiver_in_x0 = false;
     bool vm_scope_entered = false;
     bool skip_original = false;
     bool call_original = false;
@@ -176,7 +181,8 @@ extern "C" uint8_t dartplant_arm64_invoke_original(DartPlantArm64Context* contex
 extern "C" uint8_t dartplant_arm64_prepare_invoke_original_frame(uintptr_t native_frame_sp);
 
 extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_hook(
-    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits);
+    DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits,
+    uintptr_t return_lr);
 
 extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
                                                           uintptr_t target_fp);

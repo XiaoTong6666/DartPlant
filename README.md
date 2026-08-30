@@ -61,7 +61,8 @@ so replacing the process default backend does not redirect a later unhook.
 
 The current implementation provides:
 
-- A stable C ABI.
+- A stable C ABI: existing public struct prefixes remain byte-for-byte stable,
+  and versioned extensions are appended behind `struct_size` gates.
 - A generic `DartPlantHostApi` hook-backend contract, with `native_init`
   compatibility retained as an optional loader adapter.
 - ELF module enumeration and load-bias aware address resolution.
@@ -74,6 +75,12 @@ The current implementation provides:
   resolver.
 - Raw method/address hooks with original trampolines and unhook support.
 - ARM64 native enter/leave callbacks with a validated GP-register profile.
+- Entry-owned ARM64 return interception: RET patches are discovered from the
+  selected entry's reachable control-flow graph, and the return dispatcher also
+  verifies the real Dart caller LR before consuming a TLS invocation frame.
+- Artifact/ABI fingerprints normalize only exact byte patches currently owned by
+  DartPlant (entry backend + RET interception), in reverse installation order;
+  unrelated or third-party code mutations remain visible and fail closed.
 - Limited argument/result mutation, skip-original, and original-call policy.
 - Per-thread invocation depth and nested call tracking.
 - Shared HookChain listeners with priority ordering and safe removal snapshots.
@@ -237,6 +244,35 @@ dl_iterate_phdr
     -> selected host backend hook(target_entry, replacement, backup)
 ```
 
+Private Dart VM layout facts are no longer duplicated across the live resolver
+and exception bridge. `scripts/data/dart_vm_profiles.json` is the checked-in
+manifest for exact PRODUCT/ARM64/compressed profiles; `scripts/main.py profiles`
+generates `src/vm/generated/runtime_profiles.generated.h`. One profile record
+binds the live heap layout, canonical bool layout, FunctionType layout, Dart
+fixed registers, Dart GP/FPU argument register sequences, and the Thread
+`JumpToFrame` cached-entry offset to the same snapshot hash. It also binds the
+ARM64 AOT monomorphic/polymorphic instruction-entry offsets needed to reproduce
+Dart's own `Code::PayloadStartOf()` calculation instead of guessing a Code
+payload boundary from the minimum cached entry address. The generator can
+also verify the common ABI contract directly against a Dart SDK source checkout:
+
+```bash
+python3 scripts/main.py profiles --check --sdk-root ../sdk
+```
+
+That source check currently verifies the ARM64 `THR/PP/CODE_REG/HEAP_BITS/
+NULL_REG/SPREG/ARGS_DESC_REG` assignments, the `R1,R2,R3,R5,R6,R7` and
+`V0..V5` Dart argument sequences, independent GP/FPU allocation in
+`ComputeCallingConvention()`, the register-parameter policy in
+`Function::MaxNumberOfParametersInRegisters()`, and Thread's cached
+`JumpToFrame` entry. It additionally verifies the precompiled
+`Code::HasMonomorphicEntry()` / `Code::PayloadStartOf()` relationship and that
+`Code.instructions_length_` is measured from that payload start. It resolves
+every checked-in profile's exact Dart SDK tag and verifies every manifest field
+that the SDK emits as a PRODUCT + ARM64 + compressed `AOT_*` offset, so those
+source-verifiable private layout facts cannot silently drift from the generated
+table.
+
 The Flutter ARM64 release fixture packages no raw DartPlant metadata asset. It
 validates both the live path and a generated exact sidecar for one deliberately
 dropped ordinary AOT Function. The sidecar producer re-runs the matching
@@ -265,11 +301,25 @@ path: they are optional per target, self-register as an embedded
 `DartPlantArtifactBundle`, and cannot replace a missing exact identity with a
 heuristic name.
 
+The compiler sidecar path now accepts DartPlant's host Capstone analyzer as an
+independent machine-code structural cross-check. Compiler
+`vm.unboxing-info.metadata` remains the ABI source of truth; optimized CFG text
+and actual final `libapp.so` machine-code observations may confirm that truth or
+fail closed on a concrete contradiction, but an `Unknown` structural result
+never fabricates an ABI fact. The analyzer publishes CFG/basic-block facts,
+incoming GP/FPU/x15-stack provenance, return sites, direct call-site/target
+edges, external branch edges, distinct indirect-call
+and indirect-branch sites, and ArgumentsDescriptor usage for later
+entry-kind/closure evidence work.
+
 The exposed invocation frame always preserves raw ARM64 machine truth. When
 exact compiler evidence and Code identity prove a `DartCallLayout`, the same
 frame additionally exposes semantic argument/result values. Unknown layouts
 remain raw rather than being guessed. Object retention still requires an
-attached VM adapter and the correct isolate scope.
+attached VM adapter and the correct isolate scope. A verified closure receiver
+can be inspected as the hidden PRODUCT ARM64 x0 value during enter, but DartPlant
+does not expose GC-safe retention for real Dart-entry callbacks until the bridge
+implements a VM-visible generated-to-native transition/rooting contract.
 
 ## Host tests
 
@@ -284,12 +334,28 @@ repeatable builds:
 
 ```bash
 python3 scripts/main.py doctor
+python3 scripts/main.py profiles --check --sdk-root ../sdk
 python3 scripts/main.py build host
 python3 scripts/main.py test host
 python3 scripts/main.py metadata ./target.apk -o ./build/target.metadata.json
 python3 scripts/main.py build android
 python3 scripts/main.py test device --device <serial>
 ```
+
+Hosts loaded by the Android/system linker may use native C++ `thread_local`.
+For custom/minimal loaders that do not implement ELF dynamic TLS, configure
+`DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT=ON`; DartPlant then switches its
+per-thread error/callback state to `pthread_key_t` storage and post-build audits
+the final shared object for forbidden AArch64 TLS relocations. The same policy
+can be run explicitly against any final host/module ELF:
+
+```bash
+python3 scripts/main.py loader-audit ./libmodule.so
+```
+
+The audit is intentionally applied to the final shared object rather than a
+static DartPlant archive because custom-loader compatibility is a property of
+the complete host image.
 
 The scripts under `scripts/` manage only DartPlant source builds and tests.
 

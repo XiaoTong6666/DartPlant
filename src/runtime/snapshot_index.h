@@ -28,6 +28,8 @@ struct SnapshotFunction {
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     uint64_t code_object_pool = 0;
+    uint64_t code_payload_start = 0;
+    uint32_t code_instructions_length = 0;
     uintptr_t runtime_entry = 0;
     uintptr_t code_entry = 0;
     uint64_t owner_class = 0;
@@ -36,6 +38,7 @@ struct SnapshotFunction {
     uint32_t physical_entry_alias_count = 0;
     DartPlantCodeIdentityProof code_identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
     uint32_t function_kind = 0;
+    bool closure_call_entry_only = false;
     bool owner_is_toplevel_class = false;
     bool code_owner_matches_function = false;
     bool live = false;
@@ -68,6 +71,11 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
                                                     const DartPlantFlutterSnapshotInfo& snapshot,
                                                     DartPlantLiveVmFunctionIndexInfo* out_info,
                                                     std::string* error);
+
+// Internal record adapter shared by the live-VM visitor and host regression
+// tests. Returns false rather than publishing a partial entry family.
+bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& function,
+                                      uint32_t profile_version, SnapshotIndex* index);
 
 }  // namespace dartplant
 

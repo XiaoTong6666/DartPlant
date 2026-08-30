@@ -2,9 +2,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
+#include <cstddef>
 
 #include "abi/evidence_solver.h"
+#include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
+
+static_assert(offsetof(DartPlantLiveVmProfile, code_entry_point_offset) == 88);
+static_assert(offsetof(DartPlantLiveVmProfile, code_object_pool_offset) == 92);
+static_assert(offsetof(DartPlantLiveVmProfile, function_entry_point_offset) == 104);
+static_assert(offsetof(DartPlantLiveVmProfile, function_name_offset) == 108);
+static_assert(offsetof(DartPlantLiveVmProfile, cid_two_byte_string) == 212);
+static_assert(offsetof(DartPlantLiveVmProfile, code_unchecked_entry_point_offset) == 216);
+
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, function) == 8);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, code) == 16);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, code_object_pool) == 24);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, function_entry_point) == 32);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, code_entry_point) == 40);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, entry_va) == 48);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, code_section_va) == 56);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, code_size) == 64);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, function_kind) == 68);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, owner_class) == 72);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, library) == 80);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, owner_is_toplevel_class) == 88);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, function_name) == 96);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, class_name) == 256);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, library_uri) == 416);
+static_assert(offsetof(DartPlantLiveVmFunctionInfo, entry_alias_counts) == 736);
+
+static_assert(offsetof(DartPlantLiveVmProbeInfo, reserved_count) == 20);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, thread) == 24);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, code) == 112);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, function) == 136);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, owner_class) == 152);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, heap_bits_match) == 168);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, function_name) == 185);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, class_name) == 345);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, library_uri) == 505);
+static_assert(offsetof(DartPlantLiveVmProbeInfo, requested_entry_kind) == 832);
 
 namespace {
 

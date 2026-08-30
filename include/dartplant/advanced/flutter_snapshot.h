@@ -43,6 +43,14 @@ typedef struct DartPlantSnapshotFunctionInfo {
     const char* fingerprint;
     DartPlantCodeIdentityProof code_identity_proof;
     uint32_t physical_entry_alias_count;
+    // UntaggedFunction::Kind from the exact compiler artifact. The first three
+    // stable SDK values are RegularFunction=0, ClosureFunction=1 and
+    // ImplicitClosureFunction=2. closure_call_entry_only is asserted only when
+    // compiler/source evidence proves PRODUCT AOT invokes it through the
+    // cached Closure.entry_point (the Function normal entry).
+    uint32_t function_kind;
+    uint8_t closure_call_entry_only;
+    uint8_t reserved_function_flags[3];
 } DartPlantSnapshotFunctionInfo;
 
 typedef struct DartPlantSnapshotIndexInfo {

@@ -4,6 +4,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <new>
+
+#if defined(DARTPLANT_USE_PTHREAD_TLS)
+#include <pthread.h>
+#endif
 
 #include "core/internal.h"
 #include "runtime/default_runtime.h"
@@ -11,7 +16,36 @@
 namespace dartplant {
 namespace {
 
+#if defined(DARTPLANT_USE_PTHREAD_TLS)
+pthread_key_t g_last_error_key;
+pthread_once_t g_last_error_key_once = PTHREAD_ONCE_INIT;
+bool g_last_error_key_ready = false;
+
+void DestroyLastError(void* value) { delete static_cast<std::string*>(value); }
+
+void CreateLastErrorKey() {
+    if (pthread_key_create(&g_last_error_key, DestroyLastError) == 0) {
+        g_last_error_key_ready = true;
+    }
+}
+
+std::string* LastErrorStorage() {
+    pthread_once(&g_last_error_key_once, CreateLastErrorKey);
+    if (!g_last_error_key_ready) return nullptr;
+    auto* value = static_cast<std::string*>(pthread_getspecific(g_last_error_key));
+    if (value != nullptr) return value;
+    value = new (std::nothrow) std::string();
+    if (value == nullptr || pthread_setspecific(g_last_error_key, value) != 0) {
+        delete value;
+        return nullptr;
+    }
+    return value;
+}
+#else
 thread_local std::string g_last_error;
+
+std::string* LastErrorStorage() { return &g_last_error; }
+#endif
 
 bool EqualsIgnoreCase(const std::string& left, const std::string& right) {
     return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
@@ -45,11 +79,20 @@ DartPlantStatus ValidateTarget(const ModuleImage& module, uintptr_t target, uint
 
 }  // namespace
 
-void SetLastError(std::string message) { g_last_error = std::move(message); }
+void SetLastError(std::string message) {
+    if (std::string* storage = LastErrorStorage(); storage != nullptr) {
+        *storage = std::move(message);
+    }
+}
 
-void ClearLastError() { g_last_error.clear(); }
+void ClearLastError() {
+    if (std::string* storage = LastErrorStorage(); storage != nullptr) storage->clear();
+}
 
-const char* LastError() { return g_last_error.c_str(); }
+const char* LastError() {
+    if (std::string* storage = LastErrorStorage(); storage != nullptr) return storage->c_str();
+    return "DartPlant per-thread error storage is unavailable";
+}
 
 }  // namespace dartplant
 

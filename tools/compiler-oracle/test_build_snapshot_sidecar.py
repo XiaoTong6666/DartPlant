@@ -11,10 +11,15 @@ from build_snapshot_sidecar import (
     AbiEvidence,
     ElfIdentity,
     LoadSegment,
+    _extract_entry_points,
     _extract_code_identity_profile,
+    _extract_machine_code,
     _find_unique_executable_code,
     _load_abi_oracle,
     _normalize_aarch64_direct_branches,
+    _expected_register_representations,
+    _run_machine_code_analyzer,
+    _validate_machine_code_cross_check,
     _validate_cfg_cross_check,
     _write_header,
 )
@@ -84,6 +89,146 @@ class ProfileBuilder:
                     "strings": self.strings,
                 }
             )
+        )
+
+
+class MachineCodeCrossCheckTests(unittest.TestCase):
+    def test_compiler_entry_family_preserves_aliasing_and_function_kind(self) -> None:
+        log = """Code for optimized function 'package:fixture/main.dart_::_target' (RegularFunction) {
+0x1000    d503201f               nop
+0x1004    d65f03c0               ret
+}
+Entry points for function 'package:fixture/main.dart_::_target' {
+  [code+0x07] 1000 kNormal
+  [code+0x0f] 1000 kMonomorphic
+  [code+0x17] 1004 kUnchecked
+  [code+0x1f] 1004 kMonomorphicUnchecked
+}
+"""
+        machine = _extract_machine_code(log, "target")
+        self.assertEqual("RegularFunction", machine.function_kind)
+        self.assertEqual(0x1000, machine.start_address)
+        self.assertEqual(bytes.fromhex("1f2003d5c0035fd6"), machine.code)
+        self.assertEqual(
+            {
+                "kNormal": 0x1000,
+                "kMonomorphic": 0x1000,
+                "kUnchecked": 0x1004,
+                "kMonomorphicUnchecked": 0x1004,
+            },
+            _extract_entry_points(log, machine.printed_name),
+        )
+
+    def test_compiler_entry_family_rejects_missing_entry_kind(self) -> None:
+        log = """Entry points for function 'package:fixture/main.dart_::_target' {
+  [code+0x07] 1000 kNormal
+  [code+0x17] 1004 kUnchecked
+}
+"""
+        with self.assertRaisesRegex(ValueError, "entry-point family.*incomplete"):
+            _extract_entry_points(log, "package:fixture/main.dart_::_target")
+
+    def test_cli_analyzes_real_machine_bytes(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        analyzer = root / "build" / "host" / "dartplant_aot_abi_analyzer_cli"
+        if not analyzer.is_file():
+            self.skipTest(f"host analyzer was not built: {analyzer}")
+        document = _run_machine_code_analyzer(
+            analyzer,
+            bytes.fromhex("0028611ec0035fd6"),  # fadd d0, d0, d1; ret
+            0x4000,
+        )
+        self.assertEqual(1, document["schema_version"])
+        self.assertEqual(2, document["decoded_instructions"])
+        self.assertEqual([0x4004], document["return_sites"])
+        self.assertTrue(document["reached_return"])
+
+    def test_cli_rejects_truncated_structural_fact_set(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        analyzer = root / "build" / "host" / "dartplant_aot_abi_analyzer_cli"
+        if not analyzer.is_file():
+            self.skipTest(f"host analyzer was not built: {analyzer}")
+        code = bytes.fromhex("00000094") * 65 + bytes.fromhex("c0035fd6")
+        with self.assertRaisesRegex(ValueError, "exceeded its fixed proof capacity"):
+            _run_machine_code_analyzer(analyzer, code, 0x8000)
+
+    def test_independent_gp_and_fpu_allocators_match_dart_arm64(self) -> None:
+        abi = AbiEvidence(
+            parameters=("unboxed-double", "unboxed-int64", "unboxed-double", "tagged"),
+            result="tagged",
+            max_parameters_in_registers=4,
+            must_use_stack_calling_convention=False,
+        )
+        self.assertEqual(
+            {
+                ("fpu", 0): "unboxed-double",
+                ("gp", 1): "unboxed-int64",
+                ("fpu", 1): "unboxed-double",
+                ("gp", 2): "tagged",
+            },
+            _expected_register_representations(abi),
+        )
+
+    def test_machine_code_known_fact_must_agree_with_compiler_truth(self) -> None:
+        abi = AbiEvidence(
+            parameters=("unboxed-double",),
+            result="unboxed-double",
+            max_parameters_in_registers=1,
+            must_use_stack_calling_convention=False,
+        )
+        _validate_machine_code_cross_check(
+            abi,
+            {
+                "observations": [
+                    {
+                        "location": "fpu",
+                        "register": 0,
+                        "stack_offset": 0,
+                        "representation": "unboxed-double",
+                    }
+                ]
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "disagrees with machine-code"):
+            _validate_machine_code_cross_check(
+                abi,
+                {
+                    "observations": [
+                        {
+                            "location": "fpu",
+                            "register": 0,
+                            "stack_offset": 0,
+                            "representation": "unboxed-int64",
+                        }
+                    ]
+                },
+            )
+
+    def test_machine_code_unknown_and_stack_facts_do_not_override_metadata(self) -> None:
+        abi = AbiEvidence(
+            parameters=("unboxed-double",),
+            result="unboxed-double",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        _validate_machine_code_cross_check(
+            abi,
+            {
+                "observations": [
+                    {
+                        "location": "entry-stack",
+                        "register": 0,
+                        "stack_offset": 16,
+                        "representation": "unboxed-double",
+                    },
+                    {
+                        "location": "fpu",
+                        "register": 0,
+                        "stack_offset": 0,
+                        "representation": "unknown",
+                    },
+                ]
+            },
         )
 
 
@@ -226,6 +371,51 @@ class GeneratedBundleTest(unittest.TestCase):
             self.assertIn('#include "dartplant/advanced/artifact.h"', text)
             self.assertIn("DartPlantArtifactBundle", text)
             self.assertIn("dartplant_register_embedded_artifact_bundle", text)
+            self.assertIn(".structural_schema_version = 0", text)
+
+    def test_generated_header_carries_verified_structural_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            header = Path(temp) / "sidecar.h"
+            _write_header(
+                header,
+                {
+                    "library_uri": "package:fixture/main.dart",
+                    "class_name": "Global",
+                    "function_name": "target",
+                    "entry_va": 0x1234,
+                    "code_size": 16,
+                    "fingerprint": "0123456789abcdef",
+                    "build_id": "00112233",
+                    "snapshot_hash": "0123456789abcdef0123456789abcdef",
+                    "code_identity_proof": "unique",
+                    "physical_entry_alias_count": 1,
+                    "abi_parameters": ["unboxed-double"],
+                    "abi_result": "unboxed-double",
+                    "max_parameters_in_registers": 1,
+                    "must_use_stack_calling_convention": False,
+                    "has_optional_parameters": False,
+                    "has_overrides_with_less_direct_parameters": False,
+                    "structural_analysis": {
+                        "decoded_instructions": 4,
+                        "basic_block_count": 1,
+                        "has_unknown_control_flow": False,
+                        "uses_arguments_descriptor": True,
+                        "reached_return": True,
+                        "direct_call_count": 1,
+                        "return_site_count": 1,
+                        "external_branch_count": 0,
+                        "indirect_call_count": 0,
+                        "indirect_branch_count": 0,
+                        "address_materialization_count": 2,
+                    },
+                },
+            )
+            text = header.read_text()
+            self.assertIn(".structural_schema_version = 1", text)
+            self.assertIn(".structural_verified = 1", text)
+            self.assertIn(".structural_relation_count = 5", text)
+            self.assertIn(".structural_uses_arguments_descriptor = 1", text)
+            self.assertIn(".structural_reached_return = 1", text)
 
     def test_generated_header_supports_unique_symbol_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -256,6 +446,38 @@ class GeneratedBundleTest(unittest.TestCase):
             self.assertIn("kDartPlantP6Int64ArtifactBundle", text)
             self.assertIn("DartPlantP6Int64ArtifactRegistrar", text)
             self.assertNotIn("kDartPlantOrdinaryAotArtifactBundle", text)
+
+    def test_generated_header_binds_exact_non_default_entry_and_closure_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            header = Path(temp) / "sidecar.h"
+            _write_header(
+                header,
+                {
+                    "library_uri": "package:fixture/main.dart",
+                    "class_name": "Global",
+                    "function_name": "target",
+                    "entry_kind": "unchecked",
+                    "entry_va": 0x1240,
+                    "code_size": 12,
+                    "fingerprint": "0123456789abcdef",
+                    "build_id": "00112233",
+                    "snapshot_hash": "0123456789abcdef0123456789abcdef",
+                    "code_identity_proof": "unique",
+                    "physical_entry_alias_count": 1,
+                    "function_kind": 0,
+                    "closure_call_entry_only": False,
+                    "abi_parameters": ["tagged"],
+                    "abi_result": "tagged",
+                    "max_parameters_in_registers": 1,
+                    "must_use_stack_calling_convention": False,
+                    "has_optional_parameters": False,
+                    "has_overrides_with_less_direct_parameters": False,
+                },
+            )
+            text = header.read_text()
+            self.assertGreaterEqual(text.count(".entry_kind = DARTPLANT_ENTRY_UNCHECKED"), 2)
+            self.assertIn(".function_kind = 0u", text)
+            self.assertIn(".closure_call_entry_only = 0", text)
 
 
 class CfgCrossCheckTest(unittest.TestCase):

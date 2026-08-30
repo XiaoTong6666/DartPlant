@@ -68,30 +68,65 @@ int CollectModule(dl_phdr_info* info, size_t, void* data) {
         return 0;
     }
 
-    ModuleImage image;
-    image.path = info->dlpi_name;
-    image.name = BaseName(image.path);
-    image.load_bias = info->dlpi_addr;
-    image.build_id = ReadBuildId(info);
-
+    std::vector<ElfProgramHeaderView> headers;
+    headers.reserve(info->dlpi_phnum);
     for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
         const ElfW(Phdr) & header = info->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD || (header.p_flags & PF_X) == 0) {
-            continue;
-        }
-        image.executable_ranges.push_back({
-            .start = image.load_bias + header.p_vaddr,
-            .end = image.load_bias + header.p_vaddr + header.p_memsz,
-            .file_offset = header.p_offset,
+        headers.push_back({
+            .type = header.p_type,
+            .flags = header.p_flags,
+            .offset = header.p_offset,
             .virtual_address = header.p_vaddr,
             .file_size = header.p_filesz,
+            .memory_size = header.p_memsz,
         });
     }
+    ModuleImage image;
+    if (!BuildModuleImageFromProgramHeaders(info->dlpi_name, info->dlpi_addr, headers, &image)) {
+        return 0;
+    }
+    image.build_id = ReadBuildId(info);
     modules->push_back(std::move(image));
     return 0;
 }
 
 }  // namespace
+
+bool BuildModuleImageFromProgramHeaders(std::string_view path, uintptr_t load_bias,
+                                        std::span<const ElfProgramHeaderView> headers,
+                                        ModuleImage* out_image) {
+    if (out_image == nullptr || path.empty()) return false;
+    ModuleImage image;
+    image.path = path;
+    image.name = BaseName(path);
+    image.load_bias = load_bias;
+
+    for (const ElfProgramHeaderView& header : headers) {
+        if (header.type != PT_LOAD || (header.flags & PF_X) == 0) continue;
+        if (header.file_size > header.memory_size ||
+            header.virtual_address > UINTPTR_MAX - load_bias) {
+            return false;
+        }
+        const uintptr_t start = load_bias + static_cast<uintptr_t>(header.virtual_address);
+        if (header.memory_size > UINTPTR_MAX - start ||
+            header.offset > UINT64_MAX - header.file_size) {
+            return false;
+        }
+        image.executable_ranges.push_back({
+            .start = start,
+            .end = start + static_cast<uintptr_t>(header.memory_size),
+            .file_offset = header.offset,
+            .virtual_address = header.virtual_address,
+            .file_size = header.file_size,
+        });
+    }
+    std::sort(image.executable_ranges.begin(), image.executable_ranges.end(),
+              [](const ExecutableRange& left, const ExecutableRange& right) {
+                  return left.virtual_address < right.virtual_address;
+              });
+    *out_image = std::move(image);
+    return true;
+}
 
 bool ModuleImage::ContainsExecutable(uintptr_t address, size_t size) const {
     if (size == 0 || address > UINTPTR_MAX - size) {
@@ -116,8 +151,14 @@ std::optional<uintptr_t> ModuleImage::Resolve(DartPlantAddressKind kind, uint64_
         return load_bias + static_cast<uintptr_t>(address);
     case DARTPLANT_ADDRESS_FILE_OFFSET:
         for (const ExecutableRange& range : executable_ranges) {
-            if (address >= range.file_offset && address < range.file_offset + range.file_size) {
+            if (range.file_offset > UINT64_MAX - range.file_size) continue;
+            const uint64_t file_end = range.file_offset + range.file_size;
+            if (address >= range.file_offset && address < file_end) {
                 const uint64_t delta = address - range.file_offset;
+                if (range.virtual_address > UINTPTR_MAX - load_bias ||
+                    delta > UINTPTR_MAX - (load_bias + range.virtual_address)) {
+                    return std::nullopt;
+                }
                 return load_bias + range.virtual_address + delta;
             }
         }

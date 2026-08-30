@@ -20,6 +20,9 @@
 #else
 #define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 0
 #endif
+#if __has_include("p6_forced_stack_closure_sidecar.h")
+#include "p6_forced_stack_closure_sidecar.h"
+#endif
 
 namespace {
 
@@ -32,7 +35,9 @@ DartPlantMethod* g_echo_object = nullptr;
 DartPlantMethod* g_negate_bool = nullptr;
 DartPlantMethod* g_signature_probe = nullptr;
 DartPlantMethod* g_verified_abi_double = nullptr;
+DartPlantMethod* g_forced_stack_closure = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
+DartPlantHook* g_forced_stack_closure_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
 DartPlantHook* g_negate_bool_hook = nullptr;
 DartPlantHookHandle* g_verified_abi_double_hook = nullptr;
@@ -64,6 +69,8 @@ std::atomic<uint64_t> g_verified_abi_double_enter = 0;
 std::atomic<uint64_t> g_verified_abi_double_leave = 0;
 std::atomic<uint64_t> g_verified_abi_double_failures = 0;
 std::atomic<uint64_t> g_verified_abi_double_observer_enter = 0;
+std::atomic<uint64_t> g_forced_stack_closure_enter = 0;
+std::atomic<uint64_t> g_forced_stack_closure_failures = 0;
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -422,6 +429,24 @@ void OnVerifiedAbiDoubleObserver(DartPlantInvocation* invocation, void*) {
     g_verified_abi_double_observer_enter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void OnForcedStackClosureEnter(DartPlantInvocation* invocation, void*) {
+    DartPlantValue closure{};
+    uint64_t raw_x0 = 0;
+    const bool valid =
+        dartplant_invocation_has_verified_abi(invocation) == 0 &&
+        dartplant_invocation_argument_count(invocation) == 0 &&
+        dartplant_invocation_has_closure_receiver(invocation) != 0 &&
+        dartplant_invocation_get_closure_receiver(invocation, &closure) == DARTPLANT_OK &&
+        dartplant_invocation_get_gp_register(invocation, 0, &raw_x0) == DARTPLANT_OK &&
+        closure.kind == DARTPLANT_VALUE_HEAP_OBJECT && closure.raw != 0 && closure.raw == raw_x0;
+    if (!valid) {
+        g_forced_stack_closure_failures.fetch_add(1, std::memory_order_relaxed);
+        LogFailure("artifact closure receiver contract");
+        return;
+    }
+    g_forced_stack_closure_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool FindLiveTopLevelMethod(const char* name, DartPlantMethod** out_method) {
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -448,6 +473,61 @@ DartPlantStatus InstallMethodHook(DartPlantMethod* method, const DartPlantRuntim
     };
     return dartplant_runtime_hook_method_with_profile(g_runtime, method, &profile, &options,
                                                       out_hook);
+}
+
+DartPlantStatus InstallForcedStackClosureHook() {
+    if (g_forced_stack_closure_hook != nullptr) return DARTPLANT_ALREADY_HOOKED;
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "[tear-off] verifiedAbiForcedStack",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    const DartPlantStatus lookup_status =
+        dartplant_runtime_find_method(g_runtime, &query, &g_forced_stack_closure);
+    const bool identity_ok =
+        lookup_status == DARTPLANT_OK && g_forced_stack_closure != nullptr &&
+        g_forced_stack_closure->function != nullptr &&
+        g_forced_stack_closure->function->source ==
+            dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+        g_forced_stack_closure->function->function_kind == 2 &&
+        g_forced_stack_closure->function->closure_call_entry_only &&
+        g_forced_stack_closure->function->code_target != nullptr &&
+        g_forced_stack_closure->function->code_target->HasProvenUniqueIdentity();
+    if (!identity_ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "artifact closure identity failed status=%d method=%p source_offline=%u kind=%u default_only=%u error=%s",
+            lookup_status, g_forced_stack_closure,
+            static_cast<unsigned>(g_forced_stack_closure != nullptr &&
+                                  g_forced_stack_closure->function != nullptr &&
+                                  g_forced_stack_closure->function->source ==
+                                      dartplant::DartFunctionSource::kOfflineSnapshotIndex),
+            g_forced_stack_closure == nullptr || g_forced_stack_closure->function == nullptr
+                ? 0U
+                : g_forced_stack_closure->function->function_kind,
+            static_cast<unsigned>(g_forced_stack_closure != nullptr &&
+                                  g_forced_stack_closure->function != nullptr &&
+                                  g_forced_stack_closure->function->closure_call_entry_only),
+            dartplant_last_error());
+        return lookup_status == DARTPLANT_OK ? DARTPLANT_PROFILE_MISMATCH : lookup_status;
+    }
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    const DartPlantStatus hook_status =
+        InstallMethodHook(g_forced_stack_closure, profile, nullptr, &g_forced_stack_closure_hook,
+                          OnForcedStackClosureEnter);
+    __android_log_print(
+        hook_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "artifact closure hook status=%d source_offline=1 kind=%u default_only=%u receiver_x0=1 target=0x%llx error=%s",
+        hook_status, g_forced_stack_closure->function->function_kind,
+        static_cast<unsigned>(g_forced_stack_closure->function->closure_call_entry_only),
+        static_cast<unsigned long long>(dartplant_method_runtime_address(g_forced_stack_closure)),
+        hook_status == DARTPLANT_OK ? "none" : dartplant_last_error());
+    return hook_status;
 }
 
 DartPlantStatus InstallAdvancedOrdinaryAotHooks() {
@@ -616,6 +696,7 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     }
     bool indexed_instrumented_add = false;
     bool indexed_echo_object = false;
+    bool indexed_closure_entry_proof = false;
     uint64_t indexed_entry_va = 0;
     for (uint32_t position = 0; position < function_index.function_count; ++position) {
         DartPlantLiveVmFunctionInfo function{};
@@ -628,10 +709,27 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
             std::strcmp(function.class_name, "Global") == 0 &&
             std::strcmp(function.function_name, "instrumentedAdd") == 0) {
+            __android_log_print(
+                ANDROID_LOG_INFO, kTag,
+                "entry-family instrumentedAdd mask=0x%x aliases=%u/%u/%u/%u fn=0x%llx fn_u=0x%llx code=0x%llx code_u=0x%llx mono=0x%llx mono_u=0x%llx",
+                function.entry_kind_mask, function.entry_alias_counts[0],
+                function.entry_alias_counts[1], function.entry_alias_counts[2],
+                function.entry_alias_counts[3],
+                static_cast<unsigned long long>(function.function_entry_point),
+                static_cast<unsigned long long>(function.function_unchecked_entry_point),
+                static_cast<unsigned long long>(function.code_entry_point),
+                static_cast<unsigned long long>(function.code_unchecked_entry_point),
+                static_cast<unsigned long long>(function.code_monomorphic_entry_point),
+                static_cast<unsigned long long>(function.code_monomorphic_unchecked_entry_point));
             indexed_instrumented_add =
                 function.function != 0 && function.code != 0 && function.code_size != 0 &&
                 function.entry_alias_count == 2 &&
-                function.entry_va + g_snapshot_info.load_bias == function.function_entry_point;
+                function.entry_va + g_snapshot_info.load_bias == function.function_entry_point &&
+                function.entry_kind_mask == 0x0f &&
+                function.function_entry_point == function.code_entry_point &&
+                function.function_unchecked_entry_point == function.code_unchecked_entry_point &&
+                function.code_monomorphic_entry_point != 0 &&
+                function.code_monomorphic_unchecked_entry_point != 0;
             indexed_entry_va = function.entry_va;
         }
         if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
@@ -639,6 +737,30 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
             std::strcmp(function.function_name, "nullableEchoObject") == 0) {
             indexed_echo_object = function.function != 0 && function.code != 0 &&
                                   function.code_size != 0 && function.entry_alias_count == 1;
+        }
+        if (function.function_kind == 1 || function.function_kind == 2) {
+            __android_log_print(
+                ANDROID_LOG_INFO, kTag,
+                "closure-entry name=%s kind=%u only=%u mask=0x%x aliases=%u/%u/%u/%u fn=0x%llx fn_u=0x%llx code=0x%llx code_u=0x%llx mono=0x%llx mono_u=0x%llx",
+                function.function_name, function.function_kind, function.closure_call_entry_only,
+                function.entry_kind_mask, function.entry_alias_counts[0],
+                function.entry_alias_counts[1], function.entry_alias_counts[2],
+                function.entry_alias_counts[3],
+                static_cast<unsigned long long>(function.function_entry_point),
+                static_cast<unsigned long long>(function.function_unchecked_entry_point),
+                static_cast<unsigned long long>(function.code_entry_point),
+                static_cast<unsigned long long>(function.code_unchecked_entry_point),
+                static_cast<unsigned long long>(function.code_monomorphic_entry_point),
+                static_cast<unsigned long long>(function.code_monomorphic_unchecked_entry_point));
+        }
+        if (function.function_kind == 2 && function.closure_call_entry_only != 0 &&
+            function.entry_kind_mask == 0x01 && function.function_entry_point != 0 &&
+            function.function_entry_point == function.code_entry_point &&
+            function.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] != 0 &&
+            function.entry_alias_counts[DARTPLANT_ENTRY_UNCHECKED] == 0 &&
+            function.entry_alias_counts[DARTPLANT_ENTRY_MONOMORPHIC] == 0 &&
+            function.entry_alias_counts[DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED] == 0) {
+            indexed_closure_entry_proof = true;
         }
     }
     uint32_t decoded_pool_entries = 0;
@@ -665,16 +787,17 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         ++decoded_pool_entries;
     }
     if (!indexed_instrumented_add || !indexed_echo_object) {
-        LogFailure("live FunctionInfo entry_va verification");
+        LogFailure("live FunctionInfo entry verification");
         g_cold_bootstrap_status.store(DARTPLANT_METHOD_NOT_FOUND, std::memory_order_release);
         return;
     }
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "live-index functions=%u code_targets=%u shared_targets=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u",
+        "live-index functions=%u code_targets=%u shared_targets=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u",
         function_index.function_count, function_index.code_target_count,
         function_index.shared_code_target_count, function_index.skipped_function_count,
-        static_cast<unsigned long long>(indexed_entry_va), decoded_pool_entries);
+        static_cast<unsigned long long>(indexed_entry_va), decoded_pool_entries,
+        static_cast<unsigned>(indexed_closure_entry_proof));
 
     if (!FindLiveTopLevelMethod("instrumentedAdd", &g_instrumented_add)) {
         LogFailure("live VM method resolution");
@@ -1090,6 +1213,29 @@ dartplant_fixture_verified_abi_double_probe() {
 }
 
 extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_forced_stack_closure_probe() {
+    const uint64_t enter = g_forced_stack_closure_enter.load(std::memory_order_relaxed);
+    const uint64_t failures = g_forced_stack_closure_failures.load(std::memory_order_relaxed);
+    const bool source_offline = g_forced_stack_closure != nullptr &&
+                                g_forced_stack_closure->function != nullptr &&
+                                g_forced_stack_closure->function->source ==
+                                    dartplant::DartFunctionSource::kOfflineSnapshotIndex;
+    const bool receiver_x0 = g_forced_stack_closure != nullptr &&
+                             g_forced_stack_closure->function != nullptr &&
+                             g_forced_stack_closure->function->closure_call_entry_only;
+    const bool active =
+        g_forced_stack_closure_hook != nullptr && g_forced_stack_closure_hook->active;
+    const bool passed = enter == 1 && failures == 0 && source_offline && receiver_x0 && active;
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "artifact closure receiver probe enter=%llu failures=%llu source_offline=%u receiver_x0=%u active=%u passed=%u",
+        static_cast<unsigned long long>(enter), static_cast<unsigned long long>(failures),
+        static_cast<unsigned>(source_offline), static_cast<unsigned>(receiver_x0),
+        static_cast<unsigned>(active), static_cast<unsigned>(passed));
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
 dartplant_fixture_instrumented_add_probe() {
     const uint64_t enter = g_instrumented_add_enter.load(std::memory_order_relaxed);
     const uint64_t leave = g_instrumented_add_leave.load(std::memory_order_relaxed);
@@ -1196,6 +1342,13 @@ dartplant_fixture_simple_facade_stage2() {
 }
 
 extern "C" __attribute__((visibility("default"))) int32_t
+dartplant_fixture_enable_forced_stack_closure_hook() {
+    const DartPlantStatus host_status = dartplant_install_host_api(dartplant_dobby_host_api());
+    if (host_status != DARTPLANT_OK) return host_status;
+    return InstallForcedStackClosureHook();
+}
+
+extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
     // default HostApi during dartplant_shutdown(). This advanced runtime is a
@@ -1260,6 +1413,8 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
+    g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
+    g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
     dartplant_fixture_reset_null_semantic_probe();
     dartplant_fixture_reset_bool_semantic_probe();
 
@@ -1320,6 +1475,10 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
         dartplant_unhook(g_instrumented_add_hook);
         dartplant_release_hook(g_instrumented_add_hook);
     }
+    if (g_forced_stack_closure_hook != nullptr) {
+        dartplant_unhook(g_forced_stack_closure_hook);
+        dartplant_release_hook(g_forced_stack_closure_hook);
+    }
     if (g_echo_object_hook != nullptr) {
         dartplant_unhook(g_echo_object_hook);
         dartplant_release_hook(g_echo_object_hook);
@@ -1343,6 +1502,7 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     if (g_negate_bool != nullptr) dartplant_release_method(g_negate_bool);
     if (g_signature_probe != nullptr) dartplant_release_method(g_signature_probe);
     if (g_verified_abi_double != nullptr) dartplant_release_method(g_verified_abi_double);
+    if (g_forced_stack_closure != nullptr) dartplant_release_method(g_forced_stack_closure);
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
     g_instrumented_add = nullptr;
     g_add_int = nullptr;
@@ -1350,7 +1510,9 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_negate_bool = nullptr;
     g_signature_probe = nullptr;
     g_verified_abi_double = nullptr;
+    g_forced_stack_closure = nullptr;
     g_instrumented_add_hook = nullptr;
+    g_forced_stack_closure_hook = nullptr;
     g_echo_object_hook = nullptr;
     g_negate_bool_hook = nullptr;
     g_verified_abi_double_hook = nullptr;
@@ -1364,6 +1526,8 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
+    g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
+    g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
     dartplant_fixture_reset_null_semantic_probe();
     dartplant_fixture_reset_bool_semantic_probe();
     dartplant_fixture_reset_verified_abi_double_probe();

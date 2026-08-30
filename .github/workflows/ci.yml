@@ -132,6 +132,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:

@@ -6,6 +6,35 @@
 #include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
 
+namespace {
+
+void BeginHookDiagnostics(DartPlantRuntime* runtime) {
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_HOOK_INSTALL,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
+}
+
+DartPlantStatus RejectHook(DartPlantRuntime* runtime, DartPlantStatus status,
+                           DartPlantResolveRejectReason reason, const char* message) {
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_HOOK_INSTALL,
+                                     DARTPLANT_RESOLVE_REJECTED, status, reason);
+    dartplant::SetLastError(message);
+    return status;
+}
+
+DartPlantStatus FinishHook(DartPlantRuntime* runtime, DartPlantStatus status) {
+    if (status == DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_COMPLETE,
+                                         DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
+    } else {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_HOOK_INSTALL,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_HOOK_FAILED);
+    }
+    return status;
+}
+
+}  // namespace
+
 extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* runtime,
                                                              const DartPlantMethod* method,
                                                              void* replacement, void** backup,
@@ -21,17 +50,19 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* r
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
+    BeginHookDiagnostics(runtime);
     if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
-        dartplant::SetLastError("runtime is not ready for method hooks");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY,
+                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                          "runtime is not ready for method hooks");
     }
     if (!runtime->profile_matched) {
-        dartplant::SetLastError("runtime app image is not matched");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return RejectHook(runtime, DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_MODULE_NOT_FOUND,
+                          "runtime app image is not matched");
     }
     if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
-        dartplant::SetLastError("method belongs to a stale or different runtime generation");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                          "method belongs to a stale or different runtime generation");
     }
     const DartPlantStatus status =
         dartplant::InstallHook(method->function->code_target, replacement, backup, out_hook);
@@ -40,7 +71,7 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_raw(DartPlantRuntime* r
         (*out_hook)->expected_runtime_generation =
             runtime->generation->load(std::memory_order_acquire);
     }
-    return status;
+    return FinishHook(runtime, status);
 }
 
 extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runtime,
@@ -57,24 +88,27 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method(DartPlantRuntime* runti
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
+    BeginHookDiagnostics(runtime);
     if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
-        dartplant::SetLastError("runtime is not ready for method hooks");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY,
+                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                          "runtime is not ready for method hooks");
     }
     if (!runtime->profile_matched) {
-        dartplant::SetLastError("runtime app image is not matched");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return RejectHook(runtime, DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_MODULE_NOT_FOUND,
+                          "runtime app image is not matched");
     }
     if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
-        dartplant::SetLastError("method belongs to a stale or different runtime generation");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                          "method belongs to a stale or different runtime generation");
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
-    return dartplant::InstallCallbackHook(method, runtime->profile.profile, *options, 0, out_hook,
-                                          nullptr, runtime->live_vm_null_value, runtime->generation,
-                                          generation, runtime->live_vm_bool_true_value,
-                                          runtime->live_vm_bool_false_value, call_layout);
+    return FinishHook(runtime, dartplant::InstallCallbackHook(
+                                   method, runtime->profile.profile, *options, 0, out_hook, nullptr,
+                                   runtime->live_vm_null_value, runtime->generation, generation,
+                                   runtime->live_vm_bool_true_value,
+                                   runtime->live_vm_bool_false_value, call_layout));
 }
 
 extern "C" DartPlantStatus dartplant_runtime_hook_method_handle(DartPlantRuntime* runtime,
@@ -119,23 +153,26 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
+    BeginHookDiagnostics(runtime);
     if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
-        dartplant::SetLastError("runtime is not ready for method hooks");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY,
+                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                          "runtime is not ready for method hooks");
     }
     if (!runtime->profile_matched) {
-        dartplant::SetLastError("runtime app image is not matched");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return RejectHook(runtime, DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_MODULE_NOT_FOUND,
+                          "runtime app image is not matched");
     }
     if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
-        dartplant::SetLastError("method belongs to a stale or different runtime generation");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                          "method belongs to a stale or different runtime generation");
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
-    return dartplant::InstallCallbackHook(method, *profile, *options, 0, out_hook, nullptr,
-                                          runtime->live_vm_null_value, runtime->generation,
-                                          generation, runtime->live_vm_bool_true_value,
-                                          runtime->live_vm_bool_false_value);
+    return FinishHook(
+        runtime, dartplant::InstallCallbackHook(method, *profile, *options, 0, out_hook, nullptr,
+                                                runtime->live_vm_null_value, runtime->generation,
+                                                generation, runtime->live_vm_bool_true_value,
+                                                runtime->live_vm_bool_false_value));
 }
 
 extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runtime,
@@ -154,17 +191,19 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
     }
 
     std::lock_guard lock(runtime->mutex);
+    BeginHookDiagnostics(runtime);
     if (!dartplant::RuntimeReadyForMethodOperation(runtime, method)) {
-        dartplant::SetLastError("runtime is not ready for method listeners");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY,
+                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                          "runtime is not ready for method listeners");
     }
     if (!runtime->profile_matched) {
-        dartplant::SetLastError("runtime app image is not matched");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return RejectHook(runtime, DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_MODULE_NOT_FOUND,
+                          "runtime app image is not matched");
     }
     if (!dartplant::IsCurrentRuntimeMethod(runtime, method)) {
-        dartplant::SetLastError("method belongs to a stale or different runtime generation");
-        return DARTPLANT_RUNTIME_NOT_READY;
+        return RejectHook(runtime, DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                          "method belongs to a stale or different runtime generation");
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
 
@@ -172,12 +211,12 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
         method, *options, priority, out_listener, runtime->generation, generation);
     if (status == DARTPLANT_NOT_INITIALIZED) {
         const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
-        return dartplant::InstallCallbackHook(
+        status = dartplant::InstallCallbackHook(
             method, runtime->profile.profile, *options, priority, nullptr, out_listener,
             runtime->live_vm_null_value, runtime->generation, generation,
             runtime->live_vm_bool_true_value, runtime->live_vm_bool_false_value, call_layout);
     }
-    return status;
+    return FinishHook(runtime, status);
 }
 
 extern "C" DartPlantStatus dartplant_remove_listener(DartPlantListener* listener) {

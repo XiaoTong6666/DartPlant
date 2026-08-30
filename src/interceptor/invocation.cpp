@@ -15,6 +15,9 @@ bool HasVerifiedCallLayout(const DartPlantInvocation* invocation) {
     return invocation != nullptr && invocation->call_layout != nullptr;
 }
 
+bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
+                          const dartplant::abi::DartAbiLocation& location, uint64_t* out_value);
+
 bool ArgumentAccessEnabled(const DartPlantInvocation* invocation) {
     return HasVerifiedCallLayout(invocation) ||
            (invocation != nullptr && invocation->profile != nullptr &&
@@ -25,6 +28,25 @@ bool ResultAccessEnabled(const DartPlantInvocation* invocation) {
     return HasVerifiedCallLayout(invocation) ||
            (invocation != nullptr && invocation->profile != nullptr &&
             (invocation->profile->flags & DARTPLANT_PROFILE_RAW_GP_RESULT) != 0);
+}
+
+bool ClosureReceiverAccessEnabled(const DartPlantInvocation* invocation) {
+    if (invocation == nullptr) return false;
+    if (invocation->closure_receiver_in_x0) return true;
+    return HasVerifiedCallLayout(invocation) && invocation->call_layout->has_closure_receiver &&
+           invocation->call_layout->closure_receiver_location.kind ==
+               dartplant::abi::DartAbiLocationKind::kGpRegister;
+}
+
+bool ReadClosureReceiverRaw(const DartPlantInvocation* invocation, uint64_t* out_raw) {
+    if (invocation == nullptr || invocation->context == nullptr || out_raw == nullptr) return false;
+    if (invocation->closure_receiver_in_x0) {
+        *out_raw = invocation->context->x[0];
+        return true;
+    }
+    return HasVerifiedCallLayout(invocation) && invocation->call_layout->has_closure_receiver &&
+           ReadVerifiedLocation(invocation, invocation->call_layout->closure_receiver_location,
+                                out_raw);
 }
 
 bool LegacyTaggedArgumentAccessEnabled(const DartPlantInvocation* invocation) {
@@ -463,6 +485,32 @@ uint32_t dartplant_invocation_argument_count(const DartPlantInvocation* invocati
     return HasVerifiedCallLayout(invocation)
                ? static_cast<uint32_t>(invocation->call_layout->parameters.size())
                : invocation->profile->argument_count;
+}
+
+uint8_t dartplant_invocation_has_closure_receiver(const DartPlantInvocation* invocation) {
+    return ClosureReceiverAccessEnabled(invocation) ? 1 : 0;
+}
+
+DartPlantStatus dartplant_invocation_get_closure_receiver(const DartPlantInvocation* invocation,
+                                                          DartPlantValue* out_value) {
+    if (!ClosureReceiverAccessEnabled(invocation) || invocation->context == nullptr ||
+        out_value == nullptr) {
+        dartplant::SetLastError("verified closure receiver is unavailable");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure receiver is only available during enter");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    uint64_t raw = 0;
+    if (!ReadClosureReceiverRaw(invocation, &raw)) {
+        dartplant::SetLastError("verified closure receiver location is unreadable");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_value =
+        RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                  raw, true, ActiveValidatedNullValue(invocation)));
+    return DARTPLANT_OK;
 }
 
 DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* invocation,

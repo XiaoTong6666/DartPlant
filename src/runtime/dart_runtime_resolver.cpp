@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <thread>
 #include <unordered_map>
@@ -11,6 +13,7 @@
 #include "abi/value_codec.h"
 #include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 
@@ -25,16 +28,6 @@ struct RuntimeRegistration {
 
 namespace {
 
-uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash) {
-    // Exact PRODUCT + ARM64 + compressed Thread layouts matching the live VM
-    // profiles supported by DartPlant. The exception bridge consumes this
-    // offset internally; it is intentionally not part of the public C ABI.
-    if (snapshot_hash == "d20a1be77c3d3c41b2a5accaee1ce549") return 0x268;
-    if (snapshot_hash == "80a49c7111088100a233b2ae788e1f48") return 0x270;
-    if (snapshot_hash == "ace654289f5abc240509fc941453ebc5") return 0x278;
-    return 0;
-}
-
 bool BuildIdMatches(const ModuleImage& module, const std::string& expected) {
     return expected.empty() || EqualsIgnoreCaseAscii(module.build_id, expected);
 }
@@ -44,6 +37,7 @@ enum class ModuleSelectionState { kMissing, kUnique, kAmbiguous };
 struct ModuleSelection {
     ModuleSelectionState state = ModuleSelectionState::kMissing;
     std::optional<ModuleImage> module;
+    uint32_t candidate_count = 0;
 };
 
 ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
@@ -53,6 +47,7 @@ ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
     for (const auto& module : modules) {
         const bool name_matches = exact_path ? module.path == name : module.name == name;
         if (!name_matches || !BuildIdMatches(module, build_id)) continue;
+        if (selection.candidate_count != UINT32_MAX) ++selection.candidate_count;
         if (selection.module.has_value()) {
             selection.state = ModuleSelectionState::kAmbiguous;
             selection.module.reset();
@@ -65,9 +60,15 @@ ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
 }
 
 bool CanUseLiveVmForQuery(const DartPlantMethodQuery& query) {
-    return query.entry_kind == DARTPLANT_ENTRY_DEFAULT && query.class_name != nullptr &&
-           query.class_name[0] != '\0' &&
+    return query.entry_kind >= DARTPLANT_ENTRY_DEFAULT &&
+           query.entry_kind <= DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED &&
+           query.class_name != nullptr && query.class_name[0] != '\0' &&
            (query.signature == nullptr || query.signature[0] == '\0');
+}
+
+bool SameSnapshotLogicalFunction(const SnapshotFunction& left, const SnapshotFunction& right) {
+    return left.library_uri == right.library_uri && left.class_name == right.class_name &&
+           left.function_name == right.function_name && left.signature == right.signature;
 }
 
 bool SameExecutableRange(const ExecutableRange& left, const ExecutableRange& right) {
@@ -250,6 +251,8 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     function->function_object = record->function_object;
     function->code_object = record->code_object;
     function->source = DartFunctionSource::kLiveVm;
+    function->function_kind = record->function_kind;
+    function->closure_call_entry_only = record->function_kind == 1 || record->function_kind == 2;
     function->thread_jump_to_frame_entry_point_offset =
         ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
     function->code_target = code_target;
@@ -296,9 +299,8 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
         SetLastError("artifact snapshot index entry is outside executable module ranges");
         return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
     }
-    if (!IsTargetHooked(record->runtime_entry) &&
-        FingerprintCode(reinterpret_cast<const void*>(record->runtime_entry), record->code_size) !=
-            record->fingerprint) {
+    if (FingerprintCodeWithManagedPatches(reinterpret_cast<const void*>(record->runtime_entry),
+                                          record->code_size) != record->fingerprint) {
         SetLastError("artifact snapshot index code fingerprint no longer matches the live image");
         return DARTPLANT_FINGERPRINT_MISMATCH;
     }
@@ -324,6 +326,8 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
     function->source = DartFunctionSource::kOfflineSnapshotIndex;
+    function->function_kind = record->function_kind;
+    function->closure_call_entry_only = record->closure_call_entry_only;
     function->thread_jump_to_frame_entry_point_offset =
         ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
     function->code_target = code_target;
@@ -352,13 +356,19 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         return DARTPLANT_PROFILE_MISMATCH;
     }
 
-    std::unordered_map<uintptr_t, uint32_t> aliases;
     std::unordered_map<uintptr_t, DartPlantCodeIdentityProof> identity_proofs;
     std::unordered_map<uintptr_t, uint32_t> physical_alias_counts;
     for (auto& record : index->functions) {
-        if (record.entry_kind != DARTPLANT_ENTRY_DEFAULT || record.entry_va == 0 ||
+        if (record.entry_kind < DARTPLANT_ENTRY_DEFAULT ||
+            record.entry_kind > DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED || record.entry_va == 0 ||
             record.code_size == 0 || record.code_size > UINT32_MAX || record.fingerprint.empty()) {
             SetLastError("artifact snapshot index contains an unsupported or incomplete record");
+            return DARTPLANT_METADATA_INVALID;
+        }
+        const bool closure_kind = record.function_kind == 1 || record.function_kind == 2;
+        if (record.closure_call_entry_only != closure_kind ||
+            (closure_kind && record.entry_kind != DARTPLANT_ENTRY_DEFAULT)) {
+            SetLastError("artifact closure entry evidence contradicts Dart PRODUCT AOT semantics");
             return DARTPLANT_METADATA_INVALID;
         }
         const SnapshotFunction* reusable = nullptr;
@@ -388,8 +398,8 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
                 return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
             }
             runtime_entry = *resolved;
-            if (FingerprintCode(reinterpret_cast<const void*>(runtime_entry), record.code_size) !=
-                record.fingerprint) {
+            if (FingerprintCodeWithManagedPatches(reinterpret_cast<const void*>(runtime_entry),
+                                                  record.code_size) != record.fingerprint) {
                 SetLastError(
                     "artifact snapshot index code fingerprint does not match the live image");
                 return DARTPLANT_FINGERPRINT_MISMATCH;
@@ -397,7 +407,6 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         }
         record.runtime_entry = runtime_entry;
         record.code_entry = runtime_entry;
-        ++aliases[runtime_entry];
 
         const auto proof = identity_proofs.find(runtime_entry);
         if (proof == identity_proofs.end()) {
@@ -411,7 +420,22 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         }
     }
     for (auto& record : index->functions) {
-        const uint32_t indexed_alias_count = aliases[record.runtime_entry];
+        uint32_t indexed_alias_count = 0;
+        for (size_t candidate_index = 0; candidate_index < index->functions.size();
+             ++candidate_index) {
+            const auto& candidate = index->functions[candidate_index];
+            if (candidate.runtime_entry != record.runtime_entry) continue;
+            bool already_counted = false;
+            for (size_t earlier = 0; earlier < candidate_index; ++earlier) {
+                const auto& previous = index->functions[earlier];
+                if (previous.runtime_entry == record.runtime_entry &&
+                    SameSnapshotLogicalFunction(previous, candidate)) {
+                    already_counted = true;
+                    break;
+                }
+            }
+            if (!already_counted) ++indexed_alias_count;
+        }
         if (record.code_identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE &&
             indexed_alias_count != 1) {
             SetLastError("artifact snapshot index contradicts compiler UNIQUE Code identity proof");
@@ -522,10 +546,47 @@ size_t RuntimeActiveOperationCountForTesting(const DartPlantRuntime* runtime) {
     return found == RuntimeRegistry().end() ? 0 : (*found)->active_operations;
 }
 
+void SetRuntimeDiagnostics(DartPlantRuntime* runtime, DartPlantResolveStage stage,
+                           DartPlantResolveOutcome outcome, DartPlantStatus status,
+                           DartPlantResolveRejectReason reject_reason) {
+    if (runtime == nullptr) return;
+    std::lock_guard lock(runtime->mutex);
+    if (stage == DARTPLANT_RESOLVE_MODULE_SELECTION) {
+        runtime->diagnostics.requested_entry_kind = DARTPLANT_ENTRY_DEFAULT;
+        runtime->diagnostics.module_candidate_count = 0;
+        runtime->diagnostics.function_candidate_count = 0;
+        runtime->diagnostics.code_alias_count = 0;
+        runtime->diagnostics.abi_provider_count = 0;
+        runtime->diagnostics.structural_candidate_count = 0;
+        runtime->diagnostics.structural_relation_count = 0;
+        runtime->diagnostics.selected_entry = 0;
+    } else if (stage == DARTPLANT_RESOLVE_FUNCTION_IDENTITY &&
+               outcome == DARTPLANT_RESOLVE_IN_PROGRESS) {
+        runtime->diagnostics.function_candidate_count = 0;
+        runtime->diagnostics.code_alias_count = 0;
+        runtime->diagnostics.abi_provider_count = 0;
+        runtime->diagnostics.structural_candidate_count = 0;
+        runtime->diagnostics.structural_relation_count = 0;
+        runtime->diagnostics.selected_entry = 0;
+    } else if (stage == DARTPLANT_RESOLVE_ABI_EVIDENCE &&
+               outcome == DARTPLANT_RESOLVE_IN_PROGRESS) {
+        runtime->diagnostics.abi_provider_count = 0;
+    }
+    runtime->diagnostics.struct_size = sizeof(runtime->diagnostics);
+    runtime->diagnostics.stage = stage;
+    runtime->diagnostics.outcome = outcome;
+    runtime->diagnostics.reject_reason = reject_reason;
+    runtime->diagnostics.status = status;
+    runtime->diagnostics.runtime_generation = runtime->generation->load(std::memory_order_acquire);
+}
+
 DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                                       const std::vector<ModuleImage>& modules) {
     if (runtime == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     std::lock_guard lock(runtime->mutex);
+
+    SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_MODULE_SELECTION,
+                          DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
 
     const auto old_app = runtime->selected_app_module;
     const auto old_dart_runtime = runtime->selected_runtime_module;
@@ -533,6 +594,8 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         modules, runtime->profile.app_module_name, runtime->profile.app_build_id);
     const ModuleSelection dart_runtime_selection = SelectProfileModule(
         modules, runtime->profile.runtime_module_name, runtime->profile.runtime_build_id);
+    runtime->diagnostics.module_candidate_count =
+        app_selection.candidate_count + dart_runtime_selection.candidate_count;
     if (app_selection.state == ModuleSelectionState::kAmbiguous ||
         dart_runtime_selection.state == ModuleSelectionState::kAmbiguous) {
         const bool old_app_mapping_present = ContainsModuleIdentity(modules, old_app);
@@ -560,6 +623,9 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->profile_matched = false;
         runtime->state = DARTPLANT_RUNTIME_FAILED;
         if (invalidation_status != DARTPLANT_OK) return invalidation_status;
+        SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_MODULE_SELECTION,
+                              DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                              DARTPLANT_REJECT_MODULE_AMBIGUOUS);
         SetLastError("runtime profile module identity is ambiguous");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
@@ -615,17 +681,27 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     runtime->profile_matched = new_app.has_value() && new_dart_runtime.has_value();
     if (!runtime->profile_matched) {
         runtime->state = DARTPLANT_RUNTIME_CREATED;
+        SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_MODULE_SELECTION,
+                              DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                              DARTPLANT_REJECT_MODULE_NOT_FOUND);
         SetLastError("runtime profile modules are not loaded or mismatch");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
+    SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY,
+                          DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
     if (!runtime->snapshot.has_value()) {
         runtime->state = DARTPLANT_RUNTIME_FAILED;
+        SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY,
+                              DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                              DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
         SetLastError("loaded app module has no usable Flutter snapshot source");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     if (relevant_identity_changed || runtime->state != DARTPLANT_RUNTIME_READY) {
         runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
     }
+    SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY, DARTPLANT_RESOLVE_RESOLVED,
+                          DARTPLANT_OK);
     ClearLastError();
     return DARTPLANT_OK;
 }
@@ -835,6 +911,25 @@ DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
     return DARTPLANT_OK;
 }
 
+DartPlantStatus dartplant_runtime_get_resolution_diagnostics(
+    const DartPlantRuntime* runtime, DartPlantResolutionDiagnostics* out_diagnostics) {
+    if (runtime == nullptr || out_diagnostics == nullptr ||
+        out_diagnostics->struct_size < sizeof(DartPlantResolutionDiagnostics)) {
+        dartplant::SetLastError("runtime diagnostics arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) {
+        dartplant::SetLastError("runtime is closing or destroyed");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    std::lock_guard lock(runtime->mutex);
+    *out_diagnostics = runtime->diagnostics;
+    out_diagnostics->struct_size = sizeof(*out_diagnostics);
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus dartplant_runtime_get_flutter_snapshot(const DartPlantRuntime* runtime,
                                                        DartPlantFlutterSnapshotInfo* out_info) {
     if (runtime == nullptr || out_info == nullptr || out_info->struct_size < sizeof(*out_info)) {
@@ -869,7 +964,12 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::lock_guard lock(runtime->mutex);
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
     if (!runtime->snapshot.has_value()) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                                         DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
         dartplant::SetLastError("Flutter snapshot source is not available for live VM capture");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
@@ -880,6 +980,9 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         invocation->hook->expected_runtime_generation !=
             runtime->generation->load(std::memory_order_acquire) ||
         invocation->context == nullptr) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                                         DARTPLANT_REJECT_STALE_GENERATION);
         dartplant::SetLastError(
             "live VM capture invocation belongs to a stale or different runtime generation");
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -891,20 +994,40 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
     DartPlantLiveVmProbeInfo probe{};
     probe.struct_size = sizeof(probe);
     DartPlantStatus status = dartplant_live_vm_probe_invocation(invocation, &snapshot_info, &probe);
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
+        return status;
+    }
 
     DartPlantLiveVmProfile profile{};
     profile.struct_size = sizeof(profile);
     status = dartplant_live_vm_select_profile(&snapshot_info, &profile);
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_VM_PROFILE,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_PROFILE_UNSUPPORTED);
+        return status;
+    }
 
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
     status = dartplant_live_vm_context_from_probe(&probe, &context);
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
+        return status;
+    }
     status = dartplant::BuildLiveIndexForContext(runtime, context, *runtime->snapshot,
                                                  invocation->context->x[profile.null_register]);
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_FUNCTION_AMBIGUOUS);
+        return status;
+    }
 
     if (invocation->requested_method != nullptr &&
         invocation->requested_method->function != nullptr &&
@@ -929,10 +1052,15 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
                 unhook_status == DARTPLANT_OK
                     ? "live VM discovered a shared Code entry for a callback hook without explicit shared-code opt-in; the hook was disabled"
                     : "live VM discovered a shared Code entry for a callback hook without explicit shared-code opt-in and the hook could not be disabled");
+            dartplant::SetRuntimeDiagnostics(
+                runtime, DARTPLANT_RESOLVE_CODE_TARGET, DARTPLANT_RESOLVE_REJECTED,
+                DARTPLANT_SHARED_CODE_ENTRY, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS);
             return DARTPLANT_SHARED_CODE_ENTRY;
         }
     }
 
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_RESOLVED,
+                                     DARTPLANT_OK);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -952,6 +1080,9 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
         return DARTPLANT_RUNTIME_NOT_READY;
     }
 
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
+
     dartplant::FlutterSnapshotSource snapshot;
     std::optional<dartplant::ModuleImage> app_module;
     uint64_t generation = 0;
@@ -959,6 +1090,9 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
         std::lock_guard lock(runtime->mutex);
         if (!runtime->profile_matched || !runtime->snapshot.has_value() ||
             !runtime->selected_app_module.has_value()) {
+            dartplant::SetRuntimeDiagnostics(
+                runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_REJECTED,
+                DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
             dartplant::SetLastError("runtime images/snapshot are not ready for cold bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
@@ -977,20 +1111,35 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
     const DartPlantStatus status =
         dartplant_live_vm_bootstrap_process(&snapshot_info, options, &context, &bootstrap_info);
     if (out_info != nullptr) *out_info = bootstrap_info;
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
+        return status;
+    }
 
     {
         std::lock_guard lock(runtime->mutex);
         if (runtime->generation->load(std::memory_order_acquire) != generation ||
             !dartplant::SameModuleIdentity(runtime->selected_app_module, app_module) ||
             !dartplant::SameSnapshotIdentity(runtime->snapshot, snapshot)) {
+            dartplant::SetRuntimeDiagnostics(
+                runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_REJECTED,
+                DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION);
             dartplant::SetLastError("runtime incarnation changed during cold bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         const DartPlantStatus index_status = dartplant::BuildLiveIndexForContext(
             runtime, context, snapshot, bootstrap_info.last_candidate_null);
-        if (index_status != DARTPLANT_OK) return index_status;
+        if (index_status != DARTPLANT_OK) {
+            dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                             DARTPLANT_RESOLVE_REJECTED, index_status,
+                                             DARTPLANT_REJECT_FUNCTION_AMBIGUOUS);
+            return index_status;
+        }
     }
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_RESOLVED,
+                                     DARTPLANT_OK);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1010,6 +1159,9 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
         return DARTPLANT_RUNTIME_NOT_READY;
     }
 
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
+
     dartplant::FlutterSnapshotSource snapshot;
     std::optional<dartplant::ModuleImage> app_module;
     uint64_t generation = 0;
@@ -1017,6 +1169,9 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
         std::lock_guard lock(runtime->mutex);
         if (!runtime->profile_matched || !runtime->snapshot.has_value() ||
             !runtime->selected_app_module.has_value()) {
+            dartplant::SetRuntimeDiagnostics(
+                runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_REJECTED,
+                DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
             dartplant::SetLastError("runtime images/snapshot are not ready for register bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
@@ -1032,19 +1187,32 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
     context.struct_size = sizeof(context);
     const DartPlantStatus status =
         dartplant_live_vm_context_from_arm64_registers(&snapshot_info, registers, &context);
-    if (status != DARTPLANT_OK) return status;
+    if (status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
+                                         DARTPLANT_RESOLVE_REJECTED, status,
+                                         DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
+        return status;
+    }
 
     {
         std::lock_guard lock(runtime->mutex);
         if (runtime->generation->load(std::memory_order_acquire) != generation ||
             !dartplant::SameModuleIdentity(runtime->selected_app_module, app_module) ||
             !dartplant::SameSnapshotIdentity(runtime->snapshot, snapshot)) {
+            dartplant::SetRuntimeDiagnostics(
+                runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_REJECTED,
+                DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION);
             dartplant::SetLastError("runtime incarnation changed during register bootstrap");
             return DARTPLANT_RUNTIME_NOT_READY;
         }
         const DartPlantStatus index_status =
             dartplant::BuildLiveIndexForContext(runtime, context, snapshot, registers->null_value);
-        if (index_status != DARTPLANT_OK) return index_status;
+        if (index_status != DARTPLANT_OK) {
+            dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                             DARTPLANT_RESOLVE_REJECTED, index_status,
+                                             DARTPLANT_REJECT_FUNCTION_AMBIGUOUS);
+            return index_status;
+        }
     }
 
     if (out_info != nullptr) {
@@ -1065,6 +1233,8 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
         info.last_candidate_null = registers->null_value;
         *out_info = info;
     }
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM, DARTPLANT_RESOLVE_RESOLVED,
+                                     DARTPLANT_OK);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1093,8 +1263,10 @@ DartPlantStatus dartplant_runtime_get_function_index_info(
 
 DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runtime, uint32_t index,
                                                     DartPlantLiveVmFunctionInfo* out_info) {
+    constexpr size_t kLiveVmFunctionInfoV1Size =
+        offsetof(DartPlantLiveVmFunctionInfo, entry_alias_counts);
     if (runtime == nullptr || out_info == nullptr ||
-        out_info->struct_size < sizeof(DartPlantLiveVmFunctionInfo)) {
+        out_info->struct_size < kLiveVmFunctionInfoV1Size) {
         dartplant::SetLastError("runtime Function info arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
@@ -1105,33 +1277,97 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
     }
     std::lock_guard lock(runtime->mutex);
     if (!runtime->live_snapshot_index.has_value() ||
-        index >= runtime->live_snapshot_index->functions.size()) {
+        index >= runtime->live_function_index_info.function_count) {
         dartplant::SetLastError("runtime Function index position is out of range");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const auto& source = runtime->live_snapshot_index->functions[index];
+    const dartplant::SnapshotFunction* source = nullptr;
+    uint32_t default_index = 0;
+    for (const auto& candidate : runtime->live_snapshot_index->functions) {
+        if (candidate.entry_kind != DARTPLANT_ENTRY_DEFAULT) continue;
+        if (default_index++ == index) {
+            source = &candidate;
+            break;
+        }
+    }
+    if (source == nullptr) {
+        dartplant::SetLastError("runtime Function index default-entry record is missing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
     DartPlantLiveVmFunctionInfo info{};
     info.struct_size = sizeof(info);
-    info.entry_alias_count = source.entry_alias_count;
-    info.function = source.function_object;
-    info.code = source.code_object;
-    info.code_object_pool = source.code_object_pool;
-    info.function_entry_point = source.runtime_entry;
-    info.code_entry_point = source.code_entry;
-    info.entry_va = source.entry_va;
-    info.code_section_va = source.code_section_va;
-    info.code_size = static_cast<uint32_t>(source.code_size);
-    info.function_kind = source.function_kind;
-    info.owner_class = source.owner_class;
-    info.library = source.library;
-    info.owner_is_toplevel_class = source.owner_is_toplevel_class ? 1 : 0;
-    info.entry_is_shared = source.entry_alias_count > 1 ? 1 : 0;
-    info.code_owner_matches_function = source.code_owner_matches_function ? 1 : 0;
-    std::snprintf(info.library_uri, sizeof(info.library_uri), "%s", source.library_uri.c_str());
-    std::snprintf(info.class_name, sizeof(info.class_name), "%s", source.class_name.c_str());
+    info.function = source->function_object;
+    info.code = source->code_object;
+    info.code_object_pool = source->code_object_pool;
+    info.code_section_va = source->code_section_va;
+    info.code_size = source->code_instructions_length;
+    info.function_kind = source->function_kind;
+    info.owner_class = source->owner_class;
+    info.library = source->library;
+    info.owner_is_toplevel_class = source->owner_is_toplevel_class ? 1 : 0;
+    info.code_owner_matches_function = source->code_owner_matches_function ? 1 : 0;
+    const uint64_t payload_start = source->code_payload_start;
+    if (payload_start == 0 || info.code_size == 0 || payload_start > UINT64_MAX - info.code_size) {
+        dartplant::SetLastError("runtime Function index has no exact Code payload range");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    const uint64_t payload_end = payload_start + info.code_size;
+    for (const auto& candidate : runtime->live_snapshot_index->functions) {
+        if (candidate.function_object != source->function_object ||
+            candidate.library_uri != source->library_uri ||
+            candidate.class_name != source->class_name ||
+            candidate.function_name != source->function_name ||
+            candidate.signature != source->signature) {
+            continue;
+        }
+        const uint32_t raw_kind = static_cast<uint32_t>(candidate.entry_kind);
+        if (raw_kind >= 4 || candidate.runtime_entry == 0 || candidate.entry_va == 0) continue;
+        if (candidate.code_payload_start != payload_start ||
+            candidate.code_instructions_length != info.code_size ||
+            candidate.runtime_entry < payload_start || candidate.runtime_entry >= payload_end ||
+            candidate.code_size != payload_end - candidate.runtime_entry) {
+            dartplant::SetLastError(
+                "runtime Function index contains inconsistent Code payload ranges");
+            return DARTPLANT_RUNTIME_NOT_READY;
+        }
+        info.entry_kind_mask |= static_cast<uint8_t>(1u << raw_kind);
+        info.entry_alias_counts[raw_kind] = candidate.entry_alias_count;
+        switch (candidate.entry_kind) {
+        case DARTPLANT_ENTRY_DEFAULT:
+            info.function_entry_point = candidate.runtime_entry;
+            info.code_entry_point = candidate.runtime_entry;
+            info.entry_va = candidate.entry_va;
+            break;
+        case DARTPLANT_ENTRY_UNCHECKED:
+            info.function_unchecked_entry_point = candidate.runtime_entry;
+            info.code_unchecked_entry_point = candidate.runtime_entry;
+            info.unchecked_entry_va = candidate.entry_va;
+            break;
+        case DARTPLANT_ENTRY_MONOMORPHIC:
+            info.code_monomorphic_entry_point = candidate.runtime_entry;
+            info.monomorphic_entry_va = candidate.entry_va;
+            break;
+        case DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED:
+            info.code_monomorphic_unchecked_entry_point = candidate.runtime_entry;
+            info.monomorphic_unchecked_entry_va = candidate.entry_va;
+            break;
+        }
+    }
+    if (payload_end <= payload_start) {
+        dartplant::SetLastError("runtime Function index entry family is incomplete");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    info.entry_alias_count = info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
+    info.entry_is_shared = info.entry_alias_count > 1 ? 1 : 0;
+    info.closure_call_entry_only = source->function_kind == 1 || source->function_kind == 2 ? 1 : 0;
+    std::snprintf(info.library_uri, sizeof(info.library_uri), "%s", source->library_uri.c_str());
+    std::snprintf(info.class_name, sizeof(info.class_name), "%s", source->class_name.c_str());
     std::snprintf(info.function_name, sizeof(info.function_name), "%s",
-                  source.function_name.c_str());
-    *out_info = info;
+                  source->function_name.c_str());
+    const size_t caller_size = out_info->struct_size;
+    const size_t written_size = std::min(caller_size, sizeof(info));
+    std::memcpy(out_info, &info, written_size);
+    out_info->struct_size = static_cast<uint32_t>(written_size);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1283,11 +1519,25 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     std::unique_lock lock(runtime->mutex);
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                     DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
+    runtime->diagnostics.requested_entry_kind = query->entry_kind;
+    runtime->diagnostics.function_candidate_count = 0;
+    runtime->diagnostics.code_alias_count = 0;
+    runtime->diagnostics.selected_entry = 0;
     if (!runtime->snapshot.has_value() || !runtime->selected_app_module.has_value()) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY,
+                                         DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                                         DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
         dartplant::SetLastError("runtime app image/snapshot is not ready for method resolution");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     if (!dartplant::CanUseLiveVmForQuery(*query)) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ENTRY_KIND,
+                                         DARTPLANT_RESOLVE_REJECTED, DARTPLANT_METHOD_NOT_FOUND,
+                                         query->entry_kind == DARTPLANT_ENTRY_DEFAULT
+                                             ? DARTPLANT_REJECT_FUNCTION_NOT_FOUND
+                                             : DARTPLANT_REJECT_ENTRY_KIND_UNSUPPORTED);
         dartplant::SetLastError(
             "method query is outside the supported live Function-index identity domain");
         return DARTPLANT_METHOD_NOT_FOUND;
@@ -1311,15 +1561,40 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
             "method is not present in the exact artifact index and the live VM is not ready");
         status = DARTPLANT_RUNTIME_NOT_READY;
     }
+    if (status != DARTPLANT_OK) {
+        const DartPlantResolveRejectReason reason =
+            status == DARTPLANT_AMBIGUOUS_METHOD    ? DARTPLANT_REJECT_FUNCTION_AMBIGUOUS
+            : status == DARTPLANT_PROFILE_MISMATCH  ? DARTPLANT_REJECT_ARTIFACT_MISMATCH
+            : status == DARTPLANT_RUNTIME_NOT_READY ? DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE
+                                                    : DARTPLANT_REJECT_FUNCTION_NOT_FOUND;
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                         DARTPLANT_RESOLVE_REJECTED, status, reason);
+    }
     lock.unlock();
     if (status != DARTPLANT_OK) return status;
+    {
+        std::lock_guard diagnostics_lock(runtime->mutex);
+        runtime->diagnostics.function_candidate_count = 1;
+        runtime->diagnostics.code_alias_count =
+            (*out_method)->function != nullptr && (*out_method)->function->code_target != nullptr
+                ? (*out_method)->function->code_target->KnownAliasCount()
+                : 0;
+        runtime->diagnostics.selected_entry = dartplant_method_runtime_address(*out_method);
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_CODE_TARGET,
+                                         DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
+    }
     const DartPlantStatus evidence_status =
         dartplant::BindRegisteredCompilerEvidenceIfPresent(runtime, *out_method);
     if (evidence_status != DARTPLANT_OK) {
+        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ABI_EVIDENCE,
+                                         DARTPLANT_RESOLVE_REJECTED, evidence_status,
+                                         DARTPLANT_REJECT_ABI_CONFLICT);
         dartplant_release_method(*out_method);
         *out_method = nullptr;
         return evidence_status;
     }
+    dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_COMPLETE,
+                                     DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
     return DARTPLANT_OK;
 }
 

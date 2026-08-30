@@ -9,6 +9,8 @@ import format as format_cmd
 import lint as lint_cmd
 import metadata as metadata_cmd
 import flutter_cold_bootstrap as flutter_cold_cmd
+import generate_vm_profiles as vm_profiles_cmd
+import check_loader_compat as loader_compat_cmd
 
 from util import (
     BUILD_TYPE_TO_CMAKE,
@@ -122,6 +124,22 @@ def main() -> None:
 
     audit_parser = subparsers.add_parser("audit")
     audit_parser.set_defaults(func=lambda _: audit_cmd.run_audit())
+
+    profiles_parser = subparsers.add_parser("profiles")
+    profiles_parser.add_argument("--check", action="store_true")
+    profiles_parser.add_argument("--sdk-root", type=Path)
+    profiles_parser.set_defaults(
+        func=lambda args: vm_profiles_cmd.run(check=args.check, sdk_root=args.sdk_root)
+    )
+
+    loader_parser = subparsers.add_parser("loader-audit")
+    loader_parser.add_argument("binary", type=Path)
+    loader_parser.add_argument("--readelf")
+    loader_parser.set_defaults(
+        func=lambda args: loader_compat_cmd.check_binary(
+            args.binary, readelf=args.readelf
+        )
+    )
 
     metadata_parser = subparsers.add_parser("metadata")
     metadata_parser.add_argument("input", nargs="?")

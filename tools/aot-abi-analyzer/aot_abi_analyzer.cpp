@@ -62,14 +62,19 @@ struct Decoded {
 };
 
 bool IsGpRegister(aarch64_reg reg) {
-    return (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X30) ||
-           (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W30);
+    // Capstone 6 aliases architectural x29/x30 to FP/LR instead of placing
+    // them after x28 in the generated enum, so a naive X0..X30 range check is
+    // false even for x0. Normalize both alias registers explicitly.
+    return (reg >= ARM64_REG_X0 && reg <= AARCH64_REG_X28) || reg == AARCH64_REG_FP ||
+           reg == AARCH64_REG_LR || (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W30);
 }
 
 bool IsFpuRegister(aarch64_reg reg) { return reg >= AARCH64_REG_D0 && reg <= AARCH64_REG_D31; }
 
 uint8_t RegisterIndex(aarch64_reg reg) {
-    if (reg >= AARCH64_REG_X0 && reg <= AARCH64_REG_X30) return reg - AARCH64_REG_X0;
+    if (reg >= AARCH64_REG_X0 && reg <= AARCH64_REG_X28) return reg - AARCH64_REG_X0;
+    if (reg == AARCH64_REG_FP) return 29;
+    if (reg == AARCH64_REG_LR) return 30;
     if (reg >= AARCH64_REG_W0 && reg <= AARCH64_REG_W30) return reg - AARCH64_REG_W0;
     if (reg >= AARCH64_REG_D0 && reg <= AARCH64_REG_D31) return reg - AARCH64_REG_D0;
     return 0;
@@ -88,8 +93,8 @@ bool IsConditionalBranch(const cs_insn& instruction) {
 
 bool IsTerminator(const cs_insn& instruction) {
     return instruction.id == ARM64_INS_RET || instruction.id == ARM64_INS_BR ||
-           instruction.id == ARM64_INS_BLR || instruction.id == ARM64_INS_BRK ||
-           instruction.id == ARM64_INS_B || IsConditionalBranch(instruction);
+           instruction.id == ARM64_INS_BRK || instruction.id == ARM64_INS_B ||
+           IsConditionalBranch(instruction);
 }
 
 bool IsDirectBranch(const cs_insn& instruction) {
@@ -312,6 +317,8 @@ void ApplyDirectCallClobber(State* state) {
     for (uint8_t reg = 16; reg < kFpuCount; ++reg) state->fpu[reg] = {};
 }
 
+void ApplyCallClobber(State* state) { ApplyDirectCallClobber(state); }
+
 void AddObservation(AnalysisResult* result, const Source& source, ParameterEvidence evidence,
                     uint64_t pc) {
     if (!source.valid || source.location.kind == LocationKind::kUnknown) return;
@@ -346,6 +353,184 @@ void AddObservation(AnalysisResult* result, const Source& source, ParameterEvide
     if (source.location.kind == LocationKind::kFpuRegister &&
         source.location.register_index < result->fpu_arguments.size()) {
         result->fpu_arguments[source.location.register_index] = evidence;
+    }
+}
+
+bool AddStructuralSite(std::array<uint64_t, kMaxStructuralSites>* sites, size_t* count,
+                       uint64_t value) {
+    if (sites == nullptr || count == nullptr || *count >= sites->size()) return false;
+    (*sites)[(*count)++] = value;
+    return true;
+}
+
+bool AddStructuralEdge(std::array<DirectControlFlowEdge, kMaxStructuralSites>* edges, size_t* count,
+                       uint64_t site, uint64_t target) {
+    if (edges == nullptr || count == nullptr || *count >= edges->size()) return false;
+    (*edges)[(*count)++] = {.site = site, .target = target};
+    return true;
+}
+
+bool AddAddressMaterialization(AnalysisResult* result, AddressMaterializationKind kind,
+                               aarch64_reg destination, uint64_t site, uint64_t completion_site,
+                               uint64_t target) {
+    if (result == nullptr || !IsGpRegister(destination) ||
+        result->address_materialization_count >= result->address_materializations.size()) {
+        return false;
+    }
+    result->address_materializations[result->address_materialization_count++] = {
+        .kind = kind,
+        .destination_register = RegisterIndex(destination),
+        .site = site,
+        .completion_site = completion_site,
+        .target = target,
+    };
+    return true;
+}
+
+bool SameGpRegister(aarch64_reg left, aarch64_reg right) {
+    return IsGpRegister(left) && IsGpRegister(right) && RegisterIndex(left) == RegisterIndex(right);
+}
+
+bool WritesGpRegister(csh handle, const cs_insn& instruction, aarch64_reg wanted) {
+    if (instruction.id == ARM64_INS_HINT) return false;
+    cs_regs regs_read{};
+    cs_regs regs_write{};
+    uint8_t read_count = 0;
+    uint8_t write_count = 0;
+    if (cs_regs_access(handle, &instruction, regs_read, &read_count, regs_write, &write_count) !=
+        CS_ERR_OK) {
+        return true;
+    }
+    for (uint8_t index = 0; index < write_count; ++index) {
+        const auto written = static_cast<aarch64_reg>(regs_write[index]);
+        if (SameGpRegister(written, wanted)) return true;
+    }
+    return false;
+}
+
+bool DecodeAddressAdd(const cs_insn& instruction, aarch64_reg base, aarch64_reg* destination,
+                      uint64_t* immediate) {
+    if (instruction.id != ARM64_INS_ADD || instruction.detail == nullptr ||
+        destination == nullptr || immediate == nullptr) {
+        return false;
+    }
+    const auto& arm64 = instruction.detail->arm64;
+    if (arm64.op_count < 3 || arm64.operands[0].type != ARM64_OP_REG ||
+        arm64.operands[1].type != ARM64_OP_REG || arm64.operands[2].type != ARM64_OP_IMM ||
+        !SameGpRegister(arm64.operands[1].reg, base) || arm64.operands[2].imm < 0) {
+        return false;
+    }
+    *destination = arm64.operands[0].reg;
+    *immediate = static_cast<uint64_t>(arm64.operands[2].imm);
+    return IsGpRegister(*destination);
+}
+
+void CollectStructuralFacts(csh handle, const Decoded& decoded, uint64_t address, size_t size,
+                            AnalysisResult* result) {
+    if (result == nullptr) return;
+    const uint64_t end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+    if (decoded.block_starts.empty()) return;
+
+    std::vector<bool> reachable(decoded.block_starts.size(), false);
+    std::vector<size_t> pending{0};
+    reachable[0] = true;
+    while (!pending.empty()) {
+        const size_t block = pending.back();
+        pending.pop_back();
+        for (size_t successor : decoded.successors[block]) {
+            if (reachable[successor]) continue;
+            reachable[successor] = true;
+            pending.push_back(successor);
+        }
+    }
+
+    for (size_t block = 0; block < decoded.block_starts.size(); ++block) {
+        if (!reachable[block]) continue;
+        const size_t block_begin = decoded.block_starts[block];
+        const size_t block_end = block + 1 < decoded.block_starts.size()
+                                     ? decoded.block_starts[block + 1]
+                                     : decoded.instruction_count;
+        for (size_t index = block_begin; index < block_end; ++index) {
+            const auto& instruction = decoded.instructions[index];
+            if (instruction.detail == nullptr) continue;
+            const auto& arm64 = instruction.detail->arm64;
+
+            if (instruction.id == ARM64_INS_BL && arm64.op_count > 0 &&
+                arm64.operands[0].type == ARM64_OP_IMM) {
+                if (!AddStructuralEdge(&result->direct_calls, &result->direct_call_count,
+                                       instruction.address,
+                                       static_cast<uint64_t>(arm64.operands[0].imm))) {
+                    result->structural_evidence_truncated = true;
+                }
+            } else if (instruction.id == ARM64_INS_RET) {
+                result->reached_return = true;
+                if (!AddStructuralSite(&result->return_sites, &result->return_site_count,
+                                       instruction.address)) {
+                    result->structural_evidence_truncated = true;
+                }
+            } else if (instruction.id == ARM64_INS_BLR) {
+                if (!AddStructuralSite(&result->indirect_call_sites, &result->indirect_call_count,
+                                       instruction.address)) {
+                    result->structural_evidence_truncated = true;
+                }
+            } else if (instruction.id == ARM64_INS_BR) {
+                result->has_unknown_control_flow = true;
+                if (!AddStructuralSite(&result->indirect_branch_sites,
+                                       &result->indirect_branch_count, instruction.address)) {
+                    result->structural_evidence_truncated = true;
+                }
+            }
+
+            if (IsDirectBranch(instruction) && arm64.op_count > 0 &&
+                arm64.operands[0].type == ARM64_OP_IMM) {
+                const uint64_t target = static_cast<uint64_t>(arm64.operands[0].imm);
+                if (target < address || target >= end) {
+                    if (!AddStructuralEdge(&result->external_branches,
+                                           &result->external_branch_count, instruction.address,
+                                           target)) {
+                        result->structural_evidence_truncated = true;
+                    }
+                }
+            }
+
+            if (instruction.id == ARM64_INS_ADR && arm64.op_count >= 2 &&
+                arm64.operands[0].type == ARM64_OP_REG && arm64.operands[1].type == ARM64_OP_IMM) {
+                if (!AddAddressMaterialization(result, AddressMaterializationKind::kAdr,
+                                               arm64.operands[0].reg, instruction.address,
+                                               instruction.address,
+                                               static_cast<uint64_t>(arm64.operands[1].imm))) {
+                    result->structural_evidence_truncated = true;
+                }
+                continue;
+            }
+
+            if (instruction.id != ARM64_INS_ADRP || arm64.op_count < 2 ||
+                arm64.operands[0].type != ARM64_OP_REG || arm64.operands[1].type != ARM64_OP_IMM ||
+                arm64.operands[1].imm < 0) {
+                continue;
+            }
+            const aarch64_reg page_register = arm64.operands[0].reg;
+            const uint64_t page = static_cast<uint64_t>(arm64.operands[1].imm);
+            for (size_t distance = 1; distance <= 2 && index + distance < block_end; ++distance) {
+                const auto& candidate = decoded.instructions[index + distance];
+                aarch64_reg destination = AARCH64_REG_INVALID;
+                uint64_t addend = 0;
+                if (DecodeAddressAdd(candidate, page_register, &destination, &addend)) {
+                    if (page <= UINT64_MAX - addend) {
+                        if (!AddAddressMaterialization(result, AddressMaterializationKind::kAdrpAdd,
+                                                       destination, instruction.address,
+                                                       candidate.address, page + addend)) {
+                            result->structural_evidence_truncated = true;
+                        }
+                    }
+                    break;
+                }
+                // FlutterTap permits one unrelated instruction between ADRP and
+                // ADD. Keep that flexibility, but fail closed if it overwrites the
+                // ADRP result before the ADD consumes it.
+                if (WritesGpRegister(handle, candidate, page_register)) break;
+            }
+        }
     }
 }
 
@@ -492,10 +677,15 @@ void ProcessInstruction(csh handle, const cs_insn& instruction, State* state,
     cs_regs_access(handle, &instruction, regs_read, &read_count, regs_write, &write_count);
 
     if (IsDoubleOperation(instruction.id)) {
-        for (uint8_t operand = 0; operand < arm64.op_count; ++operand) {
-            const auto& value = arm64.operands[operand];
-            if (value.type != ARM64_OP_REG || !IsFpuRegister(value.reg)) continue;
-            const Source source = ReadSource(*state, value.reg);
+        // Only registers in Capstone's explicit/implicit read set are evidence
+        // about incoming values. Treating operand 0 uniformly as an input is
+        // wrong for three-operand instructions such as `fmul d4, d0, d3`: d4
+        // is a destination whose pre-instruction entry provenance must not be
+        // mistaken for a fifth FPU argument.
+        for (uint8_t index = 0; index < read_count; ++index) {
+            const auto reg = static_cast<aarch64_reg>(regs_read[index]);
+            if (!IsFpuRegister(reg)) continue;
+            const Source source = ReadSource(*state, reg);
             if (source.location.kind == LocationKind::kFpuRegister ||
                 source.location.kind == LocationKind::kEntryStack) {
                 AddObservation(result, source, ParameterEvidence::kUnboxedDouble, pc);
@@ -511,10 +701,6 @@ void ProcessInstruction(csh handle, const cs_insn& instruction, State* state,
         }
     }
 
-    if (instruction.id == ARM64_INS_RET) {
-        result->reached_return = true;
-    }
-
     for (uint8_t reg = 0; reg < write_count; ++reg) {
         InvalidateRegister(state, static_cast<aarch64_reg>(regs_write[reg]));
     }
@@ -524,7 +710,7 @@ void ProcessInstruction(csh handle, const cs_insn& instruction, State* state,
     UpdateDartStackPointer(instruction, state);
     UpdateFramePointer(instruction, state);
     ApplyDartStackWriteback(instruction, state);
-    if (instruction.id == ARM64_INS_BL) ApplyDirectCallClobber(state);
+    if (instruction.id == ARM64_INS_BL || instruction.id == ARM64_INS_BLR) ApplyCallClobber(state);
 }
 
 }  // namespace
@@ -546,6 +732,8 @@ AnalysisResult AnalyzeArm64Entry(const uint8_t* code, size_t size, uint64_t addr
         return result;
     }
 
+    CollectStructuralFacts(handle, decoded, address, size, &result);
+
     std::vector<State> entry_states(decoded.block_starts.size());
     std::vector<bool> has_state(decoded.block_starts.size(), false);
     InitializeEntryState(&entry_states[0]);
@@ -562,10 +750,6 @@ AnalysisResult AnalyzeArm64Entry(const uint8_t* code, size_t size, uint64_t addr
             const auto& instruction = decoded.instructions[index];
             if (IsTerminator(instruction) && instruction.id != ARM64_INS_RET) {
                 result.stopped_at_control_flow = true;
-            }
-            if ((instruction.id == ARM64_INS_BR || instruction.id == ARM64_INS_BLR) &&
-                instruction.id != ARM64_INS_RET) {
-                result.has_unknown_control_flow = true;
             }
             ProcessInstruction(handle, instruction, &state, &result);
         }
@@ -602,6 +786,73 @@ const AbiObservation* FindObservation(const AnalysisResult& result, const AbiLoc
         }
     }
     return nullptr;
+}
+
+namespace {
+
+size_t CountRelationMatches(const AnalysisResult& analysis,
+                            const StructuralRelationConstraint& constraint) {
+    switch (constraint.kind) {
+    case StructuralRelationKind::kDirectCallTarget:
+        return static_cast<size_t>(std::count_if(
+            analysis.direct_calls.begin(),
+            analysis.direct_calls.begin() + analysis.direct_call_count,
+            [&](const DirectControlFlowEdge& edge) { return edge.target == constraint.value; }));
+    case StructuralRelationKind::kAddressTarget:
+        return static_cast<size_t>(std::count_if(
+            analysis.address_materializations.begin(),
+            analysis.address_materializations.begin() + analysis.address_materialization_count,
+            [&](const AddressMaterialization& materialization) {
+                return materialization.target == constraint.value;
+            }));
+    case StructuralRelationKind::kExternalBranchTarget:
+        return static_cast<size_t>(std::count_if(
+            analysis.external_branches.begin(),
+            analysis.external_branches.begin() + analysis.external_branch_count,
+            [&](const DirectControlFlowEdge& edge) { return edge.target == constraint.value; }));
+    case StructuralRelationKind::kReturnSite:
+        if (constraint.value == 0) return analysis.return_site_count;
+        return static_cast<size_t>(std::count(
+            analysis.return_sites.begin(),
+            analysis.return_sites.begin() + analysis.return_site_count, constraint.value));
+    case StructuralRelationKind::kUsesArgumentsDescriptor:
+        return analysis.uses_arguments_descriptor ? 1U : 0U;
+    case StructuralRelationKind::kNoUnknownControlFlow:
+        return analysis.has_unknown_control_flow ? 0U : 1U;
+    }
+    return 0;
+}
+
+bool MatchesRelations(const AnalysisResult& analysis,
+                      std::span<const StructuralRelationConstraint> constraints) {
+    return std::all_of(constraints.begin(), constraints.end(), [&](const auto& constraint) {
+        const size_t count = CountRelationMatches(analysis, constraint);
+        return count >= constraint.min_count && count <= constraint.max_count;
+    });
+}
+
+}  // namespace
+
+StructuralSelection SelectUniqueStructuralCandidate(
+    std::span<const StructuralCandidate> candidates,
+    std::span<const StructuralRelationConstraint> constraints) {
+    StructuralSelection selection;
+    selection.candidate_count = candidates.size();
+    for (const StructuralCandidate& candidate : candidates) {
+        if (candidate.analysis == nullptr || candidate.analysis->structural_evidence_truncated ||
+            !MatchesRelations(*candidate.analysis, constraints)) {
+            continue;
+        }
+        ++selection.matching_count;
+        selection.selected_id = candidate.id;
+    }
+    if (selection.matching_count == 1) {
+        selection.status = StructuralSelectionStatus::kUnique;
+    } else if (selection.matching_count > 1) {
+        selection.status = StructuralSelectionStatus::kAmbiguous;
+        selection.selected_id = 0;
+    }
+    return selection;
 }
 
 }  // namespace dartplant::aot

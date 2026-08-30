@@ -18,6 +18,7 @@ APK_PATH = FIXTURE_DIR / "build" / "app" / "outputs" / "flutter-apk" / "app-rele
 GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
 SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
+CLOSURE_SIDECAR_HEADER = GENERATED_DIR / "p6_forced_stack_closure_sidecar.h"
 P6_SIDECARS = (
     ("verifiedAbiInt64", "DartPlantP6Int64", GENERATED_DIR / "p6_int64_sidecar.h"),
     (
@@ -88,6 +89,14 @@ def _resolve_flutter(flutter: str | None) -> str:
 
 
 def _build_fixture(flutter: str) -> None:
+    run(
+        [sys.executable, str(ROOT_DIR / "scripts" / "main.py"), "build", "host"],
+        cwd=ROOT_DIR,
+        env=os.environ.copy(),
+    )
+    aot_analyzer = ROOT_DIR / "build" / "host" / "dartplant_aot_abi_analyzer_cli"
+    if not aot_analyzer.is_file():
+        raise FileNotFoundError(f"DartPlant ARM64 structural analyzer not found: {aot_analyzer}")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     SIDECAR_HEADER.write_text(
         "// Generated placeholder; replaced after the first AOT build.\n"
@@ -99,6 +108,10 @@ def _build_fixture(flutter: str) -> None:
             "// Generated placeholder; replaced after the first AOT build.\n"
             "#pragma once\n"
         )
+    CLOSURE_SIDECAR_HEADER.write_text(
+        "// Generated placeholder; replaced after the first AOT build.\n"
+        "#pragma once\n"
+    )
     run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=os.environ.copy())
     build_command = [
         flutter,
@@ -184,6 +197,8 @@ def _build_fixture(flutter: str) -> None:
                 function_name,
                 "--abi-oracle-json",
                 str(ABI_ORACLE_JSON),
+                "--aot-analyzer",
+                str(aot_analyzer),
                 "--symbol-prefix",
                 symbol_prefix,
                 "--output-header",
@@ -207,9 +222,44 @@ def _build_fixture(flutter: str) -> None:
             "--class-name",
             "Global",
             "--function-name",
+            "verifiedAbiForcedStack",
+            "--artifact-function-name",
+            "[tear-off] verifiedAbiForcedStack",
+            "--compiler-function-kind",
+            "ImplicitClosureFunction",
+            "--identity-only",
+            "--abi-oracle-json",
+            str(ABI_ORACLE_JSON),
+            "--aot-analyzer",
+            str(aot_analyzer),
+            "--symbol-prefix",
+            "DartPlantP6ForcedStackClosure",
+            "--output-header",
+            str(CLOSURE_SIDECAR_HEADER),
+        ],
+        cwd=ROOT_DIR,
+        env=os.environ.copy(),
+    )
+    run(
+        [
+            sys.executable,
+            str(ROOT_DIR / "tools" / "compiler-oracle" / "build_snapshot_sidecar.py"),
+            "--gen-snapshot",
+            str(gen_snapshot),
+            "--dill",
+            str(dill),
+            "--libapp",
+            str(libapp),
+            "--library-uri",
+            "package:dartplant_fixture/main.dart",
+            "--class-name",
+            "Global",
+            "--function-name",
             "verifiedAbiDouble",
             "--abi-oracle-json",
             str(ABI_ORACLE_JSON),
+            "--aot-analyzer",
+            str(aot_analyzer),
             "--output-header",
             str(SIDECAR_HEADER),
         ],
@@ -271,6 +321,7 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             and "DartPlant FunctionType named semantic probe:" in latest
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
+            and "DartPlant closure receiver probe:" in latest
             and "DartPlant P6 ABI corpus:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
             and "DartPlant late shared typed fail-close:" in latest
@@ -314,6 +365,29 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     if "DartPlant simple facade typed hook: 1 values=27.625/29.25 stages=1/1" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: simple typed facade lifecycle failed\n{logs}"
+        )
+    if "entry-family instrumentedAdd mask=0xf" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: four-kind Dart Code entry family was not proven\n{logs}"
+        )
+    if (
+        "artifact closure hook status=0 source_offline=1 kind=2 default_only=1 receiver_x0=1"
+        not in logs
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: artifact closure hook installation failed\n{logs}"
+        )
+    if (
+        "artifact closure receiver probe enter=1 failures=0 source_offline=1 receiver_x0=1 "
+        "active=1 passed=1"
+        not in logs
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: native closure receiver contract failed\n{logs}"
+        )
+    if "DartPlant closure receiver probe: 1 value=78 native=1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: Dart implicit closure invocation failed\n{logs}"
         )
     if "simple facade typed install ready=1 status=0" not in logs:
         raise RuntimeError(

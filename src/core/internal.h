@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,22 @@ struct ModuleImage {
                                      uint64_t section_va = 0) const;
 };
 
+struct ElfProgramHeaderView {
+    uint32_t type = 0;
+    uint32_t flags = 0;
+    uint64_t offset = 0;
+    uint64_t virtual_address = 0;
+    uint64_t file_size = 0;
+    uint64_t memory_size = 0;
+};
+
+// Pure program-header parser shared by dl_iterate_phdr production discovery
+// and the synthetic ELF regression corpus. It deliberately does not dereference
+// mapped addresses or read build-id notes.
+bool BuildModuleImageFromProgramHeaders(std::string_view path, uintptr_t load_bias,
+                                        std::span<const ElfProgramHeaderView> headers,
+                                        ModuleImage* out_image);
+
 struct MethodRecord {
     std::string library_uri;
     std::string class_name;
@@ -73,6 +90,13 @@ struct HostApiBinding {
 struct Arm64ReturnPatch {
     uintptr_t address = 0;
     uint32_t original_instruction = 0;
+    uint32_t patched_instruction = 0;
+};
+
+struct ManagedCodePatch {
+    uintptr_t address = 0;
+    std::vector<uint8_t> original_bytes;
+    std::vector<uint8_t> patched_bytes;
 };
 
 struct HostApi {
@@ -124,6 +148,7 @@ std::vector<ModuleImage> EnumerateModules();
 std::optional<ModuleImage> FindModule(const std::vector<ModuleImage>& modules,
                                       const std::string& name);
 std::string FingerprintCode(const void* address, size_t size);
+std::string FingerprintCodeWithManagedPatches(const void* address, size_t size);
 
 void InstallHostApi(const DartPlantHostApi* api);
 void ClearHostApi(const HostApiBinding* expected_binding);
@@ -161,6 +186,8 @@ bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners);
 void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out_size);
 void DestroyArm64CallbackStub(void* entry, size_t size);
+bool CollectReachableArm64Returns(const uint8_t* code, size_t size, uintptr_t logical_start,
+                                  std::vector<Arm64ReturnPatch>* out_returns);
 DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook);
 bool RestoreArm64ReturnInterception(DartPlantHook* hook);
 void RegisterArm64ExceptionBridgeConsumer(DartPlantHook* hook);
@@ -239,6 +266,7 @@ struct DartPlantHook {
     size_t replacement_entry_size = 0;
     void* replacement_return_entry = nullptr;
     std::vector<dartplant::Arm64ReturnPatch> return_patches;
+    std::vector<dartplant::ManagedCodePatch> managed_backend_patches;
     bool exception_bridge_consumer = false;
 };
 

@@ -25,6 +25,7 @@
 #endif
 
 #include "core/internal.h"
+#include "host/signal_lease.h"
 
 namespace dartplant {
 namespace {
@@ -67,48 +68,6 @@ void CaptureSignalHandler(int, siginfo_t*, void* raw_context) {
     __atomic_store_n(&g_capture.x28, context->uc_mcontext.regs[28], __ATOMIC_RELAXED);
     __atomic_store_n(&g_capture_ready, 1, __ATOMIC_RELEASE);
 }
-
-class ScopedSamplingSignal final {
-public:
-    bool Install() {
-        // Use signals whose Linux default disposition is ignore. If a sampled
-        // thread blocks the signal and delivery is delayed past our timeout,
-        // restoring SIG_DFL must not turn the pending sample into a future
-        // process-killing event. We only borrow a signal while its current
-        // disposition is still SIG_DFL, so applications that own either signal
-        // are left untouched.
-        constexpr int kCandidates[] = {SIGWINCH, SIGURG};
-        for (const int candidate : kCandidates) {
-            struct sigaction current{};
-            if (sigaction(candidate, nullptr, &current) != 0 || current.sa_handler != SIG_DFL) {
-                continue;
-            }
-
-            struct sigaction action{};
-            sigemptyset(&action.sa_mask);
-            action.sa_sigaction = CaptureSignalHandler;
-            action.sa_flags = SA_SIGINFO | SA_RESTART;
-            if (sigaction(candidate, &action, &old_action_) == 0) {
-                signal_ = candidate;
-                installed_ = true;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    ~ScopedSamplingSignal() {
-        __atomic_store_n(&g_capture_active, 0, __ATOMIC_RELEASE);
-        if (installed_) sigaction(signal_, &old_action_, nullptr);
-    }
-
-    int signal_number() const { return signal_; }
-
-private:
-    bool installed_ = false;
-    int signal_ = 0;
-    struct sigaction old_action_{};
-};
 
 struct ThreadSampleTarget {
     pid_t tid = 0;
@@ -255,8 +214,16 @@ extern "C" DartPlantStatus dartplant_live_vm_bootstrap_process(
     DartPlantLiveVmBootstrapInfo info{};
     info.struct_size = sizeof(info);
 
-    dartplant::ScopedSamplingSignal sampling_signal;
-    if (!sampling_signal.Install()) {
+    // Both candidates are ignore-by-default on Linux. The generic lease only
+    // accepts a SIG_DFL disposition and re-checks the action returned by
+    // sigaction(), then restores it only while our handler still owns the
+    // disposition. This avoids intentionally displacing host/app handlers and
+    // deliberately avoids FlutterTap's process-wide SIGSEGV/SIGBUS probing
+    // strategy; unrelated concurrent sigaction() calls remain process-global
+    // and therefore cannot be made atomic with this lease.
+    constexpr int kSamplingSignals[] = {SIGWINCH, SIGURG};
+    dartplant::ScopedSignalLease sampling_signal;
+    if (!sampling_signal.Install(kSamplingSignals, dartplant::CaptureSignalHandler, SA_RESTART)) {
         dartplant::SetLastError(
             "no unused ignore-by-default signal is available for live VM sampling");
         return DARTPLANT_RUNTIME_NOT_READY;

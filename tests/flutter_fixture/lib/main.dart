@@ -83,6 +83,15 @@ int verifiedAbiForcedStack(int left, int right) {
 }
 
 @pragma('vm:never-inline')
+@pragma('vm:entry-point')
+int invokeForcedStackClosure(
+  int Function(int, int) callback,
+  int left,
+  int right,
+) =>
+    callback(left, right);
+
+@pragma('vm:never-inline')
 (Object?, Object?) verifiedAbiPair(Object? left, Object? right) {
   return (left, right);
 }
@@ -213,10 +222,28 @@ Future<void> main() async {
       'DartPlant exception bridge lifetime: ${exceptionLifetimePassed ? 1 : 0} install=$exceptionLifetimeInstall catch=$exceptionLifetimeCatch probe=$exceptionLifetimeProbe',
     );
 
+    // Every independent artifact consumer above has now removed its physical
+    // hooks and shut down. The advanced runtime already prebound the pristine
+    // artifact registry during bootstrap, so it is safe to patch the exact
+    // AOT-dropped implicit-closure target without invalidating another
+    // runtime's whole-bundle fingerprint validation.
+    final forcedStackClosureInstall =
+        DartPlantNative.enableForcedStackClosureHook();
+    const forcedStackTearOff = verifiedAbiForcedStack;
+    final forcedStackClosureValue =
+        invokeForcedStackClosure(forcedStackTearOff, 7, 8);
+    final forcedStackClosureProbe = DartPlantNative.forcedStackClosureProbe();
+    final forcedStackClosurePassed = forcedStackClosureInstall == 0 &&
+        forcedStackClosureValue == 78 &&
+        forcedStackClosureProbe == 1;
+    debugPrint(
+      'DartPlant closure receiver probe: ${forcedStackClosurePassed ? 1 : 0} value=$forcedStackClosureValue native=$forcedStackClosureProbe install=$forcedStackClosureInstall',
+    );
+
     // Only after the simple consumer has removed its final subscription and
-    // the P6 corpus has removed all of its artifact-first hooks and shut down
-    // the default runtime may the advanced fixture reuse physical CodeTargets
-    // for its ABI/late-shared diagnostics.
+    // the P6/exception consumers have removed all artifact-first hooks and
+    // shut down may the advanced fixture reuse physical CodeTargets for its
+    // ABI/late-shared diagnostics.
     final advancedOrdinaryHook = DartPlantNative.enableAdvancedOrdinaryHook();
     debugPrint(
         'DartPlant advanced ordinary hook enable: $advancedOrdinaryHook');

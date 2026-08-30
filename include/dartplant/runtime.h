@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "dartplant/advanced/abi_evidence.h"
+#include "dartplant/advanced/diagnostics.h"
 #include "dartplant/advanced/flutter_snapshot.h"
 #include "dartplant/advanced/live_vm.h"
 #include "dartplant/advanced/runtime_profile.h"
@@ -55,6 +56,12 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRun
 
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
                                                             DartPlantRuntimeInfo* out_info);
+
+// Returns the latest structured proof/rejection snapshot. This is diagnostic
+// state only: callers must still use the operation's DartPlantStatus as the
+// authoritative result.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_resolution_diagnostics(
+    const DartPlantRuntime* runtime, DartPlantResolutionDiagnostics* out_diagnostics);
 
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_flutter_snapshot(
     const DartPlantRuntime* runtime, DartPlantFlutterSnapshotInfo* out_info);

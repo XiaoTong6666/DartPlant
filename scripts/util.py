@@ -192,6 +192,11 @@ def build_all(ctx: BuildContext, *, force: bool = False) -> None:
 
 def test_host(ctx: BuildContext, *, force: bool = False) -> None:
     build_host(ctx, force=force)
+    run(["python3", str(ROOT_DIR / "tests" / "loader_compat_test.py")], cwd=ROOT_DIR)
+    run(["python3", str(ROOT_DIR / "tests" / "vm_profiles_generator_test.py")], cwd=ROOT_DIR)
+    run(["python3", str(ROOT_DIR / "scripts" / "generate_vm_profiles.py"), "--check"], cwd=ROOT_DIR)
+    run(["dart", "pub", "get"], cwd=ROOT_DIR / "tests" / "dart")
+    run(["dart", "test"], cwd=ROOT_DIR / "tests" / "dart")
     run(
         ["python3", str(ROOT_DIR / "tools" / "compiler-oracle" / "test_build_snapshot_sidecar.py")],
         cwd=ROOT_DIR,

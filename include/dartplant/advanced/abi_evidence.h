@@ -53,6 +53,18 @@ typedef struct DartPlantCompilerAbiEvidence {
     DartPlantEntryKind entry_kind;
     uint64_t entry_va;
     uint64_t code_size;
+    // V3 structural cross-check summary. This is not an alternative identity
+    // or ABI source: the compiler oracle remains authoritative. A generated
+    // sidecar sets structural_verified only after the final libapp.so machine
+    // bytes have been analyzed and every known structural ABI fact agrees.
+    uint32_t structural_schema_version;
+    uint32_t structural_decoded_instructions;
+    uint32_t structural_basic_block_count;
+    uint32_t structural_relation_count;
+    uint8_t structural_verified;
+    uint8_t structural_has_unknown_control_flow;
+    uint8_t structural_uses_arguments_descriptor;
+    uint8_t structural_reached_return;
 } DartPlantCompilerAbiEvidence;
 
 typedef enum DartPlantMethodAbiState {

@@ -13,10 +13,19 @@ from pathlib import Path
 
 
 _CODE_HEADER_RE = re.compile(
-    r"^Code for optimized function '(?P<name>.+)' \(RegularFunction\) \{$"
+    r"^Code for optimized function '(?P<name>.+)' \((?P<kind>[A-Za-z]+Function)\) \{$"
 )
-_INSTRUCTION_RE = re.compile(r"^0x[0-9a-fA-F]+\s+(?P<word>[0-9a-fA-F]{8})\s+")
-_CFG_HEADER_RE = re.compile(r"^==== (?P<name>.+) \(RegularFunction\)$")
+_INSTRUCTION_RE = re.compile(
+    r"^(?P<address>0x[0-9a-fA-F]+)\s+(?P<word>[0-9a-fA-F]{8})\s+"
+)
+_CFG_HEADER_RE = re.compile(
+    r"^==== (?P<name>.+) \((?P<kind>[A-Za-z]+Function)\)$"
+)
+_ENTRY_POINTS_HEADER_RE = re.compile(r"^Entry points for function '(?P<name>.+)' \{$")
+_ENTRY_POINT_RE = re.compile(
+    r"^\s*\[code\+0x[0-9a-fA-F]+\]\s+(?P<address>[0-9a-fA-F]+)\s+"
+    r"(?P<kind>kNormal|kUnchecked|kMonomorphic|kMonomorphicUnchecked)$"
+)
 _PARAMETER_RE = re.compile(
     r"^\s*v(?P<value>\d+) <- Parameter\((?P<index>\d+) @(?P<location>[^)]+)\)(?P<tail>.*)$"
 )
@@ -24,6 +33,24 @@ _VALUE_DEF_RE = re.compile(r"^\s*(?:\d+:\s+)?v(?P<value>\d+) <- (?P<body>.+)$")
 _RETURN_RE = re.compile(r"^\s*\d+:\s+DartReturn(?::\d+)?\(v(?P<value>\d+)\)")
 _SNAPSHOT_MAGIC = b"\xf5\xf5\xdc\xdc"
 _HEX_32_RE = re.compile(rb"^[0-9a-fA-F]{32}$")
+
+_ENTRY_KIND_LABELS = {
+    "default": "kNormal",
+    "unchecked": "kUnchecked",
+    "monomorphic": "kMonomorphic",
+    "monomorphic-unchecked": "kMonomorphicUnchecked",
+}
+_ENTRY_KIND_CPP = {
+    "default": "DARTPLANT_ENTRY_DEFAULT",
+    "unchecked": "DARTPLANT_ENTRY_UNCHECKED",
+    "monomorphic": "DARTPLANT_ENTRY_MONOMORPHIC",
+    "monomorphic-unchecked": "DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED",
+}
+_FUNCTION_KIND_VALUES = {
+    "RegularFunction": 0,
+    "ClosureFunction": 1,
+    "ImplicitClosureFunction": 2,
+}
 
 
 @dataclass(frozen=True)
@@ -42,6 +69,14 @@ class ElfIdentity:
 
 
 @dataclass(frozen=True)
+class MachineCodeEvidence:
+    code: bytes
+    start_address: int
+    printed_name: str
+    function_kind: str
+
+
+@dataclass(frozen=True)
 class AbiEvidence:
     parameters: tuple[str, ...]
     result: str
@@ -55,6 +90,99 @@ class AbiEvidence:
 class CodeIdentityEvidence:
     proof: str
     physical_entry_alias_count: int
+
+
+def _expected_register_representations(abi: AbiEvidence) -> dict[tuple[str, int], str]:
+    gp_registers = (1, 2, 3, 5, 6, 7)
+    fpu_registers = (0, 1, 2, 3, 4, 5)
+    gp_index = 0
+    fpu_index = 0
+    expected: dict[tuple[str, int], str] = {}
+    for index, representation in enumerate(abi.parameters):
+        if index >= abi.max_parameters_in_registers:
+            continue
+        if representation in {"tagged", "unboxed-int64"}:
+            if gp_index < len(gp_registers):
+                expected[("gp", gp_registers[gp_index])] = representation
+                gp_index += 1
+        elif representation == "unboxed-double":
+            if fpu_index < len(fpu_registers):
+                expected[("fpu", fpu_registers[fpu_index])] = representation
+                fpu_index += 1
+    return expected
+
+
+def _run_machine_code_analyzer(
+    analyzer: Path,
+    code: bytes,
+    entry_va: int,
+) -> dict[str, object]:
+    if not analyzer.is_file():
+        raise ValueError(f"ARM64 structural analyzer not found: {analyzer}")
+    with tempfile.TemporaryDirectory(prefix="dartplant-aot-analysis-") as temp_dir:
+        code_path = Path(temp_dir) / "code.bin"
+        code_path.write_bytes(code)
+        result = sp.run(
+            [
+                str(analyzer),
+                "--code-file",
+                str(code_path),
+                "--address",
+                hex(entry_va),
+            ],
+            check=False,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            text=True,
+        )
+    if result.returncode != 0:
+        raise ValueError(
+            "ARM64 structural analyzer failed: "
+            f"exit={result.returncode} stderr={result.stderr.strip()}"
+        )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("ARM64 structural analyzer emitted invalid JSON") from error
+    if not isinstance(document, dict):
+        raise ValueError("ARM64 structural analyzer result must be an object")
+    if document.get("schema_version") != 1:
+        raise ValueError("unsupported ARM64 structural analyzer schema")
+    if document.get("structural_evidence_truncated") is True:
+        raise ValueError("ARM64 structural analyzer evidence exceeded its fixed proof capacity")
+    return document
+
+
+def _validate_machine_code_cross_check(
+    abi: AbiEvidence,
+    document: dict[str, object],
+) -> None:
+    observations = document.get("observations")
+    if not isinstance(observations, list):
+        raise ValueError("ARM64 structural analyzer result has no observations array")
+    expected = _expected_register_representations(abi)
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise ValueError("ARM64 structural analyzer observation is invalid")
+        location = observation.get("location")
+        representation = observation.get("representation")
+        register = observation.get("register")
+        if representation == "unknown" or location == "entry-stack":
+            continue
+        if location not in {"gp", "fpu"} or not isinstance(register, int):
+            continue
+        expected_representation = expected.get((location, register))
+        if expected_representation is None:
+            raise ValueError(
+                "machine-code structural analysis observed an ABI value in an "
+                f"unassigned {location}{register}: {representation}"
+            )
+        if representation != expected_representation:
+            raise ValueError(
+                "compiler ABI oracle disagrees with machine-code structural analysis at "
+                f"{location}{register}: oracle={expected_representation} "
+                f"machine={representation}"
+            )
 
 
 def _load_abi_oracle(
@@ -190,36 +318,83 @@ def _parse_elf64(data: bytes) -> ElfIdentity:
     return ElfIdentity(build_id, next(iter(hashes)), tuple(segments))
 
 
-def _extract_machine_code(log: str, function_name: str) -> bytes:
-    # Current Dart printer prefixes private/top-level names with an underscore,
-    # producing ..._::_verifiedAbiDouble. Accept both forms so this producer is
-    # not tied to that cosmetic separator.
+def _extract_machine_code(
+    log: str, function_name: str, expected_kind: str | None = None
+) -> MachineCodeEvidence:
+    # Current Dart printer prefixes private/top-level names with an underscore.
+    # Ordinary functions can be selected by their exact suffix. A closure
+    # artifact additionally supplies the compiler Function kind; in that mode
+    # require exactly one disassembly of that kind whose printed identity
+    # contains the source member name instead of guessing a register/opcode
+    # signature.
     suffixes = (f"_::{function_name}", f"_::_{function_name}")
+    lines = log.splitlines()
+    matches: list[MachineCodeEvidence] = []
+    position = 0
+    while position < len(lines):
+        header = _CODE_HEADER_RE.match(lines[position])
+        if header is None:
+            position += 1
+            continue
+        candidate = header.group("name")
+        kind = header.group("kind")
+        ordinary_match = any(candidate.endswith(suffix) for suffix in suffixes)
+        kind_match = expected_kind is not None and kind == expected_kind and function_name in candidate
+        position += 1
+        words: list[int] = []
+        start_address = 0
+        while position < len(lines) and lines[position].strip() != "}":
+            instruction = _INSTRUCTION_RE.match(lines[position])
+            if instruction is not None:
+                if start_address == 0:
+                    start_address = int(instruction.group("address"), 16)
+                words.append(int(instruction.group("word"), 16))
+            position += 1
+        if (expected_kind is None and ordinary_match) or kind_match:
+            if not words or start_address == 0:
+                raise ValueError(f"empty machine code for {candidate}")
+            matches.append(
+                MachineCodeEvidence(
+                    b"".join(struct.pack("<I", word) for word in words),
+                    start_address,
+                    candidate,
+                    kind,
+                )
+            )
+        position += 1
+    if len(matches) != 1:
+        raise ValueError(
+            "gen_snapshot did not identify exactly one compiler Function for "
+            f"{function_name!r} kind={expected_kind or 'ordinary'}: {len(matches)}"
+        )
+    return matches[0]
+
+
+def _extract_entry_points(log: str, printed_name: str) -> dict[str, int]:
     collecting = False
-    words: list[int] = []
-    matched_name = ""
+    entries: dict[str, int] = {}
     for line in log.splitlines():
         if not collecting:
-            match = _CODE_HEADER_RE.match(line)
-            if match is None:
-                continue
-            candidate = match.group("name")
-            if not any(candidate.endswith(suffix) for suffix in suffixes):
+            match = _ENTRY_POINTS_HEADER_RE.match(line)
+            if match is None or match.group("name") != printed_name:
                 continue
             collecting = True
-            matched_name = candidate
             continue
         if line.strip() == "}":
             break
-        match = _INSTRUCTION_RE.match(line)
-        if match is not None:
-            words.append(int(match.group("word"), 16))
-    if not collecting or not words:
-        raise ValueError(f"gen_snapshot did not disassemble RegularFunction {function_name!r}")
-    code = b"".join(struct.pack("<I", word) for word in words)
-    if not code:
-        raise ValueError(f"empty machine code for {matched_name}")
-    return code
+        match = _ENTRY_POINT_RE.match(line)
+        if match is None:
+            continue
+        kind = match.group("kind")
+        if kind in entries:
+            raise ValueError(f"duplicate compiler entry-point record for {kind}")
+        entries[kind] = int(match.group("address"), 16)
+    required = {"kNormal", "kUnchecked", "kMonomorphic", "kMonomorphicUnchecked"}
+    if set(entries) != required:
+        raise ValueError(
+            f"compiler entry-point family for {printed_name!r} is incomplete: {sorted(entries)}"
+        )
+    return entries
 
 
 def _representation_from_text(text: str) -> str:
@@ -357,8 +532,26 @@ def _normalize_aarch64_direct_branches(code: bytes) -> bytes:
     return bytes(normalized)
 
 
+def _aarch64_has_direct_call_to(code: bytes, entry_va: int, target_va: int) -> bool:
+    if len(code) % 4 != 0:
+        return False
+    for offset in range(0, len(code), 4):
+        word = struct.unpack_from("<I", code, offset)[0]
+        if word & 0xFC000000 != 0x94000000:  # BL imm26
+            continue
+        imm26 = word & 0x03FFFFFF
+        if imm26 & 0x02000000:
+            imm26 -= 1 << 26
+        if entry_va + offset + (imm26 << 2) == target_va:
+            return True
+    return False
+
+
 def _find_unique_executable_code(
-    data: bytes, identity: ElfIdentity, code: bytes
+    data: bytes,
+    identity: ElfIdentity,
+    code: bytes,
+    required_direct_call_target_va: int | None = None,
 ) -> tuple[int, bytes, str]:
     matches: list[int] = []
     for segment in identity.load_segments:
@@ -373,12 +566,25 @@ def _find_unique_executable_code(
                 break
             matches.append(segment.virtual_address + (found - segment.file_offset))
             cursor = found + 1
+    if required_direct_call_target_va is not None and matches:
+        filtered: list[int] = []
+        for entry_va in matches:
+            for segment in identity.load_segments:
+                if segment.virtual_address <= entry_va < segment.virtual_address + segment.file_size:
+                    file_offset = segment.file_offset + (entry_va - segment.virtual_address)
+                    candidate = data[file_offset : file_offset + len(code)]
+                    if _aarch64_has_direct_call_to(
+                        candidate, entry_va, required_direct_call_target_va
+                    ):
+                        filtered.append(entry_va)
+                    break
+        matches = filtered
     if len(matches) == 1:
         entry_va = matches[0]
         for segment in identity.load_segments:
             if segment.virtual_address <= entry_va < segment.virtual_address + segment.file_size:
                 file_offset = segment.file_offset + (entry_va - segment.virtual_address)
-                return entry_va, data[file_offset : file_offset + len(code)], "exact"
+                return entry_va, data[file_offset : file_offset + len(code)], "exact+relation" if required_direct_call_target_va is not None else "exact"
         raise ValueError("exact executable code match could not be mapped back to file bytes")
     if len(matches) > 1:
         raise ValueError(
@@ -400,13 +606,31 @@ def _find_unique_executable_code(
                 continue
             entry_va = segment.virtual_address + (file_offset - segment.file_offset)
             normalized_matches.append((entry_va, candidate))
+    if required_direct_call_target_va is not None:
+        normalized_matches = [
+            (entry_va, candidate)
+            for entry_va, candidate in normalized_matches
+            if _aarch64_has_direct_call_to(
+                candidate, entry_va, required_direct_call_target_va
+            )
+        ]
     if len(normalized_matches) != 1:
+        relation = (
+            f" with required BL target 0x{required_direct_call_target_va:x}"
+            if required_direct_call_target_va is not None
+            else ""
+        )
         raise ValueError(
-            "expected one executable match after masking only AArch64 B/BL imm26 fields, found "
-            f"{[hex(value) for value, _ in normalized_matches]}"
+            "expected one executable match after masking only AArch64 B/BL imm26 fields"
+            f"{relation}, found {[hex(value) for value, _ in normalized_matches]}"
         )
     entry_va, actual_code = normalized_matches[0]
-    return entry_va, actual_code, "branch-relocation-normalized"
+    mode = (
+        "branch-relocation-normalized+direct-call-relation"
+        if required_direct_call_target_va is not None
+        else "branch-relocation-normalized"
+    )
+    return entry_va, actual_code, mode
 
 
 def _fnv1a64(data: bytes) -> str:
@@ -508,6 +732,7 @@ def _run_gen_snapshot(
     library_uri: str,
     class_name: str,
     function_name: str,
+    artifact_function_name: str | None = None,
 ) -> tuple[str, CodeIdentityEvidence]:
     with tempfile.TemporaryDirectory(prefix="dartplant-oracle-") as temp_dir:
         elf = Path(temp_dir) / "oracle.so"
@@ -531,7 +756,7 @@ def _run_gen_snapshot(
                 f"gen_snapshot oracle failed with exit code {result.returncode}\n{result.stdout}"
             )
         return result.stdout, _extract_code_identity_profile(
-            profile, library_uri, class_name, function_name
+            profile, library_uri, class_name, artifact_function_name or function_name
         )
 
 
@@ -548,11 +773,49 @@ def _write_header(
     bundle_symbol = f"k{symbol_prefix}ArtifactBundle"
     registrar_symbol = f"{symbol_prefix}ArtifactRegistrar"
     registrar_instance = f"k{symbol_prefix}ArtifactRegistrar"
+    entry_kind = str(record.get("entry_kind", "default"))
+    if entry_kind not in _ENTRY_KIND_CPP:
+        raise ValueError(f"unsupported generated entry kind: {entry_kind!r}")
+    function_kind = int(record.get("function_kind", 0))
+    closure_call_entry_only = bool(record.get("closure_call_entry_only", False))
     compatibility_macro = (
         "#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 1\n"
         if symbol_prefix == "DartPlantOrdinaryAot"
         else ""
     )
+    structural = record.get("structural_analysis")
+    if isinstance(structural, dict):
+        structural_schema_version = 1
+        structural_verified = 1
+        structural_decoded_instructions = int(structural.get("decoded_instructions", 0))
+        structural_basic_block_count = int(structural.get("basic_block_count", 0))
+        structural_relation_count = sum(
+            int(structural.get(name, 0))
+            for name in (
+                "external_branch_count",
+                "indirect_call_count",
+                "indirect_branch_count",
+                "direct_call_count",
+                "return_site_count",
+                "address_materialization_count",
+            )
+        ) + (1 if structural.get("uses_arguments_descriptor", False) else 0)
+        structural_unknown_control_flow = (
+            1 if structural.get("has_unknown_control_flow", False) else 0
+        )
+        structural_uses_arguments_descriptor = (
+            1 if structural.get("uses_arguments_descriptor", False) else 0
+        )
+        structural_reached_return = 1 if structural.get("reached_return", False) else 0
+    else:
+        structural_schema_version = 0
+        structural_verified = 0
+        structural_decoded_instructions = 0
+        structural_basic_block_count = 0
+        structural_relation_count = 0
+        structural_unknown_control_flow = 0
+        structural_uses_arguments_descriptor = 0
+        structural_reached_return = 0
     text = f"""// Generated by tools/compiler-oracle/build_snapshot_sidecar.py.
 #pragma once
 
@@ -566,13 +829,16 @@ inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
     .class_name = {json.dumps(record['class_name'])},
     .function_name = {json.dumps(record['function_name'])},
     .signature = \"\",
-    .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    .entry_kind = {_ENTRY_KIND_CPP[entry_kind]},
     .entry_va = 0x{record['entry_va']:x}ULL,
     .code_size = {record['code_size']}ULL,
     .code_section_va = 0,
     .fingerprint = {json.dumps(record['fingerprint'])},
     .code_identity_proof = DARTPLANT_CODE_IDENTITY_{str(record['code_identity_proof']).upper()},
     .physical_entry_alias_count = {record['physical_entry_alias_count']},
+    .function_kind = {function_kind}u,
+    .closure_call_entry_only = {1 if closure_call_entry_only else 0},
+    .reserved_function_flags = {{0, 0, 0}},
 }}}};
 
 inline constexpr DartPlantSnapshotIndexInfo {snapshot_symbol} = {{
@@ -606,9 +872,17 @@ inline constexpr DartPlantCompilerAbiEvidence {evidence_symbol} = {{
     .library_uri = {json.dumps(record['library_uri'])},
     .class_name = {json.dumps(record['class_name'])},
     .function_name = {json.dumps(record['function_name'])},
-    .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    .entry_kind = {_ENTRY_KIND_CPP[entry_kind]},
     .entry_va = 0x{record['entry_va']:x}ULL,
     .code_size = {record['code_size']}ULL,
+    .structural_schema_version = {structural_schema_version},
+    .structural_decoded_instructions = {structural_decoded_instructions},
+    .structural_basic_block_count = {structural_basic_block_count},
+    .structural_relation_count = {structural_relation_count},
+    .structural_verified = {structural_verified},
+    .structural_has_unknown_control_flow = {structural_unknown_control_flow},
+    .structural_uses_arguments_descriptor = {structural_uses_arguments_descriptor},
+    .structural_reached_return = {structural_reached_return},
 }};
 
 inline constexpr DartPlantArtifactBundle {bundle_symbol} = {{
@@ -633,6 +907,79 @@ inline const {registrar_symbol} {registrar_instance}{{}};
     path.write_text(text)
 
 
+
+def _write_identity_header(
+    path: Path, record: dict[str, object], symbol_prefix: str
+) -> None:
+    """Emit an exact Function/Code artifact without inventing typed ABI facts."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol_prefix) is None:
+        raise ValueError(f"invalid generated C++ symbol prefix: {symbol_prefix!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    functions_symbol = f"k{symbol_prefix}Functions"
+    snapshot_symbol = f"k{symbol_prefix}SnapshotIndex"
+    bundle_symbol = f"k{symbol_prefix}ArtifactBundle"
+    registrar_symbol = f"{symbol_prefix}ArtifactRegistrar"
+    registrar_instance = f"k{symbol_prefix}ArtifactRegistrar"
+    entry_kind = str(record.get("entry_kind", "default"))
+    if entry_kind not in _ENTRY_KIND_CPP:
+        raise ValueError(f"unsupported generated entry kind: {entry_kind!r}")
+    function_kind = int(record.get("function_kind", 0))
+    closure_call_entry_only = bool(record.get("closure_call_entry_only", False))
+    text = f"""// Generated by tools/compiler-oracle/build_snapshot_sidecar.py.
+#pragma once
+
+#include \"dartplant/advanced/artifact.h\"
+
+inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
+    .struct_size = sizeof(DartPlantSnapshotFunctionInfo),
+    .library_uri = {json.dumps(record['library_uri'])},
+    .class_name = {json.dumps(record['class_name'])},
+    .function_name = {json.dumps(record['function_name'])},
+    .signature = \"\",
+    .entry_kind = {_ENTRY_KIND_CPP[entry_kind]},
+    .entry_va = 0x{record['entry_va']:x}ULL,
+    .code_size = {record['code_size']}ULL,
+    .code_section_va = 0,
+    .fingerprint = {json.dumps(record['fingerprint'])},
+    .code_identity_proof = DARTPLANT_CODE_IDENTITY_{str(record['code_identity_proof']).upper()},
+    .physical_entry_alias_count = {record['physical_entry_alias_count']},
+    .function_kind = {function_kind}u,
+    .closure_call_entry_only = {1 if closure_call_entry_only else 0},
+    .reserved_function_flags = {{0, 0, 0}},
+}}}};
+
+inline constexpr DartPlantSnapshotIndexInfo {snapshot_symbol} = {{
+    .struct_size = sizeof(DartPlantSnapshotIndexInfo),
+    .module_name = \"libapp.so\",
+    .module_build_id = {json.dumps(record['build_id'])},
+    .snapshot_hash = {json.dumps(record['snapshot_hash'])},
+    .dart_version = \"compiler-oracle\",
+    .profile_version = \"compiler-oracle-v1\",
+    .functions = {functions_symbol},
+    .function_count = 1,
+}};
+
+inline constexpr DartPlantArtifactBundle {bundle_symbol} = {{
+    .struct_size = sizeof(DartPlantArtifactBundle),
+    .version = DARTPLANT_ARTIFACT_BUNDLE_VERSION,
+    .snapshot_index = &{snapshot_symbol},
+    .compiler_abi_evidence = nullptr,
+    .compiler_abi_evidence_count = 0,
+}};
+
+#if defined(__cplusplus)
+namespace dartplant_generated {{
+struct {registrar_symbol} {{
+    {registrar_symbol}() {{
+        (void)dartplant_register_embedded_artifact_bundle(&{bundle_symbol});
+    }}
+}};
+inline const {registrar_symbol} {registrar_instance}{{}};
+}}  // namespace dartplant_generated
+#endif
+"""
+    path.write_text(text)
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build an exact DartPlant snapshot sidecar record from compiler diagnostics"
@@ -643,7 +990,32 @@ def main() -> int:
     parser.add_argument("--library-uri", required=True)
     parser.add_argument("--class-name", required=True)
     parser.add_argument("--function-name", required=True)
+    parser.add_argument(
+        "--artifact-function-name",
+        help="exact heap-profile Function name when it differs from the source member name",
+    )
+    parser.add_argument(
+        "--compiler-function-kind",
+        choices=tuple(_FUNCTION_KIND_VALUES),
+        help="require an exact compiler Function kind, e.g. ImplicitClosureFunction",
+    )
+    parser.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="emit exact snapshot/code identity without compiler typed ABI evidence",
+    )
+    parser.add_argument(
+        "--entry-kind",
+        choices=tuple(_ENTRY_KIND_LABELS),
+        default="default",
+        help="exact Dart CodeEntryKind to bind from compiler entry-point diagnostics",
+    )
     parser.add_argument("--abi-oracle-json", type=Path, required=True)
+    parser.add_argument(
+        "--aot-analyzer",
+        type=Path,
+        help="optional DartPlant ARM64 machine-code structural analyzer",
+    )
     parser.add_argument("--output-header", type=Path, required=True)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument(
@@ -655,30 +1027,81 @@ def main() -> int:
 
     libapp = args.libapp.read_bytes()
     identity = _parse_elf64(libapp)
+    artifact_function_name = args.artifact_function_name or args.function_name
+    if args.compiler_function_kind in {"ClosureFunction", "ImplicitClosureFunction"} and not args.identity_only:
+        raise ValueError(
+            "closure artifacts require --identity-only unless exact compiler ABI metadata is available"
+        )
     log, code_identity = _run_gen_snapshot(
         args.gen_snapshot,
         args.dill,
         args.library_uri,
         args.class_name,
         args.function_name,
+        artifact_function_name,
     )
-    code = _extract_machine_code(log, args.function_name)
-    abi = _load_abi_oracle(
-        args.abi_oracle_json,
-        args.library_uri,
-        args.class_name,
-        args.function_name,
+    machine = _extract_machine_code(log, args.function_name, args.compiler_function_kind)
+    entry_points = _extract_entry_points(log, machine.printed_name)
+    closure_call_entry_only = machine.function_kind in {
+        "ClosureFunction",
+        "ImplicitClosureFunction",
+    }
+    if closure_call_entry_only and args.entry_kind != "default":
+        raise ValueError(
+            f"{machine.function_kind} is invoked through cached Closure.entry_point in PRODUCT "
+            "AOT; only the default entry can be emitted as closure-call evidence"
+        )
+    selected_compiler_entry = entry_points[_ENTRY_KIND_LABELS[args.entry_kind]]
+    selected_offset = selected_compiler_entry - machine.start_address
+    if selected_offset < 0 or selected_offset >= len(machine.code) or selected_offset % 4 != 0:
+        raise ValueError(
+            f"compiler {args.entry_kind} entry is outside the disassembled Code payload: "
+            f"start=0x{machine.start_address:x} entry=0x{selected_compiler_entry:x}"
+        )
+    abi: AbiEvidence | None = None
+    if not args.identity_only:
+        abi = _load_abi_oracle(
+            args.abi_oracle_json,
+            args.library_uri,
+            args.class_name,
+            args.function_name,
+        )
+        # gen_snapshot's human-readable CFG is intentionally only an independent
+        # cross-check. Runtime ABI evidence is emitted from vm.unboxing-info.metadata
+        # above; changing printer text cannot silently become compiler truth.
+        cfg_abi = _extract_abi(log, args.function_name)
+        _validate_cfg_cross_check(abi, cfg_abi)
+    required_direct_call_target_va: int | None = None
+    if closure_call_entry_only and args.compiler_function_kind == "ImplicitClosureFunction":
+        ordinary_machine = _extract_machine_code(log, args.function_name, "RegularFunction")
+        ordinary_entry_points = _extract_entry_points(log, ordinary_machine.printed_name)
+        ordinary_payload_va, _, _ = _find_unique_executable_code(
+            libapp, identity, ordinary_machine.code
+        )
+        ordinary_normal_offset = (
+            ordinary_entry_points["kNormal"] - ordinary_machine.start_address
+        )
+        if ordinary_normal_offset < 0 or ordinary_normal_offset >= len(ordinary_machine.code):
+            raise ValueError("related ordinary Function normal entry is outside its Code payload")
+        required_direct_call_target_va = ordinary_payload_va + ordinary_normal_offset
+    payload_va, actual_payload, location_mode = _find_unique_executable_code(
+        libapp, identity, machine.code, required_direct_call_target_va
     )
-    # gen_snapshot's human-readable CFG is intentionally only an independent
-    # cross-check. Runtime ABI evidence is emitted from vm.unboxing-info.metadata
-    # above; changing printer text cannot silently become compiler truth.
-    cfg_abi = _extract_abi(log, args.function_name)
-    _validate_cfg_cross_check(abi, cfg_abi)
-    entry_va, actual_code, location_mode = _find_unique_executable_code(libapp, identity, code)
+    entry_va = payload_va + selected_offset
+    actual_code = actual_payload[selected_offset:]
+    if not actual_code:
+        raise ValueError("selected Dart entry has no executable payload")
+    structural: dict[str, object] | None = None
+    if args.aot_analyzer is not None:
+        structural = _run_machine_code_analyzer(args.aot_analyzer, actual_code, entry_va)
+        if abi is not None:
+            _validate_machine_code_cross_check(abi, structural)
     record: dict[str, object] = {
         "library_uri": args.library_uri,
         "class_name": args.class_name,
-        "function_name": args.function_name,
+        "function_name": artifact_function_name,
+        "source_function_name": args.function_name,
+        "entry_kind": args.entry_kind,
         "entry_va": entry_va,
         "code_size": len(actual_code),
         "fingerprint": _fnv1a64(actual_code),
@@ -686,25 +1109,55 @@ def main() -> int:
         "snapshot_hash": identity.snapshot_hash,
         "code_identity_proof": code_identity.proof,
         "physical_entry_alias_count": code_identity.physical_entry_alias_count,
-        "abi_parameters": list(abi.parameters),
-        "abi_result": abi.result,
-        "max_parameters_in_registers": abi.max_parameters_in_registers,
-        "must_use_stack_calling_convention": abi.must_use_stack_calling_convention,
-        "has_optional_parameters": abi.has_optional_parameters,
-        "has_overrides_with_less_direct_parameters": (
-            abi.has_overrides_with_less_direct_parameters
-        ),
+        "function_kind": _FUNCTION_KIND_VALUES.get(machine.function_kind, 0),
+        "function_kind_name": machine.function_kind,
+        "closure_call_entry_only": closure_call_entry_only,
+        "related_direct_call_target_va": required_direct_call_target_va,
     }
-    _write_header(args.output_header, record, args.symbol_prefix)
+    if abi is not None:
+        record.update(
+            {
+                "abi_parameters": list(abi.parameters),
+                "abi_result": abi.result,
+                "max_parameters_in_registers": abi.max_parameters_in_registers,
+                "must_use_stack_calling_convention": abi.must_use_stack_calling_convention,
+                "has_optional_parameters": abi.has_optional_parameters,
+                "has_overrides_with_less_direct_parameters": (
+                    abi.has_overrides_with_less_direct_parameters
+                ),
+            }
+        )
+    if structural is not None:
+        record["structural_analysis"] = {
+            "decoded_instructions": structural.get("decoded_instructions", 0),
+            "basic_block_count": structural.get("basic_block_count", 0),
+            "has_unknown_control_flow": structural.get("has_unknown_control_flow", False),
+            "uses_arguments_descriptor": structural.get("uses_arguments_descriptor", False),
+            "reached_return": structural.get("reached_return", False),
+            "external_branch_count": len(structural.get("external_branches", [])),
+            "indirect_call_count": len(structural.get("indirect_call_sites", [])),
+            "indirect_branch_count": len(structural.get("indirect_branch_sites", [])),
+            "direct_call_count": len(structural.get("direct_calls", [])),
+            "return_site_count": len(structural.get("return_sites", [])),
+            "address_materialization_count": len(
+                structural.get("address_materializations", [])
+            ),
+        }
+    if args.identity_only:
+        _write_identity_header(args.output_header, record, args.symbol_prefix)
+    else:
+        _write_header(args.output_header, record, args.symbol_prefix)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(json.dumps(record, indent=2) + "\n")
     print(
         f"compiler sidecar: {args.library_uri}/{args.class_name}/{args.function_name} "
-        f"entry_va=0x{entry_va:x} size={len(actual_code)} fingerprint={record['fingerprint']} "
+        f"entry={args.entry_kind} entry_va=0x{entry_va:x} size={len(actual_code)} "
+        f"fingerprint={record['fingerprint']} "
         f"locator={location_mode} "
         f"identity={code_identity.proof}/{code_identity.physical_entry_alias_count} "
-        f"abi={abi.parameters}->{abi.result}"
+        f"abi={f'{abi.parameters}->{abi.result}' if abi is not None else 'identity-only'} "
+        f"structural={'on' if structural is not None else 'off'}"
     )
     return 0
 

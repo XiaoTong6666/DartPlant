@@ -48,6 +48,15 @@ bool SameOptionalString(const char* left, const char* right) {
     return std::strcmp(left, right) == 0;
 }
 
+template <typename T>
+T CopyStructPrefix(const T& source) {
+    T copy{};
+    const size_t bytes = std::min<size_t>(source.struct_size, sizeof(T));
+    std::memcpy(&copy, &source, bytes);
+    copy.struct_size = sizeof(T);
+    return copy;
+}
+
 struct OwnedSnapshotFunction {
     std::optional<std::string> library_uri;
     std::optional<std::string> class_name;
@@ -57,8 +66,7 @@ struct OwnedSnapshotFunction {
     DartPlantSnapshotFunctionInfo view{};
 
     void RefreshView(const DartPlantSnapshotFunctionInfo& source) {
-        view = source;
-        view.struct_size = sizeof(view);
+        view = CopyStructPrefix(source);
         view.library_uri = StringView(library_uri);
         view.class_name = StringView(class_name);
         view.function_name = StringView(function_name);
@@ -107,8 +115,7 @@ struct OwnedCompilerEvidence {
     DartPlantCompilerAbiEvidence view{};
 
     void RefreshView(const DartPlantCompilerAbiEvidence& source) {
-        view = source;
-        view.struct_size = sizeof(view);
+        view = CopyStructPrefix(source);
         view.snapshot_hash = StringView(snapshot_hash);
         view.app_build_id = StringView(app_build_id);
         view.code_fingerprint = StringView(code_fingerprint);
@@ -160,6 +167,10 @@ ArtifactRegistryState& ArtifactRegistry() {
 }
 
 bool ValidArtifactBundle(const DartPlantArtifactBundle* bundle) {
+    constexpr size_t kSnapshotFunctionV2Size =
+        offsetof(DartPlantSnapshotFunctionInfo, function_kind);
+    constexpr size_t kCompilerEvidenceV2Size =
+        offsetof(DartPlantCompilerAbiEvidence, structural_schema_version);
     if (bundle == nullptr) return true;
     if (bundle->struct_size < sizeof(DartPlantArtifactBundle) ||
         bundle->version != DARTPLANT_ARTIFACT_BUNDLE_VERSION ||
@@ -177,15 +188,14 @@ bool ValidArtifactBundle(const DartPlantArtifactBundle* bundle) {
     }
     if (bundle->snapshot_index != nullptr) {
         for (uint32_t index = 0; index < bundle->snapshot_index->function_count; ++index) {
-            if (bundle->snapshot_index->functions[index].struct_size <
-                sizeof(DartPlantSnapshotFunctionInfo)) {
+            if (bundle->snapshot_index->functions[index].struct_size < kSnapshotFunctionV2Size) {
                 return false;
             }
         }
     }
     for (uint32_t index = 0; index < bundle->compiler_abi_evidence_count; ++index) {
         const auto& evidence = bundle->compiler_abi_evidence[index];
-        if (evidence.struct_size < sizeof(DartPlantCompilerAbiEvidence) ||
+        if (evidence.struct_size < kCompilerEvidenceV2Size ||
             (evidence.parameter_count != 0 && evidence.parameter_representations == nullptr)) {
             return false;
         }
@@ -247,7 +257,9 @@ bool SameSnapshotFunction(const DartPlantSnapshotFunctionInfo& left,
            left.code_size == right.code_size && left.code_section_va == right.code_section_va &&
            SameOptionalString(left.fingerprint, right.fingerprint) &&
            left.code_identity_proof == right.code_identity_proof &&
-           left.physical_entry_alias_count == right.physical_entry_alias_count;
+           left.physical_entry_alias_count == right.physical_entry_alias_count &&
+           left.function_kind == right.function_kind &&
+           left.closure_call_entry_only == right.closure_call_entry_only;
 }
 
 bool SameSnapshotIndex(const DartPlantSnapshotIndexInfo* left,
@@ -283,7 +295,15 @@ bool SameCompilerEvidence(const DartPlantCompilerAbiEvidence& left,
         !SameOptionalString(left.class_name, right.class_name) ||
         !SameOptionalString(left.function_name, right.function_name) ||
         left.entry_kind != right.entry_kind || left.entry_va != right.entry_va ||
-        left.code_size != right.code_size) {
+        left.code_size != right.code_size ||
+        left.structural_schema_version != right.structural_schema_version ||
+        left.structural_decoded_instructions != right.structural_decoded_instructions ||
+        left.structural_basic_block_count != right.structural_basic_block_count ||
+        left.structural_relation_count != right.structural_relation_count ||
+        left.structural_verified != right.structural_verified ||
+        left.structural_has_unknown_control_flow != right.structural_has_unknown_control_flow ||
+        left.structural_uses_arguments_descriptor != right.structural_uses_arguments_descriptor ||
+        left.structural_reached_return != right.structural_reached_return) {
         return false;
     }
     for (uint32_t index = 0; index < left.parameter_count; ++index) {
@@ -373,7 +393,14 @@ DartPlantStatus BindArtifactIndexIfReady(DartPlantRuntime* runtime,
             SetLastError("matching embedded artifact index has no Function records");
             return DARTPLANT_METADATA_INVALID;
         }
-        if (first == nullptr) first = &source;
+        if (first == nullptr) {
+            first = &source;
+        } else if (!SameOptionalString(first->dart_version, source.dart_version) ||
+                   !SameOptionalString(first->profile_version, source.profile_version)) {
+            SetLastError(
+                "matching embedded artifact bundles disagree about snapshot profile identity");
+            return DARTPLANT_METADATA_INVALID;
+        }
         for (uint32_t index = 0; index < source.function_count; ++index) {
             const auto& function = source.functions[index];
             if (function.struct_size < sizeof(DartPlantSnapshotFunctionInfo) ||
@@ -401,7 +428,9 @@ DartPlantStatus BindArtifactIndexIfReady(DartPlantRuntime* runtime,
                 current.code_section_va != function.code_section_va ||
                 current_fingerprint != new_fingerprint ||
                 current.code_identity_proof != function.code_identity_proof ||
-                current.physical_entry_alias_count != function.physical_entry_alias_count) {
+                current.physical_entry_alias_count != function.physical_entry_alias_count ||
+                current.function_kind != function.function_kind ||
+                current.closure_call_entry_only != function.closure_call_entry_only) {
                 SetLastError(
                     "embedded artifact bundles disagree about one logical Function identity");
                 return DARTPLANT_METADATA_INVALID;
@@ -508,6 +537,7 @@ DartPlantStatus BindCompilerEvidenceIfPresent(DartPlantRuntime* runtime,
     if (info.state != DARTPLANT_METHOD_ABI_NONE) return DARTPLANT_OK;
 
     bool matched = false;
+    std::vector<const DartPlantCompilerAbiEvidence*> processed;
     for (const auto& owned_bundle : registry.bundles) {
         const auto* bundle = &owned_bundle->view;
         if (bundle == nullptr || bundle->compiler_abi_evidence == nullptr) continue;
@@ -519,12 +549,15 @@ DartPlantStatus BindCompilerEvidenceIfPresent(DartPlantRuntime* runtime,
             // without preventing a later exact candidate from binding.
             if (!EvidenceMatchesCurrentArtifact(runtime, evidence, method)) continue;
             matched = true;
+            if (std::any_of(processed.begin(), processed.end(), [&](const auto* previous) {
+                    return previous != nullptr && SameCompilerEvidence(*previous, evidence);
+                })) {
+                continue;
+            }
+            processed.push_back(&evidence);
             const DartPlantStatus status =
                 dartplant_runtime_register_compiler_abi_evidence(runtime, method, &evidence);
-            if (status == DARTPLANT_OK) {
-                ClearLastError();
-                return DARTPLANT_OK;
-            }
+            if (status == DARTPLANT_OK) continue;
             if (status == DARTPLANT_RUNTIME_NOT_READY) return status;
             // Compiler ABI evidence is an optional typed overlay. A stale,
             // unsupported or conflicting provider must never prevent the

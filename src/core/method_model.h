@@ -32,6 +32,12 @@ struct DartMethodIdentity {
     }
 };
 
+inline bool SameLogicalFunctionIdentity(const DartMethodIdentity& left,
+                                        const DartMethodIdentity& right) {
+    return left.library_uri == right.library_uri && left.class_name == right.class_name &&
+           left.function_name == right.function_name && left.signature == right.signature;
+}
+
 enum class DartFunctionSource {
     // Legacy process-global metadata path only.
     kLegacyMetadata,
@@ -75,9 +81,9 @@ struct DartCodeTarget {
         std::lock_guard lock(mutex);
         const auto found = std::find(aliases.begin(), aliases.end(), identity);
         if (found == aliases.end()) aliases.push_back(identity);
-        if (aliases.size() > 1) {
+        if (DistinctLogicalFunctionAliasCountLocked() > 1) {
             reported_alias_count =
-                std::max<uint32_t>(reported_alias_count, static_cast<uint32_t>(aliases.size()));
+                std::max<uint32_t>(reported_alias_count, DistinctLogicalFunctionAliasCountLocked());
             identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
         }
     }
@@ -120,13 +126,29 @@ struct DartCodeTarget {
     bool IsShared() const {
         std::lock_guard lock(mutex);
         return identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1 ||
-               aliases.size() > 1;
+               DistinctLogicalFunctionAliasCountLocked() > 1;
     }
 
     bool HasProvenUniqueIdentity() const {
         std::lock_guard lock(mutex);
         return identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE && reported_alias_count <= 1 &&
-               aliases.size() <= 1;
+               DistinctLogicalFunctionAliasCountLocked() <= 1;
+    }
+
+private:
+    uint32_t DistinctLogicalFunctionAliasCountLocked() const {
+        uint32_t count = 0;
+        for (size_t index = 0; index < aliases.size(); ++index) {
+            bool seen = false;
+            for (size_t earlier = 0; earlier < index; ++earlier) {
+                if (SameLogicalFunctionIdentity(aliases[index], aliases[earlier])) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) ++count;
+        }
+        return count;
     }
 };
 
@@ -135,6 +157,8 @@ struct DartFunctionHandle {
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     DartFunctionSource source = DartFunctionSource::kLegacyMetadata;
+    uint32_t function_kind = 0;
+    bool closure_call_entry_only = false;
     uint32_t thread_jump_to_frame_entry_point_offset = 0;
     std::shared_ptr<DartCodeTarget> code_target;
 

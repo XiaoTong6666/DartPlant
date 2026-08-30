@@ -44,6 +44,12 @@ uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash) {
     return profile == nullptr ? 0 : profile->thread_jump_to_frame_entry_point_offset;
 }
 
+bool IsClosureFunctionKind(uint32_t profile_version, uint32_t function_kind) {
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
+    return profile != nullptr && (function_kind == profile->function_kind.closure ||
+                                  function_kind == profile->function_kind.implicit_closure);
+}
+
 bool ComputeAotCodePayloadStart(uint32_t profile_version, uint64_t normal_entry,
                                 uint64_t monomorphic_entry, uint64_t* out_start,
                                 bool* out_has_monomorphic_entry) {

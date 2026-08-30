@@ -59,6 +59,17 @@ dartplant_install_host_api(&host);
 Each installed physical hook retains the exact backend binding that created it,
 so replacing the process default backend does not redirect a later unhook.
 
+Adapters that can prepare an original trampoline before patch publication should
+also provide `hook_with_publication`. It must call
+`DartPlantHostHookTransaction::backup_ready` before publishing the target. The
+reserved `DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED` result tells DartPlant to
+retain its executable callback veneer even after the adapter restores the
+target; unknown non-zero results retain the legacy never-published behavior.
+Real-Dart callback hooks fail closed when a backend provides only the legacy
+`hook(..., void** backup)` callback. Legacy backends remain available for raw
+and synthetic hooks, but must not be treated as concurrent Dart callback
+backends without the strict transaction extension.
+
 The current implementation provides:
 
 - A stable C ABI: existing public struct prefixes remain byte-for-byte stable,
@@ -108,7 +119,7 @@ concurrent `dlclose` of an image with installed hooks is unsupported until a
 host supplies a pre-unload synchronization callback or a backend-safe retire API.
 
 Normal consumers use DartPlant's high-level public API. DartPlant owns runtime
-creation, module refresh, Live VM bootstrap, CodeTarget sharing, and matching
+creation, module refresh, Live VM bootstrap, entry/payload target sharing, and matching
 embedded compiler artifacts:
 
 ```cpp
@@ -191,7 +202,7 @@ The retained `FunctionType` is used only for semantic/formal-shape validation;
 machine representation is never inferred from Dart source types. Exact evidence
 is additionally bound to snapshot hash, `libapp.so` build-id, logical Function
 identity, entry VA, code size, Code identity proof, and final Code bytes. Shared
-`CodeTarget`s deliberately suppress the typed overlay because a physical entry
+Shared physical entry targets deliberately suppress the typed overlay because a physical entry
 cannot prove which logical alias reached it.
 
 This remains a native C/C++ callback API. A sidecar is optional: retained
@@ -205,7 +216,7 @@ Public logical-hook lifecycle:
 ```text
 dartplant_hook_method()
     -> returns one DartPlantHookHandle subscription
-    -> internally creates/reuses the CodeTarget PhysicalHook
+    -> internally creates/reuses the DartEntryTarget physical hook
 
 dartplant_unhook_handle()
     -> removes only this logical subscription
@@ -237,9 +248,9 @@ dl_iterate_phdr
        -> preferred: validated Dart FFI-entry reserved registers
        -> fallback: process thread sampler
     -> IsolateGroup / ClassTable / ObjectStore / Library / Class / Function
-    -> Function* -> Code* -> CodeTarget
+    -> Function* -> Code* -> DartCodePayload -> DartEntryTarget
     -> if the logical Function was dropped by PRODUCT AOT:
-       exact compiler/artifact SnapshotIndex -> validated CodeTarget
+       exact compiler/artifact SnapshotIndex -> validated DartEntryTarget
     -> executable-range validation
     -> selected host backend hook(target_entry, replacement, backup)
 ```

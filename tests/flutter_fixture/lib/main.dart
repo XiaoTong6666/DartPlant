@@ -242,7 +242,7 @@ Future<void> main() async {
 
     // Only after the simple consumer has removed its final subscription and
     // the P6/exception consumers have removed all artifact-first hooks and
-    // shut down may the advanced fixture reuse physical CodeTargets for its
+    // shut down may the advanced fixture reuse physical entry targets for its
     // ABI/late-shared diagnostics.
     final advancedOrdinaryHook = DartPlantNative.enableAdvancedOrdinaryHook();
     debugPrint(

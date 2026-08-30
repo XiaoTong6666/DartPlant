@@ -11,6 +11,8 @@ from build_snapshot_sidecar import (
     AbiEvidence,
     ElfIdentity,
     LoadSegment,
+    _derive_closure_abi_from_cfg,
+    _extract_abi,
     _extract_entry_points,
     _extract_code_identity_profile,
     _extract_machine_code,
@@ -459,6 +461,8 @@ class GeneratedBundleTest(unittest.TestCase):
                     "entry_kind": "unchecked",
                     "entry_va": 0x1240,
                     "code_size": 12,
+                    "code_payload_va": 0x1234,
+                    "code_instructions_length": 24,
                     "fingerprint": "0123456789abcdef",
                     "build_id": "00112233",
                     "snapshot_hash": "0123456789abcdef0123456789abcdef",
@@ -478,6 +482,67 @@ class GeneratedBundleTest(unittest.TestCase):
             self.assertGreaterEqual(text.count(".entry_kind = DARTPLANT_ENTRY_UNCHECKED"), 2)
             self.assertIn(".function_kind = 0u", text)
             self.assertIn(".closure_call_entry_only = 0", text)
+            self.assertIn(".code_payload_va = 0x1234ULL", text)
+            self.assertIn(".code_instructions_length = 24ULL", text)
+
+
+class ClosureAbiDerivationTest(unittest.TestCase):
+    def test_exact_synthetic_cfg_strips_hidden_closure_and_keeps_user_stack(self) -> None:
+        log = """*** BEGIN CFG
+After AllocateRegisters
+==== package:fixture/main.dart_::_target_target (ImplicitClosureFunction)
+  2: B2[function entry]:2 {
+      v2 <- Parameter(0 @fp[4]) T{*?}
+      v3 <- Parameter(1 @fp[3]) T{int}
+      v4 <- Parameter(2 @fp[2]) T{int}
+}
+  8:     DartReturn:8(v3)
+*** END CFG
+"""
+        cfg = _extract_abi(
+            log,
+            "target",
+            exact_printed_name="package:fixture/main.dart_::_target_target",
+        )
+        parent = AbiEvidence(
+            parameters=("tagged", "tagged"),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        closure = _derive_closure_abi_from_cfg(parent, cfg)
+        self.assertEqual(("tagged", "tagged"), closure.parameters)
+        self.assertEqual("tagged", closure.result)
+        self.assertTrue(closure.must_use_stack_calling_convention)
+        self.assertEqual(0, closure.max_parameters_in_registers)
+
+    def test_synthetic_cfg_rejects_unboxed_or_wrong_formal_count(self) -> None:
+        parent = AbiEvidence(
+            parameters=("tagged", "tagged"),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        with self.assertRaisesRegex(ValueError, "boxed synthetic-closure parameter"):
+            _derive_closure_abi_from_cfg(
+                parent,
+                AbiEvidence(
+                    parameters=("tagged", "unboxed-int64", "tagged"),
+                    result="tagged",
+                    max_parameters_in_registers=0,
+                    must_use_stack_calling_convention=True,
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "formal count"):
+            _derive_closure_abi_from_cfg(
+                parent,
+                AbiEvidence(
+                    parameters=("tagged", "tagged"),
+                    result="tagged",
+                    max_parameters_in_registers=0,
+                    must_use_stack_calling_convention=True,
+                ),
+            )
 
 
 class CfgCrossCheckTest(unittest.TestCase):

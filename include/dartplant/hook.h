@@ -40,14 +40,14 @@ typedef struct DartPlantHookOptions {
 } DartPlantHookOptions;
 
 // Installs one logical method subscription. DartPlant owns the distinction
-// between an existing/new physical CodeTarget hook and an additional listener;
+// between an existing/new physical entry-target hook and an additional listener;
 // every successful call returns the same public logical-handle abstraction.
 DARTPLANT_EXPORT DartPlantStatus dartplant_hook_method(const DartPlantMethod* method,
                                                        const DartPlantHookOptions* options,
                                                        DartPlantHookHandle** out_handle);
 
 // Removes this logical subscription. The physical trampoline is removed only
-// when the final subscription for its CodeTarget disappears.
+// when the final subscription for its entry target disappears.
 DARTPLANT_EXPORT DartPlantStatus dartplant_unhook_handle(DartPlantHookHandle* handle);
 DARTPLANT_EXPORT uint8_t dartplant_hook_handle_is_active(const DartPlantHookHandle* handle);
 DARTPLANT_EXPORT uint8_t dartplant_hook_handle_is_idle(const DartPlantHookHandle* handle);

@@ -70,7 +70,11 @@ native_init(const DartPlantNativeApiEntries* entries) {
         .user_data = &g_host,
         .hook = HostHook,
         .unhook = HostUnhook,
+        .hook_with_publication = nullptr,
     };
+    // LSPosed's public native hook API has no backup-before-publication
+    // handshake. DartPlant therefore permits this binding for raw/synthetic
+    // hooks only; real-Dart callbacks fail closed in InstallCallbackHook.
     if (dartplant_install_host_api(&host_api) != DARTPLANT_OK) {
         g_initialized.store(false, std::memory_order_release);
         return nullptr;

@@ -34,7 +34,7 @@ int Hook(void* user_data, void* target, void* replacement, void** backup) {
         return -1;
     }
     // DartPlant's physical-hook model owns one trampoline/original chain for
-    // each CodeTarget. Do not inherit ShadowHook's process-wide default mode:
+    // each entry target. Do not inherit ShadowHook's process-wide default mode:
     // another module may have initialized ShadowHook in SHARED/MULTI mode
     // before us, in which case calling orig_addr directly would bypass that
     // proxy chain. Force UNIQUE per hook and fail closed on a mode conflict.
@@ -72,6 +72,7 @@ const DartPlantHostApi kShadowHookHostApi = {
     .user_data = &State(),
     .hook = Hook,
     .unhook = Unhook,
+    .hook_with_publication = nullptr,
 };
 
 }  // namespace

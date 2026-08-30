@@ -85,12 +85,7 @@ struct HostApiBinding {
     void* user_data = nullptr;
     DartPlantHostHookCallback hook = nullptr;
     DartPlantHostUnhookCallback unhook = nullptr;
-};
-
-struct Arm64ReturnPatch {
-    uintptr_t address = 0;
-    uint32_t original_instruction = 0;
-    uint32_t patched_instruction = 0;
+    DartPlantHostHookWithPublicationCallback hook_with_publication = nullptr;
 };
 
 struct ManagedCodePatch {
@@ -114,6 +109,9 @@ enum class HookRecordState {
     kUnhooking,
     kUnhooked,
     kFailed,
+    // The backend restored its target after publishing our replacement. Keep
+    // the callback veneer and HookRecord reachable for stale instruction fetch.
+    kFailedAfterPublished,
     // The target mapping disappeared before the backend could safely restore
     // its bytes. Keep ownership and executable stubs for process lifetime.
     kRetired,
@@ -135,7 +133,7 @@ struct RuntimeState {
     HostApi host;
     std::optional<MetadataIndex> metadata;
     std::vector<ModuleImage> modules;
-    DartCodeTargetRegistry code_targets;
+    DartEntryTargetRegistry entry_targets;
 };
 
 RuntimeState& State();
@@ -158,7 +156,7 @@ DartPlantStatus InvalidateRuntimeHooks(
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 
-DartPlantStatus InstallHook(const std::shared_ptr<DartCodeTarget>& code_target, void* replacement,
+DartPlantStatus InstallHook(const std::shared_ptr<DartEntryTarget>& code_target, void* replacement,
                             void** backup, DartPlantHook** out_hook);
 DartPlantStatus InstallHook(uintptr_t target, void* replacement, void** backup,
                             DartPlantHook** out_hook);
@@ -185,6 +183,7 @@ DartPlantStatus AddCallbackListenerForMethod(
 bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners);
 void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out_size);
+void* CreateArm64PayloadReturnStub(DartCodePayload* payload, uintptr_t target, size_t* out_size);
 void DestroyArm64CallbackStub(void* entry, size_t size);
 bool CollectReachableArm64Returns(const uint8_t* code, size_t size, uintptr_t logical_start,
                                   std::vector<Arm64ReturnPatch>* out_returns);
@@ -239,8 +238,8 @@ inline uint32_t MethodCodeSize(const DartPlantMethod* method) {
 
 struct DartPlantHook {
     mutable std::recursive_mutex mutex;
-    std::shared_ptr<dartplant::DartCodeTarget> code_target;
-    void* backup = nullptr;
+    std::shared_ptr<dartplant::DartEntryTarget> code_target;
+    std::atomic<void*> backup{nullptr};
     std::atomic_bool active{false};
     bool has_method = false;
     bool shared_code_opt_in = false;
@@ -260,14 +259,24 @@ struct DartPlantHook {
     uint64_t validated_bool_false_value = 0;
     std::shared_ptr<const dartplant::abi::DartCallLayout> call_layout;
     const dartplant::HostApiBinding* host_binding = nullptr;
+    // Backend entry-patch ownership and payload-return ownership are
+    // independent transactions. A failed callback install/unhook can restore
+    // one side before the other, so retries must never infer backend ownership
+    // from HookRecordState alone.
+    std::atomic_bool backend_installed{false};
+    // Published by the core only after the host has returned a visible backup
+    // trampoline. Callback veneers treat installing/not-ready as passthrough.
+    std::atomic_bool entry_published{false};
+    std::atomic_bool entry_ready{false};
     std::shared_ptr<std::atomic_uint64_t> runtime_generation;
     uint64_t expected_runtime_generation = 0;
     void* replacement_entry = nullptr;
     size_t replacement_entry_size = 0;
-    void* replacement_return_entry = nullptr;
-    std::vector<dartplant::Arm64ReturnPatch> return_patches;
+    bool payload_return_consumer = false;
+    std::vector<uintptr_t> payload_return_sites;
     std::vector<dartplant::ManagedCodePatch> managed_backend_patches;
     bool exception_bridge_consumer = false;
+    bool vm_adapter_retained = false;
 };
 
 struct DartPlantListener {

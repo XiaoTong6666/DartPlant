@@ -26,10 +26,6 @@
 namespace dartplant {
 namespace {
 
-constexpr uint64_t kHeapObjectTag = 1;
-constexpr uint64_t kSmiTagMask = 1;
-constexpr uint32_t kClassIdTagShift = 12;
-constexpr uint64_t kClassIdTagMask = (1ULL << 20) - 1;
 constexpr uint64_t kMaxObjectPoolEntries = 1ULL << 24;
 constexpr uint64_t kMaxClassFunctions = 1ULL << 20;
 constexpr size_t kLiveVmProfileV1Size =
@@ -52,6 +48,32 @@ const CanonicalBoolLayout* FindCanonicalBoolLayout(uint32_t profile_version) {
 const FunctionTypeLayout* FindFunctionTypeLayout(uint32_t profile_version) {
     const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
     return profile == nullptr ? nullptr : &profile->function_type;
+}
+
+const RawObjectLayout* FindRawObjectLayout(uint32_t profile_version) {
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
+    return profile == nullptr ? nullptr : &profile->raw_object;
+}
+
+uint64_t MaxCidCount(const DartPlantLiveVmProfile& profile) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || raw->class_id_tag_bits == 0 || raw->class_id_tag_bits >= 63) return 0;
+    return uint64_t{1} << raw->class_id_tag_bits;
+}
+
+bool DecodeFunctionKind(const DartPlantLiveVmProfile& profile, uint32_t kind_tag,
+                        uint32_t* out_kind) {
+    const RuntimeProfileRecord* runtime_profile =
+        FindRuntimeProfileByVersion(profile.profile_version);
+    if (out_kind == nullptr || runtime_profile == nullptr ||
+        runtime_profile->function_kind.tag_bits == 0 ||
+        runtime_profile->function_kind.tag_bits >= 32 ||
+        runtime_profile->function_kind.tag_shift >= 32 - runtime_profile->function_kind.tag_bits) {
+        return false;
+    }
+    const uint32_t mask = (uint32_t{1} << runtime_profile->function_kind.tag_bits) - 1;
+    *out_kind = (kind_tag >> runtime_profile->function_kind.tag_shift) & mask;
+    return true;
 }
 
 // compiler::target::kNumParameterFlagsPerElement for ARM64. Each named parameter
@@ -153,24 +175,36 @@ bool HasSnapshotFeature(const char* features, std::string_view expected) {
     return false;
 }
 
-bool IsHeapObject(uint64_t tagged) { return (tagged & kSmiTagMask) == kHeapObjectTag; }
+bool IsHeapObject(const DartPlantLiveVmProfile& profile, uint64_t tagged) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    return raw != nullptr && (tagged & raw->smi_tag_mask) == raw->heap_object_tag;
+}
 
-uintptr_t Untag(uint64_t tagged) { return static_cast<uintptr_t>(tagged - kHeapObjectTag); }
+uintptr_t Untag(const DartPlantLiveVmProfile& profile, uint64_t tagged) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    return raw == nullptr || tagged < raw->heap_object_tag
+               ? 0
+               : static_cast<uintptr_t>(tagged - raw->heap_object_tag);
+}
 
 uint64_t ObjectPoolOffsetFromIndex(const DartPlantLiveVmProfile& profile, uint32_t index) {
     // Dart ObjectPool::OffsetFromIndex(): element_offset(index) - kHeapObjectTag.
     // ObjectPool entries are native-word-sized even when Dart heap pointers are
     // compressed; the tagged-object payload stored in an entry remains a full
     // ObjectPtr-sized word.
-    return static_cast<uint64_t>(profile.object_pool_elements_offset) - kHeapObjectTag +
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || profile.object_pool_elements_offset < raw->heap_object_tag) return 0;
+    return static_cast<uint64_t>(profile.object_pool_elements_offset) - raw->heap_object_tag +
            static_cast<uint64_t>(index) * sizeof(uint64_t);
 }
 
 bool ObjectPoolIndexFromOffset(const DartPlantLiveVmProfile& profile, uint64_t offset,
                                uint32_t* out_index) {
     if (out_index == nullptr) return false;
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || profile.object_pool_elements_offset < raw->heap_object_tag) return false;
     const uint64_t first =
-        static_cast<uint64_t>(profile.object_pool_elements_offset) - kHeapObjectTag;
+        static_cast<uint64_t>(profile.object_pool_elements_offset) - raw->heap_object_tag;
     if (offset < first) return false;
     const uint64_t relative = offset - first;
     if ((relative % sizeof(uint64_t)) != 0) return false;
@@ -206,33 +240,49 @@ uint64_t DecompressObject(uint64_t heap_base, uint32_t compressed) {
     return heap_base + static_cast<uint64_t>(compressed);
 }
 
-bool ReadCid(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t* out_cid) {
-    if (out_cid == nullptr || !IsHeapObject(tagged)) return false;
+bool ReadCid(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+             uint64_t tagged, uint32_t* out_cid) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (out_cid == nullptr || raw == nullptr || raw->class_id_tag_bits == 0 ||
+        raw->class_id_tag_bits >= 64 || !IsHeapObject(profile, tagged)) {
+        return false;
+    }
     uint64_t tags = 0;
-    if (!reader.Read(Untag(tagged), &tags)) return false;
-    *out_cid = static_cast<uint32_t>((tags >> kClassIdTagShift) & kClassIdTagMask);
+    if (!reader.Read(Untag(profile, tagged), &tags)) return false;
+    const uint64_t mask = (uint64_t{1} << raw->class_id_tag_bits) - 1;
+    *out_cid = static_cast<uint32_t>((tags >> raw->class_id_tag_shift) & mask);
     return true;
 }
 
-bool RequireCid(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t expected) {
+bool RequireCid(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                uint64_t tagged, uint32_t expected) {
     uint32_t cid = 0;
-    return ReadCid(reader, tagged, &cid) && cid == expected;
+    return ReadCid(reader, profile, tagged, &cid) && cid == expected;
 }
 
-bool ReadCidSafely(const ProcessMemoryReader& reader, uint64_t tagged, uint32_t* out_cid) {
-    if (out_cid == nullptr || !IsHeapObject(tagged)) return false;
+bool ReadCidSafely(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                   uint64_t tagged, uint32_t* out_cid) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (out_cid == nullptr || raw == nullptr || raw->class_id_tag_bits == 0 ||
+        raw->class_id_tag_bits >= 64 || !IsHeapObject(profile, tagged)) {
+        return false;
+    }
     uint64_t tags = 0;
-    if (!reader.ReadSafely(Untag(tagged), &tags)) return false;
-    *out_cid = static_cast<uint32_t>((tags >> kClassIdTagShift) & kClassIdTagMask);
+    if (!reader.ReadSafely(Untag(profile, tagged), &tags)) return false;
+    const uint64_t mask = (uint64_t{1} << raw->class_id_tag_bits) - 1;
+    *out_cid = static_cast<uint32_t>((tags >> raw->class_id_tag_shift) & mask);
     return true;
 }
 
 bool ReadCompressedObject(const ProcessMemoryReader& reader, uintptr_t object_address,
-                          uint32_t offset, uint64_t heap_base, uint64_t* out_tagged) {
-    if (out_tagged == nullptr) return false;
+                          const DartPlantLiveVmProfile& profile, uint32_t offset,
+                          uint64_t heap_base, uint64_t* out_tagged) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (out_tagged == nullptr || raw == nullptr || raw->compressed_word_size != sizeof(uint32_t))
+        return false;
     uint32_t compressed = 0;
     if (!reader.Read(object_address + offset, &compressed) ||
-        (compressed & kSmiTagMask) != kHeapObjectTag) {
+        (compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
         return false;
     }
     *out_tagged = DecompressObject(heap_base, compressed);
@@ -240,26 +290,31 @@ bool ReadCompressedObject(const ProcessMemoryReader& reader, uintptr_t object_ad
 }
 
 bool ReadPositiveCompressedSmi(const ProcessMemoryReader& reader, uintptr_t address,
-                               uint64_t* out_value) {
-    if (out_value == nullptr) return false;
+                               const DartPlantLiveVmProfile& profile, uint64_t* out_value) {
+    const RawObjectLayout* layout = FindRawObjectLayout(profile.profile_version);
+    if (out_value == nullptr || layout == nullptr ||
+        layout->compressed_word_size != sizeof(uint32_t))
+        return false;
     uint32_t raw = 0;
-    if (!reader.Read(address, &raw) || (raw & kSmiTagMask) != 0) return false;
-    *out_value = static_cast<uint64_t>(raw >> 1);
+    if (!reader.Read(address, &raw) || (raw & layout->smi_tag_mask) != layout->smi_tag)
+        return false;
+    *out_value = static_cast<uint64_t>(raw >> layout->smi_tag_shift);
     return true;
 }
 
 bool ReadDartString(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                     uint64_t tagged, char* output, size_t capacity) {
-    if (output == nullptr || capacity == 0 || !IsHeapObject(tagged)) return false;
+    if (output == nullptr || capacity == 0 || !IsHeapObject(profile, tagged)) return false;
     output[0] = '\0';
     uint32_t cid = 0;
-    if (!ReadCid(reader, tagged, &cid) ||
+    if (!ReadCid(reader, profile, tagged, &cid) ||
         (cid != profile.cid_one_byte_string && cid != profile.cid_two_byte_string)) {
         return false;
     }
-    const uintptr_t object = Untag(tagged);
+    const uintptr_t object = Untag(profile, tagged);
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, object + profile.string_length_offset, &length) ||
+    if (!ReadPositiveCompressedSmi(reader, object + profile.string_length_offset, profile,
+                                   &length) ||
         length >= capacity) {
         return false;
     }
@@ -303,20 +358,22 @@ bool ReadArrayElement(const ProcessMemoryReader& reader, const DartPlantLiveVmPr
                       uint64_t* out_tagged) {
     if (out_tagged == nullptr) return false;
     uint32_t cid = 0;
-    if (!ReadCid(reader, tagged_array, &cid) ||
+    if (!ReadCid(reader, profile, tagged_array, &cid) ||
         (cid != profile.cid_array && cid != profile.cid_immutable_array)) {
         return false;
     }
-    const uintptr_t array = Untag(tagged_array);
+    const uintptr_t array = Untag(profile, tagged_array);
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, array + profile.array_length_offset, &length) ||
+    if (!ReadPositiveCompressedSmi(reader, array + profile.array_length_offset, profile, &length) ||
         index >= length) {
         return false;
     }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) return false;
     uint32_t compressed = 0;
-    if (!reader.Read(array + profile.array_elements_offset + index * sizeof(uint32_t),
+    if (!reader.Read(array + profile.array_elements_offset + index * raw->compressed_word_size,
                      &compressed) ||
-        (compressed & kSmiTagMask) != kHeapObjectTag) {
+        (compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
         return false;
     }
     *out_tagged = DecompressObject(heap_base, compressed);
@@ -327,10 +384,11 @@ bool ReadArrayLength(const ProcessMemoryReader& reader, const DartPlantLiveVmPro
                      uint64_t tagged_array, uint64_t* out_length) {
     if (out_length == nullptr) return false;
     uint32_t cid = 0;
-    return ReadCid(reader, tagged_array, &cid) &&
+    return ReadCid(reader, profile, tagged_array, &cid) &&
            (cid == profile.cid_array || cid == profile.cid_immutable_array) &&
-           ReadPositiveCompressedSmi(reader, Untag(tagged_array) + profile.array_length_offset,
-                                     out_length);
+           ReadPositiveCompressedSmi(reader,
+                                     Untag(profile, tagged_array) + profile.array_length_offset,
+                                     profile, out_length);
 }
 
 bool ReadArrayRawElement(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
@@ -338,28 +396,34 @@ bool ReadArrayRawElement(const ProcessMemoryReader& reader, const DartPlantLiveV
     if (out_raw == nullptr) return false;
     uint64_t length = 0;
     if (!ReadArrayLength(reader, profile, tagged_array, &length) || index >= length) return false;
-    return reader.Read(
-        Untag(tagged_array) + profile.array_elements_offset + index * sizeof(uint32_t), out_raw);
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) return false;
+    return reader.Read(Untag(profile, tagged_array) + profile.array_elements_offset +
+                           index * raw->compressed_word_size,
+                       out_raw);
 }
 
 bool ArrayContainsFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                            uint64_t heap_base, uint64_t tagged_array, uint64_t tagged_function) {
     uint32_t cid = 0;
-    if (!ReadCid(reader, tagged_array, &cid) ||
+    if (!ReadCid(reader, profile, tagged_array, &cid) ||
         (cid != profile.cid_array && cid != profile.cid_immutable_array)) {
         return false;
     }
-    const uintptr_t array = Untag(tagged_array);
+    const uintptr_t array = Untag(profile, tagged_array);
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, array + profile.array_length_offset, &length) ||
+    if (!ReadPositiveCompressedSmi(reader, array + profile.array_length_offset, profile, &length) ||
         length > kMaxClassFunctions) {
         return false;
     }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) return false;
     for (uint64_t index = 0; index < length; ++index) {
         uint32_t compressed = 0;
-        const uintptr_t slot = array + profile.array_elements_offset + index * sizeof(uint32_t);
+        const uintptr_t slot =
+            array + profile.array_elements_offset + index * raw->compressed_word_size;
         if (!reader.Read(slot, &compressed)) return false;
-        if ((compressed & kSmiTagMask) != kHeapObjectTag) continue;
+        if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag) continue;
         if (DecompressObject(heap_base, compressed) == tagged_function) return true;
     }
     return false;
@@ -368,11 +432,13 @@ bool ArrayContainsFunction(const ProcessMemoryReader& reader, const DartPlantLiv
 bool IsClosureFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                        uint64_t tagged_function) {
     uint32_t kind_tag = 0;
-    if (!reader.Read(Untag(tagged_function) + profile.function_kind_tag_offset, &kind_tag)) {
+    if (!reader.Read(Untag(profile, tagged_function) + profile.function_kind_tag_offset,
+                     &kind_tag)) {
         return true;
     }
-    const uint32_t kind = kind_tag & 0x1f;
-    return kind == 1 || kind == 2;  // ClosureFunction / ImplicitClosureFunction.
+    uint32_t kind = 0;
+    return !DecodeFunctionKind(profile, kind_tag, &kind) ||
+           IsClosureFunctionKind(profile.profile_version, kind);
 }
 
 bool FunctionNameMatches(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
@@ -380,8 +446,8 @@ bool FunctionNameMatches(const ProcessMemoryReader& reader, const DartPlantLiveV
     if (expected_name == nullptr || expected_name[0] == '\0') return true;
     uint64_t tagged_name = 0;
     char name[DARTPLANT_LIVE_VM_FUNCTION_NAME_MAX] = {};
-    return ReadCompressedObject(reader, Untag(tagged_function), profile.function_name_offset,
-                                heap_base, &tagged_name) &&
+    return ReadCompressedObject(reader, Untag(profile, tagged_function), profile,
+                                profile.function_name_offset, heap_base, &tagged_name) &&
            ReadDartString(reader, profile, tagged_name, name, sizeof(name)) &&
            std::strcmp(name, expected_name) == 0;
 }
@@ -395,26 +461,26 @@ bool ClassIdentityMatches(const ProcessMemoryReader& reader, const DartPlantLive
 
     uint64_t tagged_name = 0;
     char name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
-    return ReadCompressedObject(reader, Untag(tagged_class), profile.class_name_offset, heap_base,
-                                &tagged_name) &&
+    return ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                                profile.class_name_offset, heap_base, &tagged_name) &&
            ReadDartString(reader, profile, tagged_name, name, sizeof(name)) &&
            std::strcmp(name, expected_class) == 0;
 }
 
 bool ReadClassLibrary(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                       uint64_t heap_base, uint64_t tagged_class, uint64_t* out_library) {
-    return out_library != nullptr && RequireCid(reader, tagged_class, profile.cid_class) &&
-           ReadCompressedObject(reader, Untag(tagged_class), profile.class_library_offset,
-                                heap_base, out_library) &&
-           RequireCid(reader, *out_library, profile.cid_library);
+    return out_library != nullptr && RequireCid(reader, profile, tagged_class, profile.cid_class) &&
+           ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                                profile.class_library_offset, heap_base, out_library) &&
+           RequireCid(reader, profile, *out_library, profile.cid_library);
 }
 
 bool ReadLibraryUri(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                     uint64_t heap_base, uint64_t tagged_library, char* output, size_t capacity) {
-    if (!RequireCid(reader, tagged_library, profile.cid_library)) return false;
+    if (!RequireCid(reader, profile, tagged_library, profile.cid_library)) return false;
     uint64_t tagged_url = 0;
-    return ReadCompressedObject(reader, Untag(tagged_library), profile.library_url_offset,
-                                heap_base, &tagged_url) &&
+    return ReadCompressedObject(reader, Untag(profile, tagged_library), profile,
+                                profile.library_url_offset, heap_base, &tagged_url) &&
            ReadDartString(reader, profile, tagged_url, output, capacity);
 }
 
@@ -445,25 +511,25 @@ bool FindFunctionByIdentityInClass(const ProcessMemoryReader& reader,
         return false;
     }
     uint64_t functions = 0;
-    if (!ReadCompressedObject(reader, Untag(tagged_class), profile.class_functions_offset,
-                              heap_base, &functions)) {
+    if (!ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                              profile.class_functions_offset, heap_base, &functions)) {
         return false;
     }
     uint32_t array_cid = 0;
-    if (!ReadCid(reader, functions, &array_cid) ||
+    if (!ReadCid(reader, profile, functions, &array_cid) ||
         (array_cid != profile.cid_array && array_cid != profile.cid_immutable_array)) {
         return false;
     }
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, Untag(functions) + profile.array_length_offset,
-                                   &length) ||
+    if (!ReadPositiveCompressedSmi(reader, Untag(profile, functions) + profile.array_length_offset,
+                                   profile, &length) ||
         length > kMaxClassFunctions) {
         return false;
     }
     for (uint64_t index = 0; index < length; ++index) {
         uint64_t function = 0;
         if (!ReadArrayElement(reader, profile, heap_base, functions, index, &function) ||
-            !RequireCid(reader, function, profile.cid_function)) {
+            !RequireCid(reader, profile, function, profile.cid_function)) {
             continue;
         }
         if (!IsClosureFunction(reader, profile, function) &&
@@ -487,9 +553,10 @@ bool FindFunctionByIdentity(const ProcessMemoryReader& reader,
     *out_library = 0;
 
     uint64_t num_cids = 0;
-    if (class_table != 0 && cached_class_table_table != 0 &&
+    const uint64_t max_cids = MaxCidCount(profile);
+    if (max_cids != 0 && class_table != 0 && cached_class_table_table != 0 &&
         reader.Read(class_table + profile.class_table_num_cids_offset, &num_cids) && num_cids > 0 &&
-        num_cids <= kClassIdTagMask + 1) {
+        num_cids <= max_cids) {
         for (uint64_t cid = 1; cid < num_cids; ++cid) {
             uint64_t tagged_class = 0;
             if (!reader.Read(cached_class_table_table + cid * sizeof(uint64_t), &tagged_class) ||
@@ -507,29 +574,30 @@ bool FindFunctionByIdentity(const ProcessMemoryReader& reader,
     uint64_t libraries = 0;
     if (object_store == 0 ||
         !reader.Read(object_store + profile.object_store_libraries_offset, &libraries) ||
-        !RequireCid(reader, libraries, profile.cid_growable_object_array)) {
+        !RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
         return false;
     }
-    const uintptr_t growable = Untag(libraries);
+    const uintptr_t growable = Untag(profile, libraries);
     uint64_t length = 0;
     uint64_t data = 0;
     if (!ReadPositiveCompressedSmi(reader, growable + profile.growable_object_array_length_offset,
-                                   &length) ||
+                                   profile, &length) ||
         length > kMaxClassFunctions ||
-        !ReadCompressedObject(reader, growable, profile.growable_object_array_data_offset,
+        !ReadCompressedObject(reader, growable, profile, profile.growable_object_array_data_offset,
                               heap_base, &data)) {
         return false;
     }
     for (uint64_t index = 0; index < length; ++index) {
         uint64_t library = 0;
         if (!ReadArrayElement(reader, profile, heap_base, data, index, &library) ||
-            !RequireCid(reader, library, profile.cid_library) ||
+            !RequireCid(reader, profile, library, profile.cid_library) ||
             !LibraryIdentityMatches(reader, profile, heap_base, library, expected_library)) {
             continue;
         }
         uint64_t top_level_class = 0;
-        if (!ReadCompressedObject(reader, Untag(library), profile.library_toplevel_class_offset,
-                                  heap_base, &top_level_class)) {
+        if (!ReadCompressedObject(reader, Untag(profile, library), profile,
+                                  profile.library_toplevel_class_offset, heap_base,
+                                  &top_level_class)) {
             continue;
         }
         if (FindFunctionByIdentityInClass(reader, profile, heap_base, top_level_class, true,
@@ -545,8 +613,9 @@ bool ReadFunctionEntryForKind(const ProcessMemoryReader& reader,
                               const DartPlantLiveVmProfile& profile, uint64_t heap_base,
                               uint64_t function, DartPlantEntryKind entry_kind,
                               uint64_t* out_entry) {
-    if (out_entry == nullptr || !RequireCid(reader, function, profile.cid_function)) return false;
-    const uintptr_t function_address = Untag(function);
+    if (out_entry == nullptr || !RequireCid(reader, profile, function, profile.cid_function))
+        return false;
+    const uintptr_t function_address = Untag(profile, function);
     if (entry_kind == DARTPLANT_ENTRY_DEFAULT) {
         return reader.Read(function_address + profile.function_entry_point_offset, out_entry) &&
                *out_entry != 0;
@@ -558,9 +627,9 @@ bool ReadFunctionEntryForKind(const ProcessMemoryReader& reader,
     }
     if (IsClosureFunction(reader, profile, function)) return false;
     uint64_t code = 0;
-    if (!ReadCompressedObject(reader, function_address, profile.function_code_offset, heap_base,
-                              &code) ||
-        !RequireCid(reader, code, profile.cid_code)) {
+    if (!ReadCompressedObject(reader, function_address, profile, profile.function_code_offset,
+                              heap_base, &code) ||
+        !RequireCid(reader, profile, code, profile.cid_code)) {
         return false;
     }
     uint32_t offset = 0;
@@ -571,7 +640,7 @@ bool ReadFunctionEntryForKind(const ProcessMemoryReader& reader,
     } else {
         return false;
     }
-    return reader.Read(Untag(code) + offset, out_entry) && *out_entry != 0;
+    return reader.Read(Untag(profile, code) + offset, out_entry) && *out_entry != 0;
 }
 
 bool ScanFunctionsByEntryInClass(const ProcessMemoryReader& reader,
@@ -581,29 +650,29 @@ bool ScanFunctionsByEntryInClass(const ProcessMemoryReader& reader,
                                  const char* expected_class, uint64_t* selected_function,
                                  uint32_t* alias_count) {
     if (selected_function == nullptr || alias_count == nullptr ||
-        !RequireCid(reader, tagged_class, profile.cid_class)) {
+        !RequireCid(reader, profile, tagged_class, profile.cid_class)) {
         return false;
     }
     uint64_t functions = 0;
-    if (!ReadCompressedObject(reader, Untag(tagged_class), profile.class_functions_offset,
-                              heap_base, &functions)) {
+    if (!ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                              profile.class_functions_offset, heap_base, &functions)) {
         return false;
     }
     uint32_t array_cid = 0;
-    if (!ReadCid(reader, functions, &array_cid) ||
+    if (!ReadCid(reader, profile, functions, &array_cid) ||
         (array_cid != profile.cid_array && array_cid != profile.cid_immutable_array)) {
         return false;
     }
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, Untag(functions) + profile.array_length_offset,
-                                   &length) ||
+    if (!ReadPositiveCompressedSmi(reader, Untag(profile, functions) + profile.array_length_offset,
+                                   profile, &length) ||
         length > kMaxClassFunctions) {
         return false;
     }
     for (uint64_t index = 0; index < length; ++index) {
         uint64_t function = 0;
         if (!ReadArrayElement(reader, profile, heap_base, functions, index, &function) ||
-            !RequireCid(reader, function, profile.cid_function)) {
+            !RequireCid(reader, profile, function, profile.cid_function)) {
             continue;
         }
         uint64_t entry = 0;
@@ -636,9 +705,10 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
     // Normal classes: cached_class_table_table is an atomic ClassPtr* published
     // specifically for fast readers. Its entries are full Dart tagged pointers.
     uint64_t num_cids = 0;
-    if (class_table != 0 && cached_class_table_table != 0 &&
+    const uint64_t max_cids = MaxCidCount(profile);
+    if (max_cids != 0 && class_table != 0 && cached_class_table_table != 0 &&
         reader.Read(class_table + profile.class_table_num_cids_offset, &num_cids) && num_cids > 0 &&
-        num_cids <= kClassIdTagMask + 1) {
+        num_cids <= max_cids) {
         for (uint64_t cid = 1; cid < num_cids; ++cid) {
             uint64_t tagged_class = 0;
             if (!reader.Read(cached_class_table_table + cid * sizeof(uint64_t), &tagged_class) ||
@@ -657,28 +727,29 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
     uint64_t libraries = 0;
     if (object_store == 0 ||
         !reader.Read(object_store + profile.object_store_libraries_offset, &libraries) ||
-        !RequireCid(reader, libraries, profile.cid_growable_object_array)) {
+        !RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
         return *out_function != 0;
     }
-    const uintptr_t growable = Untag(libraries);
+    const uintptr_t growable = Untag(profile, libraries);
     uint64_t length = 0;
     uint64_t data = 0;
     if (!ReadPositiveCompressedSmi(reader, growable + profile.growable_object_array_length_offset,
-                                   &length) ||
+                                   profile, &length) ||
         length > kMaxClassFunctions ||
-        !ReadCompressedObject(reader, growable, profile.growable_object_array_data_offset,
+        !ReadCompressedObject(reader, growable, profile, profile.growable_object_array_data_offset,
                               heap_base, &data)) {
         return *out_function != 0;
     }
     for (uint64_t index = 0; index < length; ++index) {
         uint64_t library = 0;
         if (!ReadArrayElement(reader, profile, heap_base, data, index, &library) ||
-            !RequireCid(reader, library, profile.cid_library)) {
+            !RequireCid(reader, profile, library, profile.cid_library)) {
             continue;
         }
         uint64_t top_level_class = 0;
-        if (!ReadCompressedObject(reader, Untag(library), profile.library_toplevel_class_offset,
-                                  heap_base, &top_level_class)) {
+        if (!ReadCompressedObject(reader, Untag(profile, library), profile,
+                                  profile.library_toplevel_class_offset, heap_base,
+                                  &top_level_class)) {
             continue;
         }
         ScanFunctionsByEntryInClass(reader, profile, heap_base, top_level_class, true, target_entry,
@@ -691,13 +762,6 @@ bool FindFunctionByEntryIdentity(const ProcessMemoryReader& reader,
 struct CollectedLiveFunction {
     DartPlantLiveVmFunctionInfo info{};
 };
-
-constexpr uint32_t kClosureFunctionKind = 1;
-constexpr uint32_t kImplicitClosureFunctionKind = 2;
-
-bool IsClosureCallFunctionKind(uint32_t kind) {
-    return kind == kClosureFunctionKind || kind == kImplicitClosureFunctionKind;
-}
 
 uint64_t EntryForKind(const DartPlantLiveVmFunctionInfo& info, DartPlantEntryKind kind) {
     switch (kind) {
@@ -735,11 +799,11 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
                          const DartPlantFlutterSnapshotInfo& snapshot,
                          std::vector<CollectedLiveFunction>* functions) {
     if (functions == nullptr || library_uri == nullptr || class_name == nullptr ||
-        !RequireCid(reader, tagged_function, profile.cid_function)) {
+        !RequireCid(reader, profile, tagged_function, profile.cid_function)) {
         return false;
     }
 
-    const uintptr_t function_address = Untag(tagged_function);
+    const uintptr_t function_address = Untag(profile, tagged_function);
     CollectedLiveFunction collected{};
     collected.info.struct_size = sizeof(collected.info);
     collected.info.function = tagged_function;
@@ -757,22 +821,22 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
                      &collected.info.function_entry_point) ||
         !reader.Read(function_address + profile.function_unchecked_entry_point_offset,
                      &collected.info.function_unchecked_entry_point) ||
-        !ReadCompressedObject(reader, function_address, profile.function_name_offset, heap_base,
-                              &tagged_name) ||
+        !ReadCompressedObject(reader, function_address, profile, profile.function_name_offset,
+                              heap_base, &tagged_name) ||
         !ReadDartString(reader, profile, tagged_name, collected.info.function_name,
                         sizeof(collected.info.function_name)) ||
-        !ReadCompressedObject(reader, function_address, profile.function_owner_offset, heap_base,
-                              &function_owner) ||
+        !ReadCompressedObject(reader, function_address, profile, profile.function_owner_offset,
+                              heap_base, &function_owner) ||
         function_owner != tagged_class ||
-        !ReadCompressedObject(reader, function_address, profile.function_code_offset, heap_base,
-                              &collected.info.code) ||
-        !RequireCid(reader, collected.info.code, profile.cid_code)) {
+        !ReadCompressedObject(reader, function_address, profile, profile.function_code_offset,
+                              heap_base, &collected.info.code) ||
+        !RequireCid(reader, profile, collected.info.code, profile.cid_code)) {
         return false;
     }
 
-    const bool closure_call_entry_only = IsClosureCallFunctionKind(kind);
+    const bool closure_call_entry_only = IsClosureFunctionKind(profile.profile_version, kind);
     uint64_t code_owner = 0;
-    const uintptr_t code_address = Untag(collected.info.code);
+    const uintptr_t code_address = Untag(profile, collected.info.code);
     if (!reader.Read(code_address + profile.code_entry_point_offset,
                      &collected.info.code_entry_point) ||
         !reader.Read(code_address + profile.code_unchecked_entry_point_offset,
@@ -805,7 +869,7 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
     }
     collected.info.code_owner_matches_function = code_owner == tagged_function ? 1 : 0;
     if (!collected.info.code_owner_matches_function &&
-        (!RequireCid(reader, code_owner, profile.cid_function) ||
+        (!RequireCid(reader, profile, code_owner, profile.cid_function) ||
          !HasSnapshotFeature(snapshot.snapshot_features, "dedup_instructions"))) {
         return false;
     }
@@ -872,15 +936,15 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
                              std::vector<CollectedLiveFunction>* functions,
                              uint32_t* skipped_function_count) {
     if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr ||
-        !RequireCid(reader, tagged_class, profile.cid_class)) {
+        !RequireCid(reader, profile, tagged_class, profile.cid_class)) {
         return false;
     }
 
     uint64_t library = 0;
     uint64_t class_functions = 0;
     if (!ReadClassLibrary(reader, profile, heap_base, tagged_class, &library) ||
-        !ReadCompressedObject(reader, Untag(tagged_class), profile.class_functions_offset,
-                              heap_base, &class_functions)) {
+        !ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                              profile.class_functions_offset, heap_base, &class_functions)) {
         return false;
     }
 
@@ -893,21 +957,22 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
         std::snprintf(class_name, sizeof(class_name), "%s", "Global");
     } else {
         uint64_t class_name_object = 0;
-        if (!ReadCompressedObject(reader, Untag(tagged_class), profile.class_name_offset, heap_base,
-                                  &class_name_object) ||
+        if (!ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                                  profile.class_name_offset, heap_base, &class_name_object) ||
             !ReadDartString(reader, profile, class_name_object, class_name, sizeof(class_name))) {
             return false;
         }
     }
 
     uint32_t functions_cid = 0;
-    if (!ReadCid(reader, class_functions, &functions_cid) ||
+    if (!ReadCid(reader, profile, class_functions, &functions_cid) ||
         (functions_cid != profile.cid_array && functions_cid != profile.cid_immutable_array)) {
         return false;
     }
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, Untag(class_functions) + profile.array_length_offset,
-                                   &length) ||
+    if (!ReadPositiveCompressedSmi(reader,
+                                   Untag(profile, class_functions) + profile.array_length_offset,
+                                   profile, &length) ||
         length > kMaxClassFunctions) {
         return false;
     }
@@ -915,19 +980,23 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
     for (uint64_t index = 0; index < length; ++index) {
         uint64_t function = 0;
         if (!ReadArrayElement(reader, profile, heap_base, class_functions, index, &function) ||
-            !RequireCid(reader, function, profile.cid_function)) {
+            !RequireCid(reader, profile, function, profile.cid_function)) {
             ++*skipped_function_count;
             continue;
         }
         if (!seen_functions->insert(function).second) continue;
 
-        const uintptr_t function_address = Untag(function);
+        const uintptr_t function_address = Untag(profile, function);
         uint32_t kind_tag = 0;
         if (!reader.Read(function_address + profile.function_kind_tag_offset, &kind_tag)) {
             ++*skipped_function_count;
             continue;
         }
-        const uint32_t kind = kind_tag & 0x1f;
+        uint32_t kind = 0;
+        if (!DecodeFunctionKind(profile, kind_tag, &kind)) {
+            ++*skipped_function_count;
+            continue;
+        }
         if (!CollectLiveFunction(reader, profile, heap_base, function, kind, tagged_class, library,
                                  is_top_level, library_uri, class_name, snapshot, functions)) {
             ++*skipped_function_count;
@@ -947,11 +1016,13 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
     uint32_t skipped = 0;
     std::unordered_set<uint64_t> seen_functions;
 
+    const uint64_t max_cids = MaxCidCount(profile);
     uint64_t num_cids = 0;
-    if (!reader.Read(
+    if (max_cids == 0 ||
+        !reader.Read(
             static_cast<uintptr_t>(context.class_table) + profile.class_table_num_cids_offset,
             &num_cids) ||
-        num_cids == 0 || num_cids > kClassIdTagMask + 1) {
+        num_cids == 0 || num_cids > max_cids) {
         return false;
     }
     for (uint64_t cid = 1; cid < num_cids; ++cid) {
@@ -970,28 +1041,29 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
     if (!reader.Read(
             static_cast<uintptr_t>(context.object_store) + profile.object_store_libraries_offset,
             &libraries) ||
-        !RequireCid(reader, libraries, profile.cid_growable_object_array)) {
+        !RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
         return false;
     }
-    const uintptr_t growable = Untag(libraries);
+    const uintptr_t growable = Untag(profile, libraries);
     uint64_t library_count = 0;
     uint64_t data = 0;
     if (!ReadPositiveCompressedSmi(reader, growable + profile.growable_object_array_length_offset,
-                                   &library_count) ||
+                                   profile, &library_count) ||
         library_count > kMaxClassFunctions ||
-        !ReadCompressedObject(reader, growable, profile.growable_object_array_data_offset,
+        !ReadCompressedObject(reader, growable, profile, profile.growable_object_array_data_offset,
                               context.heap_base, &data)) {
         return false;
     }
     for (uint64_t index = 0; index < library_count; ++index) {
         uint64_t library = 0;
         if (!ReadArrayElement(reader, profile, context.heap_base, data, index, &library) ||
-            !RequireCid(reader, library, profile.cid_library)) {
+            !RequireCid(reader, profile, library, profile.cid_library)) {
             continue;
         }
         uint64_t top_level_class = 0;
-        if (!ReadCompressedObject(reader, Untag(library), profile.library_toplevel_class_offset,
-                                  context.heap_base, &top_level_class)) {
+        if (!ReadCompressedObject(reader, Untag(profile, library), profile,
+                                  profile.library_toplevel_class_offset, context.heap_base,
+                                  &top_level_class)) {
             continue;
         }
         (void) CollectFunctionsInClass(reader, profile, context.heap_base, top_level_class, true,
@@ -1099,26 +1171,32 @@ bool DecodeDartNullability(uint32_t flags, const FunctionTypeLayout& layout,
     return false;
 }
 
-bool DecodeDartType(const ProcessMemoryReader& reader, const FunctionTypeLayout& layout,
-                    uint64_t tagged_type, DartPlantDartTypeInfo* out_type) {
-    if (out_type == nullptr || !IsHeapObject(tagged_type)) return false;
+bool DecodeDartType(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                    const FunctionTypeLayout& layout, uint64_t tagged_type,
+                    DartPlantDartTypeInfo* out_type) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (out_type == nullptr || raw == nullptr || raw->class_id_tag_bits == 0 ||
+        raw->class_id_tag_bits >= 32 || !IsHeapObject(profile, tagged_type)) {
+        return false;
+    }
     DartPlantDartTypeInfo type{};
     type.struct_size = sizeof(type);
-    if (!ReadCid(reader, tagged_type, &type.object_cid)) return false;
+    if (!ReadCid(reader, profile, tagged_type, &type.object_cid)) return false;
     if (type.object_cid != layout.cid_type && type.object_cid != layout.cid_function_type &&
         type.object_cid != layout.cid_record_type && type.object_cid != layout.cid_type_parameter) {
         return false;
     }
 
     uint32_t flags = 0;
-    if (!reader.Read(Untag(tagged_type) + layout.abstract_type_flags_offset, &flags) ||
+    if (!reader.Read(Untag(profile, tagged_type) + layout.abstract_type_flags_offset, &flags) ||
         !DecodeDartNullability(flags, layout, &type.nullability)) {
         return false;
     }
 
     if (type.object_cid == layout.cid_type) {
+        const uint32_t class_id_mask = (uint32_t{1} << raw->class_id_tag_bits) - 1;
         const uint32_t represented_cid =
-            static_cast<uint32_t>((flags >> layout.type_class_id_shift) & kClassIdTagMask);
+            static_cast<uint32_t>((flags >> layout.type_class_id_shift) & class_id_mask);
         if (represented_cid == 0) return false;
         if (represented_cid == layout.cid_null) {
             type.kind = DARTPLANT_DART_TYPE_NULL;
@@ -1140,8 +1218,9 @@ bool DecodeDartType(const ProcessMemoryReader& reader, const FunctionTypeLayout&
         type.kind = DARTPLANT_DART_TYPE_PARAMETER;
         uint16_t base = 0;
         uint16_t index = 0;
-        if (!reader.Read(Untag(tagged_type) + layout.type_parameter_base_offset, &base) ||
-            !reader.Read(Untag(tagged_type) + layout.type_parameter_index_offset, &index)) {
+        if (!reader.Read(Untag(profile, tagged_type) + layout.type_parameter_base_offset, &base) ||
+            !reader.Read(Untag(profile, tagged_type) + layout.type_parameter_index_offset,
+                         &index)) {
             return false;
         }
         type.type_parameter_base = base;
@@ -1159,17 +1238,17 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
                                                uint64_t tagged_function,
                                                ParsedFunctionSignature* out_signature) {
     if (out_signature == nullptr || heap_base == 0 ||
-        !RequireCid(reader, tagged_function, profile.cid_function)) {
+        !RequireCid(reader, profile, tagged_function, profile.cid_function)) {
         return FailProbe("live VM Function is stale or has an invalid CID for signature parsing");
     }
 
     uint64_t tagged_signature = 0;
-    if (!ReadCompressedObject(reader, Untag(tagged_function), layout.function_signature_offset,
-                              heap_base, &tagged_signature)) {
+    if (!ReadCompressedObject(reader, Untag(profile, tagged_function), profile,
+                              layout.function_signature_offset, heap_base, &tagged_signature)) {
         return FailProbe("live VM Function.signature is unreadable");
     }
     uint32_t signature_cid = 0;
-    if (!ReadCid(reader, tagged_signature, &signature_cid)) {
+    if (!ReadCid(reader, profile, tagged_signature, &signature_cid)) {
         return FailProbe("live VM Function.signature is not a readable heap object");
     }
     if (signature_cid == layout.cid_null) {
@@ -1180,15 +1259,15 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
         return FailProbe("live VM Function.signature has an unexpected CID");
     }
 
-    const uintptr_t signature_address = Untag(tagged_signature);
+    const uintptr_t signature_address = Untag(profile, tagged_signature);
     uint32_t packed_counts = 0;
     uint16_t packed_type_counts = 0;
     uint64_t result_type = 0;
     if (!reader.Read(signature_address + layout.packed_parameter_counts_offset, &packed_counts) ||
         !reader.Read(signature_address + layout.packed_type_parameter_counts_offset,
                      &packed_type_counts) ||
-        !ReadCompressedObject(reader, signature_address, layout.result_type_offset, heap_base,
-                              &result_type)) {
+        !ReadCompressedObject(reader, signature_address, profile, layout.result_type_offset,
+                              heap_base, &result_type)) {
         return FailProbe("live VM FunctionType fields are unreadable");
     }
 
@@ -1205,12 +1284,12 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
         (parsed.has_named_optional_parameters && parsed.optional_parameter_count == 0)) {
         return FailProbe("live VM FunctionType parameter counts are inconsistent");
     }
-    if (!DecodeDartType(reader, layout, result_type, &parsed.result_type)) {
+    if (!DecodeDartType(reader, profile, layout, result_type, &parsed.result_type)) {
         return FailProbe("live VM FunctionType result type is invalid");
     }
 
     if (parsed.parameter_count != 0) {
-        if (!ReadCompressedObject(reader, signature_address, layout.parameter_types_offset,
+        if (!ReadCompressedObject(reader, signature_address, profile, layout.parameter_types_offset,
                                   heap_base, &parsed.parameter_types)) {
             return FailProbe("live VM FunctionType parameter_types is unreadable");
         }
@@ -1222,8 +1301,9 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
     }
 
     if (parsed.has_named_optional_parameters) {
-        if (!ReadCompressedObject(reader, signature_address, layout.named_parameter_names_offset,
-                                  heap_base, &parsed.named_parameter_names)) {
+        if (!ReadCompressedObject(reader, signature_address, profile,
+                                  layout.named_parameter_names_offset, heap_base,
+                                  &parsed.named_parameter_names)) {
             return FailProbe("live VM FunctionType named_parameter_names is unreadable");
         }
         uint64_t named_slot_count = 0;
@@ -1299,16 +1379,16 @@ DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& co
         !reader.Read(static_cast<uintptr_t>(context.thread) + layout->thread_false_offset,
                      &bool_false) ||
         bool_true == 0 || bool_false == 0 || bool_true == bool_false ||
-        !RequireCid(reader, bool_true, layout->cid) ||
-        !RequireCid(reader, bool_false, layout->cid)) {
+        !RequireCid(reader, profile, bool_true, layout->cid) ||
+        !RequireCid(reader, profile, bool_false, layout->cid)) {
         SetLastError("Dart canonical Bool roots failed CID validation");
         return DARTPLANT_PROFILE_MISMATCH;
     }
     uint8_t true_value = 0;
     uint8_t false_value = 0xff;
-    if (!reader.Read(Untag(bool_true) + layout->value_offset, &true_value) ||
-        !reader.Read(Untag(bool_false) + layout->value_offset, &false_value) || true_value != 1 ||
-        false_value != 0) {
+    if (!reader.Read(Untag(profile, bool_true) + layout->value_offset, &true_value) ||
+        !reader.Read(Untag(profile, bool_false) + layout->value_offset, &false_value) ||
+        true_value != 1 || false_value != 0) {
         SetLastError("Dart canonical Bool roots failed value validation");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -1351,6 +1431,11 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
     profile.struct_size = sizeof(profile);
     DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
     if (status != DARTPLANT_OK) return status;
+    const dartplant::RawObjectLayout* raw = dartplant::FindRawObjectLayout(profile.profile_version);
+    const uint64_t max_cids = dartplant::MaxCidCount(profile);
+    if (raw == nullptr || max_cids == 0) {
+        return dartplant::FailProbe("selected live VM raw-object profile is incomplete");
+    }
 
     dartplant::ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1389,8 +1474,8 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
 
     if (static_cast<uint32_t>(registers->heap_bits) !=
             static_cast<uint32_t>(context.heap_base >> 32) ||
-        registers->null_value != thread_null || !dartplant::IsHeapObject(thread_pool) ||
-        context.pp != thread_pool - dartplant::kHeapObjectTag) {
+        registers->null_value != thread_null || !dartplant::IsHeapObject(profile, thread_pool) ||
+        thread_pool < raw->heap_object_tag || context.pp != thread_pool - raw->heap_object_tag) {
         return dartplant::FailProbe("sampled THR/PP/HEAP_BITS/NULL_REG semantics do not match");
     }
     context.global_object_pool = thread_pool;
@@ -1414,10 +1499,11 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
         return dartplant::FailProbe("sampled Isolate/IsolateGroup roots are invalid");
     }
 
-    if (!dartplant::RequireCid(reader, context.global_object_pool, profile.cid_object_pool) ||
-        !reader.Read(
-            dartplant::Untag(context.global_object_pool) + profile.object_pool_length_offset,
-            &context.object_pool_length) ||
+    if (!dartplant::RequireCid(reader, profile, context.global_object_pool,
+                               profile.cid_object_pool) ||
+        !reader.Read(dartplant::Untag(profile, context.global_object_pool) +
+                         profile.object_pool_length_offset,
+                     &context.object_pool_length) ||
         context.object_pool_length == 0 ||
         context.object_pool_length > dartplant::kMaxObjectPoolEntries) {
         return dartplant::FailProbe("sampled global ObjectPool is invalid");
@@ -1427,7 +1513,7 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
     if (!reader.Read(
             static_cast<uintptr_t>(context.class_table) + profile.class_table_num_cids_offset,
             &num_cids) ||
-        num_cids == 0 || num_cids > dartplant::kClassIdTagMask + 1) {
+        num_cids == 0 || num_cids > max_cids) {
         return dartplant::FailProbe("sampled ClassTable is invalid");
     }
     uint64_t class_class = 0;
@@ -1435,7 +1521,7 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
         !reader.Read(static_cast<uintptr_t>(context.cached_class_table_table) +
                          static_cast<uintptr_t>(profile.cid_class) * sizeof(uint64_t),
                      &class_class) ||
-        !dartplant::RequireCid(reader, class_class, profile.cid_class)) {
+        !dartplant::RequireCid(reader, profile, class_class, profile.cid_class)) {
         return dartplant::FailProbe("sampled cached ClassTable does not expose Class CID");
     }
 
@@ -1443,22 +1529,23 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
     if (!reader.Read(
             static_cast<uintptr_t>(context.object_store) + profile.object_store_libraries_offset,
             &libraries) ||
-        !dartplant::RequireCid(reader, libraries, profile.cid_growable_object_array)) {
+        !dartplant::RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
         return dartplant::FailProbe("sampled ObjectStore.libraries is invalid");
     }
-    const uintptr_t growable = dartplant::Untag(libraries);
+    const uintptr_t growable = dartplant::Untag(profile, libraries);
     uint64_t library_count = 0;
     uint64_t library_data = 0;
     if (!dartplant::ReadPositiveCompressedSmi(
-            reader, growable + profile.growable_object_array_length_offset, &library_count) ||
+            reader, growable + profile.growable_object_array_length_offset, profile,
+            &library_count) ||
         library_count == 0 || library_count > dartplant::kMaxClassFunctions ||
-        !dartplant::ReadCompressedObject(reader, growable,
+        !dartplant::ReadCompressedObject(reader, growable, profile,
                                          profile.growable_object_array_data_offset,
                                          context.heap_base, &library_data)) {
         return dartplant::FailProbe("sampled ObjectStore library array is invalid");
     }
     uint32_t library_data_cid = 0;
-    if (!dartplant::ReadCid(reader, library_data, &library_data_cid) ||
+    if (!dartplant::ReadCid(reader, profile, library_data, &library_data_cid) ||
         (library_data_cid != profile.cid_array &&
          library_data_cid != profile.cid_immutable_array)) {
         return dartplant::FailProbe("sampled ObjectStore library backing array is invalid");
@@ -1471,7 +1558,7 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
         uint64_t library = 0;
         if (!dartplant::ReadArrayElement(reader, profile, context.heap_base, library_data, index,
                                          &library) ||
-            !dartplant::RequireCid(reader, library, profile.cid_library)) {
+            !dartplant::RequireCid(reader, profile, library, profile.cid_library)) {
             continue;
         }
         has_library = true;
@@ -1508,6 +1595,8 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     profile.struct_size = sizeof(profile);
     DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
     if (status != DARTPLANT_OK) return status;
+    const dartplant::RawObjectLayout* raw = dartplant::FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr) return dartplant::FailProbe("live VM raw-object profile is unavailable");
 
     dartplant::ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1552,10 +1641,11 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     info.heap_bits_match =
         static_cast<uint32_t>(heap_bits) == static_cast<uint32_t>(info.heap_base >> 32) ? 1 : 0;
     info.null_register_match = null_register == thread_null ? 1 : 0;
-    info.thread_pool_match =
-        dartplant::IsHeapObject(thread_pool) && info.pp == thread_pool - dartplant::kHeapObjectTag
-            ? 1
-            : 0;
+    info.thread_pool_match = dartplant::IsHeapObject(profile, thread_pool) &&
+                                     thread_pool >= raw->heap_object_tag &&
+                                     info.pp == thread_pool - raw->heap_object_tag
+                                 ? 1
+                                 : 0;
     info.global_object_pool = thread_pool;
     if (!info.heap_bits_match || !info.null_register_match || !info.thread_pool_match) {
         return dartplant::FailProbe("THR/PP/HEAP_BITS/NULL_REG semantic validation failed");
@@ -1582,11 +1672,12 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
         return dartplant::FailProbe("IsolateGroup raw layout validation failed");
     }
 
-    if (!dartplant::RequireCid(reader, info.global_object_pool, profile.cid_object_pool)) {
+    if (!dartplant::RequireCid(reader, profile, info.global_object_pool, profile.cid_object_pool)) {
         return dartplant::FailProbe("THR global object pool does not have ObjectPool CID");
     }
-    if (!reader.Read(dartplant::Untag(info.global_object_pool) + profile.object_pool_length_offset,
-                     &info.object_pool_length) ||
+    if (!reader.Read(
+            dartplant::Untag(profile, info.global_object_pool) + profile.object_pool_length_offset,
+            &info.object_pool_length) ||
         info.object_pool_length == 0 ||
         info.object_pool_length > dartplant::kMaxObjectPoolEntries) {
         return dartplant::FailProbe("live ObjectPool length is invalid");
@@ -1612,20 +1703,20 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     info.function = indexed_function;
     info.function_found_from_vm_index = 1;
     info.entry_is_shared = info.entry_alias_count > 1 ? 1 : 0;
-    if (!dartplant::RequireCid(reader, info.function, profile.cid_function)) {
+    if (!dartplant::RequireCid(reader, profile, info.function, profile.cid_function)) {
         return dartplant::FailProbe("live VM index returned a non-Function object");
     }
 
-    const uintptr_t function = dartplant::Untag(info.function);
+    const uintptr_t function = dartplant::Untag(profile, info.function);
     uint64_t function_name = 0;
     uint64_t function_owner = 0;
     uint64_t function_code = 0;
     if (!reader.Read(function + profile.function_entry_point_offset, &info.function_entry_point) ||
-        !dartplant::ReadCompressedObject(reader, function, profile.function_name_offset,
+        !dartplant::ReadCompressedObject(reader, function, profile, profile.function_name_offset,
                                          info.heap_base, &function_name) ||
-        !dartplant::ReadCompressedObject(reader, function, profile.function_owner_offset,
+        !dartplant::ReadCompressedObject(reader, function, profile, profile.function_owner_offset,
                                          info.heap_base, &function_owner) ||
-        !dartplant::ReadCompressedObject(reader, function, profile.function_code_offset,
+        !dartplant::ReadCompressedObject(reader, function, profile, profile.function_code_offset,
                                          info.heap_base, &function_code)) {
         return dartplant::FailProbe("failed to read Dart Function raw fields");
     }
@@ -1639,19 +1730,21 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     }
 
     info.code = function_code;
-    if (!dartplant::RequireCid(reader, info.code, profile.cid_code)) {
+    if (!dartplant::RequireCid(reader, profile, info.code, profile.cid_code)) {
         return dartplant::FailProbe("Function.code is not a Dart Code object");
     }
     uint64_t code_pool = 0;
-    if (!reader.Read(dartplant::Untag(info.code) + profile.code_entry_point_offset,
+    if (!reader.Read(dartplant::Untag(profile, info.code) + profile.code_entry_point_offset,
                      &info.code_entry_point) ||
-        !reader.Read(dartplant::Untag(info.code) + profile.code_object_pool_offset, &code_pool) ||
-        !reader.Read(dartplant::Untag(info.code) + profile.code_owner_offset, &info.code_owner)) {
+        !reader.Read(dartplant::Untag(profile, info.code) + profile.code_object_pool_offset,
+                     &code_pool) ||
+        !reader.Read(dartplant::Untag(profile, info.code) + profile.code_owner_offset,
+                     &info.code_owner)) {
         return dartplant::FailProbe("failed to read Dart Code raw fields");
     }
     info.function_code_match = info.code_owner == info.function ? 1 : 0;
     info.code_owner_is_function =
-        dartplant::RequireCid(reader, info.code_owner, profile.cid_function) ? 1 : 0;
+        dartplant::RequireCid(reader, profile, info.code_owner, profile.cid_function) ? 1 : 0;
     info.code_owner_mismatch_allowed =
         !info.function_code_match && info.code_owner_is_function &&
                 dartplant::HasSnapshotFeature(snapshot->snapshot_features, "dedup_instructions")
@@ -1666,7 +1759,8 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     // pool through IsolateGroup::object_store()->global_object_pool(). Keep the
     // raw field distinction visible while validating the effective PP source.
     info.code_pool_is_null = code_pool == thread_null ? 1 : 0;
-    info.code_pool_match = info.pp == info.global_object_pool - dartplant::kHeapObjectTag &&
+    info.code_pool_match = info.global_object_pool >= raw->heap_object_tag &&
+                                   info.pp == info.global_object_pool - raw->heap_object_tag &&
                                    (info.code_pool_is_null || code_pool == info.global_object_pool)
                                ? 1
                                : 0;
@@ -1676,23 +1770,24 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     }
 
     info.owner_class = function_owner;
-    if (!dartplant::RequireCid(reader, info.owner_class, profile.cid_class)) {
+    if (!dartplant::RequireCid(reader, profile, info.owner_class, profile.cid_class)) {
         return dartplant::FailProbe("Function.owner is not a Dart Class object");
     }
-    const uintptr_t owner_class = dartplant::Untag(info.owner_class);
+    const uintptr_t owner_class = dartplant::Untag(profile, info.owner_class);
     uint64_t class_name = 0;
     uint64_t class_functions = 0;
-    if (!dartplant::ReadCompressedObject(reader, owner_class, profile.class_name_offset,
+    if (!dartplant::ReadCompressedObject(reader, owner_class, profile, profile.class_name_offset,
                                          info.heap_base, &class_name) ||
-        !dartplant::ReadCompressedObject(reader, owner_class, profile.class_functions_offset,
-                                         info.heap_base, &class_functions) ||
-        !dartplant::ReadCompressedObject(reader, owner_class, profile.class_library_offset,
+        !dartplant::ReadCompressedObject(reader, owner_class, profile,
+                                         profile.class_functions_offset, info.heap_base,
+                                         &class_functions) ||
+        !dartplant::ReadCompressedObject(reader, owner_class, profile, profile.class_library_offset,
                                          info.heap_base, &info.library)) {
         return dartplant::FailProbe("failed to read Dart Class raw fields");
     }
     if (!dartplant::ReadDartString(reader, profile, class_name, info.class_name,
                                    sizeof(info.class_name)) ||
-        !dartplant::RequireCid(reader, info.library, profile.cid_library)) {
+        !dartplant::RequireCid(reader, profile, info.library, profile.cid_library)) {
         return dartplant::FailProbe("Class.name/library semantic validation failed");
     }
     info.function_in_class_functions =
@@ -1704,13 +1799,14 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
         return dartplant::FailProbe("current Function is absent from Class.functions");
     }
 
-    const uintptr_t library = dartplant::Untag(info.library);
+    const uintptr_t library = dartplant::Untag(profile, info.library);
     uint64_t library_url = 0;
     uint64_t top_level_class = 0;
-    if (!dartplant::ReadCompressedObject(reader, library, profile.library_url_offset,
+    if (!dartplant::ReadCompressedObject(reader, library, profile, profile.library_url_offset,
                                          info.heap_base, &library_url) ||
-        !dartplant::ReadCompressedObject(reader, library, profile.library_toplevel_class_offset,
-                                         info.heap_base, &top_level_class) ||
+        !dartplant::ReadCompressedObject(reader, library, profile,
+                                         profile.library_toplevel_class_offset, info.heap_base,
+                                         &top_level_class) ||
         !dartplant::ReadDartString(reader, profile, library_url, info.library_uri,
                                    sizeof(info.library_uri))) {
         return dartplant::FailProbe("failed to reconstruct Dart Library URL/top-level class");
@@ -1789,7 +1885,8 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
     }
     if (context->class_table == 0 || context->cached_class_table_table == 0 ||
         context->object_store == 0 || context->heap_base == 0 ||
-        !dartplant::RequireCid(reader, context->global_object_pool, profile.cid_object_pool)) {
+        !dartplant::RequireCid(reader, profile, context->global_object_pool,
+                               profile.cid_object_pool)) {
         return dartplant::FailProbe("live VM context roots are stale or invalid");
     }
 
@@ -1809,37 +1906,40 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
     method.function = function;
     method.library = library;
 
-    const uintptr_t function_address = dartplant::Untag(function);
+    const uintptr_t function_address = dartplant::Untag(profile, function);
     uint64_t tagged_name = 0;
     uint64_t function_owner = 0;
     if (!reader.Read(function_address + profile.function_entry_point_offset,
                      &method.function_entry_point) ||
-        !dartplant::ReadCompressedObject(reader, function_address, profile.function_name_offset,
-                                         context->heap_base, &tagged_name) ||
-        !dartplant::ReadCompressedObject(reader, function_address, profile.function_owner_offset,
-                                         context->heap_base, &function_owner) ||
-        !dartplant::ReadCompressedObject(reader, function_address, profile.function_code_offset,
-                                         context->heap_base, &method.code) ||
+        !dartplant::ReadCompressedObject(reader, function_address, profile,
+                                         profile.function_name_offset, context->heap_base,
+                                         &tagged_name) ||
+        !dartplant::ReadCompressedObject(reader, function_address, profile,
+                                         profile.function_owner_offset, context->heap_base,
+                                         &function_owner) ||
+        !dartplant::ReadCompressedObject(reader, function_address, profile,
+                                         profile.function_code_offset, context->heap_base,
+                                         &method.code) ||
         !dartplant::ReadDartString(reader, profile, tagged_name, method.function_name,
                                    sizeof(method.function_name))) {
         return dartplant::FailProbe("failed to reconstruct live VM Function identity");
     }
 
     method.owner_class = function_owner;
-    if (!dartplant::RequireCid(reader, method.owner_class, profile.cid_class) ||
-        !dartplant::RequireCid(reader, method.code, profile.cid_code)) {
+    if (!dartplant::RequireCid(reader, profile, method.owner_class, profile.cid_class) ||
+        !dartplant::RequireCid(reader, profile, method.code, profile.cid_code)) {
         return dartplant::FailProbe("live VM Function owner or Code has an invalid CID");
     }
 
     uint64_t class_name_object = 0;
     uint64_t class_functions = 0;
     uint64_t class_library = 0;
-    if (!dartplant::ReadCompressedObject(reader, dartplant::Untag(method.owner_class),
-                                         profile.class_name_offset, context->heap_base,
+    if (!dartplant::ReadCompressedObject(reader, dartplant::Untag(profile, method.owner_class),
+                                         profile, profile.class_name_offset, context->heap_base,
                                          &class_name_object) ||
-        !dartplant::ReadCompressedObject(reader, dartplant::Untag(method.owner_class),
-                                         profile.class_functions_offset, context->heap_base,
-                                         &class_functions) ||
+        !dartplant::ReadCompressedObject(reader, dartplant::Untag(profile, method.owner_class),
+                                         profile, profile.class_functions_offset,
+                                         context->heap_base, &class_functions) ||
         !dartplant::ReadClassLibrary(reader, profile, context->heap_base, method.owner_class,
                                      &class_library) ||
         class_library != method.library) {
@@ -1853,7 +1953,7 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
     }
 
     uint64_t top_level_class = 0;
-    if (!dartplant::ReadCompressedObject(reader, dartplant::Untag(method.library),
+    if (!dartplant::ReadCompressedObject(reader, dartplant::Untag(profile, method.library), profile,
                                          profile.library_toplevel_class_offset, context->heap_base,
                                          &top_level_class)) {
         return dartplant::FailProbe("failed to read live VM Library top-level class");
@@ -1872,19 +1972,17 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
     }
 
     uint64_t code_pool = 0;
-    if (!reader.Read(dartplant::Untag(method.code) + profile.code_entry_point_offset,
-                     &method.code_entry_point) ||
-        !reader.Read(dartplant::Untag(method.code) + profile.code_object_pool_offset, &code_pool) ||
-        !reader.Read(dartplant::Untag(method.code) + profile.code_owner_offset,
-                     &method.code_owner) ||
-        !reader.Read(dartplant::Untag(method.code) + profile.code_instructions_length_offset,
-                     &method.code_size) ||
+    const uintptr_t code = dartplant::Untag(profile, method.code);
+    if (!reader.Read(code + profile.code_entry_point_offset, &method.code_entry_point) ||
+        !reader.Read(code + profile.code_object_pool_offset, &code_pool) ||
+        !reader.Read(code + profile.code_owner_offset, &method.code_owner) ||
+        !reader.Read(code + profile.code_instructions_length_offset, &method.code_size) ||
         method.code_size == 0) {
         return dartplant::FailProbe("failed to reconstruct live VM Code");
     }
     method.function_code_owner_match = method.code_owner == method.function ? 1 : 0;
     method.code_owner_is_function =
-        dartplant::RequireCid(reader, method.code_owner, profile.cid_function) ? 1 : 0;
+        dartplant::RequireCid(reader, profile, method.code_owner, profile.cid_function) ? 1 : 0;
     method.code_owner_mismatch_allowed =
         !method.function_code_owner_match && method.code_owner_is_function &&
                 dartplant::HasSnapshotFeature(snapshot->snapshot_features, "dedup_instructions")
@@ -1986,7 +2084,7 @@ extern "C" DartPlantStatus dartplant_live_vm_read_function_parameter(
     DartPlantDartParameterInfo parameter{};
     parameter.struct_size = sizeof(parameter);
     parameter.index = index;
-    if (!dartplant::DecodeDartType(reader, *layout, tagged_type, &parameter.type)) {
+    if (!dartplant::DecodeDartType(reader, profile, *layout, tagged_type, &parameter.type)) {
         return dartplant::FailProbe("FunctionType parameter type is invalid");
     }
 
@@ -2018,13 +2116,16 @@ extern "C" DartPlantStatus dartplant_live_vm_read_function_parameter(
             return dartplant::FailProbe("FunctionType named parameter flags are unreadable");
         }
         if (flag_index < named_slot_count) {
+            const dartplant::RawObjectLayout* raw =
+                dartplant::FindRawObjectLayout(profile.profile_version);
             uint32_t raw_flags = 0;
-            if (!dartplant::ReadArrayRawElement(reader, profile, parsed.named_parameter_names,
+            if (raw == nullptr ||
+                !dartplant::ReadArrayRawElement(reader, profile, parsed.named_parameter_names,
                                                 flag_index, &raw_flags) ||
-                (raw_flags & dartplant::kSmiTagMask) != 0) {
+                (raw_flags & raw->smi_tag_mask) != raw->smi_tag) {
                 return dartplant::FailProbe("FunctionType required-named flags are not a Smi");
             }
-            const uint32_t flags = raw_flags >> 1;
+            const uint32_t flags = raw_flags >> raw->smi_tag_shift;
             const uint32_t mask = 1U << (named_index % dartplant::kNamedParameterFlagsPerSmi);
             parameter.is_required = (flags & mask) != 0 ? 1 : 0;
         }
@@ -2134,11 +2235,12 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
 
     dartplant::ProcessMemoryReader reader;
     uint32_t pool_cid = 0;
-    if (!reader.Refresh() || !dartplant::ReadCidSafely(reader, tagged_object_pool, &pool_cid) ||
+    if (!reader.Refresh() ||
+        !dartplant::ReadCidSafely(reader, profile, tagged_object_pool, &pool_cid) ||
         pool_cid != profile.cid_object_pool) {
         return dartplant::FailProbe("ObjectPool is stale or has an invalid CID");
     }
-    const uintptr_t pool = dartplant::Untag(tagged_object_pool);
+    const uintptr_t pool = dartplant::Untag(profile, tagged_object_pool);
     uint64_t length = 0;
     if (!reader.ReadSafely(pool + profile.object_pool_length_offset, &length) ||
         length > dartplant::kMaxObjectPoolEntries || index >= length) {
@@ -2172,8 +2274,8 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
     entry.snapshot_behavior = static_cast<uint8_t>((bits >> 5) & 0x7);
     if (entry.type == DARTPLANT_OBJECT_POOL_TAGGED_OBJECT) {
         entry.tagged_object = raw;
-        if (dartplant::IsHeapObject(raw)) {
-            (void) dartplant::ReadCidSafely(reader, raw, &entry.object_cid);
+        if (dartplant::IsHeapObject(profile, raw)) {
+            (void) dartplant::ReadCidSafely(reader, profile, raw, &entry.object_cid);
         }
     }
     *out_entry = entry;

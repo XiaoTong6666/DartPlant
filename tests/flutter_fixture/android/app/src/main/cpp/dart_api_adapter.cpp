@@ -193,6 +193,17 @@ const DartPlantVmAdapterCallbacks kCallbacks = {
     .object_kind = ObjectKind,
     .object_to_raw = ObjectToRaw,
     .object_is_alive = ObjectAlive,
+    // Public Dart API scopes/persistent handles are useful once native state
+    // has already been established, but they cannot publish a generated Dart
+    // exit frame or enter the VM safepoint protocol from an intercepted Dart
+    // frame. Keep this fixture adapter explicitly native-only instead of
+    // pretending Dart_EnterScope is a Generated->Native transition.
+    .pin_generated_roots = nullptr,
+    .generated_root_get = nullptr,
+    .generated_root_set = nullptr,
+    .unpin_generated_roots = nullptr,
+    .enter_generated_to_native = nullptr,
+    .leave_native_to_generated = nullptr,
 };
 
 }  // namespace

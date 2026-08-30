@@ -57,6 +57,11 @@ struct DartCallLayout {
     // allocators. This hidden receiver is not part of FunctionType formals.
     bool has_closure_receiver = false;
     DartAbiLocation closure_receiver_location{};
+    // Verified PRODUCT AOT closure calls carry a tagged ArgumentsDescriptor
+    // in ARGS_DESC_REG (x4). It describes the actual call shape while closure
+    // formals themselves use the forced entry-stack calling convention.
+    bool has_arguments_descriptor = false;
+    DartAbiLocation arguments_descriptor_location{};
 };
 
 }  // namespace dartplant::abi

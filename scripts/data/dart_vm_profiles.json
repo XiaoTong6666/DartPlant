@@ -137,6 +137,32 @@
         "nullability_bits": 2,
         "type_class_id_shift": 4,
         "type_parameter_function_bit": 4
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
       }
     },
     {
@@ -275,6 +301,32 @@
         "nullability_bits": 1,
         "type_class_id_shift": 3,
         "type_parameter_function_bit": 3
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
       }
     },
     {
@@ -413,6 +465,32 @@
         "nullability_bits": 1,
         "type_class_id_shift": 3,
         "type_parameter_function_bit": 3
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
       }
     }
   ]

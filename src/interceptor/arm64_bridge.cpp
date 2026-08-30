@@ -29,6 +29,49 @@ namespace dartplant {
 
 namespace {
 
+#if defined(__aarch64__)
+std::mutex& PublishedReturnPayloadsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<std::shared_ptr<DartCodePayload>>& PublishedReturnPayloads() {
+    // A published payload-return veneer can be reached by an unhooked sibling
+    // that never contributes to HookRecord::in_flight. Without a process-wide
+    // instruction-fetch grace period there is no proof that it is safe to
+    // munmap the veneer or destroy its DartCodePayload cookie after restoring
+    // the final RET patch. Retain both for process lifetime instead.
+    static auto* payloads = new std::vector<std::shared_ptr<DartCodePayload>>();
+    return *payloads;
+}
+
+bool RetainPublishedReturnPayload(const std::shared_ptr<DartCodePayload>& payload) {
+    if (payload == nullptr) return false;
+    if (payload->return_entry_published) return true;
+    std::lock_guard lock(PublishedReturnPayloadsMutex());
+    if (payload->return_entry_published) return true;
+    try {
+        // Retain before publishing the first branch. If the following code
+        // write fails, keeping this payload is conservative but safe; doing
+        // the allocation after a successful code write would create an OOM
+        // window where a live branch targets an unretained cookie/veneer.
+        PublishedReturnPayloads().push_back(payload);
+    } catch (...) {
+        return false;
+    }
+    payload->return_entry_published = true;
+    return true;
+}
+
+void DestroyUnpublishedReturnEntry(DartCodePayload* payload) {
+    if (payload == nullptr || payload->return_entry == nullptr || payload->return_entry_published)
+        return;
+    DestroyArm64CallbackStub(payload->return_entry, payload->return_entry_size);
+    payload->return_entry = nullptr;
+    payload->return_entry_size = 0;
+}
+#endif
+
 bool IsDartReturn(uint32_t instruction) { return instruction == 0xd65f03c0U; }
 
 bool IsTerminalTrap(uint32_t instruction) {
@@ -353,22 +396,7 @@ void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out
                        : reinterpret_cast<void*>(&dartplant_arm64_callback_entry);
     std::memcpy(reinterpret_cast<uint8_t*>(code) + 24, &common, sizeof(common));
 
-    // Real Dart returns are intercepted before RET so the original LR remains
-    // the actual Dart caller PC for exception unwinding. The RET replacement
-    // branches here; this veneer reloads Hook* after the original body has
-    // freely used x16/x17 and enters the common return dispatcher.
-    if (!synthetic_native) {
-        auto* return_code = code + 16;  // +64 bytes.
-        return_code[0] = 0x58000091;    // ldr x17, +16 (Hook* at +80).
-        return_code[1] = 0x580000b0;    // ldr x16, +20 (common at +88).
-        return_code[2] = 0xd61f0200;    // br x16.
-        return_code[3] = 0xd503201f;    // nop.
-        std::memcpy(reinterpret_cast<uint8_t*>(code) + 80, &hook, sizeof(hook));
-        void* return_common = reinterpret_cast<void*>(&dartplant_arm64_return_entry);
-        std::memcpy(reinterpret_cast<uint8_t*>(code) + 88, &return_common, sizeof(return_common));
-        hook->replacement_return_entry = return_code;
-    }
-    __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code) + 96);
+    __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code) + 32);
     if (mprotect(code, allocation_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(code, allocation_size);
         return nullptr;
@@ -383,114 +411,244 @@ void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out
 #endif
 }
 
+void* CreateArm64PayloadReturnStub(DartCodePayload* payload, uintptr_t target, size_t* out_size) {
+#if defined(__aarch64__)
+    if (payload == nullptr || out_size == nullptr || target == 0) return nullptr;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return nullptr;
+    const size_t allocation_size = static_cast<size_t>(page_size);
+    auto* code =
+        static_cast<uint32_t*>(AllocateCallbackStub(allocation_size, target, kArm64BranchReach));
+    if (code == nullptr) return nullptr;
+    code[0] = 0x58000091;  // ldr x17, +16 (DartCodePayload*).
+    code[1] = 0x580000b0;  // ldr x16, +20 (common dispatcher).
+    code[2] = 0xd61f0200;  // br x16.
+    code[3] = 0xd503201f;  // nop.
+    std::memcpy(reinterpret_cast<uint8_t*>(code) + 16, &payload, sizeof(payload));
+    void* common = reinterpret_cast<void*>(&dartplant_arm64_return_entry);
+    std::memcpy(reinterpret_cast<uint8_t*>(code) + 24, &common, sizeof(common));
+    __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code) + 32);
+    if (mprotect(code, allocation_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, allocation_size);
+        return nullptr;
+    }
+    *out_size = allocation_size;
+    return code;
+#else
+    (void) payload;
+    (void) target;
+    (void) out_size;
+    return nullptr;
+#endif
+}
+
 bool CollectReachableArm64Returns(const uint8_t* code, size_t size, uintptr_t logical_start,
                                   std::vector<Arm64ReturnPatch>* out_returns) {
     if (code == nullptr || out_returns == nullptr || size < sizeof(uint32_t) ||
         (logical_start & 3U) != 0 || (size & 3U) != 0 || logical_start > UINTPTR_MAX - size) {
         return false;
     }
-    out_returns->clear();
-    const size_t instruction_count = size / sizeof(uint32_t);
-    std::vector<uint8_t> visited(instruction_count, 0);
-    std::vector<size_t> pending{0};
-    const uintptr_t logical_end = logical_start + size;
+    try {
+        out_returns->clear();
+        const size_t instruction_count = size / sizeof(uint32_t);
+        std::vector<uint8_t> visited(instruction_count, 0);
+        std::vector<size_t> pending{0};
+        const uintptr_t logical_end = logical_start + size;
 
-    const auto enqueue = [&](uintptr_t target, std::vector<size_t>* worklist) -> bool {
-        if (target < logical_start || target >= logical_end || (target & 3U) != 0) return false;
-        const size_t index = static_cast<size_t>((target - logical_start) / sizeof(uint32_t));
-        if (index >= instruction_count) return false;
-        worklist->push_back(index);
-        return true;
-    };
+        const auto enqueue = [&](uintptr_t target, std::vector<size_t>* worklist) -> bool {
+            if (target < logical_start || target >= logical_end || (target & 3U) != 0) return false;
+            const size_t index = static_cast<size_t>((target - logical_start) / sizeof(uint32_t));
+            if (index >= instruction_count) return false;
+            worklist->push_back(index);
+            return true;
+        };
 
-    while (!pending.empty()) {
-        const size_t index = pending.back();
-        pending.pop_back();
-        if (visited[index] != 0) continue;
-        visited[index] = 1;
-        uint32_t instruction = 0;
-        std::memcpy(&instruction, code + index * sizeof(uint32_t), sizeof(instruction));
-        const uintptr_t pc = logical_start + index * sizeof(uint32_t);
-        if (IsDartReturn(instruction)) {
-            out_returns->push_back({.address = pc, .original_instruction = instruction});
-            continue;
-        }
-        if (IsTerminalTrap(instruction)) continue;
-        if (IsIndirectBranch(instruction)) return false;
-
-        int64_t branch_delta = 0;
-        bool conditional = false;
-        if (DecodeDirectBranch(instruction, &branch_delta, &conditional)) {
-            const int64_t signed_pc = static_cast<int64_t>(pc);
-            const int64_t signed_target = signed_pc + branch_delta;
-            if (signed_target < 0 || !enqueue(static_cast<uintptr_t>(signed_target), &pending)) {
-                return false;
+        while (!pending.empty()) {
+            const size_t index = pending.back();
+            pending.pop_back();
+            if (visited[index] != 0) continue;
+            visited[index] = 1;
+            uint32_t instruction = 0;
+            std::memcpy(&instruction, code + index * sizeof(uint32_t), sizeof(instruction));
+            const uintptr_t pc = logical_start + index * sizeof(uint32_t);
+            if (IsDartReturn(instruction)) {
+                out_returns->push_back({.address = pc, .original_instruction = instruction});
+                continue;
             }
-            if (!conditional) continue;
-        }
+            if (IsTerminalTrap(instruction)) continue;
+            if (IsIndirectBranch(instruction)) return false;
 
-        // BL/BLR are returning calls, so their only intra-Function successor is
-        // the fallthrough instruction. All ordinary instructions fall through
-        // as well. Reaching the end without a RET/taken B is an unsupported
-        // tail exit rather than permission to scan into an adjacent Code body.
-        if (index + 1 >= instruction_count) return false;
-        pending.push_back(index + 1);
+            int64_t branch_delta = 0;
+            bool conditional = false;
+            if (DecodeDirectBranch(instruction, &branch_delta, &conditional)) {
+                const int64_t signed_pc = static_cast<int64_t>(pc);
+                const int64_t signed_target = signed_pc + branch_delta;
+                if (signed_target < 0 ||
+                    !enqueue(static_cast<uintptr_t>(signed_target), &pending)) {
+                    return false;
+                }
+                if (!conditional) continue;
+            }
+
+            // BL/BLR are returning calls, so their only intra-Function successor is
+            // the fallthrough instruction. All ordinary instructions fall through
+            // as well. Reaching the end without a RET/taken B is an unsupported
+            // tail exit rather than permission to scan into an adjacent Code body.
+            if (index + 1 >= instruction_count) return false;
+            pending.push_back(index + 1);
+        }
+        std::sort(out_returns->begin(), out_returns->end(),
+                  [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
+                      return left.address < right.address;
+                  });
+        out_returns->erase(
+            std::unique(out_returns->begin(), out_returns->end(),
+                        [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
+                            return left.address == right.address;
+                        }),
+            out_returns->end());
+        return !out_returns->empty();
+    } catch (...) {
+        out_returns->clear();
+        return false;
     }
-    std::sort(out_returns->begin(), out_returns->end(),
-              [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
-                  return left.address < right.address;
-              });
-    out_returns->erase(std::unique(out_returns->begin(), out_returns->end(),
-                                   [](const Arm64ReturnPatch& left, const Arm64ReturnPatch& right) {
-                                       return left.address == right.address;
-                                   }),
-                       out_returns->end());
-    return !out_returns->empty();
 }
 
 DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook) {
 #if defined(__aarch64__)
-    if (hook == nullptr || hook->code_target == nullptr ||
-        hook->replacement_return_entry == nullptr || hook->code_target->entry == 0 ||
-        hook->code_target->code_size < sizeof(uint32_t)) {
+    if (hook == nullptr || hook->code_target == nullptr || hook->code_target->payload == nullptr ||
+        hook->code_target->entry == 0 || hook->code_target->code_size < sizeof(uint32_t)) {
         SetLastError("Dart callback hook has no exact code range for exception-safe returns");
         return DARTPLANT_UNSUPPORTED_ABI;
     }
+    auto payload = hook->code_target->payload;
+    std::lock_guard payload_lock(payload->mutex);
     const uintptr_t start = hook->code_target->entry;
     const uintptr_t end = start + hook->code_target->code_size;
-    if (end <= start || (start & 3U) != 0) {
+    const uintptr_t payload_end = payload->end();
+    if (end <= start || (start & 3U) != 0 || payload_end == 0 || end > payload_end ||
+        !payload->Contains(start, hook->code_target->code_size) ||
+        payload->pristine_bytes.size() != payload->instructions_length) {
         SetLastError("Dart callback code range is invalid");
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    if (payload->return_entry == nullptr) {
+        payload->return_entry = CreateArm64PayloadReturnStub(payload.get(), payload->start,
+                                                             &payload->return_entry_size);
+        if (payload->return_entry == nullptr) {
+            SetLastError("failed to allocate payload-level ARM64 return veneer");
+            return DARTPLANT_HOOK_FAILED;
+        }
+    }
 
     std::vector<Arm64ReturnPatch> candidates;
-    if (!CollectReachableArm64Returns(reinterpret_cast<const uint8_t*>(start), end - start, start,
-                                      &candidates)) {
+    const size_t pristine_offset = static_cast<size_t>(start - payload->start);
+    if (!CollectReachableArm64Returns(payload->pristine_bytes.data() + pristine_offset, end - start,
+                                      start, &candidates)) {
         SetLastError(
             "Dart callback entry has no complete reachable ARM64 RET graph; indirect/tail exits fail closed");
+        if (payload->return_interception_consumers == 0 && payload->return_patches.empty()) {
+            DestroyUnpublishedReturnEntry(payload.get());
+        }
         return DARTPLANT_UNSUPPORTED_ABI;
     }
 
-    const uintptr_t return_entry = reinterpret_cast<uintptr_t>(hook->replacement_return_entry);
-    hook->return_patches.clear();
+    const uintptr_t return_entry = reinterpret_cast<uintptr_t>(payload->return_entry);
+    std::vector<Arm64ReturnPatch> newly_installed;
+    std::vector<Arm64ReturnPatch*> existing_consumed;
+    std::vector<uintptr_t> acquired_sites;
+    std::vector<Arm64ReturnPatch> residual;
+    try {
+        newly_installed.reserve(candidates.size());
+        existing_consumed.reserve(candidates.size());
+        acquired_sites.reserve(candidates.size());
+        residual.reserve(candidates.size());
+        if (candidates.size() >
+            payload->return_patches.max_size() - payload->return_patches.size()) {
+            SetLastError("too many ARM64 Dart return interception sites");
+            if (payload->return_interception_consumers == 0 && payload->return_patches.empty()) {
+                DestroyUnpublishedReturnEntry(payload.get());
+            }
+            return DARTPLANT_HOOK_FAILED;
+        }
+        payload->return_patches.reserve(payload->return_patches.size() + candidates.size());
+    } catch (...) {
+        SetLastError("failed to reserve ARM64 Dart return interception ownership");
+        if (payload->return_interception_consumers == 0 && payload->return_patches.empty()) {
+            DestroyUnpublishedReturnEntry(payload.get());
+        }
+        return DARTPLANT_HOOK_FAILED;
+    }
+    const auto rollback_newly_installed = [&](const char* error) {
+        residual.clear();
+        bool clean_rollback = true;
+        for (auto it = newly_installed.rbegin(); it != newly_installed.rend(); ++it) {
+            uint32_t current = 0;
+            std::memcpy(&current, reinterpret_cast<const void*>(it->address), sizeof(current));
+            if (current == it->original_instruction) continue;
+            if (current == it->patched_instruction &&
+                WriteExecutableInstruction(it->address, it->original_instruction)) {
+                continue;
+            }
+            clean_rollback = false;
+            std::memcpy(&current, reinterpret_cast<const void*>(it->address), sizeof(current));
+            if (current == it->patched_instruction) residual.push_back(*it);
+        }
+        if (!residual.empty()) {
+            hook->payload_return_sites.clear();
+            for (auto& patch : residual) {
+                patch.consumers = 1;
+                hook->payload_return_sites.push_back(patch.address);
+                payload->return_patches.push_back(patch);
+            }
+            hook->payload_return_consumer = true;
+            ++payload->return_interception_consumers;
+        }
+        if (payload->return_interception_consumers == 0 && payload->return_patches.empty()) {
+            DestroyUnpublishedReturnEntry(payload.get());
+        }
+        SetLastError(
+            clean_rollback
+                ? error
+                : "ARM64 Dart return interception failed and could not be fully rolled back");
+        return DARTPLANT_HOOK_FAILED;
+    };
     for (const auto& candidate : candidates) {
+        auto existing = std::find_if(payload->return_patches.begin(), payload->return_patches.end(),
+                                     [&candidate](const Arm64ReturnPatch& patch) {
+                                         return patch.address == candidate.address;
+                                     });
         uint32_t current = 0;
         std::memcpy(&current, reinterpret_cast<const void*>(candidate.address), sizeof(current));
+        if (existing != payload->return_patches.end()) {
+            if (existing->original_instruction != candidate.original_instruction ||
+                existing->consumers == 0 || current != existing->patched_instruction) {
+                return rollback_newly_installed(
+                    "existing payload RET patch no longer matches managed ownership");
+            }
+            existing_consumed.push_back(&*existing);
+            acquired_sites.push_back(candidate.address);
+            continue;
+        }
         uint32_t branch = 0;
         if (current != candidate.original_instruction ||
             !EncodeDirectBranch(candidate.address, return_entry, &branch) ||
+            !RetainPublishedReturnPayload(payload) ||
             !WriteExecutableInstruction(candidate.address, branch)) {
-            for (auto it = hook->return_patches.rbegin(); it != hook->return_patches.rend(); ++it) {
-                (void) WriteExecutableInstruction(it->address, it->original_instruction);
-            }
-            hook->return_patches.clear();
-            SetLastError("failed to install ARM64 Dart return interception");
-            return DARTPLANT_HOOK_FAILED;
+            return rollback_newly_installed("failed to install ARM64 Dart return interception");
         }
         Arm64ReturnPatch installed = candidate;
         installed.patched_instruction = branch;
-        hook->return_patches.push_back(installed);
+        installed.consumers = 1;
+        newly_installed.push_back(installed);
+        acquired_sites.push_back(candidate.address);
     }
+    for (Arm64ReturnPatch* patch : existing_consumed) ++patch->consumers;
+    payload->return_patches.insert(payload->return_patches.end(), newly_installed.begin(),
+                                   newly_installed.end());
+    ++payload->return_interception_consumers;
+    hook->payload_return_consumer = true;
+    hook->payload_return_sites = std::move(acquired_sites);
     return DARTPLANT_OK;
 #else
     (void) hook;
@@ -502,12 +660,73 @@ DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook) {
 bool RestoreArm64ReturnInterception(DartPlantHook* hook) {
 #if defined(__aarch64__)
     if (hook == nullptr) return false;
-    bool ok = true;
-    for (auto it = hook->return_patches.rbegin(); it != hook->return_patches.rend(); ++it) {
-        if (!WriteExecutableInstruction(it->address, it->original_instruction)) ok = false;
+    if (!hook->payload_return_consumer) return true;
+    if (hook->code_target == nullptr || hook->code_target->payload == nullptr) return false;
+    auto payload = hook->code_target->payload;
+    std::lock_guard payload_lock(payload->mutex);
+    if (payload->return_interception_consumers == 0 || hook->payload_return_sites.empty()) {
+        return false;
     }
-    if (ok) hook->return_patches.clear();
-    return ok;
+
+    std::vector<Arm64ReturnPatch> restore_sites;
+    for (uintptr_t address : hook->payload_return_sites) {
+        const auto patch = std::find_if(
+            payload->return_patches.begin(), payload->return_patches.end(),
+            [address](const Arm64ReturnPatch& value) { return value.address == address; });
+        if (patch == payload->return_patches.end() || patch->consumers == 0) return false;
+        uint32_t current = 0;
+        std::memcpy(&current, reinterpret_cast<const void*>(patch->address), sizeof(current));
+        // Even a shared site must still contain the branch DartPlant owns
+        // before this consumer is allowed to relinquish ownership. Otherwise a
+        // foreign writer could make the refcount lie and the final consumer
+        // would later restore over somebody else's code.
+        if (current != patch->patched_instruction) return false;
+        if (patch->consumers == 1) restore_sites.push_back(*patch);
+    }
+
+    std::vector<Arm64ReturnPatch> restored;
+    for (const auto& patch : restore_sites) {
+        uint32_t current = 0;
+        std::memcpy(&current, reinterpret_cast<const void*>(patch.address), sizeof(current));
+        if (current != patch.patched_instruction ||
+            !WriteExecutableInstruction(patch.address, patch.original_instruction)) {
+            bool rollback_ok = true;
+            for (auto it = restored.rbegin(); it != restored.rend(); ++it) {
+                if (!WriteExecutableInstruction(it->address, it->patched_instruction)) {
+                    rollback_ok = false;
+                }
+            }
+            if (!rollback_ok) {
+                SetLastError("failed to roll back partial ARM64 Dart return restoration");
+            }
+            return false;
+        }
+        restored.push_back(patch);
+    }
+
+    for (uintptr_t address : hook->payload_return_sites) {
+        auto patch = std::find_if(
+            payload->return_patches.begin(), payload->return_patches.end(),
+            [address](const Arm64ReturnPatch& value) { return value.address == address; });
+        if (patch == payload->return_patches.end() || patch->consumers == 0) return false;
+        --patch->consumers;
+    }
+    payload->return_patches.erase(
+        std::remove_if(payload->return_patches.begin(), payload->return_patches.end(),
+                       [](const Arm64ReturnPatch& patch) { return patch.consumers == 0; }),
+        payload->return_patches.end());
+    --payload->return_interception_consumers;
+    hook->payload_return_consumer = false;
+    hook->payload_return_sites.clear();
+    if (payload->return_interception_consumers == 0) {
+        if (!payload->return_patches.empty()) return false;
+        // Do not unmap a veneer that has ever been made reachable from live
+        // Dart code. An unhooked sibling can fetch the managed branch without
+        // participating in HookRecord::in_flight, so there is no local grace
+        // period proving that executable page (or its payload cookie) unused.
+        DestroyUnpublishedReturnEntry(payload.get());
+    }
+    return true;
 #else
     (void) hook;
     return true;

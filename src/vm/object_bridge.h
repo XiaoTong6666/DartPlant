@@ -22,6 +22,8 @@ struct DartPlantVmAdapter {
     uint32_t entered = 0;
     uint64_t live_handles = 0;
     uint64_t hook_refs = 0;
+    uint64_t generated_root_leases = 0;
+    uint32_t generated_native_transitions = 0;
     std::vector<DartPlantObjectHandle*> released_handles;
     bool attached = false;
     bool isolate_entered = false;
@@ -40,8 +42,24 @@ struct DartPlantObjectHandle {
 namespace dartplant {
 
 bool VmAdapterIsEntered(DartPlantVmAdapter* adapter);
+bool VmAdapterSupportsGeneratedRootBridge(const DartPlantVmAdapter* adapter);
+bool VmAdapterSupportsGeneratedCallbackBridge(const DartPlantVmAdapter* adapter);
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter);
 void VmAdapterReleaseHook(DartPlantVmAdapter* adapter);
+DartPlantStatus VmAdapterPinGeneratedRoots(DartPlantVmAdapter* adapter, const uint64_t* raw_values,
+                                           uint32_t value_count, void** out_root_lease);
+DartPlantStatus VmAdapterGeneratedRootGet(DartPlantVmAdapter* adapter, void* root_lease,
+                                          uint32_t index, uint64_t* out_raw);
+DartPlantStatus VmAdapterGeneratedRootSet(DartPlantVmAdapter* adapter, void* root_lease,
+                                          uint32_t index, uint64_t raw);
+DartPlantStatus VmAdapterUnpinGeneratedRoots(DartPlantVmAdapter* adapter, void* root_lease,
+                                             uint64_t* out_raw_values, uint32_t value_count);
+DartPlantStatus VmAdapterEnterGeneratedToNative(DartPlantVmAdapter* adapter,
+                                                const DartPlantGeneratedTransitionFrame* frame,
+                                                void* root_lease);
+DartPlantStatus VmAdapterLeaveNativeToGenerated(DartPlantVmAdapter* adapter,
+                                                const DartPlantGeneratedTransitionFrame* frame,
+                                                void* root_lease);
 DartPlantStatus VmAdapterRetainObject(DartPlantVmAdapter* adapter, uint64_t raw,
                                       DartPlantObjectStrength strength,
                                       DartPlantObjectHandle** out_handle);

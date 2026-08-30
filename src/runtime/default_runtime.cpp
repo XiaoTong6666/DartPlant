@@ -625,7 +625,7 @@ DartPlantStatus dartplant_init(const DartPlantInitInfo* info) {
         info->version != DARTPLANT_INIT_API_VERSION ||
         !dartplant::ValidArtifactBundle(info->artifact_bundle) ||
         (info->host_api != nullptr &&
-         (info->host_api->struct_size < sizeof(DartPlantHostApi) ||
+         (info->host_api->struct_size < DARTPLANT_HOST_API_LEGACY_SIZE ||
           info->host_api->version < DARTPLANT_HOST_API_VERSION || info->host_api->hook == nullptr ||
           info->host_api->unhook == nullptr))) {
         dartplant::SetLastError("DartPlant init info is invalid or unsupported");

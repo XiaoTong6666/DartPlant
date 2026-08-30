@@ -123,7 +123,7 @@ struct DartPlantRuntime {
     uint64_t live_vm_bool_true_value = 0;
     uint64_t live_vm_bool_false_value = 0;
     std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
-    dartplant::DartCodeTargetRegistry code_targets;
+    dartplant::DartEntryTargetRegistry entry_targets;
     std::vector<dartplant::RuntimeAbiEvidenceEntry> abi_evidence;
     DartPlantResolutionDiagnostics diagnostics{};
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
@@ -153,7 +153,7 @@ DartPlantStatus ReplaceRuntimeArtifactSnapshotIndex(DartPlantRuntime* runtime,
 struct DartPlantInvocation {
     DartPlantHook* hook = nullptr;
     const DartPlantMethod* requested_method = nullptr;
-    std::shared_ptr<dartplant::DartCodeTarget> code_target;
+    std::shared_ptr<dartplant::DartEntryTarget> code_target;
     std::vector<dartplant::DartMethodIdentity> code_alias_snapshot;
     const DartPlantRuntimeProfile* profile = nullptr;
     const dartplant::abi::DartCallLayout* call_layout = nullptr;
@@ -167,6 +167,7 @@ struct DartPlantInvocation {
     bool identity_ambiguous = false;
     bool closure_receiver_in_x0 = false;
     bool vm_scope_entered = false;
+    bool generated_vm_bridge_active = false;
     bool skip_original = false;
     bool call_original = false;
     bool original_called = false;
@@ -182,7 +183,11 @@ extern "C" uint8_t dartplant_arm64_prepare_invoke_original_frame(uintptr_t nativ
 
 extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_hook(
     DartPlantHook* hook, uint64_t result0, uint64_t result1, uint64_t fp_result_bits,
-    uintptr_t return_lr);
+    uintptr_t return_lr, uintptr_t return_spreg, uintptr_t return_fp);
+
+extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_from_payload(
+    dartplant::DartCodePayload* payload, uint64_t result0, uint64_t result1,
+    uint64_t fp_result_bits, uintptr_t return_lr, uintptr_t return_spreg, uintptr_t return_fp);
 
 extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
                                                           uintptr_t target_fp);

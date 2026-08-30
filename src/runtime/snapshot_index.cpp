@@ -173,6 +173,8 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
             offsetof(DartPlantSnapshotFunctionInfo, code_identity_proof);
         constexpr size_t kSnapshotFunctionV2Size =
             offsetof(DartPlantSnapshotFunctionInfo, function_kind);
+        constexpr size_t kSnapshotFunctionV3Size =
+            offsetof(DartPlantSnapshotFunctionInfo, code_payload_va);
         if (function.struct_size < kSnapshotFunctionV1Size || function.library_uri == nullptr ||
             function.function_name == nullptr || function.entry_va == 0 ||
             function.code_size == 0 || function.code_section_va > function.entry_va) {
@@ -187,9 +189,28 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
         }
         uint32_t function_kind = 0;
         bool closure_call_entry_only = false;
-        if (function.struct_size >= sizeof(function)) {
+        if (function.struct_size >= kSnapshotFunctionV3Size) {
             function_kind = function.function_kind;
             closure_call_entry_only = function.closure_call_entry_only != 0;
+        }
+        uint64_t code_payload_va = 0;
+        uint32_t code_instructions_length = 0;
+        if (function.struct_size >= sizeof(function)) {
+            if (function.code_instructions_length > UINT32_MAX) {
+                if (error != nullptr) *error = "snapshot Code payload is too large";
+                return std::nullopt;
+            }
+            code_payload_va = function.code_payload_va;
+            code_instructions_length = static_cast<uint32_t>(function.code_instructions_length);
+            if ((code_payload_va == 0) != (code_instructions_length == 0) ||
+                (code_payload_va != 0 &&
+                 (code_payload_va > function.entry_va ||
+                  function.entry_va - code_payload_va >= code_instructions_length ||
+                  function.code_size !=
+                      code_instructions_length - (function.entry_va - code_payload_va)))) {
+                if (error != nullptr) *error = "snapshot Code payload identity is inconsistent";
+                return std::nullopt;
+            }
         }
         if ((identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE && physical_entry_alias_count != 1) ||
             (identity_proof == DARTPLANT_CODE_IDENTITY_SHARED && physical_entry_alias_count < 2) ||
@@ -209,6 +230,8 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
             .code_size = function.code_size,
             .code_section_va = function.code_section_va,
             .fingerprint = function.fingerprint == nullptr ? "" : function.fingerprint,
+            .code_payload_va = code_payload_va,
+            .code_instructions_length = code_instructions_length,
             .physical_entry_alias_count = physical_entry_alias_count,
             .code_identity_proof = identity_proof,
             .function_kind = function_kind,

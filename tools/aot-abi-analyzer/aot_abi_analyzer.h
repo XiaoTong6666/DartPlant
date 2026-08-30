@@ -67,7 +67,7 @@ struct AnalysisResult {
     size_t address_materialization_count = 0;
 };
 
-// Generic relationship proof for already identity-bound Dart CodeTargets.
+// Generic relationship proof for already identity-bound Dart entry targets.
 // Candidate discovery and relationship proof are deliberately separate: scan
 // order is never used to pick a winner, and zero or multiple matches fail
 // closed. This is the reusable form of the relationship/uniqueness technique

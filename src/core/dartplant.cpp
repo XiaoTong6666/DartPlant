@@ -99,7 +99,7 @@ const char* LastError() {
 extern "C" {
 
 DartPlantStatus dartplant_install_host_api(const DartPlantHostApi* api) {
-    if (api == nullptr || api->struct_size < sizeof(DartPlantHostApi) ||
+    if (api == nullptr || api->struct_size < DARTPLANT_HOST_API_LEGACY_SIZE ||
         api->version < DARTPLANT_HOST_API_VERSION || api->hook == nullptr ||
         api->unhook == nullptr) {
         dartplant::SetLastError("host API version or function pointers are invalid");
@@ -132,7 +132,7 @@ void dartplant_reset(void) {
     std::lock_guard lock(state.mutex);
     state.metadata.reset();
     state.modules.clear();
-    state.code_targets.Clear();
+    state.entry_targets.Clear();
     dartplant::ClearLastError();
 }
 
@@ -199,7 +199,7 @@ DartPlantStatus dartplant_find_method(const DartPlantMethodQuery* query,
         matches[0]->fingerprint.c_str());
     if (validation != DARTPLANT_OK) return validation;
 
-    auto code_target = state.code_targets.GetOrCreate(*target, matches[0]->code_size);
+    auto code_target = state.entry_targets.GetOrCreate(*target, matches[0]->code_size);
     if (code_target == nullptr) {
         dartplant::SetLastError("method resolver produced an invalid code target");
         return DARTPLANT_METHOD_NOT_FOUND;

@@ -201,7 +201,7 @@ void ReleaseRuntimeOperation(std::shared_ptr<RuntimeRegistration>* registration)
 }
 
 DartPlantStatus ResolveLiveIndexedRuntimeMethod(
-    const SnapshotIndex& index, const ModuleImage& module, DartCodeTargetRegistry& code_targets,
+    const SnapshotIndex& index, const ModuleImage& module, DartEntryTargetRegistry& entry_targets,
     const DartPlantMethodQuery& query,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
     uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
@@ -239,11 +239,12 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     method_record.address = record->runtime_entry;
     method_record.code_size = static_cast<uint32_t>(record->code_size);
 
-    auto code_target =
-        code_targets.GetOrCreate(record->runtime_entry, static_cast<uint32_t>(record->code_size),
-                                 record->code_object, record->entry_alias_count);
+    auto code_target = entry_targets.GetOrCreate(
+        record->runtime_entry, static_cast<uint32_t>(record->code_size), record->code_object,
+        record->entry_alias_count, DARTPLANT_CODE_IDENTITY_UNKNOWN,
+        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length);
     if (code_target == nullptr) {
-        SetLastError("live Function index produced an invalid CodeTarget");
+        SetLastError("live Function index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
     auto function = std::make_shared<DartFunctionHandle>();
@@ -252,7 +253,12 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     function->code_object = record->code_object;
     function->source = DartFunctionSource::kLiveVm;
     function->function_kind = record->function_kind;
-    function->closure_call_entry_only = record->function_kind == 1 || record->function_kind == 2;
+    if (const RuntimeProfileRecord* profile = FindRuntimeProfileBySnapshot(index.snapshot_hash);
+        profile != nullptr) {
+        function->runtime_profile_version = profile->live_vm.profile_version;
+    }
+    function->closure_call_entry_only =
+        IsClosureFunctionKind(function->runtime_profile_version, record->function_kind);
     function->thread_jump_to_frame_entry_point_offset =
         ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
     function->code_target = code_target;
@@ -271,7 +277,7 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
 
 DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     const SnapshotIndex& index, const FlutterSnapshotSource& snapshot, const ModuleImage& module,
-    DartCodeTargetRegistry& code_targets, const DartPlantMethodQuery& query,
+    DartEntryTargetRegistry& entry_targets, const DartPlantMethodQuery& query,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
     uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
     bool ambiguous = false;
@@ -316,17 +322,22 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     method_record.code_size = static_cast<uint32_t>(record->code_size);
     method_record.fingerprint = record->fingerprint;
 
-    auto code_target = code_targets.GetOrCreate(
+    auto code_target = entry_targets.GetOrCreate(
         record->runtime_entry, static_cast<uint32_t>(record->code_size), 0,
-        std::max<uint32_t>(1, record->entry_alias_count), record->code_identity_proof);
+        std::max<uint32_t>(1, record->entry_alias_count), record->code_identity_proof,
+        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length);
     if (code_target == nullptr) {
-        SetLastError("artifact snapshot index produced an invalid CodeTarget");
+        SetLastError("artifact snapshot index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
     function->source = DartFunctionSource::kOfflineSnapshotIndex;
     function->function_kind = record->function_kind;
+    if (const RuntimeProfileRecord* profile = FindRuntimeProfileBySnapshot(index.snapshot_hash);
+        profile != nullptr) {
+        function->runtime_profile_version = profile->live_vm.profile_version;
+    }
     function->closure_call_entry_only = record->closure_call_entry_only;
     function->thread_jump_to_frame_entry_point_offset =
         ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
@@ -356,6 +367,8 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         return DARTPLANT_PROFILE_MISMATCH;
     }
 
+    const RuntimeProfileRecord* vm_profile = FindRuntimeProfileBySnapshot(index->snapshot_hash);
+
     std::unordered_map<uintptr_t, DartPlantCodeIdentityProof> identity_proofs;
     std::unordered_map<uintptr_t, uint32_t> physical_alias_counts;
     for (auto& record : index->functions) {
@@ -365,7 +378,18 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
             SetLastError("artifact snapshot index contains an unsupported or incomplete record");
             return DARTPLANT_METADATA_INVALID;
         }
-        const bool closure_kind = record.function_kind == 1 || record.function_kind == 2;
+        bool closure_kind = false;
+        if (vm_profile != nullptr) {
+            closure_kind =
+                IsClosureFunctionKind(vm_profile->live_vm.profile_version, record.function_kind);
+        } else if (record.function_kind != 0 || record.closure_call_entry_only) {
+            // Ordinary V1/V2 artifacts and synthetic tests do not require VM
+            // private Function-kind knowledge. Any artifact that claims a
+            // non-regular kind, however, needs an exact profile so closure
+            // entry/stack semantics can be source-verified rather than guessed.
+            SetLastError("artifact Function kind requires an exact Dart VM runtime profile");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
         if (record.closure_call_entry_only != closure_kind ||
             (closure_kind && record.entry_kind != DARTPLANT_ENTRY_DEFAULT)) {
             SetLastError("artifact closure entry evidence contradicts Dart PRODUCT AOT semantics");
@@ -379,6 +403,8 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
                 existing->functions.begin(), existing->functions.end(), [&record](const auto& old) {
                     return old.entry_va == record.entry_va && old.code_size == record.code_size &&
                            old.code_section_va == record.code_section_va &&
+                           old.code_payload_va == record.code_payload_va &&
+                           old.code_instructions_length == record.code_instructions_length &&
                            old.fingerprint == record.fingerprint && old.runtime_entry != 0;
                 });
             if (found != existing->functions.end()) reusable = &*found;
@@ -407,6 +433,25 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         }
         record.runtime_entry = runtime_entry;
         record.code_entry = runtime_entry;
+        if (record.code_payload_va != 0) {
+            const auto resolved_payload =
+                snapshot.ResolveInstructionVa(module, record.code_payload_va);
+            if (!resolved_payload.has_value() || record.code_instructions_length == 0 ||
+                !module.ContainsExecutable(*resolved_payload, record.code_instructions_length) ||
+                runtime_entry < *resolved_payload ||
+                runtime_entry - *resolved_payload >= record.code_instructions_length ||
+                record.code_size !=
+                    record.code_instructions_length - (runtime_entry - *resolved_payload)) {
+                SetLastError("artifact Code payload identity does not match the live image");
+                return DARTPLANT_PROFILE_MISMATCH;
+            }
+            record.code_payload_start = *resolved_payload;
+        } else {
+            // Compatibility with V1/V2 sidecars: without explicit payload
+            // identity the selected entry is conservatively its own payload.
+            record.code_payload_start = runtime_entry;
+            record.code_instructions_length = static_cast<uint32_t>(record.code_size);
+        }
 
         const auto proof = identity_proofs.find(runtime_entry);
         if (proof == identity_proofs.end()) {
@@ -606,7 +651,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         } else {
             invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         }
-        runtime->code_targets.Clear();
+        runtime->entry_targets.Clear();
         runtime->abi_evidence.clear();
         runtime->snapshot.reset();
         runtime->live_vm_context.reset();
@@ -660,7 +705,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         } else {
             hook_invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         }
-        runtime->code_targets.Clear();
+        runtime->entry_targets.Clear();
         runtime->abi_evidence.clear();
         runtime->snapshot = std::move(snapshot);
         runtime->live_vm_context.reset();
@@ -811,7 +856,7 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
                              context, validated_null_value, bool_true_value, bool_false_value)) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
         const DartPlantStatus invalidation_status = InvalidateRuntimeHooks(runtime->generation);
-        runtime->code_targets.Clear();
+        runtime->entry_targets.Clear();
         runtime->abi_evidence.clear();
         if (invalidation_status != DARTPLANT_OK) {
             runtime->state = DARTPLANT_RUNTIME_FAILED;
@@ -1033,10 +1078,18 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         invocation->requested_method->function != nullptr &&
         invocation->requested_method->function->code_target != nullptr) {
         auto& function = *invocation->requested_method->function;
+        if (!function.code_target->MergeEvidence(
+                dartplant::MethodCodeSize(invocation->requested_method), probe.code,
+                probe.entry_alias_count)) {
+            dartplant::SetLastError(
+                "live VM Code identity contradicts the existing physical entry certificate");
+            dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_CODE_TARGET,
+                                             DARTPLANT_RESOLVE_REJECTED, DARTPLANT_PROFILE_MISMATCH,
+                                             DARTPLANT_REJECT_ARTIFACT_MISMATCH);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
         function.function_object = probe.function;
         function.code_object = probe.code;
-        function.code_target->Update(dartplant::MethodCodeSize(invocation->requested_method),
-                                     probe.code, probe.entry_alias_count);
         dartplant::DartMethodIdentity live_identity = {
             .library_uri = probe.library_uri,
             .class_name = probe.class_name,
@@ -1359,7 +1412,12 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
     }
     info.entry_alias_count = info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
     info.entry_is_shared = info.entry_alias_count > 1 ? 1 : 0;
-    info.closure_call_entry_only = source->function_kind == 1 || source->function_kind == 2 ? 1 : 0;
+    info.closure_call_entry_only =
+        runtime->live_vm_context.has_value() &&
+                dartplant::IsClosureFunctionKind(runtime->live_vm_context->profile_version,
+                                                 source->function_kind)
+            ? 1
+            : 0;
     std::snprintf(info.library_uri, sizeof(info.library_uri), "%s", source->library_uri.c_str());
     std::snprintf(info.class_name, sizeof(info.class_name), "%s", source->class_name.c_str());
     std::snprintf(info.function_name, sizeof(info.function_name), "%s",
@@ -1511,13 +1569,16 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         dartplant::SetLastError("runtime method query is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const DartPlantStatus artifact_status = dartplant::BindRegisteredArtifactIndexIfReady(runtime);
-    if (artifact_status != DARTPLANT_OK) return artifact_status;
     auto operation = dartplant::AcquireRuntimeOperation(runtime);
     if (!operation) {
         dartplant::SetLastError("runtime is closing or destroyed");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
+    // Artifact binding reads and mutates runtime state, so it must be covered
+    // by the same lifetime lease as the lookup itself. Acquiring this after the
+    // bind leaves a destroy race before runtime->mutex is first touched.
+    const DartPlantStatus artifact_status = dartplant::BindRegisteredArtifactIndexIfReady(runtime);
+    if (artifact_status != DARTPLANT_OK) return artifact_status;
     std::unique_lock lock(runtime->mutex);
     dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
                                      DARTPLANT_RESOLVE_IN_PROGRESS, DARTPLANT_OK);
@@ -1546,14 +1607,14 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
     if (runtime->state == DARTPLANT_RUNTIME_READY && runtime->live_vm_context.has_value() &&
         runtime->live_snapshot_index.has_value()) {
         status = dartplant::ResolveLiveIndexedRuntimeMethod(
-            *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->code_targets,
+            *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->entry_targets,
             *query, runtime->generation, runtime->generation->load(std::memory_order_acquire),
             out_method);
     }
     if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->artifact_snapshot_index.has_value()) {
         status = dartplant::ResolveArtifactIndexedRuntimeMethod(
             *runtime->artifact_snapshot_index, *runtime->snapshot, *runtime->selected_app_module,
-            runtime->code_targets, *query, runtime->generation,
+            runtime->entry_targets, *query, runtime->generation,
             runtime->generation->load(std::memory_order_acquire), out_method);
     }
     if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->state != DARTPLANT_RUNTIME_READY) {

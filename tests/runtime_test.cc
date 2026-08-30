@@ -5,6 +5,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -70,6 +71,16 @@ struct FakeVmState {
     int scope_leaves = 0;
     int retains = 0;
     int releases = 0;
+    int generated_pins = 0;
+    int generated_unpins = 0;
+    int generated_enters = 0;
+    int generated_leaves = 0;
+    bool fail_generated_leave = false;
+    DartPlantGeneratedTransitionFrame last_transition{};
+};
+
+struct FakeGeneratedRootLease {
+    std::vector<uint64_t> values;
 };
 
 DartPlantStatus FakeEnter(void* user_data, const DartPlantIsolateIdentity*) {
@@ -121,6 +132,81 @@ DartPlantStatus FakeRaw(void*, const DartPlantIsolateIdentity*, void* backend_ha
 DartPlantStatus FakeAlive(void*, const DartPlantIsolateIdentity*, void* backend_handle,
                           uint8_t* out_alive) {
     *out_alive = static_cast<FakeVmObject*>(backend_handle)->alive;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakePinGeneratedRoots(void* user_data, const DartPlantIsolateIdentity*,
+                                      const uint64_t* raw_values, uint32_t value_count,
+                                      void** out_root_lease) {
+    if (raw_values == nullptr || value_count == 0 || out_root_lease == nullptr) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto* state = static_cast<FakeVmState*>(user_data);
+    ++state->generated_pins;
+    auto* lease = new FakeGeneratedRootLease;
+    lease->values.assign(raw_values, raw_values + value_count);
+    *out_root_lease = lease;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeGeneratedRootGet(void*, const DartPlantIsolateIdentity*, void* root_lease,
+                                     uint32_t index, uint64_t* out_raw) {
+    auto* lease = static_cast<FakeGeneratedRootLease*>(root_lease);
+    if (lease == nullptr || out_raw == nullptr || index >= lease->values.size()) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    *out_raw = lease->values[index];
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeGeneratedRootSet(void*, const DartPlantIsolateIdentity*, void* root_lease,
+                                     uint32_t index, uint64_t raw) {
+    auto* lease = static_cast<FakeGeneratedRootLease*>(root_lease);
+    if (lease == nullptr || index >= lease->values.size()) return DARTPLANT_INVALID_ARGUMENT;
+    lease->values[index] = raw;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeUnpinGeneratedRoots(void* user_data, const DartPlantIsolateIdentity*,
+                                        void* root_lease, uint64_t* out_raw_values,
+                                        uint32_t value_count) {
+    auto* state = static_cast<FakeVmState*>(user_data);
+    auto* lease = static_cast<FakeGeneratedRootLease*>(root_lease);
+    if (lease == nullptr || out_raw_values == nullptr || value_count != lease->values.size()) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ++state->generated_unpins;
+    std::copy(lease->values.begin(), lease->values.end(), out_raw_values);
+    delete lease;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeEnterGeneratedToNative(void* user_data, const DartPlantIsolateIdentity*,
+                                           const DartPlantGeneratedTransitionFrame* frame,
+                                           void* root_lease) {
+    auto* state = static_cast<FakeVmState*>(user_data);
+    if (frame == nullptr || frame->struct_size < sizeof(*frame) || root_lease == nullptr ||
+        (frame->flags & DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME) == 0 ||
+        frame->exit_frame == 0) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ++state->generated_enters;
+    state->last_transition = *frame;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeLeaveNativeToGenerated(void* user_data, const DartPlantIsolateIdentity*,
+                                           const DartPlantGeneratedTransitionFrame* frame,
+                                           void* root_lease) {
+    auto* state = static_cast<FakeVmState*>(user_data);
+    if (frame == nullptr || frame->struct_size < sizeof(*frame) || root_lease == nullptr) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (static_cast<FakeVmState*>(user_data)->fail_generated_leave) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    ++state->generated_leaves;
+    state->last_transition = *frame;
     return DARTPLANT_OK;
 }
 
@@ -221,6 +307,8 @@ int FakeHook(void* target, void*, void** backup) {
     return 0;
 }
 
+int FakeFailHook(void*, void*, void**) { return -1; }
+
 int FakeUnhook(void*) {
     ++g_fake_unhook_calls;
     return 0;
@@ -271,6 +359,7 @@ void InstallTestHost(TestHostHook hook, TestHostUnhook unhook) {
         .user_data = bridge,
         .hook = TestHostHookAdapter,
         .unhook = TestHostUnhookAdapter,
+        .hook_with_publication = nullptr,
     };
     dartplant::InstallHostApi(&api);
 }
@@ -353,8 +442,8 @@ void SeedSyntheticArtifactImage(DartPlantRuntime* runtime, const dartplant::Modu
 
 }  // namespace
 
-TEST_CASE(FunctionHandlesShareCodeTargetByEntry) {
-    dartplant::DartCodeTargetRegistry registry;
+TEST_CASE(FunctionHandlesShareEntryTargetByEntry) {
+    dartplant::DartEntryTargetRegistry registry;
     auto first_target = registry.GetOrCreate(0x123456, 76, 0x7300000011, 2);
     auto second_target = registry.GetOrCreate(0x123456, 76, 0x7300000011, 2);
     EXPECT_TRUE(first_target != nullptr);
@@ -407,7 +496,7 @@ TEST_CASE(FunctionHandlesShareCodeTargetByEntry) {
 }
 
 TEST_CASE(SharedCodeCallbacksFailClosedAndExposeRequestedIdentity) {
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(Replacement);
     target->entry = reinterpret_cast<uintptr_t>(Replacement);
     target->code_size = 16;
@@ -540,6 +629,12 @@ TEST_CASE(VmAdapterOwnsOpaqueObjectLifetime) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
+        .pin_generated_roots = nullptr,
+        .generated_root_get = nullptr,
+        .generated_root_set = nullptr,
+        .unpin_generated_roots = nullptr,
+        .enter_generated_to_native = nullptr,
+        .leave_native_to_generated = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     DartPlantObjectHandle* handle = nullptr;
@@ -569,6 +664,108 @@ TEST_CASE(VmAdapterOwnsOpaqueObjectLifetime) {
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
 }
 
+TEST_CASE(VmAdapterGeneratedCallbackBridgePinsRootsAcrossSafepointTransition) {
+    FakeVmState state{};
+    DartPlantVmAdapterCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.adapter_version = 3;
+    callbacks.enter_isolate = FakeEnter;
+    callbacks.leave_isolate = FakeLeave;
+    callbacks.enter_scope = FakeEnterScope;
+    callbacks.leave_scope = FakeLeaveScope;
+    callbacks.retain_object = FakeRetain;
+    callbacks.release_object = FakeRelease;
+    callbacks.object_kind = FakeKind;
+    callbacks.object_to_raw = FakeRaw;
+    callbacks.object_is_alive = FakeAlive;
+    callbacks.pin_generated_roots = FakePinGeneratedRoots;
+    callbacks.generated_root_get = FakeGeneratedRootGet;
+    callbacks.generated_root_set = FakeGeneratedRootSet;
+    callbacks.unpin_generated_roots = FakeUnpinGeneratedRoots;
+    callbacks.enter_generated_to_native = FakeEnterGeneratedToNative;
+    callbacks.leave_native_to_generated = FakeLeaveNativeToGenerated;
+
+    DartPlantVmAdapter* adapter = nullptr;
+    const DartPlantIsolateIdentity isolate = {31, 32, 33};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    EXPECT_TRUE(dartplant::VmAdapterSupportsGeneratedRootBridge(adapter));
+    EXPECT_TRUE(dartplant::VmAdapterSupportsGeneratedCallbackBridge(adapter));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter, &isolate));
+
+    const uint64_t roots[] = {0x101, 0x201};
+    void* lease = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterPinGeneratedRoots(adapter, roots, 2, &lease));
+    EXPECT_TRUE(lease != nullptr);
+    EXPECT_EQ(1, state.generated_pins);
+
+    DartPlantGeneratedTransitionFrame frame = {
+        .struct_size = sizeof(frame),
+        .flags = DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME,
+        .thread = 0x1000,
+        .dart_sp = 0x2000,
+        .exit_frame = 0x1ff0,
+        .caller_fp = 0x3000,
+        .caller_lr = 0x4000,
+    };
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterEnterGeneratedToNative(adapter, &frame, lease));
+    EXPECT_EQ(1, state.generated_enters);
+    EXPECT_EQ(frame.thread, state.last_transition.thread);
+    EXPECT_EQ(frame.dart_sp, state.last_transition.dart_sp);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_enter_scope(adapter));
+    uint64_t relocated = 0;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterGeneratedRootGet(adapter, lease, 0, &relocated));
+    EXPECT_EQ(0x101ULL, relocated);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterGeneratedRootSet(adapter, lease, 1, 0x301));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_leave_scope(adapter));
+    state.fail_generated_leave = true;
+    EXPECT_EQ(DARTPLANT_VM_BRIDGE_UNAVAILABLE,
+              dartplant::VmAdapterLeaveNativeToGenerated(adapter, &frame, lease));
+    EXPECT_EQ(DARTPLANT_VM_ADAPTER_BUSY, dartplant_vm_adapter_destroy(adapter));
+    state.fail_generated_leave = false;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterLeaveNativeToGenerated(adapter, &frame, lease));
+    EXPECT_EQ(1, state.generated_leaves);
+
+    uint64_t refreshed[2] = {};
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterUnpinGeneratedRoots(adapter, lease, refreshed, 2));
+    EXPECT_EQ(1, state.generated_unpins);
+    EXPECT_EQ(0x101ULL, refreshed[0]);
+    EXPECT_EQ(0x301ULL, refreshed[1]);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter, &isolate));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
+TEST_CASE(VmAdapterOldPrefixDoesNotPretendToSupportGeneratedCallbacks) {
+    FakeVmState state{};
+    DartPlantVmAdapterCallbacks callbacks{};
+    callbacks.struct_size = offsetof(DartPlantVmAdapterCallbacks, pin_generated_roots);
+    callbacks.adapter_version = 1;
+    callbacks.enter_isolate = FakeEnter;
+    callbacks.leave_isolate = FakeLeave;
+    callbacks.enter_scope = FakeEnterScope;
+    callbacks.leave_scope = FakeLeaveScope;
+    callbacks.retain_object = FakeRetain;
+    callbacks.release_object = FakeRelease;
+    callbacks.object_kind = FakeKind;
+    callbacks.object_to_raw = FakeRaw;
+    callbacks.object_is_alive = FakeAlive;
+    // Deliberately populate fields beyond struct_size. dartplant_vm_adapter_create
+    // must not read/copy them from an old caller ABI.
+    callbacks.pin_generated_roots = FakePinGeneratedRoots;
+    callbacks.generated_root_get = FakeGeneratedRootGet;
+    callbacks.generated_root_set = FakeGeneratedRootSet;
+    callbacks.unpin_generated_roots = FakeUnpinGeneratedRoots;
+    callbacks.enter_generated_to_native = FakeEnterGeneratedToNative;
+    callbacks.leave_native_to_generated = FakeLeaveNativeToGenerated;
+
+    DartPlantVmAdapter* adapter = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    EXPECT_FALSE(dartplant::VmAdapterSupportsGeneratedRootBridge(adapter));
+    EXPECT_FALSE(dartplant::VmAdapterSupportsGeneratedCallbackBridge(adapter));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
 TEST_CASE(VmAdapterRejectsWrongThreadAndIsolateGeneration) {
     FakeVmState state{};
     const DartPlantVmAdapterCallbacks callbacks = {
@@ -583,6 +780,12 @@ TEST_CASE(VmAdapterRejectsWrongThreadAndIsolateGeneration) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
+        .pin_generated_roots = nullptr,
+        .generated_root_get = nullptr,
+        .generated_root_set = nullptr,
+        .unpin_generated_roots = nullptr,
+        .enter_generated_to_native = nullptr,
+        .leave_native_to_generated = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     DartPlantObjectHandle* handle = nullptr;
@@ -620,6 +823,12 @@ TEST_CASE(InvocationObjectBridgeUsesActiveVmScope) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
+        .pin_generated_roots = nullptr,
+        .generated_root_get = nullptr,
+        .generated_root_set = nullptr,
+        .unpin_generated_roots = nullptr,
+        .enter_generated_to_native = nullptr,
+        .leave_native_to_generated = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     const DartPlantIsolateIdentity isolate = {21, 22, 23};
@@ -638,7 +847,7 @@ TEST_CASE(InvocationObjectBridgeUsesActiveVmScope) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
@@ -681,7 +890,7 @@ TEST_CASE(DartCallbackHookRejectsVmAdapterWithoutGcSafeNativeTransition) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
 
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(Replacement);
     target->entry = reinterpret_cast<uintptr_t>(Replacement);
     target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
@@ -699,6 +908,36 @@ TEST_CASE(DartCallbackHookRejectsVmAdapterWithoutGcSafeNativeTransition) {
         .user_data = nullptr,
         // The guard is checked before the adapter can be retained or called.
         .vm_adapter = reinterpret_cast<DartPlantVmAdapter*>(uintptr_t{1}),
+    };
+    DartPlantHook* hook = nullptr;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant::InstallCallbackHook(&method, profile, options, 0, &hook, nullptr));
+    EXPECT_EQ(nullptr, hook);
+}
+
+TEST_CASE(RealDartCallbackHookRejectsLegacyHostPublication) {
+    InstallTestHost(FakeHook, FakeUnhook);
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
+    target->id = reinterpret_cast<uintptr_t>(Replacement);
+    target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    auto function = std::make_shared<dartplant::DartFunctionHandle>();
+    function->source = dartplant::DartFunctionSource::kLiveVm;
+    function->thread_jump_to_frame_entry_point_offset = 1;
+    function->code_target = std::move(target);
+    DartPlantMethod method{};
+    method.function = std::move(function);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
     };
     DartPlantHook* hook = nullptr;
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
@@ -771,6 +1010,20 @@ TEST_CASE(RuntimeDestroyWaitsForPinnedOperations) {
     operation = {};
     destroyer.join();
     EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+}
+
+TEST_CASE(FailedHostHookDoesNotUnhookAnUnownedTarget) {
+    InstallTestHost(FakeFailHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(RetiredReplacementLater),
+                                     reinterpret_cast<void*>(Replacement), &backup, &hook));
+    EXPECT_TRUE(hook == nullptr);
+    EXPECT_TRUE(backup == nullptr);
+    EXPECT_EQ(0, g_fake_unhook_calls);
 }
 
 TEST_CASE(RuntimeHookMethodHandleKeepsOuterOperationPinnedAcrossHelpers) {
@@ -927,6 +1180,22 @@ TEST_CASE(HookUnhooksWithItsInstallingBackend) {
     EXPECT_EQ(1, g_backend_a_unhook_calls);
     EXPECT_EQ(0, g_backend_b_unhook_calls);
     dartplant_release_hook(hook);
+}
+
+TEST_CASE(ReturnOnlyFailedHookCleanupDoesNotCallBackendUnhook) {
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    DartPlantHook hook{};
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
+    hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    hook.state = dartplant::HookRecordState::kFailed;
+    hook.backend_installed = false;
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(&hook));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooked);
 }
 
 TEST_CASE(RetiredRuntimeHookRetainsBackendOwnership) {
@@ -1482,7 +1751,7 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     EXPECT_TRUE(dartplant::FindRuntimeCallLayoutLocked(runtime, dropped) == nullptr);
     dartplant_release_method(live);
 
-    // Restore the test-only CodeTarget to its compiler-proven unique state so
+    // Restore the test-only entry target to its compiler-proven unique state so
     // the next registration reaches the formal-shape consistency check. A
     // later provider is not allowed to redefine the established dimension.
     {
@@ -2252,7 +2521,7 @@ TEST_CASE(RuntimeAbiEvidenceBindingRequiresIdentityTargetGenerationAndUniqueCode
         .signature = "",
         .entry_kind = DARTPLANT_ENTRY_DEFAULT,
     };
-    method.function->code_target = std::make_shared<dartplant::DartCodeTarget>();
+    method.function->code_target = std::make_shared<dartplant::DartEntryTarget>();
     method.function->code_target->id = 0x12340000;
     method.function->code_target->entry = 0x12340000;
 
@@ -2314,6 +2583,60 @@ TEST_CASE(VerifiedClosureReceiverUsesHiddenArm64X0WithoutChangingFormalCount) {
               dartplant_invocation_get_closure_receiver(&invocation, &receiver));
 }
 
+TEST_CASE(VerifiedClosureArgumentsDescriptorIncludesHiddenClosureReceiver) {
+    alignas(8) std::array<uint8_t, 64> descriptor{};
+    const uint64_t tags = uint64_t{90} << 12;  // Dart 3.4.4 ImmutableArrayCid.
+    std::memcpy(descriptor.data(), &tags, sizeof(tags));
+    const auto write_smi = [&](size_t offset, uint32_t value) {
+        const uint32_t raw = value << 1;
+        std::memcpy(descriptor.data() + offset, &raw, sizeof(raw));
+    };
+    write_smi(16, 0);  // type-args vector length.
+    write_smi(20, 3);  // Hidden Closure receiver followed by two user arguments.
+    write_smi(24, 3);  // boxed argument size.
+    write_smi(28, 3);  // all fixed-arity call arguments are positional.
+
+    dartplant::abi::DartCallLayout layout;
+    layout.parameters.resize(2);
+    layout.has_closure_receiver = true;
+    layout.closure_receiver_location = {
+        .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+        .register_index = 0,
+    };
+    layout.has_arguments_descriptor = true;
+    layout.arguments_descriptor_location = {
+        .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+        .register_index = 4,
+    };
+
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->runtime_profile_version = 1;
+    DartPlantArm64Context context{};
+    context.x[4] = reinterpret_cast<uint64_t>(descriptor.data()) + 1;
+    DartPlantInvocation invocation{};
+    invocation.requested_method = &method;
+    invocation.call_layout = &layout;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+
+    DartPlantArgumentsDescriptorInfo info{};
+    info.struct_size = sizeof(info);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_arguments_descriptor(&invocation, &info));
+    EXPECT_EQ(0U, info.type_args_len);
+    EXPECT_EQ(3U, info.count);
+    EXPECT_EQ(3U, info.size);
+    EXPECT_EQ(3U, info.positional_count);
+    EXPECT_EQ(0U, info.named_count);
+    EXPECT_EQ(context.x[4], info.raw_descriptor);
+
+    write_smi(20, 2);  // Omitting the hidden Closure receiver must fail closed.
+    info = {};
+    info.struct_size = sizeof(info);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant_invocation_get_arguments_descriptor(&invocation, &info));
+}
+
 TEST_CASE(VerifiedPairOfTaggedResultUsesBothArm64ReturnRegisters) {
     constexpr uint64_t kCanonicalNull = 0x7400000001ULL;
     dartplant::abi::DartFunctionAbiResolution abi;
@@ -2366,7 +2689,7 @@ TEST_CASE(LeaveDispatcherCapturesPairAndFloatingPointReturnChannels) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
@@ -2412,7 +2735,7 @@ TEST_CASE(InvocationDispatchRunsEnterLeaveAndOriginalPolicy) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
@@ -2473,7 +2796,23 @@ TEST_CASE(InvocationDispatchRunsEnterLeaveAndOriginalPolicy) {
     dartplant_release_listener(listener);
 }
 
-TEST_CASE(ReturnDispatchRequiresMatchingDartCallerLr) {
+TEST_CASE(InactivePublishedEntryFailsThroughWithoutStartingBridge) {
+    DartPlantHook hook{};
+    hook.active.store(false, std::memory_order_release);
+    hook.has_method = true;
+    hook.backup.store(reinterpret_cast<void*>(Replacement), std::memory_order_release);
+    DartPlantArm64Context context{};
+    context.x[0] = 0x1234;
+
+    const auto result = dartplant_arm64_dispatch_enter(&context, &hook);
+    EXPECT_TRUE(result.context != nullptr);
+    EXPECT_TRUE(result.original == reinterpret_cast<void*>(Replacement));
+    const auto leave = dartplant_arm64_dispatch_leave_from_tls(0x55, 0, 0);
+    EXPECT_TRUE(leave.context == nullptr);
+    EXPECT_EQ(0x55ULL, leave.result);
+}
+
+TEST_CASE(ReturnDispatchRequiresMatchingDartCallerFrame) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
     profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
@@ -2484,7 +2823,7 @@ TEST_CASE(ReturnDispatchRequiresMatchingDartCallerLr) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
     hook.profile = profile;
@@ -2502,24 +2841,122 @@ TEST_CASE(ReturnDispatchRequiresMatchingDartCallerLr) {
 
     g_leave_calls = 0;
     DartPlantArm64Context context{};
+    context.x[15] = 0x11223000U;
+    context.x[29] = 0x55667788U;
     context.x[30] = 0x12345678U;
     EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
 
-    // A sibling entry can hit a RET patched to the same hook while the outer
-    // invocation is still on TLS. Its LR identifies a different callsite, so
-    // it must pass through without consuming the outer DispatchFrame.
-    const auto sibling_return =
-        dartplant_arm64_dispatch_return_from_hook(&hook, 7, 0, 0, 0x87654321U);
+    // A sibling entry can hit a RET patched to the same payload while the
+    // outer invocation is still on TLS. A different caller frame must pass
+    // through without consuming the outer DispatchFrame.
+    const auto sibling_return = dartplant_arm64_dispatch_return_from_hook(
+        &hook, 7, 0, 0, 0x87654321U, context.x[15], context.x[29]);
     EXPECT_TRUE(sibling_return.context == nullptr);
     EXPECT_EQ(0, g_leave_calls);
 
-    const auto owned_return =
-        dartplant_arm64_dispatch_return_from_hook(&hook, 9, 0, 0, context.x[30]);
+    const auto wrong_spreg = dartplant_arm64_dispatch_return_from_hook(
+        &hook, 8, 0, 0, context.x[30], context.x[15] + 16, context.x[29]);
+    EXPECT_TRUE(wrong_spreg.context == nullptr);
+    EXPECT_EQ(0, g_leave_calls);
+
+    const auto wrong_fp = dartplant_arm64_dispatch_return_from_hook(
+        &hook, 8, 0, 0, context.x[30], context.x[15], context.x[29] + 16);
+    EXPECT_TRUE(wrong_fp.context == nullptr);
+    EXPECT_EQ(0, g_leave_calls);
+
+    const auto owned_return = dartplant_arm64_dispatch_return_from_hook(
+        &hook, 9, 0, 0, context.x[30], context.x[15], context.x[29]);
     EXPECT_TRUE(owned_return.context != nullptr);
     EXPECT_EQ(1, g_leave_calls);
 
     EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
     dartplant_release_listener(listener);
+}
+
+TEST_CASE(PayloadReturnDispatchKeepsSiblingHookFramesIndependent) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    auto payload = std::make_shared<dartplant::DartCodePayload>();
+    payload->id = 0x1000;
+    payload->start = 0x1000;
+    payload->instructions_length = 0x100;
+
+    DartPlantMethod first_method{};
+    DartPlantHook first_hook{};
+    first_hook.active = true;
+    first_hook.has_method = true;
+    first_hook.state = dartplant::HookRecordState::kInstalled;
+    first_hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    first_hook.code_target->entry = 0x1020;
+    first_hook.code_target->payload = payload;
+    first_hook.method_storage = std::make_unique<DartPlantMethod>(first_method);
+    first_hook.profile = profile;
+    first_hook.backup = reinterpret_cast<void*>(Replacement);
+
+    DartPlantMethod second_method{};
+    DartPlantHook second_hook{};
+    second_hook.active = true;
+    second_hook.has_method = true;
+    second_hook.state = dartplant::HookRecordState::kInstalled;
+    second_hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    second_hook.code_target->entry = 0x1040;
+    second_hook.code_target->payload = payload;
+    second_hook.method_storage = std::make_unique<DartPlantMethod>(second_method);
+    second_hook.profile = profile;
+    second_hook.backup = reinterpret_cast<void*>(Replacement);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = nullptr,
+        .on_leave = OnLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* first_listener = nullptr;
+    DartPlantListener* second_listener = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&first_hook, &first_method, options, 0,
+                                                           &first_listener));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&second_hook, &second_method, options, 0,
+                                                           &second_listener));
+
+    g_leave_calls = 0;
+    DartPlantArm64Context first_context{};
+    first_context.x[15] = 0x2000;
+    first_context.x[29] = 0x3000;
+    first_context.x[30] = 0x4000;
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&first_context, &first_hook).original != nullptr);
+
+    DartPlantArm64Context second_context{};
+    second_context.x[15] = 0x1f00;
+    second_context.x[29] = 0x2f00;
+    second_context.x[30] = 0x5000;
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&second_context, &second_hook).original != nullptr);
+
+    // Both entries share one payload-level return veneer. While the second
+    // invocation is on top, a return belonging to the first must pass through.
+    const auto premature_first = dartplant_arm64_dispatch_return_from_payload(
+        payload.get(), 11, 0, 0, first_context.x[30], first_context.x[15], first_context.x[29]);
+    EXPECT_TRUE(premature_first.context == nullptr);
+    EXPECT_EQ(0, g_leave_calls);
+
+    const auto second_return = dartplant_arm64_dispatch_return_from_payload(
+        payload.get(), 22, 0, 0, second_context.x[30], second_context.x[15], second_context.x[29]);
+    EXPECT_TRUE(second_return.context != nullptr);
+    EXPECT_EQ(1, g_leave_calls);
+
+    const auto first_return = dartplant_arm64_dispatch_return_from_payload(
+        payload.get(), 33, 0, 0, first_context.x[30], first_context.x[15], first_context.x[29]);
+    EXPECT_TRUE(first_return.context != nullptr);
+    EXPECT_EQ(2, g_leave_calls);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(second_listener));
+    dartplant_release_listener(second_listener);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(first_listener));
+    dartplant_release_listener(first_listener);
 }
 
 TEST_CASE(RuntimeBoundCallbackHookFailsClosedAfterGenerationAdvance) {
@@ -2533,7 +2970,7 @@ TEST_CASE(RuntimeBoundCallbackHookFailsClosedAfterGenerationAdvance) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
     hook.profile = profile;
@@ -2581,7 +3018,7 @@ TEST_CASE(HookChainUsesPrioritySnapshotAndPairedLeaveOrder) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
@@ -2634,7 +3071,7 @@ TEST_CASE(LateSharedCodeWithoutOptInBypassesCallbacksAndVerifiedAbi) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
 
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(Replacement);
     target->entry = reinterpret_cast<uintptr_t>(Replacement);
     target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
@@ -2708,7 +3145,7 @@ TEST_CASE(LateSharedCodeWithOptInKeepsRawCallbackButDropsVerifiedAbi) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
 
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(Replacement);
     target->entry = reinterpret_cast<uintptr_t>(Replacement);
     target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
@@ -2848,7 +3285,8 @@ TEST_CASE(ListenerRemovalInsideEnterDefersUnhookUntilLeave) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
-    hook.code_target = std::make_shared<dartplant::DartCodeTarget>();
+    hook.backend_installed = true;
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->id = reinterpret_cast<uintptr_t>(Replacement);
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
     hook.method_storage = std::make_unique<DartPlantMethod>(method);

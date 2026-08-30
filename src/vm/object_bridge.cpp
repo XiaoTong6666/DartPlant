@@ -3,11 +3,19 @@
 
 #include "vm/object_bridge.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <utility>
 
 #include "core/internal.h"
 
 namespace {
+
+constexpr size_t kVmAdapterCallbacksV1Size =
+    offsetof(DartPlantVmAdapterCallbacks, pin_generated_roots);
+constexpr size_t kVmAdapterCallbacksV2Size =
+    offsetof(DartPlantVmAdapterCallbacks, enter_generated_to_native);
 
 bool SameIsolate(const DartPlantIsolateIdentity& left, const DartPlantIsolateIdentity& right) {
     return left.isolate == right.isolate && left.isolate_group == right.isolate_group &&
@@ -19,12 +27,39 @@ bool SameOwner(const DartPlantVmAdapter& adapter) {
 }
 
 bool ValidAdapterCallbacks(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >= kVmAdapterCallbacksV1Size && callbacks.adapter_version != 0 &&
+           callbacks.enter_isolate != nullptr && callbacks.leave_isolate != nullptr &&
+           callbacks.enter_scope != nullptr && callbacks.leave_scope != nullptr &&
+           callbacks.retain_object != nullptr && callbacks.release_object != nullptr &&
+           callbacks.object_kind != nullptr && callbacks.object_to_raw != nullptr &&
+           callbacks.object_is_alive != nullptr;
+}
+
+bool GeneratedRootCallbacksAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >= kVmAdapterCallbacksV2Size &&
+           callbacks.pin_generated_roots != nullptr && callbacks.generated_root_get != nullptr &&
+           callbacks.generated_root_set != nullptr && callbacks.unpin_generated_roots != nullptr;
+}
+
+bool GeneratedTransitionCallbacksAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
     return callbacks.struct_size >= sizeof(DartPlantVmAdapterCallbacks) &&
-           callbacks.adapter_version != 0 && callbacks.enter_isolate != nullptr &&
-           callbacks.leave_isolate != nullptr && callbacks.enter_scope != nullptr &&
-           callbacks.leave_scope != nullptr && callbacks.retain_object != nullptr &&
-           callbacks.release_object != nullptr && callbacks.object_kind != nullptr &&
-           callbacks.object_to_raw != nullptr && callbacks.object_is_alive != nullptr;
+           callbacks.enter_generated_to_native != nullptr &&
+           callbacks.leave_native_to_generated != nullptr;
+}
+
+DartPlantStatus CheckAttachedOwnerLocked(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr || !adapter->attached) {
+        dartplant::SetLastError("VM adapter has no attached isolate");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (adapter->owner_thread != std::thread::id{} && !SameOwner(*adapter)) {
+        dartplant::SetLastError("VM adapter is owned by another thread");
+        return DARTPLANT_VM_THREAD_MISMATCH;
+    }
+    if (adapter->owner_thread == std::thread::id{}) {
+        adapter->owner_thread = std::this_thread::get_id();
+    }
+    return DARTPLANT_OK;
 }
 
 DartPlantStatus CheckEnteredLocked(const DartPlantVmAdapter& adapter) {
@@ -53,6 +88,15 @@ bool VmAdapterIsEntered(DartPlantVmAdapter* adapter) {
     return CheckEnteredLocked(*adapter) == DARTPLANT_OK;
 }
 
+bool VmAdapterSupportsGeneratedRootBridge(const DartPlantVmAdapter* adapter) {
+    return adapter != nullptr && GeneratedRootCallbacksAvailable(adapter->callbacks);
+}
+
+bool VmAdapterSupportsGeneratedCallbackBridge(const DartPlantVmAdapter* adapter) {
+    return adapter != nullptr && GeneratedRootCallbacksAvailable(adapter->callbacks) &&
+           GeneratedTransitionCallbacksAvailable(adapter->callbacks);
+}
+
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter) {
     if (adapter == nullptr) return;
     std::lock_guard lock(adapter->mutex);
@@ -63,6 +107,171 @@ void VmAdapterReleaseHook(DartPlantVmAdapter* adapter) {
     if (adapter == nullptr) return;
     std::lock_guard lock(adapter->mutex);
     if (adapter->hook_refs != 0) --adapter->hook_refs;
+}
+
+DartPlantStatus VmAdapterPinGeneratedRoots(DartPlantVmAdapter* adapter, const uint64_t* raw_values,
+                                           uint32_t value_count, void** out_root_lease) {
+    if (adapter == nullptr || raw_values == nullptr || value_count == 0 ||
+        out_root_lease == nullptr) {
+        SetLastError("generated root pin arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    *out_root_lease = nullptr;
+    std::unique_lock lock(adapter->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SetLastError("VM adapter generated-root state is busy");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!GeneratedRootCallbacksAvailable(adapter->callbacks)) {
+        SetLastError("VM adapter has no generated-root bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
+    if (owner != DARTPLANT_OK) return owner;
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+        SetLastError("generated roots must be pinned while the mutator is in generated state");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    void* lease = nullptr;
+    const DartPlantStatus status = adapter->callbacks.pin_generated_roots(
+        adapter->user_data, &adapter->isolate, raw_values, value_count, &lease);
+    if (status != DARTPLANT_OK) return status;
+    if (lease == nullptr) {
+        SetLastError("VM adapter returned a null generated-root lease");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    ++adapter->generated_root_leases;
+    *out_root_lease = lease;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus VmAdapterGeneratedRootGet(DartPlantVmAdapter* adapter, void* root_lease,
+                                          uint32_t index, uint64_t* out_raw) {
+    if (adapter == nullptr || root_lease == nullptr || out_raw == nullptr) {
+        SetLastError("generated root read arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (!GeneratedRootCallbacksAvailable(adapter->callbacks) ||
+        adapter->generated_root_leases == 0) {
+        SetLastError("generated root lease is unavailable");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus entered = CheckEnteredLocked(*adapter);
+    if (entered != DARTPLANT_OK) return entered;
+    return adapter->callbacks.generated_root_get(adapter->user_data, &adapter->isolate, root_lease,
+                                                 index, out_raw);
+}
+
+DartPlantStatus VmAdapterGeneratedRootSet(DartPlantVmAdapter* adapter, void* root_lease,
+                                          uint32_t index, uint64_t raw) {
+    if (adapter == nullptr || root_lease == nullptr) {
+        SetLastError("generated root write arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (!GeneratedRootCallbacksAvailable(adapter->callbacks) ||
+        adapter->generated_root_leases == 0) {
+        SetLastError("generated root lease is unavailable");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus entered = CheckEnteredLocked(*adapter);
+    if (entered != DARTPLANT_OK) return entered;
+    return adapter->callbacks.generated_root_set(adapter->user_data, &adapter->isolate, root_lease,
+                                                 index, raw);
+}
+
+DartPlantStatus VmAdapterUnpinGeneratedRoots(DartPlantVmAdapter* adapter, void* root_lease,
+                                             uint64_t* out_raw_values, uint32_t value_count) {
+    if (adapter == nullptr || root_lease == nullptr || out_raw_values == nullptr ||
+        value_count == 0) {
+        SetLastError("generated root unpin arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::unique_lock lock(adapter->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SetLastError("VM adapter generated/native transition state is busy");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!GeneratedRootCallbacksAvailable(adapter->callbacks) ||
+        adapter->generated_root_leases == 0) {
+        SetLastError("generated root lease is unavailable");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
+    if (owner != DARTPLANT_OK) return owner;
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+        SetLastError("generated roots can only be unpinned after returning to generated state");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const DartPlantStatus status = adapter->callbacks.unpin_generated_roots(
+        adapter->user_data, &adapter->isolate, root_lease, out_raw_values, value_count);
+    if (status != DARTPLANT_OK) return status;
+    --adapter->generated_root_leases;
+    if (adapter->generated_root_leases == 0 && !adapter->isolate_entered) {
+        adapter->owner_thread = {};
+    }
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus VmAdapterEnterGeneratedToNative(DartPlantVmAdapter* adapter,
+                                                const DartPlantGeneratedTransitionFrame* frame,
+                                                void* root_lease) {
+    if (adapter == nullptr || frame == nullptr ||
+        frame->struct_size < sizeof(DartPlantGeneratedTransitionFrame) || root_lease == nullptr) {
+        SetLastError("generated-to-native transition arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::unique_lock lock(adapter->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SetLastError("VM adapter generated/native transition state is busy");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!GeneratedTransitionCallbacksAvailable(adapter->callbacks) ||
+        adapter->generated_root_leases == 0) {
+        SetLastError("VM adapter has no complete generated callback bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
+    if (owner != DARTPLANT_OK) return owner;
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+        SetLastError("VM adapter already has a generated/native transition or scope");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const DartPlantStatus status = adapter->callbacks.enter_generated_to_native(
+        adapter->user_data, &adapter->isolate, frame, root_lease);
+    if (status != DARTPLANT_OK) return status;
+    ++adapter->generated_native_transitions;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus VmAdapterLeaveNativeToGenerated(DartPlantVmAdapter* adapter,
+                                                const DartPlantGeneratedTransitionFrame* frame,
+                                                void* root_lease) {
+    if (adapter == nullptr || frame == nullptr ||
+        frame->struct_size < sizeof(DartPlantGeneratedTransitionFrame) || root_lease == nullptr) {
+        SetLastError("native-to-generated transition arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (!GeneratedTransitionCallbacksAvailable(adapter->callbacks) ||
+        adapter->generated_native_transitions == 0 || adapter->generated_root_leases == 0) {
+        SetLastError("VM adapter generated/native transition is not active");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!SameOwner(*adapter)) {
+        SetLastError("VM adapter is owned by another thread");
+        return DARTPLANT_VM_THREAD_MISMATCH;
+    }
+    if (adapter->entered != 0) {
+        SetLastError("VM adapter scope must be left before returning to generated state");
+        return DARTPLANT_VM_SCOPE_REQUIRED;
+    }
+    const DartPlantStatus status = adapter->callbacks.leave_native_to_generated(
+        adapter->user_data, &adapter->isolate, frame, root_lease);
+    if (status != DARTPLANT_OK) return status;
+    --adapter->generated_native_transitions;
+    return DARTPLANT_OK;
 }
 
 DartPlantStatus VmAdapterCheckHandle(const DartPlantVmAdapter* adapter,
@@ -150,7 +359,9 @@ dartplant_vm_adapter_create(const DartPlantVmAdapterCallbacks* callbacks, void* 
         return DARTPLANT_INVALID_ARGUMENT;
     }
     auto* adapter = new DartPlantVmAdapter;
-    adapter->callbacks = *callbacks;
+    std::memset(&adapter->callbacks, 0, sizeof(adapter->callbacks));
+    std::memcpy(&adapter->callbacks, callbacks,
+                std::min<size_t>(callbacks->struct_size, sizeof(adapter->callbacks)));
     adapter->user_data = user_data;
     *out_adapter = adapter;
     return DARTPLANT_OK;
@@ -163,7 +374,8 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_destroy(DartPlantVmAdapter
     }
     std::unique_lock lock(adapter->mutex);
     if (adapter->attached || adapter->entered != 0 || adapter->isolate_entered ||
-        adapter->live_handles != 0 || adapter->hook_refs != 0) {
+        adapter->live_handles != 0 || adapter->hook_refs != 0 ||
+        adapter->generated_root_leases != 0 || adapter->generated_native_transitions != 0) {
         dartplant::SetLastError("VM adapter still owns an isolate, scope, or object handle");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -200,7 +412,8 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_detach_isolate(
         dartplant::SetLastError("VM adapter isolate does not match");
         return DARTPLANT_VM_ISOLATE_MISMATCH;
     }
-    if (adapter->entered != 0 || adapter->isolate_entered || adapter->live_handles != 0) {
+    if (adapter->entered != 0 || adapter->isolate_entered || adapter->live_handles != 0 ||
+        adapter->generated_root_leases != 0 || adapter->generated_native_transitions != 0) {
         dartplant::SetLastError("VM adapter isolate still has active scopes or handles");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -288,7 +501,10 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_leave_scope(DartPlantVmAdapter* ad
         adapter->callbacks.leave_scope(adapter->user_data, &adapter->isolate);
     if (status != DARTPLANT_OK) return status;
     --adapter->entered;
-    if (adapter->entered == 0 && !adapter->isolate_entered) adapter->owner_thread = {};
+    if (adapter->entered == 0 && !adapter->isolate_entered && adapter->generated_root_leases == 0 &&
+        adapter->generated_native_transitions == 0) {
+        adapter->owner_thread = {};
+    }
     return DARTPLANT_OK;
 }
 

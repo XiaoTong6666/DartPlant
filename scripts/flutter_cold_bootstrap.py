@@ -227,7 +227,6 @@ def _build_fixture(flutter: str) -> None:
             "[tear-off] verifiedAbiForcedStack",
             "--compiler-function-kind",
             "ImplicitClosureFunction",
-            "--identity-only",
             "--abi-oracle-json",
             str(ABI_ORACLE_JSON),
             "--aot-analyzer",
@@ -482,7 +481,7 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         )
     if "DartPlant late shared transition: 1" not in logs:
         raise RuntimeError(
-            f"cold start {round_index}: late shared CodeTarget transition failed\n{logs}"
+            f"cold start {round_index}: late shared entry-target transition failed\n{logs}"
         )
     if "DartPlant late shared typed fail-close: 1" not in logs:
         raise RuntimeError(

@@ -192,6 +192,7 @@ def build_all(ctx: BuildContext, *, force: bool = False) -> None:
 
 def test_host(ctx: BuildContext, *, force: bool = False) -> None:
     build_host(ctx, force=force)
+    run(["python3", str(ROOT_DIR / "tests" / "public_c_header_test.py")], cwd=ROOT_DIR)
     run(["python3", str(ROOT_DIR / "tests" / "loader_compat_test.py")], cwd=ROOT_DIR)
     run(["python3", str(ROOT_DIR / "tests" / "vm_profiles_generator_test.py")], cwd=ROOT_DIR)
     run(["python3", str(ROOT_DIR / "scripts" / "generate_vm_profiles.py"), "--check"], cwd=ROOT_DIR)

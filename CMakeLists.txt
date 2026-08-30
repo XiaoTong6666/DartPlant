@@ -116,7 +116,14 @@ if(DARTPLANT_BUILD_DOBBY_ADAPTER)
     target_include_directories(
         dartplant_adapter_dobby
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-        PRIVATE ${DARTPLANT_DOBBY_ROOT}/include
+        PRIVATE
+            ${DARTPLANT_DOBBY_ROOT}/include
+            ${DARTPLANT_DOBBY_ROOT}
+            ${DARTPLANT_DOBBY_ROOT}/source
+            ${DARTPLANT_DOBBY_ROOT}/source/include
+            ${DARTPLANT_DOBBY_ROOT}/source/Backend/UserMode
+            ${DARTPLANT_DOBBY_ROOT}/external
+            ${DARTPLANT_DOBBY_ROOT}/external/logging
     )
     target_link_libraries(dartplant_adapter_dobby PUBLIC dartplant_core PRIVATE dobby)
 endif()
@@ -224,7 +231,14 @@ if(ANDROID)
             target_include_directories(
                 dartplant_adapter_dobby
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                PRIVATE ${DARTPLANT_DOBBY_ROOT}/include
+                PRIVATE
+                    ${DARTPLANT_DOBBY_ROOT}/include
+                    ${DARTPLANT_DOBBY_ROOT}
+                    ${DARTPLANT_DOBBY_ROOT}/source
+                    ${DARTPLANT_DOBBY_ROOT}/source/include
+                    ${DARTPLANT_DOBBY_ROOT}/source/Backend/UserMode
+                    ${DARTPLANT_DOBBY_ROOT}/external
+                    ${DARTPLANT_DOBBY_ROOT}/external/logging
             )
             target_link_libraries(dartplant_adapter_dobby PUBLIC dartplant_core PRIVATE dobby)
         endif()

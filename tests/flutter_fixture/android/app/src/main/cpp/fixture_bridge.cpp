@@ -431,17 +431,46 @@ void OnVerifiedAbiDoubleObserver(DartPlantInvocation* invocation, void*) {
 
 void OnForcedStackClosureEnter(DartPlantInvocation* invocation, void*) {
     DartPlantValue closure{};
+    DartPlantValue left{};
+    DartPlantValue right{};
+    DartPlantArgumentsDescriptorInfo descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
     uint64_t raw_x0 = 0;
+    const uint8_t has_verified_abi = dartplant_invocation_has_verified_abi(invocation);
+    const uint32_t argument_count = dartplant_invocation_argument_count(invocation);
+    const DartPlantStatus left_status = dartplant_invocation_get_argument(invocation, 0, &left);
+    const DartPlantStatus right_status = dartplant_invocation_get_argument(invocation, 1, &right);
+    const uint8_t has_closure_receiver = dartplant_invocation_has_closure_receiver(invocation);
+    const DartPlantStatus closure_status =
+        dartplant_invocation_get_closure_receiver(invocation, &closure);
+    const DartPlantStatus raw_x0_status =
+        dartplant_invocation_get_gp_register(invocation, 0, &raw_x0);
+    const DartPlantStatus descriptor_status =
+        dartplant_invocation_get_arguments_descriptor(invocation, &descriptor);
     const bool valid =
-        dartplant_invocation_has_verified_abi(invocation) == 0 &&
-        dartplant_invocation_argument_count(invocation) == 0 &&
-        dartplant_invocation_has_closure_receiver(invocation) != 0 &&
-        dartplant_invocation_get_closure_receiver(invocation, &closure) == DARTPLANT_OK &&
-        dartplant_invocation_get_gp_register(invocation, 0, &raw_x0) == DARTPLANT_OK &&
-        closure.kind == DARTPLANT_VALUE_HEAP_OBJECT && closure.raw != 0 && closure.raw == raw_x0;
+        has_verified_abi != 0 && argument_count == 2 && left_status == DARTPLANT_OK &&
+        right_status == DARTPLANT_OK && left.kind == DARTPLANT_VALUE_SMI &&
+        right.kind == DARTPLANT_VALUE_SMI && has_closure_receiver != 0 &&
+        closure_status == DARTPLANT_OK && raw_x0_status == DARTPLANT_OK &&
+        closure.kind == DARTPLANT_VALUE_HEAP_OBJECT && closure.raw != 0 && closure.raw == raw_x0 &&
+        descriptor_status == DARTPLANT_OK && descriptor.type_args_len == 0 &&
+        descriptor.count == 3 && descriptor.size == 3 && descriptor.positional_count == 3 &&
+        descriptor.named_count == 0;
     if (!valid) {
         g_forced_stack_closure_failures.fetch_add(1, std::memory_order_relaxed);
-        LogFailure("artifact closure receiver contract");
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "artifact closure contract failed verified=%u argc=%u left=%d/%u/0x%llx right=%d/%u/0x%llx receiver=%u/%d/%u/0x%llx x0=%d/0x%llx args_desc=%d raw=0x%llx type_args=%u count=%u size=%u positional=%u named=%u error=%s",
+            static_cast<unsigned>(has_verified_abi), argument_count, left_status,
+            static_cast<unsigned>(left.kind), static_cast<unsigned long long>(left.raw),
+            right_status, static_cast<unsigned>(right.kind),
+            static_cast<unsigned long long>(right.raw), static_cast<unsigned>(has_closure_receiver),
+            closure_status, static_cast<unsigned>(closure.kind),
+            static_cast<unsigned long long>(closure.raw), raw_x0_status,
+            static_cast<unsigned long long>(raw_x0), descriptor_status,
+            static_cast<unsigned long long>(descriptor.raw_descriptor), descriptor.type_args_len,
+            descriptor.count, descriptor.size, descriptor.positional_count, descriptor.named_count,
+            dartplant_last_error());
         return;
     }
     g_forced_stack_closure_enter.fetch_add(1, std::memory_order_relaxed);
@@ -515,6 +544,22 @@ DartPlantStatus InstallForcedStackClosureHook() {
         return lookup_status == DARTPLANT_OK ? DARTPLANT_PROFILE_MISMATCH : lookup_status;
     }
 
+    DartPlantMethodAbiInfo abi_info{};
+    abi_info.struct_size = sizeof(abi_info);
+    const DartPlantStatus abi_status =
+        dartplant_runtime_get_method_abi_info(g_runtime, g_forced_stack_closure, &abi_info);
+    if (abi_status != DARTPLANT_OK || abi_info.state != DARTPLANT_METHOD_ABI_VERIFIED ||
+        abi_info.has_verified_call_layout == 0 || abi_info.parameter_count != 2 ||
+        abi_info.stack_words != 2) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "artifact closure ABI failed status=%d state=%u verified=%u params=%u stack=%u error=%s",
+            abi_status, static_cast<unsigned>(abi_info.state),
+            static_cast<unsigned>(abi_info.has_verified_call_layout), abi_info.parameter_count,
+            abi_info.stack_words, dartplant_last_error());
+        return abi_status == DARTPLANT_OK ? DARTPLANT_UNSUPPORTED_ABI : abi_status;
+    }
+
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
     const DartPlantStatus hook_status =
@@ -522,7 +567,7 @@ DartPlantStatus InstallForcedStackClosureHook() {
                           OnForcedStackClosureEnter);
     __android_log_print(
         hook_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "artifact closure hook status=%d source_offline=1 kind=%u default_only=%u receiver_x0=1 target=0x%llx error=%s",
+        "artifact closure hook status=%d source_offline=1 kind=%u default_only=%u receiver_x0=1 typed_stack=1 args_desc=1 target=0x%llx error=%s",
         hook_status, g_forced_stack_closure->function->function_kind,
         static_cast<unsigned>(g_forced_stack_closure->function->closure_call_entry_only),
         static_cast<unsigned long long>(dartplant_method_runtime_address(g_forced_stack_closure)),
@@ -793,7 +838,7 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     }
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "live-index functions=%u code_targets=%u shared_targets=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u",
+        "live-index functions=%u entry_targets=%u shared_payloads=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u",
         function_index.function_count, function_index.code_target_count,
         function_index.shared_code_target_count, function_index.skipped_function_count,
         static_cast<unsigned long long>(indexed_entry_va), decoded_pool_entries,
@@ -1146,7 +1191,7 @@ dartplant_fixture_mark_verified_abi_double_shared() {
     }
 
     // The observer is a second logical subscription to the same physical
-    // CodeTarget. Remove it independently before mutating alias identity; the
+    // entry target. Remove it independently before mutating alias identity; the
     // primary handle must remain active and keep owning the physical hook.
     if (g_verified_abi_double_observer_hook == nullptr ||
         g_verified_abi_double_observer_enter.load(std::memory_order_relaxed) != 1 ||

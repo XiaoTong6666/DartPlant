@@ -127,7 +127,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime*
 
 // Registers exact compiler-side ABI evidence for the current live method
 // incarnation. DartPlant binds the evidence to the method identity, physical
-// CodeTarget and runtime generation before deriving a DartCallLayout. Evidence
+// entry target and runtime generation before deriving a DartCallLayout. Evidence
 // cannot be installed after that physical target is already hooked.
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     DartPlantRuntime* runtime, const DartPlantMethod* method,

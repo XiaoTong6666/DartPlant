@@ -106,6 +106,7 @@ void ResetFakeHost() {
         .user_data = nullptr,
         .hook = FakeHostHook,
         .unhook = FakeHostUnhook,
+        .hook_with_publication = nullptr,
     };
     dartplant::InstallHostApi(&api);
     dartplant::RefreshModules();
@@ -194,10 +195,11 @@ TEST_CASE(ManagedHookPatchFingerprintPreservesSiblingArtifactBytes) {
         .user_data = &host,
         .hook = MutatingHook,
         .unhook = MutatingUnhook,
+        .hook_with_publication = nullptr,
     };
     dartplant::InstallHostApi(&api);
 
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(bytes + 16);
     target->entry = target->id;
     target->code_size = 16;
@@ -247,12 +249,13 @@ TEST_CASE(ManagedHookPatchFingerprintUnwindsOverlappingSiblingHooksInReverseOrde
         .user_data = &first_state,
         .hook = MutatingHook,
         .unhook = MutatingUnhook,
+        .hook_with_publication = nullptr,
     };
     DartPlantHostApi second_api = first_api;
     second_api.user_data = &second_state;
     dartplant::InstallHostApi(&first_api);
 
-    auto first_target = std::make_shared<dartplant::DartCodeTarget>();
+    auto first_target = std::make_shared<dartplant::DartEntryTarget>();
     first_target->id = reinterpret_cast<uintptr_t>(bytes + 16);
     first_target->entry = first_target->id;
     first_target->code_size = 16;
@@ -266,7 +269,7 @@ TEST_CASE(ManagedHookPatchFingerprintUnwindsOverlappingSiblingHooksInReverseOrde
     // patch overlaps the last two bytes of the first backend patch. Its saved
     // "original" therefore contains the first hook's patched bytes.
     dartplant::InstallHostApi(&second_api);
-    auto second_target = std::make_shared<dartplant::DartCodeTarget>();
+    auto second_target = std::make_shared<dartplant::DartEntryTarget>();
     second_target->id = reinterpret_cast<uintptr_t>(bytes + 18);
     second_target->entry = second_target->id;
     second_target->code_size = 14;
@@ -287,8 +290,8 @@ TEST_CASE(ManagedHookPatchFingerprintUnwindsOverlappingSiblingHooksInReverseOrde
     EXPECT_EQ(0, munmap(mapping, static_cast<size_t>(page_size)));
 }
 
-TEST_CASE(CodeTargetEntryKindsDoNotCreateFalseSharedFunctionIdentity) {
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+TEST_CASE(EntryTargetKindsDoNotCreateFalseSharedFunctionIdentity) {
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->entry = 0x1000;
     target->id = 0x1000;
     target->reported_alias_count = 1;
@@ -320,6 +323,69 @@ TEST_CASE(CodeTargetEntryKindsDoNotCreateFalseSharedFunctionIdentity) {
     EXPECT_FALSE(target->HasProvenUniqueIdentity());
 }
 
+TEST_CASE(EntryTargetsShareExactCodePayloadOwnership) {
+    dartplant::DartEntryTargetRegistry registry;
+    auto normal =
+        registry.GetOrCreate(0x1020, 0x60, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000, 0x80);
+    auto unchecked =
+        registry.GetOrCreate(0x1040, 0x40, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000, 0x80);
+    EXPECT_TRUE(normal != nullptr);
+    EXPECT_TRUE(unchecked != nullptr);
+    EXPECT_TRUE(normal != unchecked);
+    EXPECT_TRUE(normal->payload == unchecked->payload);
+    EXPECT_EQ(0x1000ULL, static_cast<unsigned long long>(normal->payload->start));
+    EXPECT_EQ(0x80U, normal->payload->instructions_length);
+    EXPECT_EQ(0x1080ULL, static_cast<unsigned long long>(normal->payload->end()));
+    EXPECT_TRUE(normal->payload->Contains(normal->entry, normal->code_size));
+    EXPECT_TRUE(unchecked->payload->Contains(unchecked->entry, unchecked->code_size));
+
+    EXPECT_TRUE(registry.GetOrCreate(0x1060, 0x20, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
+                                     0x90) == nullptr);
+
+    // Once a physical entry is bound, later producers may add a previously
+    // unknown Code* but must not rewrite its exact entry-to-payload range or
+    // contradict an already-known Code identity.
+    EXPECT_TRUE(registry.GetOrCreate(0x1020, 0x50, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
+                                     0x80) == nullptr);
+    EXPECT_TRUE(registry.GetOrCreate(0x1020, 0x60, 0xdef, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
+                                     0x80) == nullptr);
+
+    dartplant::DartEntryTargetRegistry artifact_first_registry;
+    auto artifact = artifact_first_registry.GetOrCreate(
+        0x2020, 0x60, 0, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x2000, 0x80);
+    auto live = artifact_first_registry.GetOrCreate(0x2020, 0x60, 0x1234, 1,
+                                                    DARTPLANT_CODE_IDENTITY_UNIQUE, 0x2000, 0x80);
+    EXPECT_TRUE(artifact != nullptr);
+    EXPECT_TRUE(live == artifact);
+    EXPECT_EQ(0x1234ULL, static_cast<unsigned long long>(live->code_object));
+
+    dartplant::DartEntryTargetRegistry legacy_registry;
+    auto legacy = legacy_registry.GetOrCreate(0x3020, 0x60, 0, 1, DARTPLANT_CODE_IDENTITY_UNIQUE);
+    EXPECT_TRUE(legacy != nullptr);
+    EXPECT_EQ(0x3020ULL, static_cast<unsigned long long>(legacy->payload->start));
+    EXPECT_TRUE(!legacy->payload->exact_identity);
+    auto upgraded = legacy_registry.GetOrCreate(0x3020, 0x60, 0x5678, 1,
+                                                DARTPLANT_CODE_IDENTITY_UNIQUE, 0x3000, 0x80);
+    EXPECT_TRUE(upgraded == legacy);
+    EXPECT_EQ(0x3000ULL, static_cast<unsigned long long>(upgraded->payload->start));
+    EXPECT_EQ(0x80U, upgraded->payload->instructions_length);
+    EXPECT_EQ(0x5678ULL, static_cast<unsigned long long>(upgraded->payload->code_object));
+    EXPECT_TRUE(upgraded->payload->exact_identity);
+    EXPECT_TRUE(legacy_registry.GetOrCreate(0x3020, 0x60, 0x5678, 1,
+                                            DARTPLANT_CODE_IDENTITY_UNIQUE) == upgraded);
+    EXPECT_TRUE(legacy_registry.GetOrCreate(0x3070, 0x20, 0, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                            0x3000, 0x90) == nullptr);
+
+    dartplant::DartEntryTargetRegistry hooked_legacy_registry;
+    auto hooked_legacy =
+        hooked_legacy_registry.GetOrCreate(0x4020, 0x60, 0, 1, DARTPLANT_CODE_IDENTITY_UNIQUE);
+    EXPECT_TRUE(hooked_legacy != nullptr);
+    hooked_legacy->BindHookRecord(reinterpret_cast<DartPlantHook*>(1));
+    EXPECT_TRUE(hooked_legacy_registry.GetOrCreate(0x4020, 0x60, 0x9abc, 1,
+                                                   DARTPLANT_CODE_IDENTITY_UNIQUE, 0x4000,
+                                                   0x80) == nullptr);
+}
+
 TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
     dartplant_reset();
     ContextHostState first;
@@ -330,6 +396,7 @@ TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
         .user_data = &first,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     const DartPlantHostApi second_api = {
         .struct_size = sizeof(DartPlantHostApi),
@@ -337,6 +404,7 @@ TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
         .user_data = &second,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     EXPECT_EQ(DARTPLANT_OK, dartplant_install_host_api(&first_api));
 
@@ -381,6 +449,7 @@ TEST_CASE(SimpleInitOwnsRuntimeProfileAndBootstrapsFindLazily) {
         .user_data = &host_state,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
@@ -422,6 +491,7 @@ TEST_CASE(SimpleInitValidatesReconfigurationAndShutdownClearsOnlyCurrentHost) {
         .user_data = &first,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     const DartPlantHostApi second_api = {
         .struct_size = sizeof(DartPlantHostApi),
@@ -429,6 +499,7 @@ TEST_CASE(SimpleInitValidatesReconfigurationAndShutdownClearsOnlyCurrentHost) {
         .user_data = &second,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
@@ -518,6 +589,7 @@ TEST_CASE(SimpleShutdownClearsHostBeforeConcurrentNullHostReinit) {
         .user_data = &first,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     const DartPlantHostApi second_api = {
         .struct_size = sizeof(DartPlantHostApi),
@@ -525,6 +597,7 @@ TEST_CASE(SimpleShutdownClearsHostBeforeConcurrentNullHostReinit) {
         .user_data = &second,
         .hook = ContextHook,
         .unhook = ContextUnhook,
+        .hook_with_publication = nullptr,
     };
     const DartPlantInitInfo first_init = {
         .struct_size = sizeof(DartPlantInitInfo),

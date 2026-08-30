@@ -1,11 +1,11 @@
 #include "simple_facade_consumer.h"
 
 #include <android/log.h>
-#include <dobby.h>
 
 #include <atomic>
 #include <bit>
 
+#include "dartplant/adapters/dobby.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/hook.h"
 #include "dartplant/host_api.h"
@@ -21,21 +21,6 @@ std::atomic_uint64_t g_enter{0};
 std::atomic_uint64_t g_leave{0};
 std::atomic_uint64_t g_observer_enter{0};
 std::atomic_uint64_t g_failures{0};
-
-int DobbyHostHook(void*, void* target, void* replacement, void** backup) {
-    return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replacement),
-                     reinterpret_cast<dobby_dummy_func_t*>(backup));
-}
-
-int DobbyHostUnhook(void*, void* target) { return DobbyDestroy(target); }
-
-const DartPlantHostApi kHostApi = {
-    .struct_size = sizeof(DartPlantHostApi),
-    .version = DARTPLANT_HOST_API_VERSION,
-    .user_data = nullptr,
-    .hook = DobbyHostHook,
-    .unhook = DobbyHostUnhook,
-};
 
 void Fail(const char* operation) {
     g_failures.fetch_add(1, std::memory_order_relaxed);
@@ -108,10 +93,12 @@ int32_t dartplant_simple_consumer_install() {
     g_observer_enter.store(0, std::memory_order_relaxed);
     g_failures.store(0, std::memory_order_relaxed);
 
+    const DartPlantHostApi* host_api = dartplant_dobby_host_api();
+    if (host_api == nullptr) return DARTPLANT_HOST_API_UNAVAILABLE;
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
         .version = DARTPLANT_INIT_API_VERSION,
-        .host_api = &kHostApi,
+        .host_api = host_api,
         .artifact_bundle = nullptr,
         .app_module_name = nullptr,
         .runtime_module_name = nullptr,

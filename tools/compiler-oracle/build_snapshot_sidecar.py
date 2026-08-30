@@ -84,6 +84,7 @@ class AbiEvidence:
     must_use_stack_calling_convention: bool
     has_optional_parameters: bool = False
     has_overrides_with_less_direct_parameters: bool = False
+    implicit_parameter_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -239,8 +240,15 @@ def _load_abi_oracle(
     must_use_stack = function.get("must_use_stack_calling_convention")
     has_optional = function.get("has_optional_parameters")
     has_overrides = function.get("has_overrides_with_less_direct_parameters")
+    implicit_parameter_count = function.get("implicit_parameter_count", 0)
     if not all(isinstance(value, bool) for value in (must_use_stack, has_optional, has_overrides)):
         raise ValueError("ABI oracle calling-convention flags are invalid")
+    if (
+        not isinstance(implicit_parameter_count, int)
+        or implicit_parameter_count < 0
+        or implicit_parameter_count > fixed_parameter_count
+    ):
+        raise ValueError("ABI oracle implicit-parameter count is invalid")
     if must_use_stack and max_parameters_in_registers != 0:
         raise ValueError("ABI oracle forced-stack Function still reports register parameters")
 
@@ -251,6 +259,7 @@ def _load_abi_oracle(
         must_use_stack_calling_convention=must_use_stack,
         has_optional_parameters=has_optional,
         has_overrides_with_less_direct_parameters=has_overrides,
+        implicit_parameter_count=implicit_parameter_count,
     )
 
 
@@ -408,7 +417,9 @@ def _representation_from_text(text: str) -> str:
     return "unknown"
 
 
-def _extract_abi(log: str, function_name: str) -> AbiEvidence:
+def _extract_abi(
+    log: str, function_name: str, *, exact_printed_name: str | None = None
+) -> AbiEvidence:
     suffixes = (f"_::{function_name}", f"_::_{function_name}")
     in_function = False
     parameters: dict[int, tuple[str, str]] = {}
@@ -417,9 +428,12 @@ def _extract_abi(log: str, function_name: str) -> AbiEvidence:
     for line in log.splitlines():
         if not in_function:
             match = _CFG_HEADER_RE.match(line)
-            if match is None or not any(
-                match.group("name").endswith(suffix) for suffix in suffixes
-            ):
+            if match is None:
+                continue
+            if exact_printed_name is not None:
+                if match.group("name") != exact_printed_name:
+                    continue
+            elif not any(match.group("name").endswith(suffix) for suffix in suffixes):
                 continue
             in_function = True
             continue
@@ -463,6 +477,49 @@ def _extract_abi(log: str, function_name: str) -> AbiEvidence:
         result=result,
         max_parameters_in_registers=max_in_registers,
         must_use_stack_calling_convention=must_use_stack,
+    )
+
+
+def _derive_closure_abi_from_cfg(
+    parent: AbiEvidence,
+    closure_cfg: AbiEvidence,
+) -> AbiEvidence:
+    """Derive the synthetic closure call ABI from exact compiler CFG facts.
+
+    vm.unboxing-info.metadata is attached to Kernel members, not to the
+    synthetic ClosureFunction/ImplicitClosureFunction object emitted by the VM.
+    Dart source gives that family a dedicated call contract: the Closure object
+    is hidden from the user formal list, MaxNumberOfParametersInRegisters()
+    returns zero, and the synthetic Function starts with boxed parameter/return
+    state. We therefore require the selected synthetic CFG to prove exactly the
+    matching boxed stack shape and strip only its leading hidden Closure formal.
+    """
+    if not closure_cfg.parameters:
+        raise ValueError("compiler closure CFG has no hidden Closure parameter")
+    if not closure_cfg.must_use_stack_calling_convention or closure_cfg.max_parameters_in_registers != 0:
+        raise ValueError("compiler closure CFG does not use the required forced-stack convention")
+    if any(parameter != "tagged" for parameter in closure_cfg.parameters):
+        raise ValueError(
+            "compiler closure CFG contradicts the boxed synthetic-closure parameter contract"
+        )
+    if closure_cfg.result != "tagged":
+        raise ValueError(
+            "compiler closure CFG contradicts the boxed synthetic-closure result contract"
+        )
+    user_parameter_count = len(parent.parameters) - parent.implicit_parameter_count
+    if user_parameter_count < 0 or len(closure_cfg.parameters) != user_parameter_count + 1:
+        raise ValueError(
+            "compiler closure CFG formal count disagrees with the parent Function signature: "
+            f"parent_user={user_parameter_count} closure={len(closure_cfg.parameters)}"
+        )
+    return AbiEvidence(
+        parameters=closure_cfg.parameters[1:],
+        result=closure_cfg.result,
+        max_parameters_in_registers=0,
+        must_use_stack_calling_convention=True,
+        has_optional_parameters=parent.has_optional_parameters,
+        has_overrides_with_less_direct_parameters=False,
+        implicit_parameter_count=0,
     )
 
 
@@ -778,6 +835,10 @@ def _write_header(
         raise ValueError(f"unsupported generated entry kind: {entry_kind!r}")
     function_kind = int(record.get("function_kind", 0))
     closure_call_entry_only = bool(record.get("closure_call_entry_only", False))
+    code_payload_va = int(record.get("code_payload_va", record["entry_va"]))
+    code_instructions_length = int(
+        record.get("code_instructions_length", record["code_size"])
+    )
     compatibility_macro = (
         "#define DARTPLANT_ORDINARY_AOT_SIDECAR_AVAILABLE 1\n"
         if symbol_prefix == "DartPlantOrdinaryAot"
@@ -839,6 +900,8 @@ inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
     .function_kind = {function_kind}u,
     .closure_call_entry_only = {1 if closure_call_entry_only else 0},
     .reserved_function_flags = {{0, 0, 0}},
+    .code_payload_va = 0x{code_payload_va:x}ULL,
+    .code_instructions_length = {code_instructions_length}ULL,
 }}}};
 
 inline constexpr DartPlantSnapshotIndexInfo {snapshot_symbol} = {{
@@ -925,6 +988,10 @@ def _write_identity_header(
         raise ValueError(f"unsupported generated entry kind: {entry_kind!r}")
     function_kind = int(record.get("function_kind", 0))
     closure_call_entry_only = bool(record.get("closure_call_entry_only", False))
+    code_payload_va = int(record.get("code_payload_va", record["entry_va"]))
+    code_instructions_length = int(
+        record.get("code_instructions_length", record["code_size"])
+    )
     text = f"""// Generated by tools/compiler-oracle/build_snapshot_sidecar.py.
 #pragma once
 
@@ -946,6 +1013,8 @@ inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
     .function_kind = {function_kind}u,
     .closure_call_entry_only = {1 if closure_call_entry_only else 0},
     .reserved_function_flags = {{0, 0, 0}},
+    .code_payload_va = 0x{code_payload_va:x}ULL,
+    .code_instructions_length = {code_instructions_length}ULL,
 }}}};
 
 inline constexpr DartPlantSnapshotIndexInfo {snapshot_symbol} = {{
@@ -1028,10 +1097,6 @@ def main() -> int:
     libapp = args.libapp.read_bytes()
     identity = _parse_elf64(libapp)
     artifact_function_name = args.artifact_function_name or args.function_name
-    if args.compiler_function_kind in {"ClosureFunction", "ImplicitClosureFunction"} and not args.identity_only:
-        raise ValueError(
-            "closure artifacts require --identity-only unless exact compiler ABI metadata is available"
-        )
     log, code_identity = _run_gen_snapshot(
         args.gen_snapshot,
         args.dill,
@@ -1060,17 +1125,28 @@ def main() -> int:
         )
     abi: AbiEvidence | None = None
     if not args.identity_only:
-        abi = _load_abi_oracle(
+        parent_abi = _load_abi_oracle(
             args.abi_oracle_json,
             args.library_uri,
             args.class_name,
             args.function_name,
         )
+        if closure_call_entry_only:
+            closure_cfg = _extract_abi(
+                log, args.function_name, exact_printed_name=machine.printed_name
+            )
+            abi = _derive_closure_abi_from_cfg(parent_abi, closure_cfg)
+        else:
+            abi = parent_abi
         # gen_snapshot's human-readable CFG is intentionally only an independent
         # cross-check. Runtime ABI evidence is emitted from vm.unboxing-info.metadata
-        # above; changing printer text cannot silently become compiler truth.
-        cfg_abi = _extract_abi(log, args.function_name)
-        _validate_cfg_cross_check(abi, cfg_abi)
+        # above for ordinary Functions. Synthetic closures have no independent
+        # Kernel-member metadata record, so their exact selected CFG is accepted
+        # only through _derive_closure_abi_from_cfg(), which enforces the
+        # separately source-verified boxed/forced-stack closure contract.
+        if not closure_call_entry_only:
+            cfg_abi = _extract_abi(log, args.function_name)
+            _validate_cfg_cross_check(abi, cfg_abi)
     required_direct_call_target_va: int | None = None
     if closure_call_entry_only and args.compiler_function_kind == "ImplicitClosureFunction":
         ordinary_machine = _extract_machine_code(log, args.function_name, "RegularFunction")
@@ -1104,6 +1180,8 @@ def main() -> int:
         "entry_kind": args.entry_kind,
         "entry_va": entry_va,
         "code_size": len(actual_code),
+        "code_payload_va": payload_va,
+        "code_instructions_length": len(actual_payload),
         "fingerprint": _fnv1a64(actual_code),
         "build_id": identity.build_id,
         "snapshot_hash": identity.snapshot_hash,

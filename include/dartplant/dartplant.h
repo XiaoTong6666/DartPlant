@@ -119,6 +119,10 @@ DARTPLANT_EXPORT void dartplant_shutdown(void);
 DARTPLANT_EXPORT uint8_t dartplant_is_initialized(void);
 
 // Legacy/offline compatibility API. New consumers should call dartplant_init().
+// Reset restores physical entry bytes before releasing active hook records.
+// Published callback entry veneers and the hook objects they name remain
+// process-lifetime objects so stale instruction fetches cannot dereference
+// freed hook state.
 DARTPLANT_EXPORT DartPlantStatus dartplant_initialize_from_json(const char* metadata_json);
 DARTPLANT_EXPORT void dartplant_reset(void);
 DARTPLANT_EXPORT const char* dartplant_last_error(void);

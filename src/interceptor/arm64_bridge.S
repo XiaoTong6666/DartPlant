@@ -174,14 +174,19 @@ dartplant_arm64_native_continuation:
 
 .size dartplant_arm64_native_continuation, .-dartplant_arm64_native_continuation
 
-// Each real Dart RET is replaced with a direct B to a per-hook veneer. The
-// veneer reloads DartPlantHook* into x17 and branches here. Because the real
-// Dart LR was never replaced, x30 is still the true caller PC and exception
-// unwinding sees exactly the same Dart frame chain as the unhooked function.
+// Each real Dart RET is replaced with a direct B to a payload-owned veneer.
+// The veneer reloads DartCodePayload* into x17 and branches here. Because the
+// real Dart LR was never replaced, x30 is still the true caller PC and
+// exception unwinding sees exactly the same Dart frame chain as the unhooked
+// function.
 dartplant_arm64_return_entry:
   mov x16, sp
   mov sp, x15
-  sub sp, sp, #64
+  // Leave [x15-32, x15) unused. The generated/native bridge materializes two
+  // GC-scanned fixed ObjectPtr slots at [x15-32, x15-16) and the synthetic VM
+  // ExitFrame FP/LR pair at [x15-16, x15), so none of the native scratch saves
+  // below may overlap that frame image.
+  sub sp, sp, #112
   tbz x15, #3, .Ldartplant_return_stack_aligned
   sub sp, sp, #8
 .Ldartplant_return_stack_aligned:
@@ -189,12 +194,20 @@ dartplant_arm64_return_entry:
   stp q0, q1, [sp, #16]
   str x30, [sp, #48]
   str x16, [sp, #56]
+  // x15 is Dart's SPREG but is caller-saved by the native AAPCS. Preserve it
+  // explicitly for the passthrough path and also pass the return-time Dart
+  // frame identity to the dispatcher. x29 is AAPCS callee-saved, but snapshot
+  // it here so ownership is checked against the exact value at the Dart RET.
+  str x15, [sp, #64]
+  str x29, [sp, #72]
   mov x0, x17
   ldr x1, [sp, #0]
   ldr x2, [sp, #8]
   ldr x3, [sp, #16]
   ldr x4, [sp, #48]
-  bl dartplant_arm64_dispatch_return_from_hook
+  ldr x5, [sp, #64]
+  ldr x6, [sp, #72]
+  bl dartplant_arm64_dispatch_return_from_payload
   // x0 = TLS context (or null for passthrough), x1 = synchronous
   // invoke-original native-frame SP (or zero for an automatic return).
   cbnz x1, .Ldartplant_resume_synchronous_original
@@ -203,6 +216,7 @@ dartplant_arm64_return_entry:
   ldp q0, q1, [sp, #16]
   ldr x30, [sp, #48]
   ldr x16, [sp, #56]
+  ldr x15, [sp, #64]
   mov sp, x16
   ret
 .Ldartplant_return_has_context:

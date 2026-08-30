@@ -47,7 +47,7 @@ the advanced explicit registration functions remain available for tooling and
 tests. Runtime binding revalidates snapshot hash, build-id, logical Function
 identity, entry VA, code size and code fingerprint against the live runtime.
 Typed `DartCallLayout` creation additionally requires a compiler-proven unique
-`CodeTarget`.
+`DartEntryTarget`.
 
 For ordinary Kernel members, the producer mirrors the same rules used by
 `Function::MaxNumberOfParametersInRegisters()`: generic functions and

@@ -168,11 +168,17 @@ extern "C" DartPlantStatus dartplant_runtime_hook_method_with_profile(
                           "method belongs to a stale or different runtime generation");
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
+    // The explicit runtime profile controls the raw/fallback register surface;
+    // it must not discard an exact compiler-derived DartCallLayout already
+    // bound to this physical entry. Closure stack arguments and the hidden
+    // ArgumentsDescriptor in particular are only exposed through that verified
+    // layout.
+    const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
     return FinishHook(
         runtime, dartplant::InstallCallbackHook(method, *profile, *options, 0, out_hook, nullptr,
                                                 runtime->live_vm_null_value, runtime->generation,
                                                 generation, runtime->live_vm_bool_true_value,
-                                                runtime->live_vm_bool_false_value));
+                                                runtime->live_vm_bool_false_value, call_layout));
 }
 
 extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runtime,

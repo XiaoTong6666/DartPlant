@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "core/internal.h"
@@ -98,7 +99,7 @@ int ExerciseDartPadBranch() {
     const uintptr_t end = reinterpret_cast<uintptr_t>(mapping) + kFakeStackSize;
     const uintptr_t dart_spreg = ((end - (64U << 10)) & ~uintptr_t{0xf}) + 8;
 
-    auto target = std::make_shared<dartplant::DartCodeTarget>();
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
     target->id = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
     target->entry = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
     target->code_size = 4;
@@ -150,6 +151,117 @@ int ExerciseDartPadBranch() {
     if (add_status != DARTPLANT_OK || result != 77 || !g_dart_pad_branch_ok || !idle) {
         return Fail("deterministic Dart x15 alignment pad");
     }
+    return 0;
+}
+
+int ExercisePayloadReturnOwnership() {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return Fail("payload return page size");
+    void* mapping = mmap(nullptr, static_cast<size_t>(page_size),
+                         PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return Fail("map payload return fixture");
+    auto* code = static_cast<uint32_t*>(mapping);
+    code[0] = 0x540000c0U;  // entry A: b.eq shared RET at +24, else fall through.
+    code[1] = 0x14000002U;  // A fallthrough -> A-only RET at +12.
+    code[2] = 0xd503201fU;  // unreachable padding.
+    code[3] = 0xd65f03c0U;  // A-only RET.
+    code[4] = 0x54000040U;  // entry B: b.eq shared RET at +24, else fall through.
+    code[5] = 0x14000002U;  // B fallthrough -> B-only RET at +28.
+    code[6] = 0xd65f03c0U;  // shared RET.
+    code[7] = 0xd65f03c0U;  // B-only RET.
+
+    auto payload = std::make_shared<dartplant::DartCodePayload>();
+    payload->id = reinterpret_cast<uintptr_t>(mapping);
+    payload->start = payload->id;
+    payload->instructions_length = 32;
+    payload->pristine_bytes.resize(32);
+    std::memcpy(payload->pristine_bytes.data(), code, 32);
+
+    auto first = std::make_shared<dartplant::DartEntryTarget>();
+    first->id = payload->start;
+    first->entry = first->id;
+    first->code_size = 32;
+    first->payload = payload;
+    auto second = std::make_shared<dartplant::DartEntryTarget>();
+    second->id = payload->start + 16;
+    second->entry = second->id;
+    second->code_size = 16;
+    second->payload = payload;
+
+    DartPlantHook first_hook{};
+    first_hook.code_target = first;
+    DartPlantHook second_hook{};
+    second_hook.code_target = second;
+    if (dartplant::InstallArm64ReturnInterception(&first_hook) != DARTPLANT_OK ||
+        payload->return_patches.size() != 2 || payload->return_interception_consumers != 1 ||
+        code[3] == 0xd65f03c0U || code[6] == 0xd65f03c0U || code[7] != 0xd65f03c0U) {
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("first payload return interception");
+    }
+    const uint32_t first_only_branch = code[3];
+    const uint32_t shared_branch = code[6];
+    if (mprotect(mapping, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE | PROT_EXEC) !=
+        0) {
+        (void) dartplant::RestoreArm64ReturnInterception(&first_hook);
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("failed sibling return test write permission");
+    }
+    code[7] = 0xd503201fU;
+    __builtin___clear_cache(reinterpret_cast<char*>(&code[7]), reinterpret_cast<char*>(&code[8]));
+    if (dartplant::InstallArm64ReturnInterception(&second_hook) != DARTPLANT_HOOK_FAILED ||
+        payload->return_patches.size() != 2 || payload->return_interception_consumers != 1 ||
+        code[3] != first_only_branch || code[6] != shared_branch || code[7] != 0xd503201fU) {
+        code[7] = 0xd65f03c0U;
+        (void) dartplant::RestoreArm64ReturnInterception(&first_hook);
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("failed sibling return interception rollback");
+    }
+    code[7] = 0xd65f03c0U;
+    __builtin___clear_cache(reinterpret_cast<char*>(&code[7]), reinterpret_cast<char*>(&code[8]));
+    if (dartplant::InstallArm64ReturnInterception(&second_hook) != DARTPLANT_OK ||
+        payload->return_patches.size() != 3 || payload->return_interception_consumers != 2 ||
+        code[3] != first_only_branch || code[6] != shared_branch || code[7] == 0xd65f03c0U) {
+        (void) dartplant::RestoreArm64ReturnInterception(&first_hook);
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("sibling payload return interception");
+    }
+    const uint32_t foreign_instruction = 0xd503201fU;
+    // Return interception deliberately restores the containing code page to
+    // RX after every managed write. A foreign writer would have to acquire
+    // write permission independently too; mirror that here instead of
+    // faulting the test itself by assigning through an RX mapping.
+    if (mprotect(mapping, static_cast<size_t>(page_size), PROT_READ | PROT_WRITE | PROT_EXEC) !=
+        0) {
+        (void) dartplant::RestoreArm64ReturnInterception(&first_hook);
+        (void) dartplant::RestoreArm64ReturnInterception(&second_hook);
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("foreign shared RET test write permission");
+    }
+    code[6] = foreign_instruction;
+    __builtin___clear_cache(reinterpret_cast<char*>(&code[6]), reinterpret_cast<char*>(&code[7]));
+    if (dartplant::RestoreArm64ReturnInterception(&first_hook) ||
+        payload->return_interception_consumers != 2 || payload->return_patches.size() != 3 ||
+        code[6] != foreign_instruction) {
+        code[6] = shared_branch;
+        (void) dartplant::RestoreArm64ReturnInterception(&first_hook);
+        (void) dartplant::RestoreArm64ReturnInterception(&second_hook);
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("foreign shared RET patch ownership rejection");
+    }
+    code[6] = shared_branch;
+    void* const published_return_entry = payload->return_entry;
+    if (!dartplant::RestoreArm64ReturnInterception(&first_hook) ||
+        payload->return_interception_consumers != 1 || payload->return_patches.size() != 2 ||
+        code[3] != 0xd65f03c0U || code[6] != shared_branch || code[7] == 0xd65f03c0U ||
+        !dartplant::RestoreArm64ReturnInterception(&second_hook) ||
+        payload->return_interception_consumers != 0 || !payload->return_patches.empty() ||
+        code[6] != 0xd65f03c0U || code[7] != 0xd65f03c0U ||
+        payload->return_entry != published_return_entry || payload->return_entry == nullptr ||
+        !payload->return_entry_published) {
+        munmap(mapping, static_cast<size_t>(page_size));
+        return Fail("payload return interception release");
+    }
+    munmap(mapping, static_cast<size_t>(page_size));
     return 0;
 }
 
@@ -209,6 +321,7 @@ int main() {
     if (dartplant_install_host_api(dartplant_dobby_host_api()) != DARTPLANT_OK) {
         return Fail("generic host API install");
     }
+    if (ExercisePayloadReturnOwnership() != 0) return 1;
     if (ExerciseDartPadBranch() != 0) return 1;
     dartplant::RefreshModules();
 
@@ -274,9 +387,9 @@ int main() {
     // This executable is intentionally not a Dart VM. Build a synthetic method
     // only to validate the ARM64 callback/trampoline backend; runtime Function
     // discovery is tested by the real Flutter fixture below this test layer.
-    dartplant::DartCodeTargetRegistry code_targets;
+    dartplant::DartEntryTargetRegistry entry_targets;
     auto code_target =
-        code_targets.GetOrCreate(reinterpret_cast<uintptr_t>(DartPlantFixtureAdd), 4, 0, 1);
+        entry_targets.GetOrCreate(reinterpret_cast<uintptr_t>(DartPlantFixtureAdd), 4, 0, 1);
     auto function = std::make_shared<dartplant::DartFunctionHandle>();
     function->identity = {
         .library_uri = "package:fixture/main.dart",
@@ -380,6 +493,7 @@ int main() {
     }
 
     std::printf("[PASS] ARM64 deterministic Dart x15 alignment pad\n");
+    std::printf("[PASS] ARM64 payload-level sibling RET ownership\n");
     std::printf("[PASS] ARM64 Dobby hook/original/unhook\n");
     std::printf("[PASS] ARM64 callback enter/leave/result mutation\n");
     std::printf("[PASS] ARM64 raw callback without ABI mapping\n");

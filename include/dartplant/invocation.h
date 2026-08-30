@@ -62,14 +62,14 @@ typedef struct DartPlantMethodIdentityInfo {
 } DartPlantMethodIdentityInfo;
 
 // Compatibility alias for dartplant_invocation_requested_method(). On shared
-// CodeTargets this is the method under which the current listener was
+// Shared entry targets use the method under which the current listener was
 // registered, not proof of the logical caller that reached the physical entry.
 DARTPLANT_EXPORT const DartPlantMethod* dartplant_invocation_method(
     const DartPlantInvocation* invocation);
 DARTPLANT_EXPORT const DartPlantMethod* dartplant_invocation_requested_method(
     const DartPlantInvocation* invocation);
-// Returns the logical method only when the physical CodeTarget has a unique
-// identity. Shared CodeTargets return null because the entry alone cannot prove
+// Returns the logical method only when the physical entry target has a unique
+// identity. Shared entry targets return null because the entry alone cannot prove
 // which alias caused this invocation.
 DARTPLANT_EXPORT const DartPlantMethod* dartplant_invocation_logical_method(
     const DartPlantInvocation* invocation);
@@ -125,6 +125,25 @@ DARTPLANT_EXPORT uint8_t
 dartplant_invocation_has_closure_receiver(const DartPlantInvocation* invocation);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_receiver(
     const DartPlantInvocation* invocation, DartPlantValue* out_value);
+typedef struct DartPlantArgumentsDescriptorInfo {
+    uint32_t struct_size;
+    uint32_t type_args_len;
+    uint32_t count;
+    uint32_t size;
+    uint32_t positional_count;
+    uint32_t named_count;
+    uint64_t raw_descriptor;
+} DartPlantArgumentsDescriptorInfo;
+
+// Reads the verified PRODUCT ARM64 closure ArgumentsDescriptor carried in x4.
+// The descriptor is an immutable VM Array of Smis. This API exposes only its
+// raw VM call-shape counters. For closure calls, count/size/positional_count
+// include the hidden Closure receiver as one boxed argument, while
+// dartplant_invocation_argument_count() and get_argument() expose only the
+// FunctionType user formals. Named argument strings/positions remain
+// fail-closed until DartPlant can map them onto optional FunctionType formals.
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_arguments_descriptor(
+    const DartPlantInvocation* invocation, DartPlantArgumentsDescriptorInfo* out_info);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_argument(
     const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocation,

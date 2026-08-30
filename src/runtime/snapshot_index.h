@@ -28,6 +28,7 @@ struct SnapshotFunction {
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     uint64_t code_object_pool = 0;
+    uint64_t code_payload_va = 0;
     uint64_t code_payload_start = 0;
     uint32_t code_instructions_length = 0;
     uintptr_t runtime_entry = 0;

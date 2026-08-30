@@ -18,7 +18,7 @@ libapp.so
   -> Flutter snapshot hash/features
   -> LiveVmContext bootstrap
   -> Library/Class/Function lookup
-  -> Function* -> Code* -> CodeTarget
+  -> Function* -> Code* -> DartCodePayload -> DartEntryTarget
   -> shared-code hook/listener validation
 ```
 

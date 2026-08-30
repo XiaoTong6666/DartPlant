@@ -9,6 +9,7 @@
 #include "abi/calling_convention.h"
 #include "abi/evidence_solver.h"
 #include "runtime/runtime_internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 namespace {
@@ -132,12 +133,12 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     }
     if (method->function == nullptr || method->function->code_target == nullptr) {
         return reject(DARTPLANT_INVALID_ARGUMENT, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS,
-                      "compiler ABI evidence method has no CodeTarget");
+                      "compiler ABI evidence method has no entry target");
     }
     if (method->function->code_target->IsShared()) {
         return reject(
             DARTPLANT_SHARED_CODE_ENTRY, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS,
-            "compiler ABI evidence cannot create a typed frame for an identity-ambiguous shared CodeTarget");
+            "compiler ABI evidence cannot create a typed frame for an identity-ambiguous shared entry target");
     }
     if (!runtime->snapshot.has_value() || !runtime->selected_app_module.has_value()) {
         return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE,
@@ -158,7 +159,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         dartplant::FingerprintCodeWithManagedPatches(reinterpret_cast<const void*>(target),
                                                      code_size) != evidence->code_fingerprint) {
         return reject(DARTPLANT_FINGERPRINT_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
-                      "compiler ABI evidence code fingerprint does not match the CodeTarget");
+                      "compiler ABI evidence code fingerprint does not match the entry target");
     }
     const bool has_function_binding = evidence->struct_size >= kCompilerAbiEvidenceV2Size;
     const bool has_structural_summary =
@@ -190,7 +191,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         if (!evidence_target.has_value() || *evidence_target != target) {
             return reject(
                 DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
-                "compiler ABI evidence entry VA does not resolve to the runtime CodeTarget");
+                "compiler ABI evidence entry VA does not resolve to the runtime entry target");
         }
     }
     if (evidence->must_use_stack_calling_convention != 0 &&
@@ -206,6 +207,26 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     if (method->function->code_target->HookRecord() != nullptr) {
         return reject(DARTPLANT_ALREADY_HOOKED, DARTPLANT_REJECT_HOOK_FAILED,
                       "compiler ABI evidence must be registered before installing the hook");
+    }
+    const dartplant::RuntimeProfileRecord* vm_profile =
+        dartplant::FindRuntimeProfileByVersion(method->function->runtime_profile_version);
+    if (method->function->closure_call_entry_only) {
+        if (vm_profile == nullptr || method->record.entry_kind != DARTPLANT_ENTRY_DEFAULT) {
+            return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ENTRY_KIND_UNSUPPORTED,
+                          "closure ABI evidence has no exact PRODUCT ARM64 runtime profile");
+        }
+        if (evidence->must_use_stack_calling_convention == 0 ||
+            evidence->max_parameters_in_registers != 0) {
+            return reject(
+                DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_CONFLICT,
+                "Dart closure ABI evidence contradicts the forced stack calling convention");
+        }
+        for (uint32_t index = 0; index < evidence->parameter_count; ++index) {
+            if (evidence->parameter_representations[index] != DARTPLANT_ABI_REPRESENTATION_TAGGED) {
+                return reject(DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_CONFLICT,
+                              "Dart closure formals must remain boxed/tagged in PRODUCT AOT");
+            }
+        }
     }
     if (has_structural_summary) {
         if (evidence->structural_schema_version != 1 || evidence->structural_verified > 1 ||
@@ -322,6 +343,11 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         layout->closure_receiver_location = {
             .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
             .register_index = 0,
+        };
+        layout->has_arguments_descriptor = true;
+        layout->arguments_descriptor_location = dartplant::abi::DartAbiLocation{
+            .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+            .register_index = vm_profile->arguments_descriptor_register,
         };
     }
     existing->call_layout = existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&

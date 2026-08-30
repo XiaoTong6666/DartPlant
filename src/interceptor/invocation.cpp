@@ -1,11 +1,16 @@
 // Copyright (C) 2026 XiaoTong6666
 // SPDX-License-Identifier: Apache-2.0
 
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstring>
 
 #include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace {
 
@@ -13,6 +18,36 @@ bool ValidRegister(uint32_t index) { return index < 31; }
 
 bool HasVerifiedCallLayout(const DartPlantInvocation* invocation) {
     return invocation != nullptr && invocation->call_layout != nullptr;
+}
+
+template <typename T>
+bool ReadSelfValue(uintptr_t address, T* out_value) {
+    if (address == 0 || out_value == nullptr) return false;
+    iovec local{out_value, sizeof(T)};
+    iovec remote{reinterpret_cast<void*>(address), sizeof(T)};
+    return syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0) ==
+           static_cast<ssize_t>(sizeof(T));
+}
+
+bool ReadPositiveCompressedSmi(uintptr_t address, const dartplant::RawObjectLayout& layout,
+                               uint32_t* out_value) {
+    if (out_value == nullptr || layout.compressed_word_size == 0 || layout.smi_tag_shift >= 64)
+        return false;
+    uint64_t raw = 0;
+    if (layout.compressed_word_size == sizeof(uint32_t)) {
+        uint32_t compressed = 0;
+        if (!ReadSelfValue(address, &compressed)) return false;
+        raw = compressed;
+    } else if (layout.compressed_word_size == sizeof(uint64_t)) {
+        if (!ReadSelfValue(address, &raw)) return false;
+    } else {
+        return false;
+    }
+    if ((raw & layout.smi_tag_mask) != layout.smi_tag) return false;
+    const uint64_t value = raw >> layout.smi_tag_shift;
+    if (value > UINT32_MAX) return false;
+    *out_value = static_cast<uint32_t>(value);
+    return true;
 }
 
 bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
@@ -513,6 +548,92 @@ DartPlantStatus dartplant_invocation_get_closure_receiver(const DartPlantInvocat
     return DARTPLANT_OK;
 }
 
+DartPlantStatus dartplant_invocation_get_arguments_descriptor(
+    const DartPlantInvocation* invocation, DartPlantArgumentsDescriptorInfo* out_info) {
+    if (invocation == nullptr || invocation->context == nullptr || out_info == nullptr ||
+        out_info->struct_size < sizeof(DartPlantArgumentsDescriptorInfo) ||
+        !HasVerifiedCallLayout(invocation) || !invocation->call_layout->has_arguments_descriptor ||
+        invocation->requested_method == nullptr ||
+        invocation->requested_method->function == nullptr) {
+        dartplant::SetLastError("verified closure ArgumentsDescriptor is unavailable");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure ArgumentsDescriptor is only available during enter");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    const auto* profile = dartplant::FindRuntimeProfileByVersion(
+        invocation->requested_method->function->runtime_profile_version);
+    if (profile == nullptr) {
+        dartplant::SetLastError("closure ArgumentsDescriptor has no exact runtime profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    uint64_t raw = 0;
+    const auto& raw_layout = profile->raw_object;
+    if (!ReadVerifiedLocation(invocation, invocation->call_layout->arguments_descriptor_location,
+                              &raw) ||
+        raw == 0 || (raw & raw_layout.smi_tag_mask) != raw_layout.heap_object_tag ||
+        raw < raw_layout.heap_object_tag) {
+        dartplant::SetLastError("closure ArgumentsDescriptor register is not a tagged object");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (raw_layout.class_id_tag_bits == 0 || raw_layout.class_id_tag_bits >= 64 ||
+        raw_layout.class_id_tag_shift >= 64 - raw_layout.class_id_tag_bits) {
+        dartplant::SetLastError("closure ArgumentsDescriptor raw-object profile is invalid");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const uint64_t class_id_mask = (uint64_t{1} << raw_layout.class_id_tag_bits) - 1;
+    const uintptr_t object = static_cast<uintptr_t>(raw - raw_layout.heap_object_tag);
+    uint64_t tags = 0;
+    if (!ReadSelfValue(object, &tags)) {
+        dartplant::SetLastError("closure ArgumentsDescriptor object is unreadable");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const uint32_t cid =
+        static_cast<uint32_t>((tags >> raw_layout.class_id_tag_shift) & class_id_mask);
+    if (cid != profile->live_vm.cid_array && cid != profile->live_vm.cid_immutable_array) {
+        dartplant::SetLastError("closure ArgumentsDescriptor is not a Dart Array");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    DartPlantArgumentsDescriptorInfo info{};
+    info.struct_size = sizeof(info);
+    info.raw_descriptor = raw;
+    const auto& layout = profile->arguments_descriptor;
+    if (!ReadPositiveCompressedSmi(object + layout.type_args_len_offset, raw_layout,
+                                   &info.type_args_len) ||
+        !ReadPositiveCompressedSmi(object + layout.count_offset, raw_layout, &info.count) ||
+        !ReadPositiveCompressedSmi(object + layout.size_offset, raw_layout, &info.size) ||
+        !ReadPositiveCompressedSmi(object + layout.positional_count_offset, raw_layout,
+                                   &info.positional_count) ||
+        info.positional_count > info.count || info.count > info.size) {
+        dartplant::SetLastError("closure ArgumentsDescriptor counters are inconsistent");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (invocation->call_layout->has_closure_receiver) {
+        // Kernel flowgraph construction includes the Closure receiver in the
+        // call arguments, then adds a second explicit Closure input used only
+        // to load the target entry. TemplateDartCall<1> excludes that target
+        // input, not the receiver argument, from ArgumentsDescriptor. Typed
+        // Function formals deliberately expose neither hidden value.
+        const uint64_t formal_count = invocation->call_layout->parameters.size();
+        if (formal_count >= UINT32_MAX) {
+            dartplant::SetLastError("verified closure formal count is invalid");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const uint64_t expected_argument_count = formal_count + 1;
+        if (info.count != expected_argument_count || info.size != expected_argument_count ||
+            info.positional_count != expected_argument_count) {
+            dartplant::SetLastError(
+                "closure ArgumentsDescriptor does not match the verified fixed-arity call layout");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+    }
+    info.named_count = info.count - info.positional_count;
+    *out_info = info;
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* invocation,
                                                   uint32_t index, DartPlantValue* out_value) {
     const uint32_t argument_count = dartplant_invocation_argument_count(invocation);
@@ -851,11 +972,25 @@ DartPlantStatus dartplant_invocation_call_original(DartPlantInvocation* invocati
         dartplant::SetLastError("original has already been invoked");
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
-    if (invocation->hook == nullptr || invocation->hook->backup == nullptr) {
+    if (invocation->hook == nullptr ||
+        invocation->hook->backup.load(std::memory_order_acquire) == nullptr) {
         dartplant::SetLastError("original entry is unavailable");
         return DARTPLANT_HOOK_FAILED;
     }
-    if (dartplant_arm64_invoke_original(invocation->context, invocation->hook->backup) == 0) {
+    if (invocation->generated_vm_bridge_active) {
+        // The callback currently owns a VM-visible Generated->Native
+        // transition. Re-entering Dart synchronously would require leaving the
+        // API scope, returning the Thread to generated state, refreshing every
+        // rooted tagged location, then rebuilding the transition when the
+        // original returns. Until that nested protocol is implemented, keep
+        // automatic original execution safe and make explicit call_original()
+        // fail closed.
+        dartplant::SetLastError(
+            "synchronous original invocation is unavailable inside a generated/native VM bridge");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (dartplant_arm64_invoke_original(
+            invocation->context, invocation->hook->backup.load(std::memory_order_acquire)) == 0) {
         if (dartplant_last_error()[0] == '\0') {
             dartplant::SetLastError("synchronous original invocation bridge failed");
         }

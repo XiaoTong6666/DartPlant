@@ -5,7 +5,7 @@
 
 #include "dartplant/dartplant.h"
 
-struct DartPlantFlutterSnapshotInfo {
+typedef struct DartPlantFlutterSnapshotInfo {
     uint32_t struct_size;
     const char* module_name;
     const char* module_path;
@@ -18,7 +18,7 @@ struct DartPlantFlutterSnapshotInfo {
     uint64_t isolate_instructions_size;
     uint64_t isolate_instructions_runtime;
     uint8_t compressed_pointers;
-};
+} DartPlantFlutterSnapshotInfo;
 
 // Compiler-side proof about the logical identity multiplicity of one physical
 // Dart Code entry. UNKNOWN is deliberately not equivalent to UNIQUE: an
@@ -51,6 +51,12 @@ typedef struct DartPlantSnapshotFunctionInfo {
     uint32_t function_kind;
     uint8_t closure_call_entry_only;
     uint8_t reserved_function_flags[3];
+    // V3 append-only Code-payload identity. entry_va/code_size describe the
+    // selected entry suffix, while these fields identify the complete Dart
+    // Code payload shared by sibling entry kinds. Old artifacts may leave both
+    // zero and are conservatively treated as one-entry payloads.
+    uint64_t code_payload_va;
+    uint64_t code_instructions_length;
 } DartPlantSnapshotFunctionInfo;
 
 typedef struct DartPlantSnapshotIndexInfo {

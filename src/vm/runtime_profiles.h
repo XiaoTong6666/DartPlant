@@ -44,6 +44,35 @@ struct FunctionTypeLayout {
     uint8_t type_parameter_function_bit;
 };
 
+struct RawObjectLayout {
+    uint8_t heap_object_tag;
+    uint8_t smi_tag;
+    uint8_t smi_tag_mask;
+    uint8_t smi_tag_shift;
+    uint8_t class_id_tag_shift;
+    uint8_t class_id_tag_bits;
+    uint8_t compressed_word_size;
+};
+
+struct ArgumentsDescriptorLayout {
+    uint32_t type_args_len_offset;
+    uint32_t count_offset;
+    uint32_t size_offset;
+    uint32_t positional_count_offset;
+    uint32_t first_named_entry_offset;
+    uint32_t named_entry_size;
+    uint32_t name_offset;
+    uint32_t position_offset;
+};
+
+struct FunctionKindLayout {
+    uint32_t regular;
+    uint32_t closure;
+    uint32_t implicit_closure;
+    uint8_t tag_shift;
+    uint8_t tag_bits;
+};
+
 struct RuntimeProfileRecord {
     DartPlantLiveVmProfile live_vm;
     uint8_t dart_sp_register;
@@ -55,6 +84,9 @@ struct RuntimeProfileRecord {
     uint32_t thread_jump_to_frame_entry_point_offset;
     CanonicalBoolLayout canonical_bool;
     FunctionTypeLayout function_type;
+    RawObjectLayout raw_object;
+    ArgumentsDescriptorLayout arguments_descriptor;
+    FunctionKindLayout function_kind;
 };
 
 struct AotCodePayloadRange {
@@ -69,6 +101,7 @@ const RuntimeProfileRecord* FindRuntimeProfileByVersion(uint32_t profile_version
 const RuntimeProfileRecord* FindRuntimeProfileBySnapshot(std::string_view snapshot_hash,
                                                          std::string_view snapshot_profile = {});
 uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash);
+bool IsClosureFunctionKind(uint32_t profile_version, uint32_t function_kind);
 bool ComputeAotCodePayloadStart(uint32_t profile_version, uint64_t normal_entry,
                                 uint64_t monomorphic_entry, uint64_t* out_start,
                                 bool* out_has_monomorphic_entry = nullptr);

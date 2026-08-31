@@ -348,6 +348,55 @@ int TestHostUnhookAdapter(void* user_data, void* target) {
     return bridge == nullptr || bridge->unhook == nullptr ? -1 : bridge->unhook(target);
 }
 
+struct BlockingPublicationHostState {
+    std::atomic_bool replacement_published{false};
+    std::atomic_bool allow_hook_return{false};
+    std::atomic_bool hook_returned{false};
+    std::atomic_bool backup_alive{false};
+    std::atomic_int unhook_calls{0};
+    void* replacement = nullptr;
+};
+
+int BlockingPublicationHook(void* user_data, void* target, void* replacement, void** backup) {
+    auto* state = static_cast<BlockingPublicationHostState*>(user_data);
+    if (state == nullptr || target == nullptr || replacement == nullptr || backup == nullptr) {
+        return -1;
+    }
+    state->replacement = replacement;
+    // Model Vector/Irena's legacy synchronous ABI: target becomes reachable
+    // before hook() has returned the original trampoline to DartPlant.
+    state->replacement_published.store(true, std::memory_order_release);
+    while (!state->allow_hook_return.load(std::memory_order_acquire)) std::this_thread::yield();
+    *backup = target;
+    state->backup_alive.store(true, std::memory_order_release);
+    state->hook_returned.store(true, std::memory_order_release);
+    return 0;
+}
+
+int BlockingPublicationUnhook(void* user_data, void*) {
+    auto* state = static_cast<BlockingPublicationHostState*>(user_data);
+    if (state == nullptr) return -1;
+    state->unhook_calls.fetch_add(1, std::memory_order_acq_rel);
+    // Model a backend that immediately reclaims its relocated trampoline once
+    // physical unhook succeeds. DartPlant must never route a stale gate there.
+    state->backup_alive.store(false, std::memory_order_release);
+    return 0;
+}
+
+int StrictFailureAfterPublicationHook(void*, void* target, void*,
+                                      DartPlantHostHookTransaction* transaction) {
+    if (target == nullptr || transaction == nullptr ||
+        transaction->struct_size < sizeof(DartPlantHostHookTransaction) ||
+        transaction->backup_ready == nullptr) {
+        return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    }
+    // The strict contract publishes a callable backup first, makes replacement
+    // reachable, restores target, then reports that stale replacement fetches
+    // may still exist.
+    transaction->backup_ready(transaction->user_data, target);
+    return DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED;
+}
+
 void InstallTestHost(TestHostHook hook, TestHostUnhook unhook) {
     // HostApi.user_data is borrowed for as long as hooks created from the
     // binding can exist. Keep these tiny test bridges process-lifetime so test
@@ -943,6 +992,375 @@ TEST_CASE(RealDartCallbackHookRejectsLegacyHostPublication) {
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant::InstallCallbackHook(&method, profile, options, 0, &hook, nullptr));
     EXPECT_EQ(nullptr, hook);
+}
+
+TEST_CASE(LocalPublicationGateBlocksLegacyEarlyPublicationUntilCoreIsReady) {
+    BlockingPublicationHostState host;
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.hook = BlockingPublicationHook;
+    binding.unhook = BlockingPublicationUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    dartplant::PublishedHostHook published;
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                &published, &binding, reinterpret_cast<uintptr_t>(target), callback,
+                                true, reinterpret_cast<void*>(uintptr_t{0x1234})));
+
+    DartPlantStatus install_status = DARTPLANT_NOT_INITIALIZED;
+    void* backup = nullptr;
+    std::thread installer(
+        [&] { install_status = dartplant::InstallPublishedHostHook(&published, &backup); });
+    while (!host.replacement_published.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    std::atomic_bool route_finished{false};
+    void* early_route = nullptr;
+    bool early_callback_pin = false;
+    std::thread contender([&] {
+        early_route =
+            dartplant::AcquirePublishedHostHookRouteForTesting(&published, &early_callback_pin);
+        route_finished.store(true, std::memory_order_release);
+    });
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        if (route_finished.load(std::memory_order_acquire)) break;
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(!route_finished.load(std::memory_order_acquire));
+    EXPECT_TRUE(!host.hook_returned.load(std::memory_order_acquire));
+
+    host.allow_hook_return.store(true, std::memory_order_release);
+    installer.join();
+    EXPECT_EQ(DARTPLANT_OK, install_status);
+    EXPECT_TRUE(backup == target);
+
+    // Before DartPlant has initialized/armed its HookRecord, an early CPU may
+    // only remain blocked or be deliberately routed to the now-known original.
+    dartplant::BypassPublishedHostHookToBackup(&published);
+    contender.join();
+    EXPECT_TRUE(route_finished.load(std::memory_order_acquire));
+    EXPECT_TRUE(early_route == target);
+    EXPECT_TRUE(!early_callback_pin);
+
+    dartplant::ArmPublishedHostHook(&published);
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(&published, &callback_pin) ==
+                callback);
+    EXPECT_TRUE(callback_pin);
+    EXPECT_EQ(1U, dartplant::PublishedHostHookEntrantCount(&published));
+    dartplant::ReleasePublishedHostHookEntrant(&published);
+    EXPECT_EQ(0U, dartplant::PublishedHostHookEntrantCount(&published));
+}
+
+TEST_CASE(StrictPublishedFailureRetainsGateCookieForStaleFetches) {
+    dartplant::HostApiBinding binding{};
+    binding.hook = BlockingPublicationHook;
+    binding.unhook = BlockingPublicationUnhook;
+    binding.hook_with_publication = StrictFailureAfterPublicationHook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kStrict;
+
+    auto published = std::make_unique<dartplant::PublishedHostHook>();
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                published.get(), &binding, reinterpret_cast<uintptr_t>(target),
+                                callback, false, reinterpret_cast<void*>(uintptr_t{0x4321})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED, dartplant::InstallPublishedHostHook(published.get(), &backup));
+    EXPECT_TRUE(backup == nullptr);
+    EXPECT_TRUE(published->ever_published);
+    EXPECT_TRUE(!published->backend_installed);
+
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(published.get(),
+                                                                   &callback_pin) == target);
+    EXPECT_TRUE(!callback_pin);
+
+    // FAILED_AFTER_PUBLISHED may leave another CPU with a fetched gate branch.
+    // Retaining only the executable page is insufficient because that page
+    // embeds HostPublicationGate*. Keep the owner/cookie process-lifetime too.
+    dartplant::PublishedHostHook* const retained = published.get();
+    dartplant::RetainPublishedHostHookForProcessLifetime(std::move(published));
+    EXPECT_TRUE(published == nullptr);
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(retained, &callback_pin) ==
+                target);
+    EXPECT_TRUE(!callback_pin);
+}
+
+TEST_CASE(PublishedHookDrainTransfersGateEntrantAndNeverUsesReclaimedBackup) {
+    BlockingPublicationHostState host;
+    host.allow_hook_return.store(true, std::memory_order_release);
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.hook = BlockingPublicationHook;
+    binding.unhook = BlockingPublicationUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    auto published = std::make_unique<dartplant::PublishedHostHook>();
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                published.get(), &binding, reinterpret_cast<uintptr_t>(target),
+                                callback, true, reinterpret_cast<void*>(uintptr_t{0x5678})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallPublishedHostHook(published.get(), &backup));
+    dartplant::ArmPublishedHostHook(published.get());
+
+    DartPlantHook hook{};
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.active.store(true, std::memory_order_release);
+    hook.host_binding = &binding;
+    hook.backend_installed.store(true, std::memory_order_release);
+    hook.backup.store(backup, std::memory_order_release);
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    hook.code_target->id = reinterpret_cast<uintptr_t>(target);
+    hook.code_target->entry = reinterpret_cast<uintptr_t>(target);
+    hook.published_entry_hook = std::move(published);
+
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(hook.published_entry_hook.get(),
+                                                                   &callback_pin) == callback);
+    EXPECT_TRUE(callback_pin);
+    EXPECT_EQ(1U, dartplant::PublishedHostHookEntrantCount(hook.published_entry_hook.get()));
+
+    // Logical unhook closes the gate, notices the CPU that already crossed it,
+    // and defers physical unhook instead of reclaiming backup underneath it.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(&hook));
+    EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(host.backup_alive.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooking);
+
+    std::vector<std::shared_ptr<dartplant::DartPlantListenerRecord>> listeners;
+    EXPECT_TRUE(dartplant::BeginInvocation(&hook, &listeners));
+    EXPECT_TRUE(listeners.empty());
+    dartplant::ReleasePublishedHostHookEntrant(&hook);
+    EXPECT_EQ(0U, dartplant::PublishedHostHookEntrantCount(hook.published_entry_hook.get()));
+    EXPECT_TRUE(host.backup_alive.load(std::memory_order_acquire));
+
+    dartplant::InvocationExited(&hook);
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(!host.backup_alive.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooked);
+
+    bool stale_callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(hook.published_entry_hook.get(),
+                                                                   &stale_callback_pin) == target);
+    EXPECT_TRUE(!stale_callback_pin);
+}
+
+TEST_CASE(PublishedHookDrainAndEntrantRaceOnOneAtomicControlWord) {
+    // Repeatedly race a DRAINING entrant against DRAINING->CLOSED. The packed
+    // control word guarantees exactly two legal outcomes:
+    //   1. entrant CAS wins: close observes entrants>0 and must defer unhook;
+    //   2. close CAS wins: entrant cannot pin and eventually routes to target.
+    // A split state/count implementation can admit the forbidden third case
+    // where close observes zero after an entrant has already committed to the
+    // callback path.
+    constexpr int kRounds = 2000;
+    for (int round = 0; round < kRounds; ++round) {
+        BlockingPublicationHostState host;
+        host.allow_hook_return.store(true, std::memory_order_release);
+        dartplant::HostApiBinding binding{};
+        binding.user_data = &host;
+        binding.hook = BlockingPublicationHook;
+        binding.unhook = BlockingPublicationUnhook;
+        binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+        dartplant::PublishedHostHook published;
+        void* const target = reinterpret_cast<void*>(Replacement);
+        void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+        EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                    &published, &binding, reinterpret_cast<uintptr_t>(target),
+                                    callback, true, reinterpret_cast<void*>(uintptr_t{0x9abc})));
+        void* backup = nullptr;
+        EXPECT_EQ(DARTPLANT_OK, dartplant::InstallPublishedHostHook(&published, &backup));
+        dartplant::ArmPublishedHostHook(&published);
+        dartplant::BeginDrainPublishedHostHook(&published);
+
+        std::atomic_bool start{false};
+        std::atomic_bool route_done{false};
+        std::atomic_bool release_callback{false};
+        void* route = nullptr;
+        bool callback_pin = false;
+        std::thread contender([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            route = dartplant::AcquirePublishedHostHookRouteForTesting(&published, &callback_pin);
+            route_done.store(true, std::memory_order_release);
+            if (callback_pin) {
+                while (!release_callback.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                dartplant::ReleasePublishedHostHookEntrant(&published);
+            }
+        });
+
+        start.store(true, std::memory_order_release);
+        const bool closed = dartplant::ClosePublishedHostHook(&published);
+        if (!closed) {
+            while (!route_done.load(std::memory_order_acquire)) std::this_thread::yield();
+            EXPECT_TRUE(callback_pin);
+            EXPECT_TRUE(route == callback);
+            EXPECT_EQ(1U, dartplant::PublishedHostHookEntrantCount(&published));
+            EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+            release_callback.store(true, std::memory_order_release);
+            contender.join();
+            EXPECT_TRUE(dartplant::PublishedHostHookEntrantsIdle(&published));
+            EXPECT_TRUE(dartplant::ClosePublishedHostHook(&published));
+            EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+        } else {
+            // Once close has won the same control-word race, a later entrant
+            // CAS cannot still commit to callback. Complete physical unhook so
+            // the waiting route can observe BYPASS_TARGET.
+            EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+            contender.join();
+            EXPECT_TRUE(!callback_pin);
+            EXPECT_TRUE(route == target);
+        }
+        EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
+    }
+}
+
+TEST_CASE(PublishedHookDrainingEntrantBecomesTrackedPassthrough) {
+    BlockingPublicationHostState host;
+    host.allow_hook_return.store(true, std::memory_order_release);
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.hook = BlockingPublicationHook;
+    binding.unhook = BlockingPublicationUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    auto published = std::make_unique<dartplant::PublishedHostHook>();
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                published.get(), &binding, reinterpret_cast<uintptr_t>(target),
+                                callback, true, reinterpret_cast<void*>(uintptr_t{0xabcd})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallPublishedHostHook(published.get(), &backup));
+    dartplant::ArmPublishedHostHook(published.get());
+
+    DartPlantHook hook{};
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.active.store(true, std::memory_order_release);
+    hook.host_binding = &binding;
+    hook.backend_installed.store(true, std::memory_order_release);
+    hook.backup.store(backup, std::memory_order_release);
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    hook.code_target->id = reinterpret_cast<uintptr_t>(target);
+    hook.code_target->entry = reinterpret_cast<uintptr_t>(target);
+    hook.published_entry_hook = std::move(published);
+
+    // Model an already-running Dart body. Logical unhook must enter DRAINING
+    // immediately, but cannot close the gate yet because this body may recurse.
+    hook.in_flight = 1;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(&hook));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooking);
+    EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(hook.published_entry_hook.get(),
+                                                                   &callback_pin) == callback);
+    EXPECT_TRUE(callback_pin);
+
+    // The draining entrant still reaches the dispatcher, where logical
+    // callbacks are suppressed but the original Dart body is accounted for by
+    // HookRecord::in_flight. It never bypasses directly through backend backup.
+    std::vector<std::shared_ptr<dartplant::DartPlantListenerRecord>> listeners;
+    EXPECT_TRUE(dartplant::BeginInvocation(&hook, &listeners));
+    EXPECT_TRUE(listeners.empty());
+    EXPECT_EQ(2U, hook.in_flight);
+    dartplant::ReleasePublishedHostHookEntrant(&hook);
+
+    // Retire the draining call and then the pre-existing body. Only the final
+    // transition to zero may close the gate and reclaim backend backup.
+    dartplant::InvocationExited(&hook);
+    EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(host.backup_alive.load(std::memory_order_acquire));
+    dartplant::InvocationExited(&hook);
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(!host.backup_alive.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooked);
+}
+
+TEST_CASE(LocalGateStaleGenerationTracksOriginalUntilPhysicalUnhook) {
+    BlockingPublicationHostState host;
+    host.allow_hook_return.store(true, std::memory_order_release);
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.hook = BlockingPublicationHook;
+    binding.unhook = BlockingPublicationUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    auto published = std::make_unique<dartplant::PublishedHostHook>();
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                published.get(), &binding, reinterpret_cast<uintptr_t>(target),
+                                callback, true, reinterpret_cast<void*>(uintptr_t{0xdef0})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallPublishedHostHook(published.get(), &backup));
+    dartplant::ArmPublishedHostHook(published.get());
+
+    DartPlantMethod method{};
+    DartPlantHook hook{};
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.active.store(true, std::memory_order_release);
+    hook.host_binding = &binding;
+    hook.backend_installed.store(true, std::memory_order_release);
+    hook.backup.store(backup, std::memory_order_release);
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    hook.code_target->id = reinterpret_cast<uintptr_t>(target);
+    hook.code_target->entry = reinterpret_cast<uintptr_t>(target);
+    hook.method_storage = std::make_unique<DartPlantMethod>(method);
+    hook.runtime_generation = std::make_shared<std::atomic_uint64_t>(7);
+    hook.expected_runtime_generation = 7;
+    hook.published_entry_hook = std::move(published);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* listener = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&hook, &method, options, 0, &listener,
+                                                           hook.runtime_generation, 7));
+
+    // The method identity becomes stale after the physical entry has already
+    // been published. A CPU that crossed ARMED must still transfer the short
+    // gate entrant into HookRecord::in_flight, but no stale logical callback is
+    // allowed to run.
+    hook.runtime_generation->store(8, std::memory_order_release);
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(hook.published_entry_hook.get(),
+                                                                   &callback_pin) == callback);
+    EXPECT_TRUE(callback_pin);
+
+    std::vector<std::shared_ptr<dartplant::DartPlantListenerRecord>> listeners;
+    EXPECT_TRUE(dartplant::BeginInvocation(&hook, &listeners));
+    EXPECT_TRUE(listeners.empty());
+    EXPECT_EQ(1U, hook.in_flight);
+    dartplant::ReleasePublishedHostHookEntrant(&hook);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RemoveHook(&hook));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooking);
+    EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(host.backup_alive.load(std::memory_order_acquire));
+
+    dartplant::InvocationExited(&hook);
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(!host.backup_alive.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook.state == dartplant::HookRecordState::kUnhooked);
+
+    hook.runtime_generation->store(7, std::memory_order_release);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
+    dartplant_release_listener(listener);
 }
 
 TEST_CASE(RuntimeRequiresMatchingAotModules) {

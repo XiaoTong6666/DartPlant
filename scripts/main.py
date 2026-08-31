@@ -30,7 +30,11 @@ def cmd_build(args: argparse.Namespace) -> None:
     if args.target == "host":
         build_host(ctx, force=args.force)
     elif args.target == "android":
-        build_android(ctx, force=args.force)
+        build_android(
+            ctx,
+            force=args.force,
+            dobby_root_override=Path(args.dobby_root) if args.dobby_root else None,
+        )
     else:
         build_all(ctx, force=args.force)
 
@@ -43,6 +47,7 @@ def cmd_test(args: argparse.Namespace) -> None:
             rounds=args.rounds,
             timeout_seconds=args.timeout,
             build=not args.no_flutter_build,
+            dobby_root=Path(args.dobby_root) if args.dobby_root else None,
         )
         return
 
@@ -50,7 +55,12 @@ def cmd_test(args: argparse.Namespace) -> None:
     if args.target in {"host", "all"}:
         test_host(ctx, force=args.force)
     if args.target in {"device", "all"}:
-        test_device(ctx, device=args.device, force=args.force)
+        test_device(
+            ctx,
+            device=args.device,
+            force=args.force,
+            dobby_root=Path(args.dobby_root) if args.dobby_root else None,
+        )
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -82,6 +92,7 @@ def main() -> None:
     build_parser.add_argument("-t", "--build-type", choices=BUILD_TYPE_TO_CMAKE, default="debug")
     build_parser.add_argument("--force", action="store_true")
     build_parser.add_argument("--ndk")
+    build_parser.add_argument("--dobby-root")
     build_parser.set_defaults(func=cmd_build)
 
     test_parser = subparsers.add_parser("test")
@@ -90,6 +101,7 @@ def main() -> None:
     test_parser.add_argument("-s", "--device")
     test_parser.add_argument("--force", action="store_true")
     test_parser.add_argument("--ndk")
+    test_parser.add_argument("--dobby-root")
     test_parser.add_argument("--flutter")
     test_parser.add_argument("--rounds", type=int, default=10)
     test_parser.add_argument("--timeout", type=float, default=5.0)

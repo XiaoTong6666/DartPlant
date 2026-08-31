@@ -8,12 +8,12 @@
 
 #include "core/internal.h"
 #include "dart_api_adapter.h"
-#include "dartplant/adapters/dobby.h"
 #include "dartplant/advanced/live_vm.h"
 #include "dartplant/invocation.h"
 #include "dartplant/native_api.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
+#include "fixture_host.h"
 #include "simple_facade_consumer.h"
 #if __has_include("ordinary_aot_sidecar.h")
 #include "ordinary_aot_sidecar.h"
@@ -1388,7 +1388,7 @@ dartplant_fixture_simple_facade_stage2() {
 
 extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_forced_stack_closure_hook() {
-    const DartPlantStatus host_status = dartplant_install_host_api(dartplant_dobby_host_api());
+    const DartPlantStatus host_status = dartplant_fixture::InstallLocalGateHost();
     if (host_status != DARTPLANT_OK) return host_status;
     return InstallForcedStackClosureHook();
 }
@@ -1397,10 +1397,10 @@ extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
     // default HostApi during dartplant_shutdown(). This advanced runtime is a
-    // separate consumer; reinstall its Dobby adapter before creating any new
+    // separate consumer; reinstall the legacy/local-gate host before creating any new
     // physical hooks. Existing advanced hooks keep their original immutable
     // binding and do not depend on this process-default pointer.
-    const DartPlantStatus host_status = dartplant_install_host_api(dartplant_dobby_host_api());
+    const DartPlantStatus host_status = dartplant_fixture::InstallLocalGateHost();
     if (host_status != DARTPLANT_OK) return host_status;
     return InstallAdvancedOrdinaryAotHooks();
 }
@@ -1411,8 +1411,12 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     if (g_runtime != nullptr) return DARTPLANT_OK;
     (void) api_dl_data;
 
-    const DartPlantHostApi* host_api = dartplant_dobby_host_api();
-    if (dartplant_install_host_api(host_api) != DARTPLANT_OK) return DARTPLANT_HOST_API_UNAVAILABLE;
+    // Exercise the exact LSPosed/Vector compatibility architecture before any
+    // strict consumer can install the process-global JumpToFrame bridge. The
+    // physical backend exposes only DobbyHook/DobbyDestroy, matching the
+    // unchanged synchronous Native API v2 shape used by LSPosed/Vector.
+    const DartPlantStatus host_status = dartplant_fixture::InstallLocalGateHost();
+    if (host_status != DARTPLANT_OK) return host_status;
     dartplant::RefreshModules();
 
     DartPlantRuntimeProfile profile{};

@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess as sp
+import re
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,23 +150,39 @@ def build_host(ctx: BuildContext, *, force: bool = False) -> None:
     cmake_build(ctx.host_build_dir)
 
 
-def build_android(ctx: BuildContext, *, force: bool = False) -> None:
+def _android_build_dir_for_dobby(ctx: BuildContext, dobby_root: Path) -> Path:
+    default_root = (ROOT_DIR / "third_party" / "dobby").resolve()
+    if dobby_root.resolve() == default_root:
+        return ctx.android_build_dir
+    owner = dobby_root.resolve().parent.parent.name.lower() or "external"
+    label = re.sub(r"[^a-z0-9]+", "-", owner).strip("-") or "external"
+    return BUILD_ROOT / f"android-arm64-{label}"
+
+
+def build_android(
+    ctx: BuildContext, *, force: bool = False, dobby_root_override: Path | None = None
+) -> Path:
     if ctx.config.abi != "arm64-v8a":
         raise ValueError("DartPlant currently supports arm64-v8a only")
-    dobby_root = ROOT_DIR / "third_party" / "dobby"
+    dobby_root = (
+        dobby_root_override.expanduser().resolve()
+        if dobby_root_override is not None
+        else (ROOT_DIR / "third_party" / "dobby").resolve()
+    )
+    build_dir = _android_build_dir_for_dobby(ctx, dobby_root)
     if not dobby_root.joinpath("CMakeLists.txt").is_file():
         raise FileNotFoundError(
             "Dobby submodule is missing; run git submodule update --init --recursive"
         )
     if force:
-        shutil.rmtree(ctx.android_build_dir, ignore_errors=True)
+        shutil.rmtree(build_dir, ignore_errors=True)
     run(
         [
             "cmake",
             "-S",
             str(ROOT_DIR),
             "-B",
-            str(ctx.android_build_dir),
+            str(build_dir),
             "-G",
             "Ninja",
             f"-DCMAKE_TOOLCHAIN_FILE={ctx.ndk_home / 'build/cmake/android.toolchain.cmake'}",
@@ -182,8 +199,8 @@ def build_android(ctx: BuildContext, *, force: bool = False) -> None:
         ],
         cwd=ROOT_DIR,
     )
-    cmake_build(ctx.android_build_dir)
-
+    cmake_build(build_dir)
+    return build_dir
 
 def build_all(ctx: BuildContext, *, force: bool = False) -> None:
     build_host(ctx, force=force)
@@ -250,15 +267,25 @@ def find_arm64_device(device: str | None = None) -> str:
 
 
 def test_device(
-    ctx: BuildContext, *, device: str | None = None, force: bool = False
+    ctx: BuildContext,
+    *,
+    device: str | None = None,
+    force: bool = False,
+    dobby_root: Path | None = None,
 ) -> None:
-    build_android(ctx, force=force)
+    build_dir = build_android(ctx, force=force, dobby_root_override=dobby_root)
     serial = find_arm64_device(device)
     remote = ctx.config.device_directory
     artifacts = [
-        ctx.android_build_dir / "dartplant_device_tests",
-        ctx.android_build_dir / "libdartplant_device_fixture.so",
+        build_dir / "dartplant_device_tests",
+        build_dir / "libdartplant_device_fixture.so",
     ]
+    # Some external Dobby trees (notably current Vector) default to a shared
+    # backend. Push it alongside the test binary when present; Irena/default
+    # builds are static and need no extra runtime artifact.
+    external_dobby = build_dir / "third_party" / "dobby" / "libdobby.so"
+    if external_dobby.is_file():
+        artifacts.append(external_dobby)
     for artifact in artifacts:
         if not artifact.is_file():
             raise FileNotFoundError(f"missing Android artifact: {artifact}")

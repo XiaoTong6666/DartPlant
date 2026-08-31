@@ -15,6 +15,145 @@
 .type dartplant_arm64_return_entry, %function
 .global dartplant_arm64_invoke_original
 .type dartplant_arm64_invoke_original, %function
+.global dartplant_arm64_generated_publication_gate_entry
+.type dartplant_arm64_generated_publication_gate_entry, %function
+.global dartplant_arm64_native_publication_gate_entry
+.type dartplant_arm64_native_publication_gate_entry, %function
+
+// HostPublicationGate layout (src/core/internal.h):
+//   +0  uint64 control: low32=state, high32=entrants
+//   +8  callback_entry
+//   +16 backup
+//   +24 target
+// States: INSTALLING=0, ARMED=1, DRAINING=2, BYPASS_TARGET=3,
+// BYPASS_BACKUP=4, FAILED=5, CLOSED=6.
+//
+// The generated-entry gate must close the tiny window between observing ARMED
+// and HookRecord::in_flight being pinned. It therefore acquires an entrant pin
+// before tail-branching to the callback stub. callback_dispatch.cpp releases
+// that entrant only after BeginInvocation has transferred ownership to the
+// HookRecord. During DRAINING callers still cross through the dispatcher as
+// tracked passthrough invocations, which preserves recursive Dart semantics.
+// CLOSED is the short no-new-entrant window immediately before physical unhook.
+dartplant_arm64_generated_publication_gate_entry:
+  // x17 = HostPublicationGate*. x16/x17 are Dart/AAPCS scratch registers.
+  // Save x9/x10 because LL/SC needs two temporary registers in addition to the
+  // gate base. Run on the active Dart stack (SPREG=x15), not parked CSP.
+  mov x16, sp
+  mov sp, x15
+  sub sp, sp, #32
+  tbz x15, #3, .Ldartplant_gate_stack_aligned
+  sub sp, sp, #8
+.Ldartplant_gate_stack_aligned:
+  stp x9, x10, [sp, #0]
+  str x16, [sp, #16]
+  str x17, [sp, #24]
+
+.Ldartplant_gate_retry:
+  ldr x17, [sp, #24]
+  ldar x9, [x17, #0]
+  cmp w9, #0
+  b.eq .Ldartplant_gate_wait
+  cmp w9, #6
+  b.eq .Ldartplant_gate_wait
+  cmp w9, #3
+  b.eq .Ldartplant_gate_target
+  cmp w9, #4
+  b.eq .Ldartplant_gate_backup
+  cmp w9, #1
+  b.eq .Ldartplant_gate_pin_retry
+  cmp w9, #2
+  b.ne .Ldartplant_gate_failed
+
+.Ldartplant_gate_pin_retry:
+  // State and entrant count share one 64-bit atomic control word. Increment
+  // the high half only if the same exclusive snapshot is still ARMED. A
+  // concurrent drain writes the same word, invalidating this exclusive store;
+  // therefore either this pin wins and drain sees entrants>0, or drain wins
+  // and this CPU cannot cross to callback.
+  ldaxr x10, [x17, #0]
+  cmp w10, #1
+  b.eq .Ldartplant_gate_pin_commit
+  cmp w10, #2
+  b.ne .Ldartplant_gate_pin_cancel
+.Ldartplant_gate_pin_commit:
+  lsr x9, x10, #32
+  add w9, w9, #1
+  cbz w9, .Ldartplant_gate_failed
+  mov x16, #1
+  add x10, x10, x16, lsl #32
+  stlxr w9, x10, [x17, #0]
+  cbnz w9, .Ldartplant_gate_pin_retry
+  b .Ldartplant_gate_callback
+
+.Ldartplant_gate_pin_cancel:
+  clrex
+  b .Ldartplant_gate_retry
+
+.Ldartplant_gate_wait:
+  yield
+  b .Ldartplant_gate_retry
+
+.Ldartplant_gate_callback:
+  ldr x16, [x17, #8]
+  cbz x16, .Ldartplant_gate_failed
+  b .Ldartplant_gate_restore_and_branch
+
+.Ldartplant_gate_backup:
+  ldr x16, [x17, #16]
+  cbz x16, .Ldartplant_gate_failed
+  b .Ldartplant_gate_restore_and_branch
+
+.Ldartplant_gate_target:
+  ldr x16, [x17, #24]
+  cbz x16, .Ldartplant_gate_failed
+
+.Ldartplant_gate_restore_and_branch:
+  ldp x9, x10, [sp, #0]
+  ldr x17, [sp, #16]
+  mov sp, x17
+  br x16
+
+.Ldartplant_gate_failed:
+  brk #0
+  b .Ldartplant_gate_failed
+
+.size dartplant_arm64_generated_publication_gate_entry, .-dartplant_arm64_generated_publication_gate_entry
+
+// Native/runtime control-flow hooks such as Thread::JumpToFrame are installed
+// once and never physically removed, so they only need the publication barrier,
+// not a generated-entry entrant handoff. x16/x17 are AAPCS scratch registers.
+dartplant_arm64_native_publication_gate_entry:
+.Ldartplant_native_gate_retry:
+  ldar x16, [x17, #0]
+  cmp w16, #0
+  b.eq .Ldartplant_native_gate_wait
+  cmp w16, #2
+  b.eq .Ldartplant_native_gate_wait
+  cmp w16, #6
+  b.eq .Ldartplant_native_gate_wait
+  cmp w16, #1
+  b.eq .Ldartplant_native_gate_callback
+  cmp w16, #3
+  b.eq .Ldartplant_native_gate_target
+  cmp w16, #4
+  b.eq .Ldartplant_native_gate_backup
+  brk #0
+  b .Ldartplant_native_gate_retry
+.Ldartplant_native_gate_wait:
+  yield
+  b .Ldartplant_native_gate_retry
+.Ldartplant_native_gate_callback:
+  ldr x16, [x17, #8]
+  br x16
+.Ldartplant_native_gate_backup:
+  ldr x16, [x17, #16]
+  br x16
+.Ldartplant_native_gate_target:
+  ldr x16, [x17, #24]
+  br x16
+
+.size dartplant_arm64_native_publication_gate_entry, .-dartplant_arm64_native_publication_gate_entry
 
 // Stack layout:
 //   [0, 248)   DartPlantArm64Context.x[31]

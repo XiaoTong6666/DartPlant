@@ -5,6 +5,7 @@
 
 #include <atomic>
 
+#include "core/internal.h"
 #include "dartplant/adapters/lsposed_native_api.h"
 #include "dartplant/host_api.h"
 #include "runtime/runtime_internal.h"
@@ -72,13 +73,13 @@ native_init(const DartPlantNativeApiEntries* entries) {
         .unhook = HostUnhook,
         .hook_with_publication = nullptr,
     };
-    // LSPosed's public native hook API has no backup-before-publication
-    // handshake. DartPlant therefore permits this binding for raw/synthetic
-    // hooks only; real-Dart callbacks fail closed in InstallCallbackHook.
-    if (dartplant_install_host_api(&host_api) != DARTPLANT_OK) {
-        g_initialized.store(false, std::memory_order_release);
-        return nullptr;
-    }
+    // The LSPosed/Vector Native API v2 implementations audited by DartPlant are
+    // synchronous Dobby wrappers: a successful backup remains callable until
+    // unhook, and every reported hook failure occurs before Dobby Commit().
+    // They can still publish replacement before hook() returns its backup, so
+    // DartPlant never exposes the real callback directly to that ABI. The
+    // local publication gate remains closed until the call returns.
+    dartplant::InstallHostApi(&host_api, dartplant::HostPublicationPolicy::kLocalGate);
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
         .version = DARTPLANT_INIT_API_VERSION,

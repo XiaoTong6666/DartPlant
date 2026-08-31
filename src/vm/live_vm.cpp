@@ -123,13 +123,17 @@ public:
 
     template <typename T>
     bool Read(uintptr_t address, T* out_value) const {
-        if (out_value == nullptr || !Contains(address, sizeof(T))) return false;
+        // Keep the raw pointer precondition explicit here instead of relying on
+        // Contains() to imply it. Besides being the correct contract for a
+        // process-memory reader, this lets clang's path-sensitive analyzer
+        // prove that memcpy never receives a null source pointer.
+        if (address == 0 || out_value == nullptr || !Contains(address, sizeof(T))) return false;
         std::memcpy(out_value, reinterpret_cast<const void*>(address), sizeof(T));
         return true;
     }
 
     bool ReadBytes(uintptr_t address, void* output, size_t size) const {
-        if (output == nullptr || !Contains(address, size)) return false;
+        if (address == 0 || output == nullptr || !Contains(address, size)) return false;
         std::memcpy(output, reinterpret_cast<const void*>(address), size);
         return true;
     }
@@ -138,7 +142,7 @@ public:
     // process_vm_readv() turns that race into EFAULT/short-read instead of a
     // synchronous SIGSEGV in diagnostic APIs that inspect volatile VM memory.
     bool ReadSafely(uintptr_t address, void* output, size_t size) const {
-        if (output == nullptr || !Contains(address, size)) return false;
+        if (address == 0 || output == nullptr || !Contains(address, size)) return false;
 #if defined(__linux__) && defined(SYS_process_vm_readv)
         iovec local = {.iov_base = output, .iov_len = size};
         iovec remote = {.iov_base = reinterpret_cast<void*>(address), .iov_len = size};

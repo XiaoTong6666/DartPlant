@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <dlfcn.h>
+#include <dobby.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/internal.h"
-#include "dartplant/adapters/dobby.h"
 #include "dartplant/invocation.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
@@ -27,6 +30,11 @@ int g_listener_calls = 0;
 bool g_null_semantic_callback_ok = false;
 bool g_raw_context_callback_ok = false;
 bool g_dart_pad_branch_ok = false;
+std::atomic_uint64_t g_local_gate_replacement_hits{0};
+std::atomic<dartplant::PublishedHostHook*> g_generated_gate_hook{nullptr};
+std::atomic<DartPlantHook*> g_generation_gate_hook{nullptr};
+std::atomic_bool g_generated_gate_hold{false};
+std::atomic_bool g_generated_gate_entered{false};
 
 void OnEnter(DartPlantInvocation* invocation, void*) {
     ++g_enter_calls;
@@ -86,6 +94,8 @@ void VerifyDartPadBranch(DartPlantInvocation* invocation, void*) {
 extern "C" uint64_t DartPlantDeviceInvokeDartCallbackWithOddSp(DartPlantHook* hook,
                                                                uintptr_t dart_spreg,
                                                                uint64_t argument);
+extern "C" int DartPlantDeviceInvokeGeneratedGate(void* target, uintptr_t dart_spreg, int left,
+                                                  int right);
 extern "C" int DartPlantFixtureAdd(int left, int right);
 
 int Fail(const char* message);
@@ -278,6 +288,355 @@ __attribute__((noinline)) int HookedAdd(int left, int right) {
     return g_original_add(left, right) + 100;
 }
 
+__attribute__((noinline)) int LocalGateReplacement(int left, int right) {
+    g_local_gate_replacement_hits.fetch_add(1, std::memory_order_relaxed);
+    return left + right + 40;
+}
+
+__attribute__((noinline)) int GeneratedGateReplacement(int left, int right) {
+    auto* published = g_generated_gate_hook.load(std::memory_order_acquire);
+    if (published == nullptr) return -1000;
+    g_generated_gate_entered.store(true, std::memory_order_release);
+    while (g_generated_gate_hold.load(std::memory_order_acquire)) std::this_thread::yield();
+    const int result = left + right + 40;
+    // A real generated callback transfers this short gate pin into
+    // HookRecord::in_flight before releasing it. This device-only probe holds
+    // the pin through the callback body so DRAINING->CLOSED can be checked
+    // against the actual ARM64 LL/SC gate implementation.
+    dartplant::ReleasePublishedHostHookEntrant(published);
+    return result;
+}
+
+__attribute__((noinline)) int GenerationGateReplacement(int left, int right) {
+    auto* hook = g_generation_gate_hook.load(std::memory_order_acquire);
+    if (hook == nullptr || hook->published_entry_hook == nullptr) return -1000;
+    std::vector<std::shared_ptr<dartplant::DartPlantListenerRecord>> listeners;
+    if (!dartplant::BeginInvocation(hook, &listeners)) {
+        dartplant::ReleasePublishedHostHookEntrant(hook);
+        return -1001;
+    }
+    // A stale runtime generation must suppress logical callbacks while still
+    // converting the generated-gate entrant into HookRecord::in_flight. This
+    // mirrors the real dispatcher handoff closely enough to prove physical
+    // backend teardown cannot race the original body on device.
+    dartplant::ReleasePublishedHostHookEntrant(hook);
+    auto original = reinterpret_cast<Add>(hook->backup.load(std::memory_order_acquire));
+    const int result = original == nullptr ? -1002 : original(left, right);
+    dartplant::InvocationExited(hook);
+    return listeners.empty() ? result : -1003;
+}
+
+int LegacyDobbyHostHook(void*, void* target, void* replacement, void** backup) {
+    return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replacement),
+                     reinterpret_cast<dobby_dummy_func_t*>(backup));
+}
+
+int LegacyDobbyHostUnhook(void*, void* target) { return DobbyDestroy(target); }
+
+int ExerciseLegacyDobbyLocalPublicationGate() {
+    dartplant::HostApiBinding binding{};
+    binding.hook = LegacyDobbyHostHook;
+    binding.unhook = LegacyDobbyHostUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    // Deliberately retain the cookie/gate after first publication. The
+    // production ownership model does the same because a CPU may have fetched
+    // the old backend branch before DobbyDestroy restores target bytes.
+    auto* published = new dartplant::PublishedHostHook();
+    if (dartplant::PreparePublishedHostHook(
+            published, &binding, reinterpret_cast<uintptr_t>(DartPlantFixtureAdd),
+            reinterpret_cast<void*>(LocalGateReplacement), false) != DARTPLANT_OK) {
+        return Fail("legacy Dobby local gate prepare");
+    }
+    void* backup = nullptr;
+    if (dartplant::InstallPublishedHostHook(published, &backup) != DARTPLANT_OK ||
+        backup == nullptr) {
+        return Fail("legacy Dobby local gate install");
+    }
+
+    // The physical Dobby patch is already live, but DartPlant controls logical
+    // publication independently. BYPASS_BACKUP must preserve original behavior.
+    dartplant::BypassPublishedHostHookToBackup(published);
+    if (DartPlantFixtureAdd(2, 3) != 5) {
+        return Fail("legacy Dobby local gate pre-arm bypass");
+    }
+    dartplant::ArmPublishedHostHook(published);
+    if (DartPlantFixtureAdd(2, 3) != 45) {
+        return Fail("legacy Dobby local gate armed callback");
+    }
+
+    dartplant::BeginDrainPublishedHostHook(published);
+    if (!dartplant::PublishedHostHookEntrantsIdle(published) ||
+        dartplant::UninstallPublishedHostHook(published) != DARTPLANT_OK ||
+        DartPlantFixtureAdd(2, 3) != 5) {
+        return Fail("legacy Dobby local gate drain/unhook");
+    }
+
+    // A stale fetch of the retained DartPlant gate after DobbyDestroy must go
+    // to restored target, never the now-backend-owned/reclaimable backup.
+    using NativeAdd = int (*)(int, int);
+    auto stale_gate = reinterpret_cast<NativeAdd>(published->gate_entry);
+    if (stale_gate == nullptr || stale_gate(2, 3) != 5) {
+        return Fail("legacy Dobby local gate stale target bypass");
+    }
+
+    // Rehook the exact same physical target with a fresh DartPlant gate. A
+    // retired gate is deliberately a target alias after physical unhook: it
+    // never touches its reclaimed first-generation backup, and while a newer
+    // hook owns the target it naturally follows that current publication.
+    auto* rehook = new dartplant::PublishedHostHook();
+    if (dartplant::PreparePublishedHostHook(
+            rehook, &binding, reinterpret_cast<uintptr_t>(DartPlantFixtureAdd),
+            reinterpret_cast<void*>(LocalGateReplacement), false) != DARTPLANT_OK) {
+        return Fail("legacy Dobby local gate rehook prepare");
+    }
+    void* rehook_backup = nullptr;
+    if (dartplant::InstallPublishedHostHook(rehook, &rehook_backup) != DARTPLANT_OK ||
+        rehook_backup == nullptr) {
+        return Fail("legacy Dobby local gate rehook install");
+    }
+    dartplant::ArmPublishedHostHook(rehook);
+    if (DartPlantFixtureAdd(2, 3) != 45 || stale_gate(2, 3) != 45) {
+        return Fail("legacy Dobby local gate rehook routing");
+    }
+    dartplant::BeginDrainPublishedHostHook(rehook);
+    if (dartplant::UninstallPublishedHostHook(rehook) != DARTPLANT_OK ||
+        DartPlantFixtureAdd(2, 3) != 5) {
+        return Fail("legacy Dobby local gate rehook unhook");
+    }
+    auto stale_rehook_gate = reinterpret_cast<NativeAdd>(rehook->gate_entry);
+    if (stale_rehook_gate == nullptr || stale_rehook_gate(2, 3) != 5 || stale_gate(2, 3) != 5) {
+        return Fail("legacy Dobby local gate rehook stale target bypass");
+    }
+    return 0;
+}
+
+int ExerciseLegacyDobbyConcurrentPublicationGate() {
+    dartplant::HostApiBinding binding{};
+    binding.hook = LegacyDobbyHostHook;
+    binding.unhook = LegacyDobbyHostUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    auto* published = new dartplant::PublishedHostHook();
+    if (dartplant::PreparePublishedHostHook(
+            published, &binding, reinterpret_cast<uintptr_t>(DartPlantFixtureAdd),
+            reinterpret_cast<void*>(LocalGateReplacement), false) != DARTPLANT_OK) {
+        return Fail("concurrent legacy Dobby gate prepare");
+    }
+
+    std::atomic_bool stop{false};
+    std::atomic_uint64_t original_results{0};
+    std::atomic_uint64_t replacement_results{0};
+    std::atomic_uint64_t invalid_results{0};
+    std::vector<std::thread> workers;
+    workers.reserve(4);
+    for (int index = 0; index < 4; ++index) {
+        workers.emplace_back([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const int result = DartPlantFixtureAdd(2, 3);
+                if (result == 5) {
+                    original_results.fetch_add(1, std::memory_order_relaxed);
+                } else if (result == 45) {
+                    replacement_results.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    invalid_results.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    while (original_results.load(std::memory_order_acquire) < 10000) std::this_thread::yield();
+
+    void* backup = nullptr;
+    if (dartplant::InstallPublishedHostHook(published, &backup) != DARTPLANT_OK ||
+        backup == nullptr) {
+        stop.store(true, std::memory_order_release);
+        for (auto& worker : workers) worker.join();
+        return Fail("concurrent legacy Dobby gate install");
+    }
+    dartplant::ArmPublishedHostHook(published);
+    while (replacement_results.load(std::memory_order_acquire) < 10000) {
+        std::this_thread::yield();
+    }
+
+    dartplant::BeginDrainPublishedHostHook(published);
+    if (dartplant::UninstallPublishedHostHook(published) != DARTPLANT_OK) {
+        stop.store(true, std::memory_order_release);
+        for (auto& worker : workers) worker.join();
+        return Fail("concurrent legacy Dobby gate unhook");
+    }
+    const uint64_t original_before_restore = original_results.load(std::memory_order_acquire);
+    while (original_results.load(std::memory_order_acquire) < original_before_restore + 10000) {
+        std::this_thread::yield();
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    if (invalid_results.load(std::memory_order_acquire) != 0 ||
+        g_local_gate_replacement_hits.load(std::memory_order_acquire) == 0 ||
+        replacement_results.load(std::memory_order_acquire) == 0) {
+        return Fail("concurrent legacy Dobby gate routing");
+    }
+    return 0;
+}
+
+int ExerciseGeneratedPublicationGateEntrantDrain() {
+    constexpr size_t kFakeStackSize = 1U << 20;
+    void* mapping =
+        mmap(nullptr, kFakeStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return Fail("map generated publication gate Dart stack");
+    const uintptr_t end = reinterpret_cast<uintptr_t>(mapping) + kFakeStackSize;
+    const uintptr_t dart_spreg = (end - (64U << 10)) & ~uintptr_t{0xf};
+
+    dartplant::HostApiBinding binding{};
+    binding.hook = LegacyDobbyHostHook;
+    binding.unhook = LegacyDobbyHostUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    // Retain after publication exactly like production PublishedCallbackHooks.
+    auto* published = new dartplant::PublishedHostHook();
+    if (dartplant::PreparePublishedHostHook(
+            published, &binding, reinterpret_cast<uintptr_t>(DartPlantFixtureAdd),
+            reinterpret_cast<void*>(GeneratedGateReplacement), true) != DARTPLANT_OK) {
+        munmap(mapping, kFakeStackSize);
+        return Fail("generated publication gate prepare");
+    }
+    void* backup = nullptr;
+    if (dartplant::InstallPublishedHostHook(published, &backup) != DARTPLANT_OK ||
+        backup == nullptr) {
+        munmap(mapping, kFakeStackSize);
+        return Fail("generated publication gate install");
+    }
+
+    g_generated_gate_hook.store(published, std::memory_order_release);
+    g_generated_gate_entered.store(false, std::memory_order_release);
+    g_generated_gate_hold.store(true, std::memory_order_release);
+    dartplant::ArmPublishedHostHook(published);
+
+    int callback_result = 0;
+    std::thread entrant([&] {
+        callback_result = DartPlantDeviceInvokeGeneratedGate(
+            reinterpret_cast<void*>(DartPlantFixtureAdd), dart_spreg, 2, 3);
+    });
+    while (!g_generated_gate_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+
+    if (dartplant::PublishedHostHookEntrantCount(published) != 1) {
+        g_generated_gate_hold.store(false, std::memory_order_release);
+        entrant.join();
+        munmap(mapping, kFakeStackSize);
+        return Fail("generated publication gate entrant pin");
+    }
+
+    dartplant::BeginDrainPublishedHostHook(published);
+    // The exact ARM64 gate pin and DRAINING/CLOSED state share one 64-bit
+    // control word. While this callback owns the high-half entrant count,
+    // physical unhook must remain impossible.
+    if (dartplant::ClosePublishedHostHook(published) ||
+        dartplant::UninstallPublishedHostHook(published) != DARTPLANT_VM_ADAPTER_BUSY) {
+        g_generated_gate_hold.store(false, std::memory_order_release);
+        entrant.join();
+        munmap(mapping, kFakeStackSize);
+        return Fail("generated publication gate premature close");
+    }
+
+    g_generated_gate_hold.store(false, std::memory_order_release);
+    entrant.join();
+    if (callback_result != 45 || !dartplant::PublishedHostHookEntrantsIdle(published) ||
+        !dartplant::ClosePublishedHostHook(published) ||
+        dartplant::UninstallPublishedHostHook(published) != DARTPLANT_OK) {
+        munmap(mapping, kFakeStackSize);
+        return Fail("generated publication gate drain/unhook");
+    }
+
+    // Both an ordinary call through the restored target and a stale fetch of
+    // the retained gate must now execute the original target directly without
+    // touching the backend trampoline that unhook was allowed to reclaim.
+    const int restored = DartPlantDeviceInvokeGeneratedGate(
+        reinterpret_cast<void*>(DartPlantFixtureAdd), dart_spreg, 2, 3);
+    const int stale = DartPlantDeviceInvokeGeneratedGate(published->gate_entry, dart_spreg, 2, 3);
+    g_generated_gate_hook.store(nullptr, std::memory_order_release);
+    munmap(mapping, kFakeStackSize);
+    if (restored != 5 || stale != 5) return Fail("generated publication gate stale target bypass");
+    return 0;
+}
+
+int ExerciseGeneratedGateStaleGenerationRetirement() {
+    constexpr size_t kFakeStackSize = 1U << 20;
+    void* mapping =
+        mmap(nullptr, kFakeStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return Fail("map stale-generation Dart stack");
+    const uintptr_t end = reinterpret_cast<uintptr_t>(mapping) + kFakeStackSize;
+    const uintptr_t dart_spreg = (end - (64U << 10)) & ~uintptr_t{0xf};
+
+    dartplant::HostApiBinding binding{};
+    binding.hook = LegacyDobbyHostHook;
+    binding.unhook = LegacyDobbyHostUnhook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kLocalGate;
+
+    auto published = std::make_unique<dartplant::PublishedHostHook>();
+    if (dartplant::PreparePublishedHostHook(
+            published.get(), &binding, reinterpret_cast<uintptr_t>(DartPlantFixtureAdd),
+            reinterpret_cast<void*>(GenerationGateReplacement), true) != DARTPLANT_OK) {
+        munmap(mapping, kFakeStackSize);
+        return Fail("stale-generation publication gate prepare");
+    }
+    void* backup = nullptr;
+    if (dartplant::InstallPublishedHostHook(published.get(), &backup) != DARTPLANT_OK ||
+        backup == nullptr) {
+        munmap(mapping, kFakeStackSize);
+        return Fail("stale-generation publication gate install");
+    }
+
+    DartPlantHook hook{};
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.active.store(true, std::memory_order_release);
+    hook.host_binding = &binding;
+    hook.backend_installed.store(true, std::memory_order_release);
+    hook.backup.store(backup, std::memory_order_release);
+    hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
+    hook.code_target->id = reinterpret_cast<uintptr_t>(DartPlantFixtureAdd);
+    hook.code_target->entry = hook.code_target->id;
+    hook.runtime_generation = std::make_shared<std::atomic_uint64_t>(7);
+    hook.expected_runtime_generation = 7;
+    hook.published_entry_hook = std::move(published);
+    g_generation_gate_hook.store(&hook, std::memory_order_release);
+    dartplant::ArmPublishedHostHook(hook.published_entry_hook.get());
+
+    // Make the logical method stale while its physical entry is still live.
+    // A generated entrant must execute the original result (5), with no
+    // listener dispatch, and leave both entrant/in_flight counts idle.
+    hook.runtime_generation->store(8, std::memory_order_release);
+    const int stale_result = DartPlantDeviceInvokeGeneratedGate(
+        reinterpret_cast<void*>(DartPlantFixtureAdd), dart_spreg, 2, 3);
+    if (stale_result != 5 || hook.in_flight != 0 ||
+        !dartplant::PublishedHostHookEntrantsIdle(hook.published_entry_hook.get())) {
+        g_generation_gate_hook.store(nullptr, std::memory_order_release);
+        munmap(mapping, kFakeStackSize);
+        return Fail("stale-generation tracked original");
+    }
+
+    // Runtime invalidation ultimately drives the same logical unhook path.
+    // Once the tracked original is gone, retirement can close the gate,
+    // restore the physical target, and make every stale gate fetch bypass the
+    // backend trampoline.
+    if (dartplant::RemoveHook(&hook) != DARTPLANT_OK ||
+        hook.state != dartplant::HookRecordState::kUnhooked ||
+        hook.backend_installed.load(std::memory_order_acquire)) {
+        g_generation_gate_hook.store(nullptr, std::memory_order_release);
+        munmap(mapping, kFakeStackSize);
+        return Fail("stale-generation retirement unhook");
+    }
+    const int restored = DartPlantDeviceInvokeGeneratedGate(
+        reinterpret_cast<void*>(DartPlantFixtureAdd), dart_spreg, 2, 3);
+    const int stale_gate =
+        DartPlantDeviceInvokeGeneratedGate(hook.published_entry_hook->gate_entry, dart_spreg, 2, 3);
+    g_generation_gate_hook.store(nullptr, std::memory_order_release);
+    munmap(mapping, kFakeStackSize);
+    if (restored != 5 || stale_gate != 5) return Fail("stale-generation target bypass");
+    return 0;
+}
+
 int Fail(const char* message) {
     std::fprintf(stderr, "[FAIL] %s: %s\n", message, dartplant_last_error());
     return 1;
@@ -318,9 +677,19 @@ int main() {
     return 1;
 #endif
 
-    if (dartplant_install_host_api(dartplant_dobby_host_api()) != DARTPLANT_OK) {
-        return Fail("generic host API install");
-    }
+    const DartPlantHostApi legacy_dobby_host = {
+        .struct_size = sizeof(DartPlantHostApi),
+        .version = DARTPLANT_HOST_API_VERSION,
+        .user_data = nullptr,
+        .hook = LegacyDobbyHostHook,
+        .unhook = LegacyDobbyHostUnhook,
+        .hook_with_publication = nullptr,
+    };
+    dartplant::InstallHostApi(&legacy_dobby_host, dartplant::HostPublicationPolicy::kLocalGate);
+    if (ExerciseLegacyDobbyLocalPublicationGate() != 0) return 1;
+    if (ExerciseLegacyDobbyConcurrentPublicationGate() != 0) return 1;
+    if (ExerciseGeneratedPublicationGateEntrantDrain() != 0) return 1;
+    if (ExerciseGeneratedGateStaleGenerationRetirement() != 0) return 1;
     if (ExercisePayloadReturnOwnership() != 0) return 1;
     if (ExerciseDartPadBranch() != 0) return 1;
     dartplant::RefreshModules();
@@ -494,6 +863,11 @@ int main() {
 
     std::printf("[PASS] ARM64 deterministic Dart x15 alignment pad\n");
     std::printf("[PASS] ARM64 payload-level sibling RET ownership\n");
+    std::printf("[PASS] ARM64 legacy Dobby local publication gate\n");
+    std::printf("[PASS] ARM64 legacy Dobby local-gate rehook\n");
+    std::printf("[PASS] ARM64 concurrent legacy Dobby publication gate\n");
+    std::printf("[PASS] ARM64 generated publication gate entrant drain\n");
+    std::printf("[PASS] ARM64 local-gate stale-generation retirement\n");
     std::printf("[PASS] ARM64 Dobby hook/original/unhook\n");
     std::printf("[PASS] ARM64 callback enter/leave/result mutation\n");
     std::printf("[PASS] ARM64 raw callback without ABI mapping\n");

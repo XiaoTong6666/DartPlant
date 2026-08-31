@@ -81,11 +81,83 @@ struct MetadataIndex {
     std::vector<MethodRecord> methods;
 };
 
+enum class HostPublicationPolicy : uint8_t {
+    // Public/unknown legacy hook APIs are not assumed to provide any
+    // publication ordering. Real Dart control-flow hooks fail closed.
+    kConservative = 0,
+    // The host exposes hook_with_publication(), so backup publication happens
+    // before the backend can make replacement reachable.
+    kStrict,
+    // Audited synchronous legacy hosts (LSPosed/Vector Native API v2) may make
+    // replacement reachable before hook() returns. DartPlant places its own
+    // publication gate in front of the real callback and keeps that gate closed
+    // until hook() has returned a callable backup. This policy is internal and
+    // must only be selected for hosts whose legacy call is synchronous, whose
+    // successful backup remains callable until unhook() completes, and whose
+    // non-zero hook result is failure-before-publication. Unknown public
+    // DartPlantHostApi providers remain kConservative.
+    kLocalGate,
+};
+
+enum class HostPublicationGateState : uint32_t {
+    kInstalling = 0,
+    kArmed = 1,
+    // Logical unhook has started. Generated-entry gates still hand callers to
+    // the dispatcher so recursive Dart calls cannot deadlock; HookRecord state
+    // suppresses listeners and counts those calls as passthrough in_flight.
+    // The packed entrant count lets the owner later close this state without
+    // racing a CPU that has committed to the callback handoff.
+    kDraining = 2,
+    kBypassTarget = 3,
+    kBypassBackup = 4,
+    kFailed = 5,
+    // No new generated entrant may cross. This state is entered only after
+    // HookRecord::in_flight and the packed gate entrant count are both observed
+    // idle, immediately before physical host unhook.
+    kClosed = 6,
+};
+
+// Keep this prefix layout synchronized with arm64_bridge.S. A gate is the
+// only replacement address exposed to a legacy real-Dart host backend.
+// generated-entry gates acquire one short entrant pin before branching to the
+// callback stub; the dispatcher transfers that pin to HookRecord::in_flight.
+//
+// State and entrant count intentionally share one 64-bit atomic word. This
+// makes ARMED->entrant and ARMED->DRAINING compete on the same LL/SC/CAS
+// object: either an entrant pins while ARMED and drain observes that count, or
+// drain wins first and the entrant cannot cross. Two independent atomics do
+// not provide that cross-object ordering guarantee with acquire/release alone.
+struct HostPublicationGate {
+    std::atomic<uint64_t> control{static_cast<uint64_t>(HostPublicationGateState::kInstalling)};
+    void* callback_entry = nullptr;
+    void* backup = nullptr;
+    void* target = nullptr;
+};
+
+static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t));
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+static_assert(offsetof(HostPublicationGate, control) == 0);
+static_assert(offsetof(HostPublicationGate, callback_entry) == 8);
+static_assert(offsetof(HostPublicationGate, backup) == 16);
+static_assert(offsetof(HostPublicationGate, target) == 24);
+
 struct HostApiBinding {
     void* user_data = nullptr;
     DartPlantHostHookCallback hook = nullptr;
     DartPlantHostUnhookCallback unhook = nullptr;
     DartPlantHostHookWithPublicationCallback hook_with_publication = nullptr;
+    HostPublicationPolicy publication_policy = HostPublicationPolicy::kConservative;
+};
+
+struct PublishedHostHook {
+    HostPublicationGate gate;
+    const HostApiBinding* binding = nullptr;
+    uintptr_t target = 0;
+    void* gate_entry = nullptr;
+    size_t gate_entry_size = 0;
+    bool track_generated_entrants = false;
+    bool backend_installed = false;
+    bool ever_published = false;
 };
 
 struct ManagedCodePatch {
@@ -148,7 +220,8 @@ std::optional<ModuleImage> FindModule(const std::vector<ModuleImage>& modules,
 std::string FingerprintCode(const void* address, size_t size);
 std::string FingerprintCodeWithManagedPatches(const void* address, size_t size);
 
-void InstallHostApi(const DartPlantHostApi* api);
+void InstallHostApi(const DartPlantHostApi* api,
+                    HostPublicationPolicy policy = HostPublicationPolicy::kConservative);
 void ClearHostApi(const HostApiBinding* expected_binding);
 void RefreshModules();
 void ReplaceModules(std::vector<ModuleImage> modules);
@@ -197,6 +270,28 @@ bool IsTargetHooked(uintptr_t target);
 void ResetHooks();
 void ReleaseHook(DartPlantHook* hook);
 void InvocationExited(DartPlantHook* hook);
+
+bool HostBindingSupportsPublishedHooks(const HostApiBinding* binding);
+DartPlantStatus PreparePublishedHostHook(PublishedHostHook* published,
+                                         const HostApiBinding* binding, uintptr_t target,
+                                         void* callback_entry, bool track_generated_entrants,
+                                         void* testing_gate_entry = nullptr);
+DartPlantStatus InstallPublishedHostHook(PublishedHostHook* published, void** out_backup);
+void ArmPublishedHostHook(PublishedHostHook* published);
+void BypassPublishedHostHookToBackup(PublishedHostHook* published);
+void BeginDrainPublishedHostHook(PublishedHostHook* published);
+bool ClosePublishedHostHook(PublishedHostHook* published);
+void ReopenPublishedHostHookDrain(PublishedHostHook* published);
+bool PublishedHostHookEntrantsIdle(const PublishedHostHook* published);
+uint32_t PublishedHostHookEntrantCount(const PublishedHostHook* published);
+DartPlantStatus UninstallPublishedHostHook(PublishedHostHook* published);
+void DestroyPublishedHostHookGate(PublishedHostHook* published);
+void RetainPublishedHostHookForProcessLifetime(std::unique_ptr<PublishedHostHook> published);
+void ReleasePublishedHostHookEntrant(PublishedHostHook* published);
+void ReleasePublishedHostHookEntrant(DartPlantHook* hook);
+void* AcquirePublishedHostHookRouteForTesting(PublishedHostHook* published, bool* out_callback_pin);
+void* CreateArm64HostPublicationGateStub(HostPublicationGate* gate, uintptr_t target,
+                                         bool track_generated_entrants, size_t* out_size);
 
 }  // namespace dartplant
 
@@ -268,6 +363,7 @@ struct DartPlantHook {
     // trampoline. Callback veneers treat installing/not-ready as passthrough.
     std::atomic_bool entry_published{false};
     std::atomic_bool entry_ready{false};
+    std::unique_ptr<dartplant::PublishedHostHook> published_entry_hook;
     std::shared_ptr<std::atomic_uint64_t> runtime_generation;
     uint64_t expected_runtime_generation = 0;
     void* replacement_entry = nullptr;

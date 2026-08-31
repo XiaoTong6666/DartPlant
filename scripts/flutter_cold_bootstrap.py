@@ -88,11 +88,22 @@ def _resolve_flutter(flutter: str | None) -> str:
     return str(Path(candidate).expanduser())
 
 
-def _build_fixture(flutter: str) -> None:
+def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
+    build_env = os.environ.copy()
+    resolved_dobby_root = (
+        dobby_root.expanduser().resolve()
+        if dobby_root is not None
+        else (ROOT_DIR / "third_party" / "dobby").resolve()
+    )
+    if not resolved_dobby_root.joinpath("CMakeLists.txt").is_file():
+        raise FileNotFoundError(f"Dobby source tree not found: {resolved_dobby_root}")
+    # Always pass the root so Gradle/CMake cannot accidentally reuse a cached
+    # external backend from a previous compatibility run.
+    build_env["DARTPLANT_DOBBY_ROOT"] = str(resolved_dobby_root)
     run(
         [sys.executable, str(ROOT_DIR / "scripts" / "main.py"), "build", "host"],
         cwd=ROOT_DIR,
-        env=os.environ.copy(),
+        env=build_env,
     )
     aot_analyzer = ROOT_DIR / "build" / "host" / "dartplant_aot_abi_analyzer_cli"
     if not aot_analyzer.is_file():
@@ -112,7 +123,7 @@ def _build_fixture(flutter: str) -> None:
         "// Generated placeholder; replaced after the first AOT build.\n"
         "#pragma once\n"
     )
-    run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=os.environ.copy())
+    run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=build_env)
     build_command = [
         flutter,
         "build",
@@ -121,7 +132,7 @@ def _build_fixture(flutter: str) -> None:
         "--target-platform",
         "android-arm64",
     ]
-    run(build_command, cwd=FIXTURE_DIR, env=os.environ.copy())
+    run(build_command, cwd=FIXTURE_DIR, env=build_env)
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"Flutter release APK was not produced: {APK_PATH}")
 
@@ -176,7 +187,7 @@ def _build_fixture(flutter: str) -> None:
             str(ABI_ORACLE_JSON),
         ],
         cwd=ROOT_DIR,
-        env=os.environ.copy(),
+        env=build_env,
     )
     for function_name, symbol_prefix, output_header in P6_SIDECARS:
         run(
@@ -316,6 +327,7 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
         if (
             "cold bootstrap status=" in latest
             and "DartPlant initialize status:" in latest
+            and "DartPlant local gate real-Dart warmup:" in latest
             and "DartPlant FunctionType semantic probe:" in latest
             and "DartPlant FunctionType named semantic probe:" in latest
             and "DartPlant bool semantic probe:" in latest
@@ -357,6 +369,10 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(f"cold start {round_index}: automatic live Function index was not ready\n{logs}")
     if "DartPlant initialize status: 0" not in logs:
         raise RuntimeError(f"cold start {round_index}: runtime init failed\n{logs}")
+    if "DartPlant local gate real-Dart warmup: 1 value=115" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: local-gated real Dart entry/JumpToFrame warmup failed\n{logs}"
+        )
     if "DartPlant simple facade install: 0" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: simple facade current-thread bootstrap failed\n{logs}"
@@ -525,6 +541,7 @@ def run_flutter_cold_bootstrap_test(
     rounds: int,
     timeout_seconds: float,
     build: bool,
+    dobby_root: Path | None = None,
 ) -> None:
     if rounds <= 0:
         raise ValueError("rounds must be greater than zero")
@@ -533,7 +550,7 @@ def run_flutter_cold_bootstrap_test(
 
     flutter_bin = _resolve_flutter(flutter) if build else ""
     if build:
-        _build_fixture(flutter_bin)
+        _build_fixture(flutter_bin, dobby_root=dobby_root)
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"missing Flutter fixture APK: {APK_PATH}")
     _assert_no_packaged_runtime_metadata()

@@ -9,10 +9,10 @@
 #include <bit>
 #include <cstdint>
 
-#include "dartplant/adapters/dobby.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/hook.h"
 #include "dartplant/invocation.h"
+#include "fixture_host.h"
 
 // These generated headers exist as empty placeholders during the first Flutter
 // AOT build. The cold-bootstrap harness replaces them with exact libapp-bound
@@ -341,15 +341,17 @@ extern "C" int32_t dartplant_fixture_p6_abi_install() {
     state.pair_leave.store(0, std::memory_order_relaxed);
     state.failures.store(0, std::memory_order_relaxed);
 
+    DartPlantStatus status = dartplant_fixture::InstallLocalGateHost();
+    if (status != DARTPLANT_OK) return status;
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
         .version = DARTPLANT_INIT_API_VERSION,
-        .host_api = dartplant_dobby_host_api(),
+        .host_api = nullptr,
         .artifact_bundle = nullptr,
         .app_module_name = nullptr,
         .runtime_module_name = nullptr,
     };
-    DartPlantStatus status = dartplant_init(&init);
+    status = dartplant_init(&init);
     if (status == DARTPLANT_OK) {
         status = InstallOne("verifiedAbiInt64", Int64Enter, Int64Leave, &state.int64_handle);
     }
@@ -447,15 +449,17 @@ extern "C" int32_t dartplant_fixture_exception_bridge_lifetime_install() {
     state.exception_lifetime_failures.store(0, std::memory_order_relaxed);
     state.exception_lifetime_unhook_ok.store(0, std::memory_order_relaxed);
 
+    DartPlantStatus status = dartplant_fixture::InstallLocalGateHost();
+    if (status != DARTPLANT_OK) return status;
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
         .version = DARTPLANT_INIT_API_VERSION,
-        .host_api = dartplant_dobby_host_api(),
+        .host_api = nullptr,
         .artifact_bundle = nullptr,
         .app_module_name = nullptr,
         .runtime_module_name = nullptr,
     };
-    DartPlantStatus status = dartplant_init(&init);
+    status = dartplant_init(&init);
     if (status == DARTPLANT_OK) {
         status = InstallOne("verifiedAbiThrowingStack", ExceptionLifetimeEnter,
                             ExceptionLifetimeLeave, &state.exception_lifetime_handle);

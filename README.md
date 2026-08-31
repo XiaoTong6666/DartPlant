@@ -65,10 +65,22 @@ also provide `hook_with_publication`. It must call
 reserved `DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED` result tells DartPlant to
 retain its executable callback veneer even after the adapter restores the
 target; unknown non-zero results retain the legacy never-published behavior.
-Real-Dart callback hooks fail closed when a backend provides only the legacy
-`hook(..., void** backup)` callback. Legacy backends remain available for raw
-and synthetic hooks, but must not be treated as concurrent Dart callback
-backends without the strict transaction extension.
+
+Real Dart control-flow hooks additionally pass through a DartPlant-owned
+publication gate. Strict hosts publish their backup before the backend can make
+that gate reachable. The built-in LSPosed/Vector `native_init` adapter uses an
+internal audited-local-gate policy instead: their unchanged synchronous Native
+API v2 `hook(target, replacement, &backup)` may make the gate reachable before
+returning, but CPUs that arrive early remain inside the gate until DartPlant has
+the callable backup and a fully initialized HookRecord. During unhook the gate
+moves through `ARMED -> DRAINING -> CLOSED -> BYPASS_TARGET`: DRAINING calls
+still enter the dispatcher as listener-free tracked passthrough invocations so
+recursive Dart calls cannot deadlock, while CLOSED is reached atomically only
+after both HookRecord invocations and gate handoff pins are idle. No stale gate
+fetch can therefore use a backend trampoline after physical unhook. Arbitrary public legacy HostApi
+providers are still conservative/raw-only unless they expose the strict
+publication extension; DartPlant does not infer local-gate safety from a plain
+function-pointer shape.
 
 The current implementation provides:
 

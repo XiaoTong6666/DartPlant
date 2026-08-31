@@ -280,15 +280,44 @@ bool HasLegacyCallbackMapping(const DartPlantRuntimeProfile& profile) {
 }
 
 DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
+    if (hook == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     const uintptr_t target = HookTarget(hook);
-    // Synthetic internal tests can construct a hook without the public
-    // installation path. Real installed hooks always retain their own binding.
     const auto* host_binding = hook->host_binding == nullptr
                                    ? State().host.binding.load(std::memory_order_acquire)
                                    : hook->host_binding;
-    const DartPlantHostUnhookCallback host_unhook =
-        host_binding == nullptr ? nullptr : host_binding->unhook;
-    if (hook->backend_installed) {
+
+    // Real Dart entry hooks enter logical DRAINING as soon as unhook starts.
+    // While draining, recursive/new Dart calls still pass through the dispatcher
+    // with listeners suppressed and are counted by HookRecord::in_flight. Once
+    // both in_flight and the short gate->dispatcher entrant handoff count are
+    // idle, atomically close the gate. A CPU racing that close either pins first
+    // (and forces us to defer) or observes CLOSED and cannot cross.
+    if (hook->published_entry_hook != nullptr && hook->backend_installed) {
+        BeginDrainPublishedHostHook(hook->published_entry_hook.get());
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            if (hook->in_flight != 0) return DARTPLANT_OK;
+        }
+        if (!ClosePublishedHostHook(hook->published_entry_hook.get())) return DARTPLANT_OK;
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            if (hook->in_flight != 0) {
+                ReopenPublishedHostHookDrain(hook->published_entry_hook.get());
+                return DARTPLANT_OK;
+            }
+        }
+        const DartPlantStatus uninstall =
+            UninstallPublishedHostHook(hook->published_entry_hook.get());
+        hook->backend_installed.store(hook->published_entry_hook->backend_installed,
+                                      std::memory_order_release);
+        if (uninstall != DARTPLANT_OK) {
+            std::lock_guard hook_lock(hook->mutex);
+            hook->state = HookRecordState::kFailed;
+            return uninstall;
+        }
+    } else if (hook->backend_installed) {
+        const DartPlantHostUnhookCallback host_unhook =
+            host_binding == nullptr ? nullptr : host_binding->unhook;
         if (target == 0 || host_unhook == nullptr ||
             host_unhook(host_binding->user_data, reinterpret_cast<void*>(target)) != 0) {
             std::lock_guard hook_lock(hook->mutex);
@@ -296,20 +325,19 @@ DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
             SetLastError("host unhook function failed");
             return DARTPLANT_UNHOOK_FAILED;
         }
-        hook->backend_installed = false;
+        hook->backend_installed.store(false, std::memory_order_release);
     }
-    // Make stale callback veneers choose passthrough before return/exception
-    // ownership is torn down. entry_published stays set until the hook is
-    // moved to the retired list, so an unexpected fetch cannot enter a
-    // partially-reset callback record.
+
     hook->active.store(false, std::memory_order_release);
     if (!RestoreArm64ReturnInterception(hook)) {
+        // If the physical entry is already restored, the gate is permanently
+        // BYPASS_TARGET and cannot start a new backup-dependent invocation.
+        // Keep the record failed/retained rather than republishing the backend.
         std::lock_guard hook_lock(hook->mutex);
         hook->state = HookRecordState::kFailed;
         SetLastError("failed to restore Dart return interception");
         return DARTPLANT_UNHOOK_FAILED;
     }
-    hook->entry_published.store(false, std::memory_order_release);
     hook->entry_ready.store(false, std::memory_order_release);
     ReleaseArm64ExceptionBridgeConsumer(hook);
     if (hook->code_target != nullptr) hook->code_target->UnbindHookRecord(hook);
@@ -328,6 +356,7 @@ DartPlantStatus FinishUnhookLocked(DartPlantHook* hook) {
 }
 
 DartPlantStatus UnhookRecordLocked(DartPlantHook* hook) {
+    bool gated_drain = false;
     {
         std::lock_guard hook_lock(hook->mutex);
         if (hook->state == HookRecordState::kUnhooked) return DARTPLANT_OK;
@@ -340,10 +369,16 @@ DartPlantStatus UnhookRecordLocked(DartPlantHook* hook) {
         }
         hook->state = HookRecordState::kUnhooking;
         hook->active.store(false, std::memory_order_release);
+        gated_drain = hook->published_entry_hook != nullptr &&
+                      hook->backend_installed.load(std::memory_order_acquire);
         for (const auto& listener : hook->listeners) {
             listener->active.store(false, std::memory_order_release);
         }
         hook->listeners.clear();
+    }
+    if (gated_drain) BeginDrainPublishedHostHook(hook->published_entry_hook.get());
+    {
+        std::lock_guard hook_lock(hook->mutex);
         if (hook->in_flight != 0) return DARTPLANT_OK;
     }
     return FinishUnhookLocked(hook);
@@ -361,7 +396,7 @@ RuntimeState& State() {
     return state;
 }
 
-void InstallHostApi(const DartPlantHostApi* api) {
+void InstallHostApi(const DartPlantHostApi* api, HostPublicationPolicy policy) {
     if (api == nullptr || api->struct_size < DARTPLANT_HOST_API_LEGACY_SIZE ||
         api->version < DARTPLANT_HOST_API_VERSION || api->hook == nullptr ||
         api->unhook == nullptr) {
@@ -375,6 +410,11 @@ void InstallHostApi(const DartPlantHostApi* api) {
     binding->unhook = api->unhook;
     binding->hook_with_publication =
         api->struct_size >= sizeof(DartPlantHostApi) ? api->hook_with_publication : nullptr;
+    if (policy == HostPublicationPolicy::kConservative &&
+        binding->hook_with_publication != nullptr) {
+        policy = HostPublicationPolicy::kStrict;
+    }
+    binding->publication_policy = policy;
     // Bindings are intentionally leaked while any hook may still own the
     // callback ABI. Replacing the default must not invalidate a stale
     // host/unhook function pointer used by an existing hook.
@@ -510,9 +550,9 @@ DartPlantStatus InstallHook(const std::shared_ptr<DartEntryTarget>& code_target,
     }
     hook->backup.store(original, std::memory_order_release);
     hook->host_binding = host_binding;
-    hook->active.store(true, std::memory_order_release);
     hook->state = HookRecordState::kInstalled;
     hook->code_target->BindHookRecord(hook.get());
+    hook->active.store(true, std::memory_order_release);
     *backup = original;
     *out_hook = hook.get();
     Hooks().push_back(std::move(hook));
@@ -602,24 +642,36 @@ bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners) {
     if (hook == nullptr || listeners == nullptr) return false;
     std::lock_guard lock(hook->mutex);
-    if (!hook->has_method || hook->state == HookRecordState::kFailed ||
-        hook->state == HookRecordState::kRetired || hook->state == HookRecordState::kUnhooking ||
-        hook->state == HookRecordState::kUnhooked) {
+    if (!hook->has_method || hook->state == HookRecordState::kRetired ||
+        hook->state == HookRecordState::kUnhooked || hook->state == HookRecordState::kInstalling) {
         return false;
     }
-    if (hook->runtime_generation != nullptr &&
-        hook->runtime_generation->load(std::memory_order_acquire) !=
-            hook->expected_runtime_generation) {
-        SetLastError("callback hook belongs to a stale runtime generation");
+
+    const bool published_passthrough = hook->published_entry_hook != nullptr &&
+                                       hook->backend_installed.load(std::memory_order_acquire);
+    const bool stale_generation = hook->runtime_generation != nullptr &&
+                                  hook->runtime_generation->load(std::memory_order_acquire) !=
+                                      hook->expected_runtime_generation;
+    if ((hook->state == HookRecordState::kFailed || stale_generation) && !published_passthrough) {
+        if (stale_generation) SetLastError("callback hook belongs to a stale runtime generation");
         return false;
     }
+
+    // A gated real-Dart entry remains physically callable while logical unhook
+    // is draining. Pin every passthrough original invocation so host unhook can
+    // never reclaim its backup trampoline underneath executing Dart code.
     ++hook->in_flight;
     listeners->clear();
-    if (hook->active.load(std::memory_order_acquire)) {
+    const bool callbacks_enabled = hook->state == HookRecordState::kInstalled &&
+                                   !stale_generation &&
+                                   hook->active.load(std::memory_order_acquire);
+    if (callbacks_enabled) {
         *listeners = hook->listeners;
         for (const auto& listener : *listeners) {
             listener->in_flight.fetch_add(1, std::memory_order_acq_rel);
         }
+    } else if (stale_generation) {
+        SetLastError("callback hook belongs to a stale runtime generation");
     }
     return true;
 }
@@ -713,12 +765,10 @@ DartPlantStatus InstallCallbackHook(
         SetLastError("host hook API is not initialized");
         return DARTPLANT_HOST_API_UNAVAILABLE;
     }
-    if (method->function->source != DartFunctionSource::kSynthetic &&
-        host_binding->hook_with_publication == nullptr) {
-        // A legacy hook(void**, backup) callback cannot publish backup into the
-        // HookRecord before another mutator can fetch the replacement. Keep
-        // raw/synthetic hooks available, but fail closed for real Dart code.
-        SetLastError("real Dart callback hooks require a strict host publication adapter");
+    const bool real_dart = method->function->source != DartFunctionSource::kSynthetic;
+    if (real_dart && !HostBindingSupportsPublishedHooks(host_binding)) {
+        SetLastError(
+            "real Dart callback hooks require strict publication or an audited local publication gate host");
         return DARTPLANT_UNSUPPORTED_ABI;
     }
     if (FindHookLocked(target) != nullptr) {
@@ -801,11 +851,14 @@ DartPlantStatus InstallCallbackHook(
         }
     }
 
-    // Reserve the process-lifetime owner before the backend can publish the
-    // replacement. No allocation is permitted after host_binding->hook().
+    // Reserve process-lifetime ownership before either a strict or local-gated
+    // backend can publish executable control flow. Published callback/gate
+    // pages are never reclaimed without a host-provided instruction-fetch
+    // quiescence proof.
     try {
         PublishedCallbackHooks().reserve(PublishedCallbackHooks().size() + 1);
     } catch (...) {
+        if (real_dart) (void) RestoreArm64ReturnInterception(hook.get());
         DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
         hook->replacement_entry = nullptr;
         hook->replacement_entry_size = 0;
@@ -814,96 +867,111 @@ DartPlantStatus InstallCallbackHook(
     }
 
     void* original = nullptr;
-    const auto publish_backup = [](void* user_data, void* backup) {
-        auto* hook = static_cast<DartPlantHook*>(user_data);
-        if (hook == nullptr || backup == nullptr) return;
-        hook->backup.store(backup, std::memory_order_release);
-        hook->backend_installed.store(true, std::memory_order_release);
-        hook->entry_ready.store(true, std::memory_order_release);
-    };
-    DartPlantHostHookTransaction transaction{
-        .struct_size = sizeof(DartPlantHostHookTransaction),
-        .user_data = hook.get(),
-        .backup_ready = publish_backup,
-    };
-    const int host_hook_status =
-        host_binding->hook_with_publication != nullptr
-            ? host_binding->hook_with_publication(host_binding->user_data,
-                                                  reinterpret_cast<void*>(target),
-                                                  hook->replacement_entry, &transaction)
-            : host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target),
-                                 hook->replacement_entry, &original);
-    if (host_binding->hook_with_publication != nullptr) {
-        original = hook->backup.load(std::memory_order_acquire);
-    }
-    if (host_hook_status != 0) {
-        const bool published = host_hook_status == DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED;
-        hook->entry_published.store(published, std::memory_order_release);
-        hook->entry_ready.store(published, std::memory_order_release);
-        hook->active.store(false, std::memory_order_release);
-        if (published) {
-            // The adapter has already restored target, but a CPU may have
-            // fetched the callback veneer. Restore only managed return sites;
-            // keep both the veneer and HookRecord alive for stale fetches.
-            hook->backend_installed.store(false, std::memory_order_release);
+    if (real_dart) {
+        try {
+            hook->published_entry_hook = std::make_unique<PublishedHostHook>();
+        } catch (...) {
             (void) RestoreArm64ReturnInterception(hook.get());
-            hook->state = HookRecordState::kFailedAfterPublished;
-            hook->listeners.clear();
-            Hooks().push_back(std::move(hook));
-        } else if (RestoreArm64ReturnInterception(hook.get())) {
+            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+            hook->replacement_entry = nullptr;
+            hook->replacement_entry_size = 0;
+            SetLastError("failed to allocate Dart entry publication ownership");
+            return DARTPLANT_HOOK_FAILED;
+        }
+        DartPlantStatus published_status = PreparePublishedHostHook(
+            hook->published_entry_hook.get(), host_binding, target, hook->replacement_entry, true);
+        if (published_status != DARTPLANT_OK) {
+            (void) RestoreArm64ReturnInterception(hook.get());
+            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+            hook->replacement_entry = nullptr;
+            hook->replacement_entry_size = 0;
+            return published_status;
+        }
+        published_status = InstallPublishedHostHook(hook->published_entry_hook.get(), &original);
+        hook->backend_installed.store(hook->published_entry_hook->backend_installed,
+                                      std::memory_order_release);
+        hook->entry_published.store(hook->published_entry_hook->ever_published,
+                                    std::memory_order_release);
+        if (published_status != DARTPLANT_OK) {
+            hook->active.store(false, std::memory_order_release);
+            const bool returns_restored = RestoreArm64ReturnInterception(hook.get());
+            if (hook->published_entry_hook->ever_published || !returns_restored) {
+                hook->state = hook->published_entry_hook->ever_published
+                                  ? HookRecordState::kFailedAfterPublished
+                                  : HookRecordState::kFailed;
+                hook->listeners.clear();
+                Hooks().push_back(std::move(hook));
+            } else {
+                DestroyPublishedHostHookGate(hook->published_entry_hook.get());
+                DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+                hook->replacement_entry = nullptr;
+                hook->replacement_entry_size = 0;
+            }
+            return published_status;
+        }
+    } else {
+        if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target),
+                               hook->replacement_entry, &original) != 0 ||
+            original == nullptr) {
+            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+            hook->replacement_entry = nullptr;
+            hook->replacement_entry_size = 0;
+            SetLastError("host hook function failed");
+            return DARTPLANT_HOOK_FAILED;
+        }
+        hook->backend_installed.store(true, std::memory_order_release);
+        hook->entry_published.store(true, std::memory_order_release);
+    }
+
+    hook->backup.store(original, std::memory_order_release);
+    hook->entry_ready.store(true, std::memory_order_release);
+    if (!CaptureManagedPatchedBytes(hook.get())) {
+        bool backend_restored = false;
+        if (real_dart) {
+            // The callback was never armed, so close INSTALLING directly before
+            // asking the host to restore target. No generated entrant can have
+            // crossed this gate.
+            (void) ClosePublishedHostHook(hook->published_entry_hook.get());
+            backend_restored =
+                UninstallPublishedHostHook(hook->published_entry_hook.get()) == DARTPLANT_OK;
+            hook->backend_installed.store(hook->published_entry_hook->backend_installed,
+                                          std::memory_order_release);
+        } else {
+            backend_restored =
+                host_binding->unhook(host_binding->user_data, reinterpret_cast<void*>(target)) == 0;
+            hook->backend_installed.store(!backend_restored, std::memory_order_release);
+        }
+        const bool returns_restored = RestoreArm64ReturnInterception(hook.get());
+        hook->active.store(false, std::memory_order_release);
+        hook->state = HookRecordState::kFailed;
+        hook->listeners.clear();
+        // A real-Dart gate whose target was ever published must retain both the
+        // gate cookie and callback veneer even after rollback, because another
+        // CPU may have fetched the old backend branch already.
+        if (real_dart && !hook->published_entry_hook->ever_published && backend_restored &&
+            returns_restored) {
+            DestroyPublishedHostHookGate(hook->published_entry_hook.get());
             DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
             hook->replacement_entry = nullptr;
             hook->replacement_entry_size = 0;
         } else {
-            hook->state = HookRecordState::kFailed;
-            hook->listeners.clear();
-            Hooks().push_back(std::move(hook));
-        }
-        SetLastError("host hook function failed");
-        return DARTPLANT_HOOK_FAILED;
-    }
-    if (original == nullptr) {
-        // A successful host transaction without a callable backup violates the
-        // HostApi contract. There is no safe original path to return to.
-        SetLastError("host hook succeeded without an original trampoline");
-        __builtin_trap();
-    }
-    hook->backend_installed.store(true, std::memory_order_release);
-    hook->backup.store(original, std::memory_order_release);
-    hook->entry_published.store(true, std::memory_order_release);
-    hook->entry_ready.store(true, std::memory_order_release);
-    if (!CaptureManagedPatchedBytes(hook.get())) {
-        const bool backend_restored =
-            host_binding->unhook(host_binding->user_data, reinterpret_cast<void*>(target)) == 0;
-        hook->backend_installed.store(!backend_restored, std::memory_order_release);
-        const bool returns_restored = RestoreArm64ReturnInterception(hook.get());
-        if (backend_restored && returns_restored) {
-            hook->active.store(false, std::memory_order_release);
-            hook->state = HookRecordState::kFailed;
-            hook->listeners.clear();
-            Hooks().push_back(std::move(hook));
-        } else {
-            hook->host_binding = host_binding;
-            hook->active.store(false, std::memory_order_release);
-            hook->state = HookRecordState::kFailed;
             Hooks().push_back(std::move(hook));
         }
         SetLastError("failed to record callback backend code patches");
         return DARTPLANT_HOOK_FAILED;
     }
-    if (method->function->source != DartFunctionSource::kSynthetic) {
-        RegisterArm64ExceptionBridgeConsumer(hook.get());
-    }
-    hook->active.store(true, std::memory_order_release);
+    if (real_dart) RegisterArm64ExceptionBridgeConsumer(hook.get());
     hook->state = HookRecordState::kInstalled;
     hook->code_target->BindHookRecord(hook.get());
+    VmAdapterRetainHook(hook->vm_adapter);
+    hook->vm_adapter_retained = hook->vm_adapter != nullptr;
+    hook->active.store(true, std::memory_order_release);
+    if (real_dart) ArmPublishedHostHook(hook->published_entry_hook.get());
     if (out_hook != nullptr) *out_hook = hook.get();
     if (out_listener != nullptr) {
         ++hook->listener_handles;
         *out_listener = listener_handle.release();
     }
-    VmAdapterRetainHook(hook->vm_adapter);
-    hook->vm_adapter_retained = hook->vm_adapter != nullptr;
     Hooks().push_back(std::move(hook));
     return DARTPLANT_OK;
 }

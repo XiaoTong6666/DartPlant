@@ -5,11 +5,11 @@
 #include <atomic>
 #include <bit>
 
-#include "dartplant/adapters/dobby.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/hook.h"
 #include "dartplant/host_api.h"
 #include "dartplant/invocation.h"
+#include "fixture_host.h"
 
 namespace {
 
@@ -93,17 +93,17 @@ int32_t dartplant_simple_consumer_install() {
     g_observer_enter.store(0, std::memory_order_relaxed);
     g_failures.store(0, std::memory_order_relaxed);
 
-    const DartPlantHostApi* host_api = dartplant_dobby_host_api();
-    if (host_api == nullptr) return DARTPLANT_HOST_API_UNAVAILABLE;
+    DartPlantStatus status = dartplant_fixture::InstallLocalGateHost();
+    if (status != DARTPLANT_OK) return status;
     const DartPlantInitInfo init = {
         .struct_size = sizeof(DartPlantInitInfo),
         .version = DARTPLANT_INIT_API_VERSION,
-        .host_api = host_api,
+        .host_api = nullptr,
         .artifact_bundle = nullptr,
         .app_module_name = nullptr,
         .runtime_module_name = nullptr,
     };
-    DartPlantStatus status = dartplant_init(&init);
+    status = dartplant_init(&init);
     if (status != DARTPLANT_OK) return status;
 
     const DartPlantMethodQuery query = {

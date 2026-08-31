@@ -19,9 +19,10 @@ typedef DartPlantNativeHook DartPlantHostHook;
 typedef DartPlantNativeUnhook DartPlantHostUnhook;
 
 // LSPosed/Vector native_init compatibility ABI. This type belongs to the
-// adapter boundary; dartplant_core consumes only DartPlantHostApi. The LSPosed
-// binding remains legacy/raw-only for physical Dart callbacks until it can
-// provide the strict publication extension.
+// adapter boundary; dartplant_core consumes only DartPlantHostApi. DartPlant's
+// built-in adapter treats the audited synchronous v2 implementations as an
+// internal local-gate host: the framework ABI stays unchanged while DartPlant
+// owns real-Dart callback publication ordering itself.
 typedef struct DartPlantNativeApiEntries {
     uint32_t version;
     DartPlantNativeHook hook_func;

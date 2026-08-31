@@ -22,6 +22,8 @@
 extern "C" void dartplant_arm64_callback_entry();
 extern "C" void dartplant_arm64_native_callback_entry();
 extern "C" void dartplant_arm64_return_entry();
+extern "C" void dartplant_arm64_generated_publication_gate_entry();
+extern "C" void dartplant_arm64_native_publication_gate_entry();
 extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg,
                                                           uintptr_t target_fp);
 
@@ -133,6 +135,7 @@ struct ExceptionBridgeState {
     std::mutex mutex;
     uintptr_t target = 0;
     JumpToFrameFn backup = nullptr;
+    std::unique_ptr<PublishedHostHook> published_hook;
     size_t consumers = 0;
 };
 
@@ -337,28 +340,83 @@ bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context
                 "Dart JumpToFrame target changed after the process exception bridge was installed");
             return false;
         }
-        return state.backup != nullptr;
+        return state.backup != nullptr && state.published_hook != nullptr;
     }
     const HostApiBinding* binding = hook->host_binding;
-    if (binding == nullptr || binding->hook == nullptr || binding->unhook == nullptr) {
-        SetLastError("exception bridge has no installing host backend");
+    if (!HostBindingSupportsPublishedHooks(binding)) {
+        SetLastError("exception bridge host cannot safely publish Dart control flow");
         return false;
     }
+
+    auto published = std::make_unique<PublishedHostHook>();
+    DartPlantStatus status = PreparePublishedHostHook(
+        published.get(), binding, target,
+        reinterpret_cast<void*>(&dartplant_arm64_jump_to_frame_hook), false);
+    if (status != DARTPLANT_OK) return false;
+
     void* backup = nullptr;
-    if (binding->hook(binding->user_data, reinterpret_cast<void*>(target),
-                      reinterpret_cast<void*>(&dartplant_arm64_jump_to_frame_hook), &backup) != 0 ||
-        backup == nullptr) {
+    status = InstallPublishedHostHook(published.get(), &backup);
+    if (status != DARTPLANT_OK || backup == nullptr) {
+        if (published->ever_published) {
+            RetainPublishedHostHookForProcessLifetime(std::move(published));
+        } else {
+            DestroyPublishedHostHookGate(published.get());
+        }
         SetLastError("failed to hook Dart JumpToFrame for exception cleanup");
         return false;
     }
+
     state.target = target;
     state.backup = reinterpret_cast<JumpToFrameFn>(backup);
+    state.published_hook = std::move(published);
+    // The gate is still INSTALLING here. Publish the callable original first,
+    // then arm replacement reachability with a release store.
     g_jump_to_frame_backup.store(state.backup, std::memory_order_release);
+    ArmPublishedHostHook(state.published_hook.get());
     return true;
 #else
     (void) hook;
     (void) context;
     return false;
+#endif
+}
+
+void* CreateArm64HostPublicationGateStub(HostPublicationGate* gate, uintptr_t target,
+                                         bool track_generated_entrants, size_t* out_size) {
+#if defined(__aarch64__)
+    if (gate == nullptr || target == 0 || out_size == nullptr) return nullptr;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return nullptr;
+    const size_t allocation_size = static_cast<size_t>(page_size);
+    // Keep generated-entry gates inside direct-B reach when possible. This is
+    // friendly to hosts that enable Dobby's near-branch plugin while still
+    // leaving the host responsible for the physical target patch.
+    auto* code = static_cast<uint32_t*>(AllocateCallbackStub(
+        allocation_size, target, track_generated_entrants ? kArm64BranchReach : 0));
+    if (code == nullptr) return nullptr;
+
+    code[0] = 0x58000091;  // ldr x17, +16 (HostPublicationGate*).
+    code[1] = 0x580000b0;  // ldr x16, +20 (common gate entry).
+    code[2] = 0xd61f0200;  // br x16.
+    code[3] = 0xd503201f;  // nop.
+    std::memcpy(reinterpret_cast<uint8_t*>(code) + 16, &gate, sizeof(gate));
+    void* common = track_generated_entrants
+                       ? reinterpret_cast<void*>(&dartplant_arm64_generated_publication_gate_entry)
+                       : reinterpret_cast<void*>(&dartplant_arm64_native_publication_gate_entry);
+    std::memcpy(reinterpret_cast<uint8_t*>(code) + 24, &common, sizeof(common));
+    __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code) + 32);
+    if (mprotect(code, allocation_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, allocation_size);
+        return nullptr;
+    }
+    *out_size = allocation_size;
+    return code;
+#else
+    (void) gate;
+    (void) target;
+    (void) track_generated_entrants;
+    (void) out_size;
+    return nullptr;
 #endif
 }
 

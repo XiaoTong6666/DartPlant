@@ -139,6 +139,18 @@ Future<void> main() async {
         : initializeStartStatus;
     debugPrint('DartPlant initialize status: $initializeStatus');
 
+    // The advanced runtime is intentionally initialized with DartPlant's local
+    // publication-gate policy. Exercise one real Dart call before the simple
+    // facade/P6 consumers replace the process-default host with the strict
+    // Dobby adapter. This first call therefore proves both the generated entry
+    // gate and the process-global JumpToFrame bridge on the legacy-host path.
+    final localGateWarmup = instrumentedAdd(2, 3);
+    final localGateWarmupPassed =
+        initializeStatus == 0 && localGateWarmup == 115;
+    debugPrint(
+      'DartPlant local gate real-Dart warmup: ${localGateWarmupPassed ? 1 : 0} value=$localGateWarmup',
+    );
+
     // The first two calls are owned only by the simple-facade consumer TU.
     // It lazy-bootstraps its own default runtime, consumes the embedded
     // compiler artifact, derives the typed V0/V1 -> V0 layout, and installs two

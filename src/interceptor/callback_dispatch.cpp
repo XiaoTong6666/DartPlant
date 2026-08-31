@@ -602,7 +602,8 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     const bool real_dart =
         hook->method_storage != nullptr && hook->method_storage->function != nullptr &&
         hook->method_storage->function->source != dartplant::DartFunctionSource::kSynthetic;
-    if (!hook->active.load(std::memory_order_acquire)) {
+    const bool gated_real_dart = real_dart && hook->published_entry_hook != nullptr;
+    if (!hook->active.load(std::memory_order_acquire) && !gated_real_dart) {
         // Reset may have restored the physical entry while a CPU was already
         // fetching the old branch. Published callback stubs retain this hook
         // object, so a stale fetch can safely take the original path.
@@ -616,12 +617,18 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     }
     DispatchStack* stack = CurrentDispatchStack();
     if (stack == nullptr) {
+        // A gated real-Dart CPU has already crossed the physical host patch.
+        // If TLS setup fails there is no return/exception bookkeeping capable
+        // of releasing that lifetime safely, so deliberately retain the gate
+        // entrant instead of allowing a later unhook to reclaim backup.
+        if (!gated_real_dart) dartplant::ReleasePublishedHostHookEntrant(hook);
         dartplant::SetLastError("DartPlant per-thread callback storage is unavailable");
         result.context = context;
         result.original = hook->backup.load(std::memory_order_acquire);
         return result;
     }
     if (stack->depth >= kMaxInvocationDepth) {
+        if (!gated_real_dart) dartplant::ReleasePublishedHostHookEntrant(hook);
         dartplant::SetLastError("DartPlant invocation depth limit exceeded");
         result.context = context;
         result.original = hook->backup.load(std::memory_order_acquire);
@@ -654,6 +661,12 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     frame.invocation.validated_bool_false_value = hook->validated_bool_false_value;
 
     if (!dartplant::BeginInvocation(hook, &frame.invocation.entered_listeners)) {
+        // If a generated entry somehow reached this point while its backend is
+        // still installed, retain the entrant forever rather than returning an
+        // untracked original invocation that a concurrent unhook could outlive.
+        if (!gated_real_dart || !hook->backend_installed.load(std::memory_order_acquire)) {
+            dartplant::ReleasePublishedHostHookEntrant(hook);
+        }
         result.context = &frame.context;
         result.original = hook->backup.load(std::memory_order_acquire);
         if (real_dart) {
@@ -666,14 +679,21 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         }
         return result;
     }
+    // BeginInvocation has acquired HookRecord::in_flight, but keep the local
+    // gate entrant until the exception bridge is known-good. Any setup failure
+    // before that point may have to execute original without normal DartPlant
+    // return bookkeeping; retaining the entrant then conservatively prevents
+    // physical backend teardown for process life.
 
     // BeginInvocation is the entry-stub quiescence pin. Reset cannot detach
     // this hook or its VM adapter after this point until FinishFrame retires it.
     frame.invocation.vm_adapter = hook->vm_adapter;
     const bool late_shared_fail_closed =
         frame.invocation.identity_ambiguous && !hook->shared_code_opt_in;
-    const bool generated_bridge =
-        real_dart && frame.invocation.vm_adapter != nullptr && !late_shared_fail_closed;
+    const bool has_callbacks = !frame.invocation.entered_listeners.empty();
+    const bool generated_bridge = real_dart && has_callbacks &&
+                                  frame.invocation.vm_adapter != nullptr &&
+                                  !late_shared_fail_closed;
 
     if (generated_bridge) {
         if (!BuildGeneratedRootBindings(&frame) || !PinGeneratedRoots(&frame, false) ||
@@ -685,7 +705,8 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
             result.original = hook->backup.load(std::memory_order_acquire);
             return result;
         }
-    } else if (!late_shared_fail_closed && frame.invocation.vm_adapter != nullptr) {
+    } else if (has_callbacks && !late_shared_fail_closed &&
+               frame.invocation.vm_adapter != nullptr) {
         if (dartplant_vm_enter_scope(frame.invocation.vm_adapter) != DARTPLANT_OK) {
             ReleaseSnapshot(&frame.invocation);
             --stack->depth;
@@ -715,6 +736,13 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         result.context = &frame.context;
         result.original = hook->backup.load(std::memory_order_acquire);
         return result;
+    }
+
+    if (gated_real_dart) {
+        // JumpToFrame is now publication-safe and HookRecord::in_flight covers
+        // the complete Dart body, so the short gate-to-dispatch handoff pin is
+        // no longer needed.
+        dartplant::ReleasePublishedHostHookEntrant(hook);
     }
 
     if (late_shared_fail_closed) {

@@ -52,6 +52,7 @@ add_library(
     src/core/hook_registry.cpp
     src/elf/module_image.cpp
     src/host/loader_contract.cpp
+    src/host/publication_gate.cpp
     src/host/signal_lease.cpp
     src/metadata/metadata.cpp
     src/abi/runtime_evidence.cpp
@@ -224,24 +225,6 @@ if(ANDROID)
                 "${CMAKE_CURRENT_BINARY_DIR}/third_party/dobby"
             )
         endif()
-        if(NOT TARGET dartplant_adapter_dobby)
-            add_library(dartplant_adapter_dobby STATIC adapters/dobby/dobby_host.cpp)
-            target_compile_features(dartplant_adapter_dobby PUBLIC cxx_std_20)
-            target_compile_options(dartplant_adapter_dobby PRIVATE -Wall -Wextra -Werror)
-            target_include_directories(
-                dartplant_adapter_dobby
-                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                PRIVATE
-                    ${DARTPLANT_DOBBY_ROOT}/include
-                    ${DARTPLANT_DOBBY_ROOT}
-                    ${DARTPLANT_DOBBY_ROOT}/source
-                    ${DARTPLANT_DOBBY_ROOT}/source/include
-                    ${DARTPLANT_DOBBY_ROOT}/source/Backend/UserMode
-                    ${DARTPLANT_DOBBY_ROOT}/external
-                    ${DARTPLANT_DOBBY_ROOT}/external/logging
-            )
-            target_link_libraries(dartplant_adapter_dobby PUBLIC dartplant_core PRIVATE dobby)
-        endif()
 
         add_library(
             dartplant_device_fixture
@@ -287,7 +270,7 @@ if(ANDROID)
             dartplant_device_tests
             PRIVATE
             dartplant_core
-            dartplant_adapter_dobby
+            dobby
             dartplant_device_fixture
             log
             dl

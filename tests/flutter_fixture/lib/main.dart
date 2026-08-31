@@ -1,10 +1,22 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'dartplant_native.dart';
 
 const fixture = DartPlantFixture();
+
+void movingGcPressure(SendPort port) {
+  port.send(1);
+  final retained = <List<Object?>>[];
+  for (var index = 0; index < 200000; ++index) {
+    retained.add(List<Object?>.filled(64, Object()));
+    if (retained.length == 128) retained.clear();
+  }
+  port.send(2);
+}
 
 @pragma('vm:entry-point')
 @pragma('vm:never-inline')
@@ -191,6 +203,17 @@ Future<void> main() async {
         'DartPlant P6 throw path: $p6ThrowPath normal=$p6BaselineThrow/$p6HookedThrow');
     final p6HookedForced = verifiedAbiForcedStack(5, 6);
     final p6HookedPair = verifiedAbiPair(31, 32);
+    final gcPort = ReceivePort();
+    await Isolate.spawn(movingGcPressure, gcPort.sendPort);
+    final gcEvents = StreamIterator<Object?>(gcPort);
+    await gcEvents.moveNext();
+    final p6HookedObjectPair = verifiedAbiPair(
+      const FixtureObject(31),
+      const FixtureObject(32),
+    );
+    await gcEvents.moveNext();
+    await gcEvents.cancel();
+    gcPort.close();
     final p6Probe = DartPlantNative.p6AbiProbe();
     final p6Passed = p6Install == 0 &&
         p6Probe == 1 &&
@@ -208,7 +231,9 @@ Future<void> main() async {
         p6BaselinePair.$1 == 21 &&
         p6BaselinePair.$2 == 22 &&
         p6HookedPair.$1 == 32 &&
-        p6HookedPair.$2 == 31;
+        p6HookedPair.$2 == 31 &&
+        p6HookedObjectPair.$1 == const FixtureObject(32) &&
+        p6HookedObjectPair.$2 == const FixtureObject(31);
     debugPrint(
       'DartPlant P6 ABI corpus: ${p6Passed ? 1 : 0} install=$p6Install probe=$p6Probe int64=$p6BaselineInt64/$p6HookedInt64 stack=$p6BaselineStack/$p6HookedStack odd=$p6BaselineOdd/$p6HookedOdd forced=$p6BaselineForced/$p6HookedForced pair=${p6BaselinePair.$1},${p6BaselinePair.$2}/${p6HookedPair.$1},${p6HookedPair.$2}',
     );

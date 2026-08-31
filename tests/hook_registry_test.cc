@@ -386,6 +386,51 @@ TEST_CASE(EntryTargetsShareExactCodePayloadOwnership) {
                                                    0x80) == nullptr);
 }
 
+TEST_CASE(ProvisionalPayloadUpgradeCommitsEvidenceAndPayloadAtomically) {
+    constexpr int kRounds = 2000;
+    for (int round = 0; round < kRounds; ++round) {
+        auto target = std::make_shared<dartplant::DartEntryTarget>();
+        auto provisional = std::make_shared<dartplant::DartCodePayload>();
+        provisional->start = 0x5000;
+        provisional->instructions_length = 0x60;
+        auto exact = std::make_shared<dartplant::DartCodePayload>();
+        exact->start = 0x4fe0;
+        exact->instructions_length = 0x80;
+        exact->code_object = 0x1234;
+        exact->exact_identity = true;
+        target->id = 0x5000;
+        target->entry = 0x5000;
+        target->code_size = 0x60;
+        target->payload = provisional;
+
+        std::atomic_bool start{false};
+        std::atomic_bool upgraded{false};
+        auto* hook = reinterpret_cast<DartPlantHook*>(uintptr_t{1});
+        std::thread binder([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            target->BindHookRecord(hook);
+        });
+        std::thread upgrader([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            upgraded.store(target->MergeEvidenceAndUpgradePayload(
+                               0x60, 0x1234, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, provisional, exact),
+                           std::memory_order_release);
+        });
+        start.store(true, std::memory_order_release);
+        binder.join();
+        upgrader.join();
+
+        if (upgraded.load(std::memory_order_acquire)) {
+            EXPECT_TRUE(target->Payload() == exact);
+            EXPECT_EQ(0x1234ULL, static_cast<unsigned long long>(target->code_object));
+        } else {
+            EXPECT_TRUE(target->Payload() == provisional);
+            EXPECT_EQ(0ULL, static_cast<unsigned long long>(target->code_object));
+        }
+        EXPECT_TRUE(target->HookRecord() == hook);
+    }
+}
+
 TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
     dartplant_reset();
     ContextHostState first;

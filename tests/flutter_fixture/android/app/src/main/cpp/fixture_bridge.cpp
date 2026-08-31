@@ -1409,8 +1409,6 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     void* api_dl_data, uint64_t null_value, uint64_t thr, uint64_t pp, uint64_t heap_bits) {
     if (api_dl_data == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     if (g_runtime != nullptr) return DARTPLANT_OK;
-    (void) api_dl_data;
-
     // Exercise the exact LSPosed/Vector compatibility architecture before any
     // strict consumer can install the process-global JumpToFrame bridge. The
     // physical backend exposes only DobbyHook/DobbyDestroy, matching the
@@ -1439,6 +1437,17 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         return snapshot_status;
     }
     g_snapshot_info = snapshot_info;
+    DartPlantVmAdapter* vm_adapter = nullptr;
+    const DartPlantStatus adapter_status = dartplant_fixture_create_dart_api_adapter(
+        api_dl_data, thr, snapshot_info.snapshot_hash, &vm_adapter);
+    if (adapter_status != DARTPLANT_OK || vm_adapter == nullptr ||
+        !dartplant_fixture_dart_api_adapter_ready_for_hooks()) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "exact V3 VM adapter initialization failed status=%d error=%s",
+                            adapter_status, dartplant_last_error());
+        g_cold_bootstrap_status.store(adapter_status, std::memory_order_release);
+        return adapter_status;
+    }
 
     DartPlantRuntimeInfo runtime_info{};
     runtime_info.struct_size = sizeof(runtime_info);

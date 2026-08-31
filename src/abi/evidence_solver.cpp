@@ -64,9 +64,18 @@ DartFunctionAbiResolution ResolveFunctionAbiEvidence(
     bool optional_value = false;
     bool max_regs_seen = false;
     uint32_t max_regs_value = 0;
+    bool closure_seen = false;
+    bool closure_value = false;
     for (const auto& provider : providers) {
         result.has_overrides_with_less_direct_parameters |=
             provider.has_overrides_with_less_direct_parameters;
+
+        if (!closure_seen) {
+            closure_seen = true;
+            closure_value = provider.is_closure;
+        } else if (closure_value != provider.is_closure) {
+            result.conflicting = true;
+        }
 
         if (provider.has_optional_parameter_info) {
             if (!optional_seen) {
@@ -101,6 +110,7 @@ DartFunctionAbiResolution ResolveFunctionAbiEvidence(
     result.has_optional_parameters = optional_value;
     result.has_max_parameters_in_registers = max_regs_seen && !result.conflicting;
     result.max_parameters_in_registers = max_regs_value;
+    result.is_closure = closure_value;
 
     const auto slot_conflicting = [](const DartAbiResolvedSlot& slot) {
         return slot.proof == DartAbiProofState::kConflicting;

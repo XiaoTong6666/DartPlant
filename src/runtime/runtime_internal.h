@@ -164,15 +164,30 @@ struct DartPlantInvocation {
     uint64_t validated_null_value = 0;
     uint64_t validated_bool_true_value = 0;
     uint64_t validated_bool_false_value = 0;
+    uint64_t live_vm_heap_base = 0;
+    struct GeneratedRootAccess {
+        dartplant::abi::DartAbiLocation location{};
+        uint32_t root_index = 0;
+        bool is_result = false;
+    };
+    void* generated_root_lease = nullptr;
+    std::vector<GeneratedRootAccess> generated_root_accesses;
     bool identity_ambiguous = false;
     bool closure_receiver_in_x0 = false;
     bool vm_scope_entered = false;
     bool generated_vm_bridge_active = false;
+    mutable std::vector<dartplant::abi::DartParameterLayout> mapped_parameters;
+    mutable dartplant::abi::DartAbiLocation closure_type_arguments_location{};
+    mutable bool closure_argument_mapping_attempted = false;
+    mutable bool closure_argument_mapping_valid = false;
     bool skip_original = false;
     bool call_original = false;
     bool original_called = false;
     std::vector<std::shared_ptr<dartplant::DartPlantListenerRecord>> entered_listeners;
 };
+
+const std::vector<dartplant::abi::DartParameterLayout>* InvocationParameters(
+    const DartPlantInvocation* invocation);
 
 extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     DartPlantArm64Context* context, DartPlantHook* hook);

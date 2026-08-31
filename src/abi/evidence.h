@@ -60,6 +60,7 @@ struct DartFunctionAbiEvidence {
     bool has_optional_parameters = false;
     bool has_max_parameters_in_registers = false;
     uint32_t max_parameters_in_registers = 0;
+    bool is_closure = false;
 };
 
 struct DartFunctionAbiResolution {
@@ -73,6 +74,7 @@ struct DartFunctionAbiResolution {
     bool has_optional_parameters = false;
     bool has_max_parameters_in_registers = false;
     uint32_t max_parameters_in_registers = 0;
+    bool is_closure = false;
 
     bool fully_proven = false;
     bool conflicting = false;

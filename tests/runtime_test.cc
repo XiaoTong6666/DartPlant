@@ -357,6 +357,12 @@ struct BlockingPublicationHostState {
     void* replacement = nullptr;
 };
 
+struct StrictPublicationHostState {
+    std::atomic_bool backup_ready{false};
+    std::atomic_bool replacement_published{false};
+    std::atomic_int unhook_calls{0};
+};
+
 int BlockingPublicationHook(void* user_data, void* target, void* replacement, void** backup) {
     auto* state = static_cast<BlockingPublicationHostState*>(user_data);
     if (state == nullptr || target == nullptr || replacement == nullptr || backup == nullptr) {
@@ -395,6 +401,31 @@ int StrictFailureAfterPublicationHook(void*, void* target, void*,
     // may still exist.
     transaction->backup_ready(transaction->user_data, target);
     return DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED;
+}
+
+int StrictNeverPublishedHook(void*, void*, void*, DartPlantHostHookTransaction*) {
+    return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+}
+
+int StrictSuccessfulPublicationHook(void* user_data, void* target, void*,
+                                    DartPlantHostHookTransaction* transaction) {
+    auto* state = static_cast<StrictPublicationHostState*>(user_data);
+    if (state == nullptr || target == nullptr || transaction == nullptr ||
+        transaction->struct_size < sizeof(DartPlantHostHookTransaction) ||
+        transaction->backup_ready == nullptr) {
+        return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    }
+    transaction->backup_ready(transaction->user_data, target);
+    state->backup_ready.store(true, std::memory_order_release);
+    state->replacement_published.store(true, std::memory_order_release);
+    return 0;
+}
+
+int StrictPublicationUnhook(void* user_data, void*) {
+    auto* state = static_cast<StrictPublicationHostState*>(user_data);
+    if (state == nullptr) return -1;
+    state->unhook_calls.fetch_add(1, std::memory_order_acq_rel);
+    return 0;
 }
 
 void InstallTestHost(TestHostHook hook, TestHostUnhook unhook) {
@@ -1086,6 +1117,63 @@ TEST_CASE(StrictPublishedFailureRetainsGateCookieForStaleFetches) {
     EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(retained, &callback_pin) ==
                 target);
     EXPECT_TRUE(!callback_pin);
+}
+
+TEST_CASE(StrictNeverPublishedFailureLeavesNoBackendOwnership) {
+    StrictPublicationHostState host;
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.unhook = StrictPublicationUnhook;
+    binding.hook_with_publication = StrictNeverPublishedHook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kStrict;
+
+    dartplant::PublishedHostHook published;
+    void* const target = reinterpret_cast<void*>(Replacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                &published, &binding, reinterpret_cast<uintptr_t>(target),
+                                reinterpret_cast<void*>(RetiredReplacement), false,
+                                reinterpret_cast<void*>(uintptr_t{0x2468})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED, dartplant::InstallPublishedHostHook(&published, &backup));
+    EXPECT_TRUE(backup == nullptr);
+    EXPECT_TRUE(published.gate.backup == nullptr);
+    EXPECT_TRUE(!published.ever_published);
+    EXPECT_TRUE(!published.backend_installed);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+    EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+}
+
+TEST_CASE(StrictSuccessfulPublicationPublishesBackupBeforeReplacement) {
+    StrictPublicationHostState host;
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.unhook = StrictPublicationUnhook;
+    binding.hook_with_publication = StrictSuccessfulPublicationHook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kStrict;
+
+    dartplant::PublishedHostHook published;
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                &published, &binding, reinterpret_cast<uintptr_t>(target), callback,
+                                false, reinterpret_cast<void*>(uintptr_t{0x1357})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallPublishedHostHook(&published, &backup));
+    EXPECT_TRUE(host.backup_ready.load(std::memory_order_acquire));
+    EXPECT_TRUE(host.replacement_published.load(std::memory_order_acquire));
+    EXPECT_TRUE(backup == target);
+    EXPECT_TRUE(published.gate.backup == target);
+    EXPECT_TRUE(published.ever_published);
+    EXPECT_TRUE(published.backend_installed);
+
+    dartplant::ArmPublishedHostHook(&published);
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(&published, &callback_pin) ==
+                callback);
+    EXPECT_TRUE(!callback_pin);
+    dartplant::BeginDrainPublishedHostHook(&published);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
 }
 
 TEST_CASE(PublishedHookDrainTransfersGateEntrantAndNeverUsesReclaimedBackup) {
@@ -3053,6 +3141,155 @@ TEST_CASE(VerifiedClosureArgumentsDescriptorIncludesHiddenClosureReceiver) {
     info.struct_size = sizeof(info);
     EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
               dartplant_invocation_get_arguments_descriptor(&invocation, &info));
+}
+
+TEST_CASE(OptionalPositionalClosureArgumentsMapOnlySuppliedFormals) {
+    alignas(8) std::array<uint8_t, 64> descriptor{};
+    const uint64_t tags = uint64_t{90} << 12;
+    std::memcpy(descriptor.data(), &tags, sizeof(tags));
+    const auto write_smi = [&](size_t offset, uint32_t value) {
+        const uint32_t raw = value << 1;
+        std::memcpy(descriptor.data() + offset, &raw, sizeof(raw));
+    };
+    write_smi(16, 0);
+    write_smi(20, 3);  // Closure receiver, required positional, one optional positional.
+    write_smi(24, 3);
+    write_smi(28, 3);
+
+    dartplant::abi::DartCallLayout layout;
+    layout.parameters.resize(3);
+    for (auto& parameter : layout.parameters) {
+        parameter.representation = dartplant::abi::DartAbiRepresentation::kTagged;
+    }
+    layout.dart_sp_register = 15;
+    layout.has_closure_receiver = true;
+    layout.has_arguments_descriptor = true;
+    layout.arguments_descriptor_location = {
+        .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+        .register_index = 4,
+    };
+    dartplant::abi::DartClosureSignatureLayout signature;
+    signature.implicit_parameter_count = 1;
+    signature.fixed_parameter_count = 2;
+    signature.optional_parameter_count = 2;
+    signature.formals = {
+        {.signature_index = 1,
+         .kind = dartplant::abi::DartClosureFormalKind::kRequiredPositional,
+         .is_required = true,
+         .name = "required"},
+        {.signature_index = 2,
+         .kind = dartplant::abi::DartClosureFormalKind::kOptionalPositional,
+         .name = "first"},
+        {.signature_index = 3,
+         .kind = dartplant::abi::DartClosureFormalKind::kOptionalPositional,
+         .name = "second"},
+    };
+    layout.closure_signature = std::move(signature);
+
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->runtime_profile_version = 1;
+    std::array<uint64_t, 2> arguments = {0x40, 0x20};
+    DartPlantArm64Context context{};
+    context.x[4] = reinterpret_cast<uint64_t>(descriptor.data()) + 1;
+    context.x[15] = reinterpret_cast<uint64_t>(arguments.data());
+    DartPlantInvocation invocation{};
+    invocation.requested_method = &method;
+    invocation.call_layout = &layout;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+
+    DartPlantValue value{};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(0x20ULL, value.raw);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 1, &value));
+    EXPECT_EQ(0x40ULL, value.raw);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant_invocation_get_argument(&invocation, 2, &value));
+}
+
+TEST_CASE(NamedGenericClosureArgumentsUseDescriptorNamesAndPositions) {
+    alignas(8) std::array<uint8_t, 64> descriptor{};
+    alignas(8) std::array<uint8_t, 32> name_object{};
+    const uint64_t descriptor_tags = uint64_t{90} << 12;
+    const uint64_t string_tags = uint64_t{93} << 12;
+    std::memcpy(descriptor.data(), &descriptor_tags, sizeof(descriptor_tags));
+    std::memcpy(name_object.data(), &string_tags, sizeof(string_tags));
+    const uint32_t name_length = 1 << 1;
+    std::memcpy(name_object.data() + 8, &name_length, sizeof(name_length));
+    name_object[16] = 'b';
+
+    const uint64_t tagged_name = reinterpret_cast<uint64_t>(name_object.data()) + 1;
+    const uint64_t heap_base = tagged_name & ~uint64_t{UINT32_MAX};
+    const uint32_t compressed_name = static_cast<uint32_t>(tagged_name - heap_base);
+    const auto write_smi = [&](size_t offset, uint32_t value) {
+        const uint32_t raw = value << 1;
+        std::memcpy(descriptor.data() + offset, &raw, sizeof(raw));
+    };
+    write_smi(16, 1);  // One function type argument vector entry.
+    write_smi(20, 3);  // Closure receiver, fixed user argument, named b.
+    write_smi(24, 4);  // Includes the type-arguments vector stack slot.
+    write_smi(28, 2);
+    std::memcpy(descriptor.data() + 32, &compressed_name, sizeof(compressed_name));
+    write_smi(36, 2);  // Actual call position, including the hidden receiver.
+
+    dartplant::abi::DartCallLayout layout;
+    layout.parameters.resize(3);
+    for (auto& parameter : layout.parameters) {
+        parameter.representation = dartplant::abi::DartAbiRepresentation::kTagged;
+    }
+    layout.dart_sp_register = 15;
+    layout.has_closure_receiver = true;
+    layout.has_arguments_descriptor = true;
+    layout.arguments_descriptor_location = {
+        .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+        .register_index = 4,
+    };
+    dartplant::abi::DartClosureSignatureLayout signature;
+    signature.implicit_parameter_count = 1;
+    signature.fixed_parameter_count = 2;
+    signature.optional_parameter_count = 2;
+    signature.type_parameter_count = 1;
+    signature.has_named_optional_parameters = true;
+    signature.formals = {
+        {.signature_index = 1,
+         .kind = dartplant::abi::DartClosureFormalKind::kRequiredPositional,
+         .is_required = true,
+         .name = "required"},
+        {.signature_index = 2, .kind = dartplant::abi::DartClosureFormalKind::kNamed, .name = "a"},
+        {.signature_index = 3, .kind = dartplant::abi::DartClosureFormalKind::kNamed, .name = "b"},
+    };
+    layout.closure_signature = std::move(signature);
+
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->runtime_profile_version = 1;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    std::array<uint64_t, 4> arguments = {0x40, 0x20, 0, 0x801};
+    DartPlantArm64Context context{};
+    context.x[4] = reinterpret_cast<uint64_t>(descriptor.data()) + 1;
+    context.x[15] = reinterpret_cast<uint64_t>(arguments.data());
+    DartPlantInvocation invocation{};
+    invocation.profile = &profile;
+    invocation.requested_method = &method;
+    invocation.call_layout = &layout;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+    invocation.live_vm_heap_base = heap_base;
+
+    DartPlantValue value{};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(0x20ULL, value.raw);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant_invocation_get_argument(&invocation, 1, &value));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 2, &value));
+    EXPECT_EQ(0x40ULL, value.raw);
+    EXPECT_EQ(24, invocation.closure_type_arguments_location.stack_offset);
+
+    const DartPlantValue replacement = {DARTPLANT_VALUE_SMI, 0, 0x80};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_set_argument(&invocation, 2, &replacement));
+    EXPECT_EQ(0x80ULL, arguments[0]);
 }
 
 TEST_CASE(VerifiedPairOfTaggedResultUsesBothArm64ReturnRegisters) {

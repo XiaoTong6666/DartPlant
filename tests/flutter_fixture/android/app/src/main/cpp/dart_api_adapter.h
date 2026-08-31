@@ -4,7 +4,8 @@
 #include "dart_raw_bridge.h"
 #include "dartplant/vm_adapter.h"
 
-DartPlantStatus dartplant_fixture_create_dart_api_adapter(void* api_dl_data,
+DartPlantStatus dartplant_fixture_create_dart_api_adapter(void* api_dl_data, uint64_t thread,
+                                                          const char* snapshot_hash,
                                                           DartPlantVmAdapter** out_adapter);
 DartPlantStatus dartplant_fixture_destroy_dart_api_adapter();
 DartPlantVmAdapter* dartplant_fixture_dart_api_adapter();

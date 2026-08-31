@@ -7,10 +7,11 @@
 #include <stdint.h>
 
 #include <array>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "abi/representation.h"
-
 namespace dartplant::abi {
 
 enum class DartCallLayoutStatus : uint8_t {
@@ -47,6 +48,30 @@ struct DartParameterLayout {
     DartAbiValueLocation location{};
 };
 
+enum class DartClosureFormalKind : uint8_t {
+    kImplicit = 0,
+    kRequiredPositional = 1,
+    kOptionalPositional = 2,
+    kNamed = 3,
+};
+
+struct DartClosureFormalLayout {
+    uint32_t signature_index = 0;
+    DartClosureFormalKind kind = DartClosureFormalKind::kImplicit;
+    bool is_required = false;
+    std::string name;
+};
+
+struct DartClosureSignatureLayout {
+    uint32_t implicit_parameter_count = 0;
+    uint32_t fixed_parameter_count = 0;
+    uint32_t optional_parameter_count = 0;
+    uint32_t type_parameter_count = 0;
+    uint32_t parent_type_argument_count = 0;
+    bool has_named_optional_parameters = false;
+    std::vector<DartClosureFormalLayout> formals;
+};
+
 struct DartCallLayout {
     std::vector<DartParameterLayout> parameters;
     DartParameterLayout result{};
@@ -62,6 +87,10 @@ struct DartCallLayout {
     // formals themselves use the forced entry-stack calling convention.
     bool has_arguments_descriptor = false;
     DartAbiLocation arguments_descriptor_location{};
+    // Present for live closures whose FunctionType was validated while ABI
+    // evidence was registered. The entries exclude the VM implicit closure
+    // receiver and are used only to map a call descriptor onto formals.
+    std::optional<DartClosureSignatureLayout> closure_signature;
 };
 
 }  // namespace dartplant::abi

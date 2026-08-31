@@ -189,7 +189,9 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
     if (frame == nullptr || frame->invocation.call_layout == nullptr) return false;
     frame->generated_root_count = 0;
     const auto& layout = *frame->invocation.call_layout;
-    for (const auto& parameter : layout.parameters) {
+    const auto* parameters = InvocationParameters(&frame->invocation);
+    if (parameters == nullptr) return false;
+    for (const auto& parameter : *parameters) {
         if (parameter.representation != dartplant::abi::DartAbiRepresentation::kTagged) continue;
         if (parameter.location.count != 1 ||
             !AddGeneratedRootBinding(frame, parameter.location.locations[0],
@@ -228,6 +230,16 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
     if (frame->generated_root_count == 0) {
         frame->generated_roots[0] = {};
         frame->generated_root_count = 1;
+    }
+    frame->invocation.generated_root_accesses.clear();
+    frame->invocation.generated_root_accesses.reserve(frame->generated_root_count);
+    for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
+        if (frame->generated_roots[index].role == GeneratedRootRole::kPadding) continue;
+        frame->invocation.generated_root_accesses.push_back({
+            .location = frame->generated_roots[index].location,
+            .root_index = index,
+            .is_result = frame->generated_roots[index].role == GeneratedRootRole::kResult,
+        });
     }
     frame->generated_transition = {
         .struct_size = sizeof(DartPlantGeneratedTransitionFrame),
@@ -303,9 +315,12 @@ bool PinGeneratedRoots(DispatchFrame* frame, bool include_result,
         }
         frame->generated_root_values[index] = value;
     }
-    return dartplant::VmAdapterPinGeneratedRoots(
-               frame->invocation.vm_adapter, frame->generated_root_values.data(),
-               frame->generated_root_count, &frame->generated_root_lease) == DARTPLANT_OK;
+    const bool pinned =
+        dartplant::VmAdapterPinGeneratedRoots(
+            frame->invocation.vm_adapter, frame->generated_root_values.data(),
+            frame->generated_root_count, &frame->generated_root_lease) == DARTPLANT_OK;
+    if (pinned) frame->invocation.generated_root_lease = frame->generated_root_lease;
+    return pinned;
 }
 
 bool SyncGeneratedRootsToContext(DispatchFrame* frame, bool include_result,
@@ -338,18 +353,10 @@ bool SyncContextToGeneratedRoots(DispatchFrame* frame, bool include_result) {
         frame->generated_root_lease == nullptr) {
         return false;
     }
-    for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
-        const auto& binding = frame->generated_roots[index];
-        if (!RootRoleActive(binding, include_result)) continue;
-        uint64_t value = 0;
-        if (!ReadGeneratedRootLocation(*frame, binding.location, &value) ||
-            dartplant::VmAdapterGeneratedRootSet(frame->invocation.vm_adapter,
-                                                 frame->generated_root_lease, index,
-                                                 value) != DARTPLANT_OK) {
-            return false;
-        }
-        frame->generated_root_values[index] = value;
-    }
+    (void) include_result;
+    // Invocation setters update both the raw context and its persistent root.
+    // A moving GC can make the raw context stale while native code is running,
+    // so the root lease must remain authoritative at bridge exit.
     return true;
 }
 
@@ -419,6 +426,7 @@ bool LeaveGeneratedVmBridge(DispatchFrame* frame, bool include_result, bool repi
         FatalGeneratedBridgeFailure("generated/native bridge could not release callback roots");
     }
     frame->generated_root_lease = nullptr;
+    frame->invocation.generated_root_lease = nullptr;
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
         const auto& binding = frame->generated_roots[index];
         if (!RootRoleActive(binding, include_result)) continue;
@@ -448,6 +456,7 @@ bool DropPersistentGeneratedRoots(DispatchFrame* frame, bool include_result,
         FatalGeneratedBridgeFailure("generated root lease could not be released");
     }
     frame->generated_root_lease = nullptr;
+    frame->invocation.generated_root_lease = nullptr;
     if (!restore_context) return true;
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
         const auto& binding = frame->generated_roots[index];

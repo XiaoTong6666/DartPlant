@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <optional>
 #include <string_view>
 
 #include "abi/calling_convention.h"
@@ -240,6 +241,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         }
     }
 
+    uint32_t layout_parameter_count = evidence->parameter_count;
+    std::optional<DartPlantDartFunctionSignatureInfo> live_signature;
     // A retained live Function gives us an independent FunctionType source for
     // cardinality validation. PRODUCT AOT may deliberately drop the Function
     // object while keeping its Code; artifact-index methods therefore have no
@@ -264,7 +267,18 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             return reject(signature_status, DARTPLANT_REJECT_ABI_INCOMPLETE,
                           "live FunctionType could not validate compiler ABI evidence");
         }
-        if (signature.fixed_parameter_count != evidence->parameter_count) {
+        if (method->function->closure_call_entry_only) {
+            if (signature.implicit_parameter_count != 1 ||
+                signature.fixed_parameter_count < signature.implicit_parameter_count ||
+                signature.parameter_count < signature.implicit_parameter_count ||
+                signature.fixed_parameter_count - signature.implicit_parameter_count !=
+                    evidence->parameter_count) {
+                return reject(
+                    DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_CONFLICT,
+                    "closure ABI evidence does not match the FunctionType implicit receiver");
+            }
+            layout_parameter_count = signature.parameter_count - signature.implicit_parameter_count;
+        } else if (signature.fixed_parameter_count != evidence->parameter_count) {
             return reject(
                 DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_CONFLICT,
                 "compiler ABI evidence fixed-parameter count does not match FunctionType");
@@ -275,6 +289,11 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
                 DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_CONFLICT,
                 "compiler ABI evidence optional-parameter flag does not match FunctionType");
         }
+        live_signature = signature;
+    } else if (method->function->closure_call_entry_only &&
+               evidence->has_optional_parameters != 0) {
+        return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
+                      "optional closure ABI requires a retained live FunctionType");
     } else if (method->function->source != dartplant::DartFunctionSource::kOfflineSnapshotIndex) {
         return reject(
             DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_ABI_INCOMPLETE,
@@ -282,7 +301,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     }
 
     dartplant::abi::DartFunctionAbiEvidence provider;
-    provider.parameters.reserve(evidence->parameter_count);
+    provider.parameters.reserve(layout_parameter_count);
     for (uint32_t index = 0; index < evidence->parameter_count; ++index) {
         const auto representation =
             dartplant::ToInternalRepresentation(evidence->parameter_representations[index], false);
@@ -307,6 +326,11 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     provider.has_optional_parameters = evidence->has_optional_parameters != 0;
     provider.has_max_parameters_in_registers = true;
     provider.max_parameters_in_registers = evidence->max_parameters_in_registers;
+    provider.is_closure = method->function->closure_call_entry_only;
+    for (uint32_t index = evidence->parameter_count; index < layout_parameter_count; ++index) {
+        provider.parameters.push_back(
+            dartplant::CompilerSlot(dartplant::abi::DartAbiRepresentation::kTagged));
+    }
 
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     auto existing =
@@ -319,10 +343,10 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         entry.identity = method->function->identity;
         entry.code_target = dartplant::MethodTarget(method);
         entry.generation = generation;
-        entry.formal_parameter_count = evidence->parameter_count;
+        entry.formal_parameter_count = layout_parameter_count;
         runtime->abi_evidence.push_back(std::move(entry));
         existing = std::prev(runtime->abi_evidence.end());
-    } else if (existing->formal_parameter_count != evidence->parameter_count) {
+    } else if (existing->formal_parameter_count != layout_parameter_count) {
         existing->resolution.conflicting = true;
         existing->layout_status = dartplant::abi::DartCallLayoutStatus::kConflictingEvidence;
         existing->call_layout.reset();
@@ -335,7 +359,47 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         existing->providers, existing->formal_parameter_count);
     auto layout = std::make_shared<dartplant::abi::DartCallLayout>();
     existing->layout_status = dartplant::abi::ComputeDartCallLayout(
-        existing->resolution, dartplant::abi::Arm64AotCallingConventionProfile(), layout.get());
+        existing->resolution, dartplant::abi::Arm64AotCallingConventionProfile(), layout.get(),
+        method->function->closure_call_entry_only);
+    if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
+        live_signature.has_value()) {
+        dartplant::abi::DartClosureSignatureLayout closure_signature;
+        closure_signature.implicit_parameter_count = live_signature->implicit_parameter_count;
+        closure_signature.fixed_parameter_count = live_signature->fixed_parameter_count;
+        closure_signature.optional_parameter_count = live_signature->optional_parameter_count;
+        closure_signature.type_parameter_count = live_signature->type_parameter_count;
+        closure_signature.parent_type_argument_count = live_signature->parent_type_argument_count;
+        closure_signature.has_named_optional_parameters =
+            live_signature->has_named_optional_parameters != 0;
+
+        DartPlantFlutterSnapshotInfo snapshot_info{};
+        snapshot_info.struct_size = sizeof(snapshot_info);
+        dartplant::FillSnapshotInfo(*runtime->snapshot, &snapshot_info);
+        for (uint32_t index = live_signature->implicit_parameter_count;
+             index < live_signature->parameter_count; ++index) {
+            DartPlantDartParameterInfo parameter{};
+            parameter.struct_size = sizeof(parameter);
+            const DartPlantStatus parameter_status = dartplant_live_vm_read_function_parameter(
+                &*runtime->live_vm_context, &snapshot_info, method->function->function_object,
+                index, &parameter);
+            if (parameter_status != DARTPLANT_OK) {
+                existing->layout_status = dartplant::abi::DartCallLayoutStatus::kIncompleteEvidence;
+                break;
+            }
+            closure_signature.formals.push_back({
+                .signature_index = parameter.index,
+                .kind = static_cast<dartplant::abi::DartClosureFormalKind>(parameter.kind),
+                .is_required = parameter.is_required != 0,
+                .name = parameter.name,
+            });
+        }
+        if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
+            closure_signature.formals.size() == layout_parameter_count) {
+            layout->closure_signature = std::move(closure_signature);
+        } else if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk) {
+            existing->layout_status = dartplant::abi::DartCallLayoutStatus::kIncompleteEvidence;
+        }
+    }
     if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
         method->function->closure_call_entry_only &&
         method->record.entry_kind == DARTPLANT_ENTRY_DEFAULT) {

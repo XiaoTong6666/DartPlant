@@ -7,6 +7,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
@@ -52,6 +56,127 @@ bool ReadPositiveCompressedSmi(uintptr_t address, const dartplant::RawObjectLayo
 
 bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
                           const dartplant::abi::DartAbiLocation& location, uint64_t* out_value);
+const std::vector<dartplant::abi::DartParameterLayout>* ActiveParameters(
+    const DartPlantInvocation* invocation);
+
+bool AddOffset(uintptr_t base, uint64_t offset, uintptr_t* out_address) {
+    if (out_address == nullptr || offset > std::numeric_limits<uintptr_t>::max() - base) {
+        return false;
+    }
+    *out_address = base + static_cast<uintptr_t>(offset);
+    return true;
+}
+
+bool ReadLiveVmHeapBase(const DartPlantInvocation* invocation, uint64_t* out_heap_base) {
+    if (invocation == nullptr || invocation->profile == nullptr || invocation->context == nullptr ||
+        out_heap_base == nullptr) {
+        return false;
+    }
+    if (invocation->live_vm_heap_base != 0) {
+        *out_heap_base = invocation->live_vm_heap_base;
+        return true;
+    }
+    const auto* profile =
+        dartplant::FindRuntimeProfileByVersion(invocation->profile->profile_version);
+    if (profile == nullptr || profile->live_vm.thr_register >= 31 ||
+        profile->live_vm.thread_heap_base_offset == 0) {
+        return false;
+    }
+    uintptr_t address = 0;
+    if (!AddOffset(static_cast<uintptr_t>(invocation->context->x[profile->live_vm.thr_register]),
+                   profile->live_vm.thread_heap_base_offset, &address) ||
+        !ReadSelfValue(address, out_heap_base) || *out_heap_base == 0) {
+        return false;
+    }
+    return true;
+}
+
+bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t index,
+                              uint32_t* out_position, std::string* out_name) {
+    if (invocation == nullptr || invocation->profile == nullptr || invocation->context == nullptr ||
+        invocation->requested_method == nullptr ||
+        invocation->requested_method->function == nullptr || out_position == nullptr ||
+        out_name == nullptr) {
+        return false;
+    }
+    const auto* profile = dartplant::FindRuntimeProfileByVersion(
+        invocation->requested_method->function->runtime_profile_version);
+    if (profile == nullptr || profile->arguments_descriptor.named_entry_size == 0) return false;
+    uint64_t descriptor_raw = 0;
+    if (!ReadVerifiedLocation(invocation, invocation->call_layout->arguments_descriptor_location,
+                              &descriptor_raw)) {
+        return false;
+    }
+    const auto& raw = profile->raw_object;
+    const auto& descriptor = profile->arguments_descriptor;
+    if (raw.compressed_word_size != sizeof(uint32_t) ||
+        (descriptor_raw & raw.smi_tag_mask) != raw.heap_object_tag ||
+        descriptor_raw < raw.heap_object_tag) {
+        return false;
+    }
+    const uintptr_t object = static_cast<uintptr_t>(descriptor_raw - raw.heap_object_tag);
+    uint64_t entry_offset = descriptor.first_named_entry_offset;
+    if (index >
+        (std::numeric_limits<uint64_t>::max() - entry_offset) / descriptor.named_entry_size) {
+        return false;
+    }
+    entry_offset += static_cast<uint64_t>(index) * descriptor.named_entry_size;
+    uintptr_t entry = 0;
+    uintptr_t name_address = 0;
+    uintptr_t position_address = 0;
+    if (!AddOffset(object, entry_offset, &entry) ||
+        !AddOffset(entry, descriptor.name_offset, &name_address) ||
+        !AddOffset(entry, descriptor.position_offset, &position_address)) {
+        return false;
+    }
+    uint32_t compressed_name = 0;
+    uint32_t raw_position = 0;
+    if (!ReadSelfValue(name_address, &compressed_name) ||
+        !ReadSelfValue(position_address, &raw_position) ||
+        (compressed_name & raw.smi_tag_mask) != raw.heap_object_tag ||
+        (raw_position & raw.smi_tag_mask) != raw.smi_tag ||
+        raw_position >> raw.smi_tag_shift > UINT32_MAX) {
+        return false;
+    }
+    uint64_t heap_base = 0;
+    if (!ReadLiveVmHeapBase(invocation, &heap_base) || heap_base > UINT64_MAX - compressed_name) {
+        return false;
+    }
+    const uint64_t tagged_name = heap_base + compressed_name;
+    uint32_t name_cid = 0;
+    const uintptr_t name_object = static_cast<uintptr_t>(tagged_name - raw.heap_object_tag);
+    uint64_t tags = 0;
+    if (!ReadSelfValue(name_object, &tags) || raw.class_id_tag_bits == 0 ||
+        raw.class_id_tag_bits >= 64) {
+        return false;
+    }
+    const uint64_t class_id_mask = (uint64_t{1} << raw.class_id_tag_bits) - 1;
+    name_cid = static_cast<uint32_t>((tags >> raw.class_id_tag_shift) & class_id_mask);
+    if (name_cid != profile->live_vm.cid_one_byte_string) return false;
+    uintptr_t length_address = 0;
+    if (!AddOffset(name_object, profile->live_vm.string_length_offset, &length_address))
+        return false;
+    uint32_t raw_length = 0;
+    if (!ReadSelfValue(length_address, &raw_length) ||
+        (raw_length & raw.smi_tag_mask) != raw.smi_tag) {
+        return false;
+    }
+    const uint64_t length = raw_length >> raw.smi_tag_shift;
+    if (length > DARTPLANT_DART_PARAMETER_NAME_MAX - 1) return false;
+    uintptr_t data_address = 0;
+    if (!AddOffset(name_object, profile->live_vm.string_data_offset, &data_address)) return false;
+    std::vector<char> bytes(static_cast<size_t>(length));
+    for (size_t cursor = 0; cursor < bytes.size(); ++cursor) {
+        uintptr_t byte_address = 0;
+        if (!AddOffset(data_address, cursor, &byte_address) ||
+            !ReadSelfValue(byte_address, &bytes[cursor])) {
+            return false;
+        }
+    }
+    *out_position = raw_position >> raw.smi_tag_shift;
+    *out_name = std::string(bytes.begin(), bytes.end());
+    return true;
+}
 
 bool ArgumentAccessEnabled(const DartPlantInvocation* invocation) {
     return HasVerifiedCallLayout(invocation) ||
@@ -98,8 +223,9 @@ bool LegacyTaggedResultAccessEnabled(const DartPlantInvocation* invocation) {
 
 bool ArgumentIsTagged(const DartPlantInvocation* invocation, uint32_t index) {
     if (HasVerifiedCallLayout(invocation)) {
-        return index < invocation->call_layout->parameters.size() &&
-               invocation->call_layout->parameters[index].representation ==
+        const auto* parameters = ActiveParameters(invocation);
+        return parameters != nullptr && index < parameters->size() &&
+               (*parameters)[index].representation ==
                    dartplant::abi::DartAbiRepresentation::kTagged;
     }
     return LegacyTaggedArgumentAccessEnabled(invocation);
@@ -213,6 +339,20 @@ bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
                           const dartplant::abi::DartAbiLocation& location, uint64_t* out_value) {
     if (invocation == nullptr || invocation->context == nullptr || out_value == nullptr)
         return false;
+    if (invocation->generated_vm_bridge_active && invocation->generated_root_lease != nullptr &&
+        invocation->vm_adapter != nullptr) {
+        const auto root = std::find_if(
+            invocation->generated_root_accesses.begin(), invocation->generated_root_accesses.end(),
+            [invocation, &location](const auto& access) {
+                return access.location == location &&
+                       access.is_result == (invocation->phase == DARTPLANT_INVOCATION_LEAVE);
+            });
+        if (root != invocation->generated_root_accesses.end()) {
+            return dartplant::VmAdapterGeneratedRootGet(
+                       invocation->vm_adapter, invocation->generated_root_lease, root->root_index,
+                       out_value) == DARTPLANT_OK;
+        }
+    }
     switch (location.kind) {
     case dartplant::abi::DartAbiLocationKind::kGpRegister:
         if (!ValidRegister(location.register_index)) return false;
@@ -247,11 +387,13 @@ bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
 bool WriteVerifiedLocation(DartPlantInvocation* invocation,
                            const dartplant::abi::DartAbiLocation& location, uint64_t value) {
     if (invocation == nullptr || invocation->context == nullptr) return false;
+    bool written = false;
     switch (location.kind) {
     case dartplant::abi::DartAbiLocationKind::kGpRegister:
         if (!ValidRegister(location.register_index)) return false;
         invocation->context->x[location.register_index] = value;
-        return true;
+        written = true;
+        break;
     case dartplant::abi::DartAbiLocationKind::kFpuRegister:
         if (location.register_index >= 32) return false;
         std::memcpy(invocation->context->v[location.register_index], &value, sizeof(value));
@@ -264,12 +406,176 @@ bool WriteVerifiedLocation(DartPlantInvocation* invocation,
         const uintptr_t base = invocation->context->x[invocation->call_layout->dart_sp_register];
         if (base == 0) return false;
         std::memcpy(reinterpret_cast<void*>(base + location.stack_offset), &value, sizeof(value));
-        return true;
+        written = true;
+        break;
     }
     case dartplant::abi::DartAbiLocationKind::kUnknown:
         return false;
     }
-    return false;
+    if (!written) return false;
+    if (invocation->generated_vm_bridge_active && invocation->generated_root_lease != nullptr &&
+        invocation->vm_adapter != nullptr) {
+        const auto root = std::find_if(
+            invocation->generated_root_accesses.begin(), invocation->generated_root_accesses.end(),
+            [invocation, &location](const auto& access) {
+                return access.location == location &&
+                       access.is_result == (invocation->phase == DARTPLANT_INVOCATION_LEAVE);
+            });
+        if (root != invocation->generated_root_accesses.end() &&
+            dartplant::VmAdapterGeneratedRootSet(invocation->vm_adapter,
+                                                 invocation->generated_root_lease, root->root_index,
+                                                 value) != DARTPLANT_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
+    if (invocation == nullptr || invocation->call_layout == nullptr ||
+        !invocation->call_layout->closure_signature.has_value()) {
+        return true;
+    }
+    if (invocation->closure_argument_mapping_attempted) {
+        return invocation->closure_argument_mapping_valid;
+    }
+    invocation->closure_argument_mapping_attempted = true;
+
+    const auto& layout = *invocation->call_layout;
+    const auto& signature = *layout.closure_signature;
+    if (!layout.has_closure_receiver || !layout.has_arguments_descriptor ||
+        signature.implicit_parameter_count != 1 ||
+        signature.formals.size() != layout.parameters.size() ||
+        signature.fixed_parameter_count < signature.implicit_parameter_count ||
+        signature.fixed_parameter_count - signature.implicit_parameter_count +
+                signature.optional_parameter_count !=
+            signature.formals.size()) {
+        dartplant::SetLastError("closure FunctionType metadata is inconsistent");
+        return false;
+    }
+
+    DartPlantArgumentsDescriptorInfo info{};
+    info.struct_size = sizeof(info);
+    if (dartplant_invocation_get_arguments_descriptor(invocation, &info) != DARTPLANT_OK ||
+        info.count == 0 ||
+        info.size != info.count + static_cast<uint32_t>(info.type_args_len != 0) ||
+        info.positional_count == 0 || info.positional_count > info.count) {
+        dartplant::SetLastError("closure ArgumentsDescriptor shape is unsupported");
+        return false;
+    }
+    const uint32_t user_argument_count = info.count - 1;
+    const uint32_t positional_user_count = info.positional_count - 1;
+    const uint32_t user_fixed_count =
+        signature.fixed_parameter_count - signature.implicit_parameter_count;
+    if (user_argument_count > signature.formals.size() ||
+        (!signature.has_named_optional_parameters && info.named_count != 0) ||
+        (signature.has_named_optional_parameters && positional_user_count != user_fixed_count) ||
+        (!signature.has_named_optional_parameters &&
+         positional_user_count != user_argument_count) ||
+        info.named_count > signature.optional_parameter_count) {
+        dartplant::SetLastError("closure ArgumentsDescriptor does not match FunctionType");
+        return false;
+    }
+    if (info.type_args_len != 0 && info.type_args_len != signature.type_parameter_count) {
+        dartplant::SetLastError("closure type-argument descriptor is inconsistent");
+        return false;
+    }
+
+    std::vector<int32_t> actual_for_formal(signature.formals.size(), -1);
+    for (uint32_t actual = 0; actual < positional_user_count; ++actual) {
+        if (actual >= user_fixed_count + (signature.has_named_optional_parameters
+                                              ? 0
+                                              : signature.optional_parameter_count)) {
+            dartplant::SetLastError("closure positional argument exceeds FunctionType formals");
+            return false;
+        }
+        actual_for_formal[actual] = static_cast<int32_t>(actual);
+    }
+
+    for (uint32_t named = 0; named < info.named_count; ++named) {
+        uint32_t argument_position = 0;
+        std::string name;
+        if (!ReadDescriptorNamedEntry(invocation, named, &argument_position, &name) ||
+            argument_position == 0 || argument_position >= info.count) {
+            dartplant::SetLastError("closure named ArgumentsDescriptor entry is invalid");
+            return false;
+        }
+        const auto formal_it = std::find_if(
+            signature.formals.begin(), signature.formals.end(), [&name](const auto& formal) {
+                return formal.kind == dartplant::abi::DartClosureFormalKind::kNamed &&
+                       formal.name == name;
+            });
+        if (formal_it == signature.formals.end()) {
+            dartplant::SetLastError("closure named argument does not match FunctionType");
+            return false;
+        }
+        const uint32_t formal = static_cast<uint32_t>(formal_it - signature.formals.begin());
+        const uint32_t actual = argument_position - 1;
+        if (actual_for_formal[formal] >= 0 || actual >= user_argument_count) {
+            dartplant::SetLastError("closure named argument position is invalid");
+            return false;
+        }
+        actual_for_formal[formal] = static_cast<int32_t>(actual);
+    }
+
+    for (uint32_t formal = 0; formal < signature.formals.size(); ++formal) {
+        const auto& parameter = signature.formals[formal];
+        if (parameter.is_required && actual_for_formal[formal] < 0) {
+            dartplant::SetLastError("closure call omits a required FunctionType parameter");
+            return false;
+        }
+        if (parameter.kind == dartplant::abi::DartClosureFormalKind::kNamed &&
+            !signature.has_named_optional_parameters) {
+            dartplant::SetLastError(
+                "closure FunctionType named-parameter metadata is inconsistent");
+            return false;
+        }
+    }
+
+    invocation->mapped_parameters = layout.parameters;
+    for (uint32_t formal = 0; formal < actual_for_formal.size(); ++formal) {
+        const int32_t actual = actual_for_formal[formal];
+        auto& parameter = invocation->mapped_parameters[formal];
+        parameter.location = {};
+        if (actual < 0) continue;
+        const uint64_t offset = static_cast<uint64_t>(user_argument_count - 1 - actual) * 8;
+        if (offset > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+            dartplant::SetLastError("closure argument stack offset is out of range");
+            invocation->mapped_parameters.clear();
+            return false;
+        }
+        parameter.location.locations[0] = {
+            .kind = dartplant::abi::DartAbiLocationKind::kEntryStack,
+            .stack_offset = static_cast<int32_t>(offset),
+        };
+        parameter.location.count = 1;
+    }
+    if (info.type_args_len != 0) {
+        const uint64_t offset = static_cast<uint64_t>(info.count) * 8;
+        if (offset > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+            dartplant::SetLastError("closure type-argument stack offset is out of range");
+            invocation->mapped_parameters.clear();
+            return false;
+        }
+        invocation->closure_type_arguments_location = {
+            .kind = dartplant::abi::DartAbiLocationKind::kEntryStack,
+            .stack_offset = static_cast<int32_t>(offset),
+        };
+    }
+    invocation->closure_argument_mapping_valid = true;
+    dartplant::ClearLastError();
+    return true;
+}
+
+const std::vector<dartplant::abi::DartParameterLayout>* ActiveParameters(
+    const DartPlantInvocation* invocation) {
+    if (!EnsureClosureArgumentMapping(invocation)) return nullptr;
+    if (invocation != nullptr && invocation->closure_argument_mapping_valid) {
+        return &invocation->mapped_parameters;
+    }
+    return invocation == nullptr || invocation->call_layout == nullptr
+               ? nullptr
+               : &invocation->call_layout->parameters;
 }
 
 DartPlantStatus DecodeVerifiedValue(const DartPlantInvocation* invocation,
@@ -405,6 +711,11 @@ DartPlantStatus EncodeVerifiedTaggedPair(DartPlantInvocation* invocation,
 }
 
 }  // namespace
+
+const std::vector<dartplant::abi::DartParameterLayout>* InvocationParameters(
+    const DartPlantInvocation* invocation) {
+    return ActiveParameters(invocation);
+}
 
 extern "C" {
 
@@ -609,7 +920,8 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
         dartplant::SetLastError("closure ArgumentsDescriptor counters are inconsistent");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    if (invocation->call_layout->has_closure_receiver) {
+    if (invocation->call_layout->has_closure_receiver &&
+        !invocation->call_layout->closure_signature.has_value()) {
         // Kernel flowgraph construction includes the Closure receiver in the
         // call arguments, then adds a second explicit Closure input used only
         // to load the target entry. TemplateDartCall<1> excludes that target
@@ -643,8 +955,9 @@ DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* inv
         return DARTPLANT_UNSUPPORTED_ABI;
     }
     if (HasVerifiedCallLayout(invocation)) {
-        return DecodeVerifiedValue(invocation, invocation->call_layout->parameters[index],
-                                   out_value);
+        const auto* parameters = ActiveParameters(invocation);
+        if (parameters == nullptr || index >= parameters->size()) return DARTPLANT_PROFILE_MISMATCH;
+        return DecodeVerifiedValue(invocation, (*parameters)[index], out_value);
     }
     const auto& location = invocation->profile->argument_locations[index];
     uint64_t raw = 0;
@@ -674,7 +987,9 @@ DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocatio
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
     if (HasVerifiedCallLayout(invocation)) {
-        return EncodeVerifiedValue(invocation, invocation->call_layout->parameters[index], value);
+        const auto* parameters = ActiveParameters(invocation);
+        if (parameters == nullptr || index >= parameters->size()) return DARTPLANT_PROFILE_MISMATCH;
+        return EncodeVerifiedValue(invocation, (*parameters)[index], value);
     }
     const auto& location = invocation->profile->argument_locations[index];
     uint64_t raw = 0;
@@ -712,7 +1027,11 @@ DartPlantStatus dartplant_invocation_retain_argument_object(DartPlantInvocation*
     }
     uint64_t raw = 0;
     if (HasVerifiedCallLayout(invocation)) {
-        const auto& layout = invocation->call_layout->parameters[index];
+        const auto* parameters = ActiveParameters(invocation);
+        if (parameters == nullptr || index >= parameters->size()) {
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const auto& layout = (*parameters)[index];
         if (layout.location.count != 1 ||
             !ReadVerifiedLocation(invocation, layout.location.locations[0], &raw)) {
             dartplant::SetLastError("verified tagged argument location is invalid");
@@ -755,7 +1074,11 @@ DartPlantStatus dartplant_invocation_set_argument_object(DartPlantInvocation* in
     const DartPlantStatus status = dartplant::VmAdapterSetRaw(handle, &raw);
     if (status != DARTPLANT_OK) return status;
     if (HasVerifiedCallLayout(invocation)) {
-        const auto& layout = invocation->call_layout->parameters[index];
+        const auto* parameters = ActiveParameters(invocation);
+        if (parameters == nullptr || index >= parameters->size()) {
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const auto& layout = (*parameters)[index];
         if (layout.location.count != 1 ||
             !WriteVerifiedLocation(invocation, layout.location.locations[0], raw)) {
             return DARTPLANT_PROFILE_MISMATCH;

@@ -70,7 +70,7 @@ DartCallingConventionProfile Arm64AotCallingConventionProfile() {
 
 DartCallLayoutStatus ComputeDartCallLayout(const DartFunctionAbiResolution& abi,
                                            const DartCallingConventionProfile& profile,
-                                           DartCallLayout* out_layout) {
+                                           DartCallLayout* out_layout, bool closure_call) {
     if (out_layout == nullptr || !ValidateProfile(profile)) {
         return DartCallLayoutStatus::kInvalidCallingConvention;
     }
@@ -84,7 +84,9 @@ DartCallLayoutStatus ComputeDartCallLayout(const DartFunctionAbiResolution& abi,
         !abi.has_max_parameters_in_registers) {
         return DartCallLayoutStatus::kIncompleteEvidence;
     }
-    if (abi.has_optional_parameters) return DartCallLayoutStatus::kOptionalArgumentsUnsupported;
+    if (abi.has_optional_parameters && !closure_call) {
+        return DartCallLayoutStatus::kOptionalArgumentsUnsupported;
+    }
     if (!IsSupportedResultRepresentation(abi.result.representation) ||
         std::any_of(abi.parameters.begin(), abi.parameters.end(), [](const auto& slot) {
             return !IsSupportedParameterRepresentation(slot.representation);

@@ -192,10 +192,27 @@ struct DartEntryTarget {
         return payload;
     }
 
-    bool UpgradePayload(const std::shared_ptr<DartCodePayload>& replacement) {
-        if (replacement == nullptr) return false;
+    bool MergeEvidenceAndUpgradePayload(uint32_t new_code_size, uint64_t new_code_object,
+                                        uint32_t alias_count,
+                                        DartPlantCodeIdentityProof new_identity_proof,
+                                        const std::shared_ptr<DartCodePayload>& expected_payload,
+                                        const std::shared_ptr<DartCodePayload>& replacement) {
+        if (expected_payload == nullptr || replacement == nullptr) return false;
         std::lock_guard lock(mutex);
-        if (hook_record != nullptr) return false;
+        if (payload != expected_payload || hook_record != nullptr ||
+            (code_size != 0 && new_code_size != 0 && code_size != new_code_size) ||
+            (code_object != 0 && new_code_object != 0 && code_object != new_code_object)) {
+            return false;
+        }
+        if (code_size == 0) code_size = new_code_size;
+        if (code_object == 0) code_object = new_code_object;
+        if (alias_count > reported_alias_count) reported_alias_count = alias_count;
+        if (new_identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1) {
+            identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
+        } else if (new_identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE &&
+                   identity_proof == DARTPLANT_CODE_IDENTITY_UNKNOWN) {
+            identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+        }
         payload = replacement;
         return true;
     }
@@ -289,9 +306,9 @@ public:
                     auto replacement = FindOrCreatePayloadLocked(payload_start, instructions_length,
                                                                  code_object, true);
                     if (replacement == nullptr ||
-                        !existing->MergeEvidence(code_size, code_object, reported_alias_count,
-                                                 identity_proof) ||
-                        !existing->UpgradePayload(replacement)) {
+                        !existing->MergeEvidenceAndUpgradePayload(
+                            code_size, code_object, reported_alias_count, identity_proof,
+                            existing_payload, replacement)) {
                         return nullptr;
                     }
                     return existing;

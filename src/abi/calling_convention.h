@@ -43,7 +43,7 @@ DartCallingConventionProfile Arm64AotCallingConventionProfile();
 // never guessed and fails closed before a typed DartCallFrame can be exposed.
 DartCallLayoutStatus ComputeDartCallLayout(const DartFunctionAbiResolution& abi,
                                            const DartCallingConventionProfile& profile,
-                                           DartCallLayout* out_layout);
+                                           DartCallLayout* out_layout, bool closure_call = false);
 
 // Convenience wrapper for the only production target currently supported by
 // DartPlant. Kept for current internal callers/tests while the generic profile

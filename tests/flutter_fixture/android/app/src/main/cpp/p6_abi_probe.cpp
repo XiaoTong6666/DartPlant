@@ -4,11 +4,13 @@
 #include "p6_abi_probe.h"
 
 #include <android/log.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <bit>
 #include <cstdint>
 
+#include "dart_api_adapter.h"
 #include "dartplant/dartplant.h"
 #include "dartplant/hook.h"
 #include "dartplant/invocation.h"
@@ -47,6 +49,7 @@ struct ProbeState {
     std::atomic_uint32_t forced_stack_enter{0};
     std::atomic_uint32_t forced_stack_leave{0};
     std::atomic_uint32_t pair_leave{0};
+    std::atomic_uint32_t moving_gc_pair_leave{0};
     std::atomic_uint32_t failures{0};
     std::atomic_uint32_t exception_lifetime_enter{0};
     std::atomic_uint32_t exception_lifetime_leave{0};
@@ -277,10 +280,29 @@ void ForcedStackLeave(DartPlantInvocation* invocation, void*) {
 void PairLeave(DartPlantInvocation* invocation, void*) {
     DartPlantValuePair pair{};
     if (dartplant_invocation_has_verified_abi(invocation) == 0 ||
-        dartplant_invocation_get_result_pair(invocation, &pair) != DARTPLANT_OK ||
-        pair.first.kind != DARTPLANT_VALUE_SMI || pair.second.kind != DARTPLANT_VALUE_SMI) {
+        dartplant_invocation_get_result_pair(invocation, &pair) != DARTPLANT_OK) {
         Fail("pair decode");
         return;
+    }
+    const bool smi_pair =
+        pair.first.kind == DARTPLANT_VALUE_SMI && pair.second.kind == DARTPLANT_VALUE_SMI;
+    const bool object_pair = pair.first.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                             pair.second.kind == DARTPLANT_VALUE_HEAP_OBJECT;
+    if (!smi_pair && !object_pair) {
+        Fail("pair semantic kinds");
+        return;
+    }
+    if (object_pair) {
+        // A sibling isolate in the same isolate group allocates aggressively
+        // while this mutator is native and at a safepoint.
+        usleep(500000);
+        if (dartplant_invocation_get_result_pair(invocation, &pair) != DARTPLANT_OK ||
+            pair.first.kind != DARTPLANT_VALUE_HEAP_OBJECT ||
+            pair.second.kind != DARTPLANT_VALUE_HEAP_OBJECT) {
+            Fail("pair relocated root refresh");
+            return;
+        }
+        State().moving_gc_pair_leave.fetch_add(1, std::memory_order_relaxed);
     }
     const DartPlantValuePair swapped = {
         .first = pair.second,
@@ -294,7 +316,8 @@ void PairLeave(DartPlantInvocation* invocation, void*) {
 }
 
 DartPlantStatus InstallOne(const char* function_name, DartPlantInvocationCallback on_enter,
-                           DartPlantInvocationCallback on_leave, DartPlantHookHandle** out_handle) {
+                           DartPlantInvocationCallback on_leave, DartPlantHookHandle** out_handle,
+                           bool use_vm_adapter = false) {
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(DartPlantMethodQuery),
         .library_uri = "package:dartplant_fixture/main.dart",
@@ -312,7 +335,7 @@ DartPlantStatus InstallOne(const char* function_name, DartPlantInvocationCallbac
         .on_enter = on_enter,
         .on_leave = on_leave,
         .user_data = nullptr,
-        .vm_adapter = nullptr,
+        .vm_adapter = use_vm_adapter ? dartplant_fixture_dart_api_adapter() : nullptr,
     };
     status = dartplant_hook_method(method, &options, out_handle);
     dartplant_release_method(method);
@@ -339,6 +362,7 @@ extern "C" int32_t dartplant_fixture_p6_abi_install() {
     state.forced_stack_enter.store(0, std::memory_order_relaxed);
     state.forced_stack_leave.store(0, std::memory_order_relaxed);
     state.pair_leave.store(0, std::memory_order_relaxed);
+    state.moving_gc_pair_leave.store(0, std::memory_order_relaxed);
     state.failures.store(0, std::memory_order_relaxed);
 
     DartPlantStatus status = dartplant_fixture::InstallLocalGateHost();
@@ -372,7 +396,7 @@ extern "C" int32_t dartplant_fixture_p6_abi_install() {
                             &state.forced_stack_handle);
     }
     if (status == DARTPLANT_OK) {
-        status = InstallOne("verifiedAbiPair", nullptr, PairLeave, &state.pair_handle);
+        status = InstallOne("verifiedAbiPair", nullptr, PairLeave, &state.pair_handle, true);
     }
     const bool ready = status == DARTPLANT_OK && state.int64_handle != nullptr &&
                        state.entry_stack_handle != nullptr && state.odd_stack_handle != nullptr &&
@@ -401,6 +425,8 @@ extern "C" uint64_t dartplant_fixture_p6_abi_probe() {
     const uint32_t forced_enter = state.forced_stack_enter.load(std::memory_order_relaxed);
     const uint32_t forced_leave = state.forced_stack_leave.load(std::memory_order_relaxed);
     const uint32_t pair_leave = state.pair_leave.load(std::memory_order_relaxed);
+    const uint32_t moving_gc_pair_leave =
+        state.moving_gc_pair_leave.load(std::memory_order_relaxed);
     const uint32_t failures = state.failures.load(std::memory_order_relaxed);
     const bool int64_ok = int64_enter == 1 && int64_leave == 1;
     const bool entry_ok = entry_enter == 1 && entry_leave == 1;
@@ -409,7 +435,7 @@ extern "C" uint64_t dartplant_fixture_p6_abi_probe() {
     // retires that invocation, then the following normal call pairs enter/leave.
     const bool throw_ok = throwing_enter == 2 && throwing_leave == 1;
     const bool forced_ok = forced_enter == 1 && forced_leave == 1;
-    const bool pair_ok = pair_leave == 1;
+    const bool pair_ok = pair_leave == 2 && moving_gc_pair_leave == 1;
 
     const bool cleanup =
         RemoveHandle(&state.pair_handle) && RemoveHandle(&state.forced_stack_handle) &&
@@ -462,7 +488,7 @@ extern "C" int32_t dartplant_fixture_exception_bridge_lifetime_install() {
     status = dartplant_init(&init);
     if (status == DARTPLANT_OK) {
         status = InstallOne("verifiedAbiThrowingStack", ExceptionLifetimeEnter,
-                            ExceptionLifetimeLeave, &state.exception_lifetime_handle);
+                            ExceptionLifetimeLeave, &state.exception_lifetime_handle, true);
     }
     const bool ready = status == DARTPLANT_OK && state.exception_lifetime_handle != nullptr;
     __android_log_print(ready ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,

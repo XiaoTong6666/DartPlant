@@ -51,7 +51,9 @@ int HookWithPublication(void* user_data, void* target, void* replacement,
     // callback stub before the first instruction patch becomes reachable.
     transaction->backup_ready(transaction->user_data,
                               reinterpret_cast<void*>(entry->relocated_addr));
-    routing->Commit();
+    if (!routing->Commit()) {
+        return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    }
     Interceptor::SharedInstance()->add(entry);
     (void) user_data;
     return RS_SUCCESS;

@@ -46,6 +46,7 @@ struct ProbeState {
     std::atomic_uint32_t odd_stack_leave{0};
     std::atomic_uint32_t throwing_stack_enter{0};
     std::atomic_uint32_t throwing_stack_leave{0};
+    std::atomic_uint32_t throwing_stack_exception{0};
     std::atomic_uint32_t forced_stack_enter{0};
     std::atomic_uint32_t forced_stack_leave{0};
     std::atomic_uint32_t pair_leave{0};
@@ -53,6 +54,7 @@ struct ProbeState {
     std::atomic_uint32_t failures{0};
     std::atomic_uint32_t exception_lifetime_enter{0};
     std::atomic_uint32_t exception_lifetime_leave{0};
+    std::atomic_uint32_t exception_object_observed{0};
     std::atomic_uint32_t exception_lifetime_failures{0};
     std::atomic_uint32_t exception_lifetime_unhook_ok{0};
 };
@@ -217,6 +219,24 @@ void ThrowingStackLeave(DartPlantInvocation* invocation, void*) {
     State().throwing_stack_leave.fetch_add(1, std::memory_order_relaxed);
 }
 
+void ThrowingStackException(DartPlantInvocation* invocation, void*) {
+    if (dartplant_invocation_phase(invocation) != DARTPLANT_INVOCATION_EXCEPTION) {
+        Fail("throwing exception phase");
+        return;
+    }
+    DartPlantValue exception{};
+    DartPlantValue stacktrace{};
+    if (dartplant_invocation_get_exception(invocation, &exception) != DARTPLANT_OK ||
+        dartplant_invocation_get_stacktrace(invocation, &stacktrace) != DARTPLANT_OK ||
+        exception.kind != DARTPLANT_VALUE_HEAP_OBJECT ||
+        stacktrace.kind != DARTPLANT_VALUE_HEAP_OBJECT) {
+        Fail("throwing exception object observation");
+        return;
+    }
+    State().exception_object_observed.fetch_add(1, std::memory_order_relaxed);
+    State().throwing_stack_exception.fetch_add(1, std::memory_order_relaxed);
+}
+
 void ExceptionLifetimeEnter(DartPlantInvocation* invocation, void*) {
     auto& state = State();
     DartPlantValue first{};
@@ -359,6 +379,8 @@ extern "C" int32_t dartplant_fixture_p6_abi_install() {
     state.odd_stack_leave.store(0, std::memory_order_relaxed);
     state.throwing_stack_enter.store(0, std::memory_order_relaxed);
     state.throwing_stack_leave.store(0, std::memory_order_relaxed);
+    state.throwing_stack_exception.store(0, std::memory_order_relaxed);
+    state.exception_object_observed.store(0, std::memory_order_relaxed);
     state.forced_stack_enter.store(0, std::memory_order_relaxed);
     state.forced_stack_leave.store(0, std::memory_order_relaxed);
     state.pair_leave.store(0, std::memory_order_relaxed);
@@ -389,7 +411,11 @@ extern "C" int32_t dartplant_fixture_p6_abi_install() {
     }
     if (status == DARTPLANT_OK) {
         status = InstallOne("verifiedAbiThrowingStack", ThrowingStackEnter, ThrowingStackLeave,
-                            &state.throwing_stack_handle);
+                            &state.throwing_stack_handle, true);
+        if (status == DARTPLANT_OK) {
+            status = dartplant_hook_handle_set_exception_callback(state.throwing_stack_handle,
+                                                                  ThrowingStackException, nullptr);
+        }
     }
     if (status == DARTPLANT_OK) {
         status = InstallOne("verifiedAbiForcedStack", ForcedStackEnter, ForcedStackLeave,
@@ -422,6 +448,10 @@ extern "C" uint64_t dartplant_fixture_p6_abi_probe() {
     const uint32_t odd_leave = state.odd_stack_leave.load(std::memory_order_relaxed);
     const uint32_t throwing_enter = state.throwing_stack_enter.load(std::memory_order_relaxed);
     const uint32_t throwing_leave = state.throwing_stack_leave.load(std::memory_order_relaxed);
+    const uint32_t throwing_exception =
+        state.throwing_stack_exception.load(std::memory_order_relaxed);
+    const uint32_t exception_object_observed =
+        state.exception_object_observed.load(std::memory_order_relaxed);
     const uint32_t forced_enter = state.forced_stack_enter.load(std::memory_order_relaxed);
     const uint32_t forced_leave = state.forced_stack_leave.load(std::memory_order_relaxed);
     const uint32_t pair_leave = state.pair_leave.load(std::memory_order_relaxed);
@@ -433,7 +463,8 @@ extern "C" uint64_t dartplant_fixture_p6_abi_probe() {
     const bool odd_ok = odd_enter == 1 && odd_leave == 1;
     // The throwing call enters but must not run on_leave. JumpToFrame cleanup
     // retires that invocation, then the following normal call pairs enter/leave.
-    const bool throw_ok = throwing_enter == 2 && throwing_leave == 1;
+    const bool throw_ok = throwing_enter == 2 && throwing_leave == 1 && throwing_exception == 1 &&
+                          exception_object_observed == 1;
     const bool forced_ok = forced_enter == 1 && forced_leave == 1;
     const bool pair_ok = pair_leave == 2 && moving_gc_pair_leave == 1;
 

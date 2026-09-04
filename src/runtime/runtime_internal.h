@@ -178,6 +178,8 @@ struct DartPlantInvocation {
     bool generated_vm_bridge_active = false;
     mutable std::vector<dartplant::abi::DartParameterLayout> mapped_parameters;
     mutable dartplant::abi::DartAbiLocation closure_type_arguments_location{};
+    uint32_t closure_type_argument_root_base = 0;
+    uint32_t closure_type_argument_root_count = 0;
     mutable bool closure_argument_mapping_attempted = false;
     mutable bool closure_argument_mapping_valid = false;
     bool skip_original = false;

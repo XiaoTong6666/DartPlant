@@ -7,6 +7,12 @@ option(DARTPLANT_BUILD_ANDROID_TESTS "Build DartPlant Android device tests" OFF)
 option(DARTPLANT_BUILD_ANDROID_MODULE "Build the optional LSPosed Native API shared module" OFF)
 option(DARTPLANT_BUILD_DOBBY_ADAPTER "Build the optional Dobby HostApi adapter" OFF)
 option(DARTPLANT_BUILD_SHADOWHOOK_ADAPTER "Build the optional ShadowHook HostApi adapter" OFF)
+option(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER "Build the exact Flutter VM V3 adapter" OFF)
+option(
+    DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4
+    "Build the exact Flutter 3.22.3 / Dart 3.4.4 VM V3 adapter"
+    OFF
+)
 option(
     DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT
     "Use pthread TLS and audit the final Android shared module for minimal/custom loader compatibility"
@@ -32,6 +38,7 @@ set(
     CACHE PATH
     "Path to a ShadowHook source tree when building the optional adapter"
 )
+set(DARTPLANT_DART_SDK_ROOT "" CACHE PATH "Path to a Dart SDK source tree")
 
 add_library(
     dartplant_abi
@@ -160,6 +167,44 @@ if(ANDROID)
     )
     if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
         message(FATAL_ERROR "DartPlant currently supports Android arm64-v8a only")
+    endif()
+
+    if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER OR DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4)
+        if(NOT EXISTS "${DARTPLANT_DART_SDK_ROOT}/runtime/include/dart_api_dl.c")
+            message(FATAL_ERROR "DARTPLANT_DART_SDK_ROOT must point to a Dart SDK source tree")
+        endif()
+        enable_language(C)
+        set(DARTPLANT_FLUTTER_VM_ADAPTER_SOURCES
+            adapters/flutter_vm/flutter_vm.cpp
+            adapters/flutter_vm/flutter_vm_transition.S
+            "${DARTPLANT_DART_SDK_ROOT}/runtime/include/dart_api_dl.c")
+        set_source_files_properties(
+            "${DARTPLANT_DART_SDK_ROOT}/runtime/include/dart_api_dl.c"
+            PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter"
+        )
+
+        function(dartplant_add_flutter_vm_adapter target_name)
+            add_library(${target_name} STATIC ${DARTPLANT_FLUTTER_VM_ADAPTER_SOURCES})
+            target_compile_features(${target_name} PUBLIC cxx_std_20)
+            target_compile_options(${target_name} PRIVATE -Wall -Wextra -Werror)
+            target_include_directories(
+                ${target_name}
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE "${DARTPLANT_DART_SDK_ROOT}/runtime/include"
+            )
+            target_link_libraries(${target_name} PUBLIC dartplant_core PRIVATE log dl)
+        endfunction()
+
+        if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER)
+            dartplant_add_flutter_vm_adapter(dartplant_adapter_flutter_vm)
+        endif()
+        if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4)
+            dartplant_add_flutter_vm_adapter(dartplant_adapter_flutter_vm_3_4_4)
+            target_compile_definitions(
+                dartplant_adapter_flutter_vm_3_4_4
+                PRIVATE DARTPLANT_FLUTTER_VM_PROFILE_3_4_4=1
+            )
+        endif()
     endif()
 
     if(DARTPLANT_BUILD_ANDROID_MODULE)

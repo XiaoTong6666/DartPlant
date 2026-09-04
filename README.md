@@ -36,8 +36,13 @@ add_subdirectory(third_party/dartplant)
 target_link_libraries(consumer_native PRIVATE dartplant_core dartplant_adapter_dobby)
 ```
 
-The optional adapter targets are `dartplant_adapter_dobby` and
-`dartplant_adapter_shadowhook`; the `native_init` compatibility module for
+The optional adapter targets are `dartplant_adapter_dobby`,
+`dartplant_adapter_shadowhook`, `dartplant_adapter_flutter_vm`, and the
+version-scoped `dartplant_adapter_flutter_vm_3_4_4`. The Flutter VM adapters
+require `DARTPLANT_DART_SDK_ROOT`. The generic target exposes the checked-in
+descriptor matrix, while the `_3_4_4` target compiles exactly one Flutter
+3.22.3 / Dart 3.4.4 PRODUCT ARM64 descriptor and is the target used by the
+release fixture. The `native_init` compatibility module for
 LSPosed Native API integration is built with `DARTPLANT_BUILD_ANDROID_MODULE=ON`.
 None of these adapters is linked into `dartplant_core`, and DartPlant does not
 own the consumer's module lifecycle.
@@ -126,9 +131,12 @@ callback schedules a full scan; events are coalesced by epoch rather than
 filtered by the top-level `dlopen` name.
 The worker and callback code are process-lifetime state; the Android module is
 linked `NODELETE` because the host ABI has no callback-unregister operation.
-This release supports process-lifetime Flutter app/runtime images. Arbitrary
-concurrent `dlclose` of an image with installed hooks is unsupported until a
-host supplies a pre-unload synchronization callback or a backend-safe retire API.
+This release supports process-lifetime Flutter app/runtime images. Hosts should
+call `dartplant_runtime_on_module_unloading()` before `dlclose`, then
+`dartplant_runtime_refresh_modules()` after loader changes. Arbitrary concurrent
+`dlclose` without that ordering remains unsupported. Deferred loading units and
+multiple independent Flutter engine image sets are refreshed conservatively but
+are not exposed as separate public snapshot-index namespaces.
 
 Normal consumers use DartPlant's high-level public API. DartPlant owns runtime
 creation, module refresh, Live VM bootstrap, entry/payload target sharing, and matching
@@ -214,13 +222,19 @@ The retained `FunctionType` is used only for semantic/formal-shape validation;
 machine representation is never inferred from Dart source types. Exact evidence
 is additionally bound to snapshot hash, `libapp.so` build-id, logical Function
 identity, entry VA, code size, Code identity proof, and final Code bytes. Shared
-Shared physical entry targets deliberately suppress the typed overlay because a physical entry
-cannot prove which logical alias reached it.
+physical entry targets deliberately suppress the typed overlay because a
+physical entry cannot prove which logical alias reached it.
 
 This remains a native C/C++ callback API. A sidecar is optional: retained
 Functions can still be resolved metadata-free and raw instrumentation remains
-available without typed ABI evidence. Optional-argument transport, closures,
-arbitrary Dart heap-object construction, and synchronous Dart callbacks remain
+available without typed ABI evidence. Retained closure Functions map supplied
+optional positional/named formals through the live ArgumentsDescriptor and expose
+the verified generic TypeArguments vector as one opaque tagged object. With an
+exact VM V3 adapter, individual TypeArguments elements are captured before the
+Generated->Native safepoint and placed in the same VM-visible root lease, so
+element reads remain valid across moving GC without exposing arbitrary VM
+memory. Dropped optional closures still require richer artifact evidence;
+arbitrary Dart heap-object construction and synchronous Dart callbacks remain
 fail-closed.
 
 Public logical-hook lifecycle:
@@ -308,6 +322,15 @@ process-wide signal sampler remains a fallback for hosts without such a mutator
 entry. Current production limitations include raw-layout profile coverage, ABI
 scope, and exact identity availability for AOT-dropped Functions; unknown or
 heuristic identities fail closed.
+The optional `dartplant_adapter_flutter_vm` target owns the exact private VM
+transition contract separately from the fixture. Its public opaque owner and
+immutable descriptors enumerate snapshot hash, Flutter build-id, Dart/Flutter
+versions, architecture and compression mode. Unknown fingerprints fail closed.
+`dartplant_adapter_flutter_vm_3_4_4` is a separate product target built from the
+same implementation but compile-gated to exactly one descriptor: Flutter 3.22.3
+/ Dart 3.4.4 Android ARM64 PRODUCT AOT. The release fixture links that target and
+asserts `descriptor_count == 1` at cold start. The 3.5.0 / 3.12.1 descriptors in
+the generic target are compatibility profiles, not device-cold validation claims.
 The optional `native_init` adapter owns loader-facing lifecycle only: it validates and
 stores the host entries, refreshes the process module inventory on initialization
 and every module-loaded callback, and lets each runtime instance select its own
@@ -339,10 +362,28 @@ The exposed invocation frame always preserves raw ARM64 machine truth. When
 exact compiler evidence and Code identity prove a `DartCallLayout`, the same
 frame additionally exposes semantic argument/result values. Unknown layouts
 remain raw rather than being guessed. Object retention still requires an
-attached VM adapter and the correct isolate scope. A verified closure receiver
-can be inspected as the hidden PRODUCT ARM64 x0 value during enter, but DartPlant
-does not expose GC-safe retention for real Dart-entry callbacks until the bridge
-implements a VM-visible generated-to-native transition/rooting contract.
+attached VM adapter and the correct isolate scope. The exact Flutter VM V3
+adapter publishes VM-visible persistent roots, performs generated/native
+safepoint transitions, and keeps the root lease authoritative while moving GC
+can make saved registers stale. A verified closure receiver and generic
+TypeArguments vector can be inspected during enter; generic TypeArguments
+elements are read only from pre-safepoint rooted slots, never by dereferencing a
+possibly relocated TypeArguments object from native state.
+
+Exception handling is intentionally asymmetric: `on_leave` remains normal-return
+only, while `dartplant_hook_handle_set_exception_callback()` provides a read-only
+notification when JumpToFrame proves that an exception unwound out of the hooked
+frame. During that callback, exact VM V3 adapters expose the current exception and
+stacktrace as raw tagged values through `dartplant_invocation_get_exception()` and
+`dartplant_invocation_get_stacktrace()`. Retention, suppression and replacement
+are not exposed.
+
+Runtime refresh is incarnation-aware. Hosts can call
+`dartplant_runtime_on_module_unloading()` before `dlclose` to invalidate hooks
+while code is mapped, then `dartplant_runtime_refresh_modules()` after loader
+changes. A changed app/runtime/snapshot identity advances generation and requires
+fresh bootstrap. Deferred loading units and simultaneous independent Flutter
+engine instances remain outside the current single-app-image resolver model.
 
 ## Host tests
 

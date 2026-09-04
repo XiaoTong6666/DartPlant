@@ -5,6 +5,10 @@
 #include <cstring>
 #include <new>
 
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+#include <android/log.h>
+#endif
+
 #if defined(DARTPLANT_USE_PTHREAD_TLS)
 #include <pthread.h>
 #endif
@@ -23,6 +27,7 @@ constexpr uint32_t kMaxGeneratedRootBindings = 96;
 enum class GeneratedRootRole : uint8_t {
     kPadding = 0,
     kInput,
+    kTypeArgument,
     kResult,
 };
 
@@ -170,6 +175,7 @@ bool SameGeneratedRootBinding(const GeneratedRootBinding& binding,
 bool AddGeneratedRootBinding(DispatchFrame* frame, const dartplant::abi::DartAbiLocation& location,
                              GeneratedRootRole role) {
     if (frame == nullptr || role == GeneratedRootRole::kPadding ||
+        role == GeneratedRootRole::kTypeArgument ||
         (location.kind != dartplant::abi::DartAbiLocationKind::kGpRegister &&
          location.kind != dartplant::abi::DartAbiLocationKind::kEntryStack)) {
         return false;
@@ -185,12 +191,33 @@ bool AddGeneratedRootBinding(DispatchFrame* frame, const dartplant::abi::DartAbi
     return true;
 }
 
+bool AddGeneratedRootValue(DispatchFrame* frame, uint64_t value, uint32_t* out_index) {
+    if (frame == nullptr || frame->generated_root_count >= frame->generated_roots.size()) {
+        return false;
+    }
+    const uint32_t index = frame->generated_root_count++;
+    frame->generated_roots[index] = {
+        .location = {},
+        .role = GeneratedRootRole::kTypeArgument,
+    };
+    frame->generated_root_values[index] = value;
+    if (out_index != nullptr) *out_index = index;
+    return true;
+}
+
 bool BuildGeneratedRootBindings(DispatchFrame* frame) {
     if (frame == nullptr || frame->invocation.call_layout == nullptr) return false;
     frame->generated_root_count = 0;
     const auto& layout = *frame->invocation.call_layout;
     const auto* parameters = InvocationParameters(&frame->invocation);
-    if (parameters == nullptr) return false;
+    if (parameters == nullptr) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+        __android_log_print(ANDROID_LOG_ERROR, "DartPlantTypeArgs",
+                            "bridge build failed stage=parameters error=%s",
+                            dartplant_last_error());
+#endif
+        return false;
+    }
     for (const auto& parameter : *parameters) {
         if (parameter.representation != dartplant::abi::DartAbiRepresentation::kTagged) continue;
         if (parameter.location.count != 1 ||
@@ -198,6 +225,57 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
                                      GeneratedRootRole::kInput)) {
             return false;
         }
+    }
+    if (frame->invocation.closure_argument_mapping_valid &&
+        frame->invocation.closure_type_arguments_location.kind !=
+            dartplant::abi::DartAbiLocationKind::kUnknown &&
+        !AddGeneratedRootBinding(frame, frame->invocation.closure_type_arguments_location,
+                                 GeneratedRootRole::kInput)) {
+        return false;
+    }
+    frame->invocation.closure_type_argument_root_base = 0;
+    frame->invocation.closure_type_argument_root_count = 0;
+    if (frame->invocation.closure_argument_mapping_valid && layout.closure_signature.has_value() &&
+        layout.closure_signature->type_parameter_count != 0 &&
+        frame->invocation.closure_type_arguments_location.kind !=
+            dartplant::abi::DartAbiLocationKind::kUnknown &&
+        dartplant::VmAdapterSupportsTypeArgumentsElementRead(frame->invocation.vm_adapter)) {
+        const uint32_t count = layout.closure_signature->type_parameter_count;
+        if (count > frame->generated_roots.size() - frame->generated_root_count) return false;
+        uint64_t vector_raw = 0;
+        if (!ReadGeneratedRootLocation(*frame, frame->invocation.closure_type_arguments_location,
+                                       &vector_raw)) {
+            return false;
+        }
+        std::array<uint64_t, kMaxGeneratedRootBindings> elements{};
+        for (uint32_t index = 0; index < count; ++index) {
+            if (dartplant::VmAdapterReadTypeArgumentsElementGenerated(
+                    frame->invocation.vm_adapter, vector_raw, index, &elements[index]) !=
+                DARTPLANT_OK) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+                __android_log_print(
+                    ANDROID_LOG_ERROR, "DartPlantTypeArgs",
+                    "bridge build failed stage=read_element index=%u vector=0x%llx error=%s", index,
+                    static_cast<unsigned long long>(vector_raw), dartplant_last_error());
+#endif
+                return false;
+            }
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+            __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+                                "capture vector=0x%llx element[%u]=0x%llx generated_state=1",
+                                static_cast<unsigned long long>(vector_raw), index,
+                                static_cast<unsigned long long>(elements[index]));
+#endif
+        }
+        frame->invocation.closure_type_argument_root_base = frame->generated_root_count;
+        for (uint32_t index = 0; index < count; ++index) {
+            uint32_t root_index = 0;
+            if (!AddGeneratedRootValue(frame, elements[index], &root_index) ||
+                root_index != frame->invocation.closure_type_argument_root_base + index) {
+                return false;
+            }
+        }
+        frame->invocation.closure_type_argument_root_count = count;
     }
     if (layout.has_closure_receiver &&
         !AddGeneratedRootBinding(frame, layout.closure_receiver_location,
@@ -234,7 +312,10 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
     frame->invocation.generated_root_accesses.clear();
     frame->invocation.generated_root_accesses.reserve(frame->generated_root_count);
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
-        if (frame->generated_roots[index].role == GeneratedRootRole::kPadding) continue;
+        if (frame->generated_roots[index].role == GeneratedRootRole::kPadding ||
+            frame->generated_roots[index].role == GeneratedRootRole::kTypeArgument) {
+            continue;
+        }
         frame->invocation.generated_root_accesses.push_back({
             .location = frame->generated_roots[index].location,
             .root_index = index,
@@ -285,7 +366,12 @@ bool PrepareGeneratedExitFrame(DispatchFrame* frame) {
 
 bool RootRoleActive(const GeneratedRootBinding& binding, bool include_result) {
     return binding.role == GeneratedRootRole::kInput ||
+           binding.role == GeneratedRootRole::kTypeArgument ||
            (include_result && binding.role == GeneratedRootRole::kResult);
+}
+
+bool RootHasPhysicalLocation(const GeneratedRootBinding& binding) {
+    return binding.role == GeneratedRootRole::kInput || binding.role == GeneratedRootRole::kResult;
 }
 
 bool IsResultLocation(const DispatchFrame& frame, const dartplant::abi::DartAbiLocation& location) {
@@ -307,7 +393,8 @@ bool PinGeneratedRoots(DispatchFrame* frame, bool include_result,
         const auto& binding = frame->generated_roots[index];
         uint64_t value = 0;
         if (RootRoleActive(binding, include_result)) {
-            if (reuse_cached_inputs && binding.role == GeneratedRootRole::kInput) {
+            if (binding.role == GeneratedRootRole::kTypeArgument ||
+                (reuse_cached_inputs && binding.role == GeneratedRootRole::kInput)) {
                 value = frame->generated_root_values[index];
             } else if (!ReadGeneratedRootLocation(*frame, binding.location, &value)) {
                 return false;
@@ -332,6 +419,7 @@ bool SyncGeneratedRootsToContext(DispatchFrame* frame, bool include_result,
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
         const auto& binding = frame->generated_roots[index];
         if (!RootRoleActive(binding, include_result)) continue;
+        if (!RootHasPhysicalLocation(binding)) continue;
         if (preserve_result_locations && binding.role == GeneratedRootRole::kInput &&
             IsResultLocation(*frame, binding.location)) {
             continue;
@@ -430,6 +518,7 @@ bool LeaveGeneratedVmBridge(DispatchFrame* frame, bool include_result, bool repi
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
         const auto& binding = frame->generated_roots[index];
         if (!RootRoleActive(binding, include_result)) continue;
+        if (!RootHasPhysicalLocation(binding)) continue;
         if (!WriteGeneratedRootLocation(frame, binding.location,
                                         frame->generated_root_values[index])) {
             FatalGeneratedBridgeFailure("generated/native bridge could not restore callback roots");
@@ -461,6 +550,7 @@ bool DropPersistentGeneratedRoots(DispatchFrame* frame, bool include_result,
     for (uint32_t index = 0; index < frame->generated_root_count; ++index) {
         const auto& binding = frame->generated_roots[index];
         if (!RootRoleActive(binding, include_result)) continue;
+        if (!RootHasPhysicalLocation(binding)) continue;
         if (!WriteGeneratedRootLocation(frame, binding.location,
                                         frame->generated_root_values[index])) {
             FatalGeneratedBridgeFailure("generated roots could not be restored to Dart context");
@@ -705,8 +795,17 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
                                   !late_shared_fail_closed;
 
     if (generated_bridge) {
-        if (!BuildGeneratedRootBindings(&frame) || !PinGeneratedRoots(&frame, false) ||
-            !EnterGeneratedVmBridge(&frame, false)) {
+        const bool bindings_ok = BuildGeneratedRootBindings(&frame);
+        const bool pin_ok = bindings_ok && PinGeneratedRoots(&frame, false);
+        const bool bridge_ok = pin_ok && EnterGeneratedVmBridge(&frame, false);
+        if (!bridge_ok) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+            __android_log_print(
+                ANDROID_LOG_ERROR, "DartPlantTypeArgs",
+                "generated bridge setup failed bindings=%u pin=%u enter=%u error=%s",
+                static_cast<unsigned>(bindings_ok), static_cast<unsigned>(pin_ok),
+                static_cast<unsigned>(bridge_ok), dartplant_last_error());
+#endif
             (void) DropPersistentGeneratedRoots(&frame, false);
             ReleaseSnapshot(&frame.invocation);
             --stack->depth;
@@ -876,6 +975,16 @@ extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg
         const bool unwound_by_sp =
             frame.entry_spreg != 0 && target_spreg != 0 && target_spreg > frame.entry_spreg;
         if (!unwound_by_fp && !unwound_by_sp) break;
+        frame.invocation.phase = DARTPLANT_INVOCATION_EXCEPTION;
+        for (auto it = frame.invocation.entered_listeners.rbegin();
+             it != frame.invocation.entered_listeners.rend(); ++it) {
+            DartPlantExceptionCallback callback =
+                (*it)->on_exception.load(std::memory_order_acquire);
+            if (callback != nullptr && (*it)->active.load(std::memory_order_acquire)) {
+                InvokeCallback(callback, &frame.invocation,
+                               (*it)->exception_user_data.load(std::memory_order_acquire));
+            }
+        }
         AbandonFrame(&frame);
         --stack->depth;
     }

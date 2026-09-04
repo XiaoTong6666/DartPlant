@@ -24,6 +24,7 @@ if (flutterVersionName == null) {
 }
 
 def dartplantDobbyRoot = System.getenv("DARTPLANT_DOBBY_ROOT")
+def dartplantSdkRoot = System.getenv("DARTPLANT_DART_SDK_ROOT")
 
 android {
     namespace = "dev.dartplant.dartplant_fixture"
@@ -61,6 +62,9 @@ android {
                 abiFilters "arm64-v8a"
                 if (dartplantDobbyRoot != null && !dartplantDobbyRoot.isEmpty()) {
                     arguments "-DDARTPLANT_DOBBY_ROOT=${dartplantDobbyRoot}"
+                }
+                if (dartplantSdkRoot != null && !dartplantSdkRoot.isEmpty()) {
+                    arguments "-DDART_SDK_ROOT=${dartplantSdkRoot}"
                 }
             }
         }

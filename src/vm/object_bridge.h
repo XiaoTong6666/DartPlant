@@ -60,6 +60,12 @@ DartPlantStatus VmAdapterEnterGeneratedToNative(DartPlantVmAdapter* adapter,
 DartPlantStatus VmAdapterLeaveNativeToGenerated(DartPlantVmAdapter* adapter,
                                                 const DartPlantGeneratedTransitionFrame* frame,
                                                 void* root_lease);
+DartPlantStatus VmAdapterReadActiveException(DartPlantVmAdapter* adapter, uint64_t* out_raw);
+DartPlantStatus VmAdapterReadActiveStacktrace(DartPlantVmAdapter* adapter, uint64_t* out_raw);
+bool VmAdapterSupportsTypeArgumentsElementRead(const DartPlantVmAdapter* adapter);
+DartPlantStatus VmAdapterReadTypeArgumentsElementGenerated(DartPlantVmAdapter* adapter,
+                                                           uint64_t type_arguments_raw,
+                                                           uint32_t index, uint64_t* out_raw);
 DartPlantStatus VmAdapterRetainObject(DartPlantVmAdapter* adapter, uint64_t raw,
                                       DartPlantObjectStrength strength,
                                       DartPlantObjectHandle** out_handle);

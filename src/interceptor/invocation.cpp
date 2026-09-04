@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+#include <android/log.h>
+#endif
+
 #include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
 #include "vm/runtime_profiles.h"
@@ -457,9 +461,8 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
     DartPlantArgumentsDescriptorInfo info{};
     info.struct_size = sizeof(info);
     if (dartplant_invocation_get_arguments_descriptor(invocation, &info) != DARTPLANT_OK ||
-        info.count == 0 ||
-        info.size != info.count + static_cast<uint32_t>(info.type_args_len != 0) ||
-        info.positional_count == 0 || info.positional_count > info.count) {
+        info.count == 0 || info.size != info.count || info.positional_count == 0 ||
+        info.positional_count > info.count) {
         dartplant::SetLastError("closure ArgumentsDescriptor shape is unsupported");
         return false;
     }
@@ -944,6 +947,108 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
     *out_info = info;
     dartplant::ClearLastError();
     return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_invocation_get_closure_type_arguments(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure type arguments are enter-phase only");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    if (!EnsureClosureArgumentMapping(invocation) ||
+        invocation->closure_type_arguments_location.kind ==
+            dartplant::abi::DartAbiLocationKind::kUnknown) {
+        dartplant::SetLastError("invocation has no verified generic closure type arguments");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    uint64_t raw = 0;
+    if (!ReadVerifiedLocation(invocation, invocation->closure_type_arguments_location, &raw)) {
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_value =
+        RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                  raw, true, ActiveValidatedNullValue(invocation)));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_invocation_retain_closure_type_arguments(
+    DartPlantInvocation* invocation, DartPlantObjectHandle** out_handle) {
+    if (invocation == nullptr || out_handle == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    DartPlantValue value{};
+    const DartPlantStatus status =
+        dartplant_invocation_get_closure_type_arguments(invocation, &value);
+    if (status != DARTPLANT_OK) return status;
+    if (value.kind != DARTPLANT_VALUE_HEAP_OBJECT || invocation->vm_adapter == nullptr ||
+        !invocation->vm_scope_entered || !invocation->generated_vm_bridge_active) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    return dartplant::VmAdapterRetainObject(invocation->vm_adapter, value.raw,
+                                            DARTPLANT_OBJECT_STRONG, out_handle);
+}
+
+DartPlantStatus dartplant_invocation_get_closure_type_argument(
+    const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure type arguments are enter-phase only");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    if (invocation->closure_type_argument_root_count == 0) {
+        dartplant::SetLastError(
+            "closure TypeArguments elements were not captured by an exact VM bridge");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (index >= invocation->closure_type_argument_root_count) {
+        dartplant::SetLastError("closure TypeArguments element index is unavailable");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (invocation->vm_adapter == nullptr || invocation->generated_root_lease == nullptr ||
+        !invocation->vm_scope_entered || !invocation->generated_vm_bridge_active) {
+        dartplant::SetLastError("generic closure TypeArguments elements are not VM-rooted");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    uint64_t raw = 0;
+    const uint32_t root_index = invocation->closure_type_argument_root_base + index;
+    const DartPlantStatus status = dartplant::VmAdapterGeneratedRootGet(
+        invocation->vm_adapter, invocation->generated_root_lease, root_index, &raw);
+    if (status != DARTPLANT_OK) return status;
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+    __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+                        "root_get element[%u] root_index=%u raw=0x%llx", index, root_index,
+                        static_cast<unsigned long long>(raw));
+#endif
+    *out_value =
+        RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                  raw, true, ActiveValidatedNullValue(invocation)));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus ReadActiveExceptionObject(const DartPlantInvocation* invocation, bool stacktrace,
+                                          DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_EXCEPTION || invocation->vm_adapter == nullptr) {
+        dartplant::SetLastError("exception objects are available only during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    uint64_t raw = 0;
+    const DartPlantStatus status =
+        stacktrace ? dartplant::VmAdapterReadActiveStacktrace(invocation->vm_adapter, &raw)
+                   : dartplant::VmAdapterReadActiveException(invocation->vm_adapter, &raw);
+    if (status != DARTPLANT_OK) return status;
+    *out_value =
+        dartplant::dartplant_vm_abi_decode_gp_word(raw, true, ActiveValidatedNullValue(invocation));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_invocation_get_exception(const DartPlantInvocation* invocation,
+                                                   DartPlantValue* out_value) {
+    return ReadActiveExceptionObject(invocation, false, out_value);
+}
+
+DartPlantStatus dartplant_invocation_get_stacktrace(const DartPlantInvocation* invocation,
+                                                    DartPlantValue* out_value) {
+    return ReadActiveExceptionObject(invocation, true, out_value);
 }
 
 DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* invocation,

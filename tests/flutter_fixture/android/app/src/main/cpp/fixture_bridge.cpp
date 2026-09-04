@@ -4,17 +4,22 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <string>
 #include <thread>
 
 #include "core/internal.h"
+#include "dart_api.h"
 #include "dart_api_adapter.h"
+#include "dart_api_dl.h"
 #include "dartplant/advanced/live_vm.h"
 #include "dartplant/invocation.h"
 #include "dartplant/native_api.h"
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
 #include "fixture_host.h"
+#include "runtime/runtime_internal.h"
 #include "simple_facade_consumer.h"
+#include "vm/runtime_profiles.h"
 #if __has_include("ordinary_aot_sidecar.h")
 #include "ordinary_aot_sidecar.h"
 #else
@@ -23,8 +28,13 @@
 #if __has_include("p6_forced_stack_closure_sidecar.h")
 #include "p6_forced_stack_closure_sidecar.h"
 #endif
+#if __has_include("type_arguments_closure_sidecar.h")
+#include "type_arguments_closure_sidecar.h"
+#endif
 
 namespace {
+
+DartPlantFlutterVmAdapter* g_flutter_vm_adapter = nullptr;
 
 constexpr char kTag[] = "DartPlantFixture";
 
@@ -36,8 +46,10 @@ DartPlantMethod* g_negate_bool = nullptr;
 DartPlantMethod* g_signature_probe = nullptr;
 DartPlantMethod* g_verified_abi_double = nullptr;
 DartPlantMethod* g_forced_stack_closure = nullptr;
+DartPlantMethod* g_type_arguments_closure = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
 DartPlantHook* g_forced_stack_closure_hook = nullptr;
+DartPlantHook* g_type_arguments_closure_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
 DartPlantHook* g_negate_bool_hook = nullptr;
 DartPlantHookHandle* g_verified_abi_double_hook = nullptr;
@@ -71,11 +83,107 @@ std::atomic<uint64_t> g_verified_abi_double_failures = 0;
 std::atomic<uint64_t> g_verified_abi_double_observer_enter = 0;
 std::atomic<uint64_t> g_forced_stack_closure_enter = 0;
 std::atomic<uint64_t> g_forced_stack_closure_failures = 0;
+std::atomic<uint64_t> g_type_arguments_enter = 0;
+std::atomic<uint64_t> g_type_arguments_failures = 0;
+std::atomic<uint64_t> g_type_arguments_gc_api_calls = 0;
+std::atomic<uint64_t> g_type_arguments_vector_before = 0;
+std::atomic<uint64_t> g_type_arguments_vector_after = 0;
+std::atomic<uint64_t> g_type_arguments_element_before = 0;
+std::atomic<uint64_t> g_type_arguments_element_after = 0;
+std::atomic_bool g_type_arguments_vector_relocated{false};
+std::atomic_bool g_type_arguments_element_relocated{false};
+std::atomic_bool g_type_arguments_callback_passed{false};
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
+}
+
+bool ResolveRetainedClosureFunction(Dart_Handle closure_handle, uintptr_t expected_entry,
+                                    uint64_t* out_closure_raw, uint64_t* out_function_raw,
+                                    uint32_t* out_field_offset) {
+    if (closure_handle == nullptr || out_closure_raw == nullptr || out_function_raw == nullptr ||
+        out_field_offset == nullptr || g_runtime == nullptr ||
+        !g_runtime->live_vm_context.has_value() || g_snapshot_info.snapshot_hash == nullptr ||
+        g_snapshot_info.snapshot_hash[0] == '\0') {
+        return false;
+    }
+    const auto* profile = dartplant::FindRuntimeProfileBySnapshot(g_snapshot_info.snapshot_hash);
+    if (profile == nullptr || profile->raw_object.compressed_word_size != sizeof(uint32_t)) {
+        return false;
+    }
+
+    // Dart 3.4.4 FFI Handle is a VM LocalHandle and its ObjectPtr slot is at
+    // offset zero (runtime/vm/dart_api_state.h). This fixture is deliberately
+    // built only against the exact 3.4.4 private VM adapter; do not generalize
+    // this test-only unwrap to unknown SDKs.
+    uint64_t closure_raw = 0;
+    std::memcpy(&closure_raw, closure_handle, sizeof(closure_raw));
+    const auto& raw = profile->raw_object;
+    if ((closure_raw & raw.smi_tag_mask) != raw.heap_object_tag ||
+        closure_raw < raw.heap_object_tag) {
+        return false;
+    }
+    const uintptr_t closure_address = static_cast<uintptr_t>(closure_raw - raw.heap_object_tag);
+    const uint64_t heap_base = g_runtime->live_vm_context->heap_base;
+    if (heap_base == 0) return false;
+
+    // Search only the fixed header-sized prefix of UntaggedClosure. Candidate
+    // compressed heap pointers are accepted solely when the public live-VM
+    // FunctionType parser validates them and their Function entry matches the
+    // exact artifact closure target. This avoids baking Closure::function_
+    // offset into the fixture while retaining a fail-closed exact-profile check.
+    constexpr uint32_t kClosureHeaderScanStart = 8;
+    constexpr uint32_t kClosureHeaderScanEnd = 32;
+    for (uint32_t offset = kClosureHeaderScanStart; offset < kClosureHeaderScanEnd;
+         offset += raw.compressed_word_size) {
+        uint32_t compressed = 0;
+        std::memcpy(&compressed, reinterpret_cast<const void*>(closure_address + offset),
+                    sizeof(compressed));
+        if ((compressed & raw.smi_tag_mask) != raw.heap_object_tag) continue;
+        const uint64_t function_raw = heap_base + static_cast<uint64_t>(compressed);
+
+        DartPlantDartFunctionSignatureInfo signature{};
+        signature.struct_size = sizeof(signature);
+        const DartPlantStatus signature_status = dartplant_live_vm_read_function_signature(
+            &*g_runtime->live_vm_context, &g_snapshot_info, function_raw, &signature);
+        if (signature_status != DARTPLANT_OK || signature.parameter_count != 4 ||
+            signature.implicit_parameter_count != 1 || signature.fixed_parameter_count != 2 ||
+            signature.optional_parameter_count != 2 || signature.type_parameter_count != 1 ||
+            signature.parent_type_argument_count != 0 ||
+            signature.has_named_optional_parameters == 0 || function_raw < raw.heap_object_tag) {
+            continue;
+        }
+
+        uint64_t function_entry = 0;
+        const uintptr_t function_address =
+            static_cast<uintptr_t>(function_raw - raw.heap_object_tag);
+        std::memcpy(&function_entry,
+                    reinterpret_cast<const void*>(function_address +
+                                                  profile->live_vm.function_entry_point_offset),
+                    sizeof(function_entry));
+        if (function_entry != expected_entry) continue;
+
+        *out_closure_raw = closure_raw;
+        *out_function_raw = function_raw;
+        *out_field_offset = offset;
+        return true;
+    }
+    return false;
+}
+
+void ResetTypeArgumentsProofState() {
+    g_type_arguments_enter.store(0, std::memory_order_relaxed);
+    g_type_arguments_failures.store(0, std::memory_order_relaxed);
+    g_type_arguments_gc_api_calls.store(0, std::memory_order_relaxed);
+    g_type_arguments_vector_before.store(0, std::memory_order_relaxed);
+    g_type_arguments_vector_after.store(0, std::memory_order_relaxed);
+    g_type_arguments_element_before.store(0, std::memory_order_relaxed);
+    g_type_arguments_element_after.store(0, std::memory_order_relaxed);
+    g_type_arguments_vector_relocated.store(false, std::memory_order_release);
+    g_type_arguments_element_relocated.store(false, std::memory_order_release);
+    g_type_arguments_callback_passed.store(false, std::memory_order_release);
 }
 
 [[maybe_unused]] void OnIntLeave(DartPlantInvocation* invocation, void*) { (void) invocation; }
@@ -476,6 +584,145 @@ void OnForcedStackClosureEnter(DartPlantInvocation* invocation, void*) {
     g_forced_stack_closure_enter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void OnTypeArgumentsProofEnter(DartPlantInvocation* invocation, void*) {
+    g_type_arguments_enter.fetch_add(1, std::memory_order_relaxed);
+
+    DartPlantArgumentsDescriptorInfo descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    DartPlantValue vector_before{};
+    DartPlantValue element_before{};
+    const DartPlantStatus descriptor_status =
+        dartplant_invocation_get_arguments_descriptor(invocation, &descriptor);
+    const DartPlantStatus vector_before_status =
+        dartplant_invocation_get_closure_type_arguments(invocation, &vector_before);
+    const DartPlantStatus element_before_status =
+        dartplant_invocation_get_closure_type_argument(invocation, 0, &element_before);
+
+    const bool before_ok = descriptor_status == DARTPLANT_OK && descriptor.type_args_len == 1 &&
+                           descriptor.named_count == 2 && vector_before_status == DARTPLANT_OK &&
+                           vector_before.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                           vector_before.raw != 0 && element_before_status == DARTPLANT_OK &&
+                           element_before.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                           element_before.raw != 0;
+    g_type_arguments_vector_before.store(vector_before.raw, std::memory_order_relaxed);
+    g_type_arguments_element_before.store(element_before.raw, std::memory_order_relaxed);
+    __android_log_print(
+        before_ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "TypeArguments proof native before descriptor=%d type_args=%u count=%u size=%u positional=%u named=%u vector=%d/%u/0x%llx element=%d/%u/0x%llx",
+        descriptor_status, descriptor.type_args_len, descriptor.count, descriptor.size,
+        descriptor.positional_count, descriptor.named_count, vector_before_status,
+        static_cast<unsigned>(vector_before.kind),
+        static_cast<unsigned long long>(vector_before.raw), element_before_status,
+        static_cast<unsigned>(element_before.kind),
+        static_cast<unsigned long long>(element_before.raw));
+    if (!before_ok) {
+        g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    if (Dart_GetMainPortId_DL == nullptr || Dart_NewSendPort_DL == nullptr ||
+        Dart_EnterScope_DL == nullptr || Dart_ExitScope_DL == nullptr ||
+        Dart_IsError_DL == nullptr) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments proof Dart API DL allocation symbols unavailable main_port=%p new_send_port=%p enter_scope=%p exit_scope=%p is_error=%p",
+            reinterpret_cast<void*>(Dart_GetMainPortId_DL),
+            reinterpret_cast<void*>(Dart_NewSendPort_DL),
+            reinterpret_cast<void*>(Dart_EnterScope_DL), reinterpret_cast<void*>(Dart_ExitScope_DL),
+            reinterpret_cast<void*>(Dart_IsError_DL));
+        g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    DartPlantValue vector_after = vector_before;
+    DartPlantValue element_after = element_before;
+    bool dart_api_ok = true;
+    bool element_relocated = false;
+    bool vector_relocated = false;
+    // Dart API DL does not expose Dart_Invoke or a direct GC entry point in
+    // PRODUCT, but Dart_NewSendPort_DL is a real VM heap allocation:
+    // SendPort::New defaults to Heap::kNew. Allocate short-lived SendPort
+    // objects in nested API scopes until a scavenging collection moves the
+    // freshly instantiated Type/TypeArguments objects captured above. The
+    // nested scope is discarded after each batch so the pressure objects do
+    // not themselves remain roots; DartPlant's generated-root lease stays
+    // live across every allocation and must be rewritten by the moving GC.
+    const Dart_Port main_port = Dart_GetMainPortId_DL();
+    if (main_port == ILLEGAL_PORT) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments proof main Dart port is unavailable");
+        g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    constexpr uint32_t kAllocationsPerBatch = 16384;
+    constexpr uint32_t kMaxAllocationBatches = 128;
+    uint64_t allocation_count = 0;
+    for (uint32_t batch = 0; batch < kMaxAllocationBatches; ++batch) {
+        Dart_EnterScope_DL();
+        bool batch_ok = true;
+        for (uint32_t index = 0; index < kAllocationsPerBatch; ++index) {
+            Dart_Handle send_port = Dart_NewSendPort_DL(main_port);
+            ++allocation_count;
+            if (send_port == nullptr || Dart_IsError_DL(send_port)) {
+                batch_ok = false;
+                break;
+            }
+        }
+        Dart_ExitScope_DL();
+        g_type_arguments_gc_api_calls.store(allocation_count, std::memory_order_relaxed);
+        if (!batch_ok) {
+            __android_log_print(
+                ANDROID_LOG_ERROR, kTag,
+                "TypeArguments proof Dart_NewSendPort_DL failed batch=%u allocations=%llu",
+                batch + 1, static_cast<unsigned long long>(allocation_count));
+            dart_api_ok = false;
+            break;
+        }
+        const DartPlantStatus vector_after_status =
+            dartplant_invocation_get_closure_type_arguments(invocation, &vector_after);
+        const DartPlantStatus element_after_status =
+            dartplant_invocation_get_closure_type_argument(invocation, 0, &element_after);
+        const bool after_ok = vector_after_status == DARTPLANT_OK &&
+                              vector_after.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                              vector_after.raw != 0 && element_after_status == DARTPLANT_OK &&
+                              element_after.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                              element_after.raw != 0;
+        vector_relocated = vector_after.raw != vector_before.raw;
+        element_relocated = element_after.raw != element_before.raw;
+        __android_log_print(
+            after_ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+            "TypeArguments proof native after batch=%u allocations=%llu vector=%d/%u/0x%llx element=%d/%u/0x%llx vector_relocated=%u element_relocated=%u",
+            batch + 1, static_cast<unsigned long long>(allocation_count), vector_after_status,
+            static_cast<unsigned>(vector_after.kind),
+            static_cast<unsigned long long>(vector_after.raw), element_after_status,
+            static_cast<unsigned>(element_after.kind),
+            static_cast<unsigned long long>(element_after.raw),
+            static_cast<unsigned>(vector_relocated), static_cast<unsigned>(element_relocated));
+        if (!after_ok) {
+            dart_api_ok = false;
+            break;
+        }
+        if (element_relocated) break;
+    }
+
+    g_type_arguments_vector_after.store(vector_after.raw, std::memory_order_relaxed);
+    g_type_arguments_element_after.store(element_after.raw, std::memory_order_relaxed);
+    g_type_arguments_vector_relocated.store(vector_relocated, std::memory_order_release);
+    g_type_arguments_element_relocated.store(element_relocated, std::memory_order_release);
+    const bool passed = dart_api_ok && element_relocated;
+    g_type_arguments_callback_passed.store(passed, std::memory_order_release);
+    if (!passed) g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "TypeArguments proof native result dart_api=%u calls=%llu vector_relocated=%u element_relocated=%u before=0x%llx after=0x%llx passed=%u",
+        static_cast<unsigned>(dart_api_ok),
+        static_cast<unsigned long long>(
+            g_type_arguments_gc_api_calls.load(std::memory_order_relaxed)),
+        static_cast<unsigned>(vector_relocated), static_cast<unsigned>(element_relocated),
+        static_cast<unsigned long long>(element_before.raw),
+        static_cast<unsigned long long>(element_after.raw), static_cast<unsigned>(passed));
+}
+
 bool FindLiveTopLevelMethod(const char* name, DartPlantMethod** out_method) {
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -571,6 +818,123 @@ DartPlantStatus InstallForcedStackClosureHook() {
         hook_status, g_forced_stack_closure->function->function_kind,
         static_cast<unsigned>(g_forced_stack_closure->function->closure_call_entry_only),
         static_cast<unsigned long long>(dartplant_method_runtime_address(g_forced_stack_closure)),
+        hook_status == DARTPLANT_OK ? "none" : dartplant_last_error());
+    return hook_status;
+}
+
+DartPlantStatus InstallTypeArgumentsProofHook(Dart_Handle retained_closure) {
+    if (g_type_arguments_closure_hook != nullptr) return DARTPLANT_OK;
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "Global",
+        .function_name = "[tear-off] signatureProbe",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    const DartPlantStatus lookup_status =
+        dartplant_runtime_find_method(g_runtime, &query, &g_type_arguments_closure);
+    const bool identity_ok =
+        lookup_status == DARTPLANT_OK && g_type_arguments_closure != nullptr &&
+        g_type_arguments_closure->function != nullptr &&
+        g_type_arguments_closure->function->function_kind == 2 &&
+        g_type_arguments_closure->function->closure_call_entry_only &&
+        g_type_arguments_closure->function->code_target != nullptr &&
+        g_type_arguments_closure->function->code_target->HasProvenUniqueIdentity();
+    if (!identity_ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments closure identity failed status=%d method=%p source=%u kind=%u closure_only=%u aliases=%u error=%s",
+            lookup_status, g_type_arguments_closure,
+            g_type_arguments_closure == nullptr || g_type_arguments_closure->function == nullptr
+                ? 0U
+                : static_cast<unsigned>(g_type_arguments_closure->function->source),
+            g_type_arguments_closure == nullptr || g_type_arguments_closure->function == nullptr
+                ? 0U
+                : g_type_arguments_closure->function->function_kind,
+            static_cast<unsigned>(g_type_arguments_closure != nullptr &&
+                                  g_type_arguments_closure->function != nullptr &&
+                                  g_type_arguments_closure->function->closure_call_entry_only),
+            g_type_arguments_closure == nullptr || g_type_arguments_closure->function == nullptr ||
+                    g_type_arguments_closure->function->code_target == nullptr
+                ? 0U
+                : g_type_arguments_closure->function->code_target->AliasCount(),
+            dartplant_last_error());
+        return lookup_status == DARTPLANT_OK ? DARTPLANT_PROFILE_MISMATCH : lookup_status;
+    }
+
+    uint64_t retained_closure_raw = 0;
+    uint64_t retained_function_raw = 0;
+    uint32_t retained_function_offset = 0;
+    if (!ResolveRetainedClosureFunction(
+            retained_closure, dartplant_method_runtime_address(g_type_arguments_closure),
+            &retained_closure_raw, &retained_function_raw, &retained_function_offset)) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments retained closure FunctionType bind failed handle=%p target=0x%llx error=%s",
+            retained_closure,
+            static_cast<unsigned long long>(
+                dartplant_method_runtime_address(g_type_arguments_closure)),
+            dartplant_last_error());
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "TypeArguments retained closure FunctionType bound closure=0x%llx function=0x%llx field_offset=%u target=0x%llx",
+        static_cast<unsigned long long>(retained_closure_raw),
+        static_cast<unsigned long long>(retained_function_raw), retained_function_offset,
+        static_cast<unsigned long long>(
+            dartplant_method_runtime_address(g_type_arguments_closure)));
+
+    // The artifact supplies the exact physical entry certificate, but optional
+    // closure argument mapping deliberately requires a retained live FunctionType.
+    // Promote this test method only after the retained Closure's Function has
+    // independently parsed as the expected generic/named FunctionType and its
+    // Function.entry_point exactly matches the artifact target above. This keeps
+    // the production fail-closed rule intact while giving the proof hook the live
+    // Function object needed to derive ArgumentsDescriptor/type-argument mapping.
+    g_type_arguments_closure->function->function_object = retained_function_raw;
+    g_type_arguments_closure->function->source = dartplant::DartFunctionSource::kLiveVm;
+
+    DartPlantMethodAbiInfo abi_info{};
+    abi_info.struct_size = sizeof(abi_info);
+    const DartPlantStatus abi_status =
+        dartplant_runtime_get_method_abi_info(g_runtime, g_type_arguments_closure, &abi_info);
+    __android_log_print(
+        abi_status == DARTPLANT_OK && abi_info.state == DARTPLANT_METHOD_ABI_VERIFIED &&
+                abi_info.has_verified_call_layout != 0
+            ? ANDROID_LOG_INFO
+            : ANDROID_LOG_ERROR,
+        kTag,
+        "TypeArguments closure ABI status=%d state=%u verified=%u params=%u stack=%u source=%u target=0x%llx",
+        abi_status, static_cast<unsigned>(abi_info.state),
+        static_cast<unsigned>(abi_info.has_verified_call_layout), abi_info.parameter_count,
+        abi_info.stack_words, static_cast<unsigned>(g_type_arguments_closure->function->source),
+        static_cast<unsigned long long>(
+            dartplant_method_runtime_address(g_type_arguments_closure)));
+    if (abi_status != DARTPLANT_OK || abi_info.state != DARTPLANT_METHOD_ABI_VERIFIED ||
+        abi_info.has_verified_call_layout == 0) {
+        return abi_status == DARTPLANT_OK ? DARTPLANT_UNSUPPORTED_ABI : abi_status;
+    }
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    DartPlantHookOptions options = {
+        .struct_size = sizeof(options),
+        .flags = 0,
+        .on_enter = OnTypeArgumentsProofEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        .vm_adapter = dartplant_fixture_dart_api_adapter(),
+    };
+    if (options.vm_adapter == nullptr) return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    const DartPlantStatus hook_status = dartplant_runtime_hook_method_with_profile(
+        g_runtime, g_type_arguments_closure, &profile, &options, &g_type_arguments_closure_hook);
+    __android_log_print(
+        hook_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "TypeArguments closure hook status=%d vm_adapter=%p target=0x%llx error=%s", hook_status,
+        options.vm_adapter,
+        static_cast<unsigned long long>(dartplant_method_runtime_address(g_type_arguments_closure)),
         hook_status == DARTPLANT_OK ? "none" : dartplant_last_error());
     return hook_status;
 }
@@ -1394,6 +1758,44 @@ dartplant_fixture_enable_forced_stack_closure_hook() {
 }
 
 extern "C" __attribute__((visibility("default"))) int32_t
+dartplant_fixture_type_arguments_proof_prepare(Dart_Handle retained_closure) {
+    ResetTypeArgumentsProofState();
+    const DartPlantStatus host_status = dartplant_fixture::InstallLocalGateHost();
+    if (host_status != DARTPLANT_OK) return host_status;
+    return InstallTypeArgumentsProofHook(retained_closure);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_type_arguments_proof() {
+    const uint64_t enter = g_type_arguments_enter.load(std::memory_order_relaxed);
+    const uint64_t failures = g_type_arguments_failures.load(std::memory_order_relaxed);
+    const uint64_t calls = g_type_arguments_gc_api_calls.load(std::memory_order_relaxed);
+    const uint64_t vector_before = g_type_arguments_vector_before.load(std::memory_order_relaxed);
+    const uint64_t vector_after = g_type_arguments_vector_after.load(std::memory_order_relaxed);
+    const uint64_t element_before = g_type_arguments_element_before.load(std::memory_order_relaxed);
+    const uint64_t element_after = g_type_arguments_element_after.load(std::memory_order_relaxed);
+    const bool vector_relocated = g_type_arguments_vector_relocated.load(std::memory_order_acquire);
+    const bool element_relocated =
+        g_type_arguments_element_relocated.load(std::memory_order_acquire);
+    const bool callback_passed = g_type_arguments_callback_passed.load(std::memory_order_acquire);
+    const bool active =
+        g_type_arguments_closure_hook != nullptr && g_type_arguments_closure_hook->active;
+    const bool passed = enter == 1 && failures == 0 && calls >= 1 && element_before != 0 &&
+                        element_after != 0 && element_relocated && callback_passed && active;
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u passed=%u",
+        static_cast<unsigned long long>(enter), static_cast<unsigned long long>(failures),
+        static_cast<unsigned long long>(calls), static_cast<unsigned long long>(vector_before),
+        static_cast<unsigned long long>(vector_after),
+        static_cast<unsigned long long>(element_before),
+        static_cast<unsigned long long>(element_after), static_cast<unsigned>(vector_relocated),
+        static_cast<unsigned>(element_relocated), static_cast<unsigned>(active),
+        static_cast<unsigned>(passed));
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
     // default HostApi during dartplant_shutdown(). This advanced runtime is a
@@ -1437,11 +1839,47 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         return snapshot_status;
     }
     g_snapshot_info = snapshot_info;
-    DartPlantVmAdapter* vm_adapter = nullptr;
-    const DartPlantStatus adapter_status = dartplant_fixture_create_dart_api_adapter(
-        api_dl_data, thr, snapshot_info.snapshot_hash, &vm_adapter);
-    if (adapter_status != DARTPLANT_OK || vm_adapter == nullptr ||
-        !dartplant_fixture_dart_api_adapter_ready_for_hooks()) {
+    __android_log_print(ANDROID_LOG_INFO, kTag, "snapshot for VM adapter hash=%s features=%s",
+                        snapshot_info.snapshot_hash, snapshot_info.snapshot_features);
+    const uint32_t descriptor_count = dartplant_flutter_vm_descriptor_count();
+    const DartPlantFlutterVmDescriptor* fixed_descriptor = dartplant_flutter_vm_descriptor_at(0);
+    const bool fixed_profile_gate =
+        descriptor_count == 1 && fixed_descriptor != nullptr &&
+        fixed_descriptor->dart_version != nullptr &&
+        std::strcmp(fixed_descriptor->dart_version, "3.4.4") == 0 &&
+        fixed_descriptor->flutter_version != nullptr &&
+        std::strcmp(fixed_descriptor->flutter_version, "3.22.3") == 0 &&
+        fixed_descriptor->descriptor_id != nullptr &&
+        std::strcmp(fixed_descriptor->descriptor_id,
+                    "flutter-3.22.3-dart-3.4.4-android-arm64-product") == 0 &&
+        dartplant_flutter_vm_descriptor_at(1) == nullptr;
+    __android_log_print(fixed_profile_gate ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DartPlant Flutter VM adapter profile gate: %u count=%u dart=%s flutter=%s",
+                        static_cast<unsigned>(fixed_profile_gate),
+                        static_cast<unsigned>(descriptor_count),
+                        fixed_descriptor == nullptr || fixed_descriptor->dart_version == nullptr
+                            ? "none"
+                            : fixed_descriptor->dart_version,
+                        fixed_descriptor == nullptr || fixed_descriptor->flutter_version == nullptr
+                            ? "none"
+                            : fixed_descriptor->flutter_version);
+    if (!fixed_profile_gate) {
+        g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const DartPlantFlutterVmAdapterOptions adapter_options = {
+        .struct_size = sizeof(DartPlantFlutterVmAdapterOptions),
+        .api_version = DARTPLANT_FLUTTER_VM_ADAPTER_API_VERSION,
+        .api_dl_data = api_dl_data,
+        .thread = thr,
+        .isolate_generation = 1,
+        .snapshot_hash = snapshot_info.snapshot_hash,
+        .snapshot_features = snapshot_info.snapshot_features,
+    };
+    const DartPlantStatus adapter_status =
+        dartplant_flutter_vm_adapter_create(&adapter_options, &g_flutter_vm_adapter);
+    DartPlantVmAdapter* vm_adapter = dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter);
+    if (adapter_status != DARTPLANT_OK || vm_adapter == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
                             "exact V3 VM adapter initialization failed status=%d error=%s",
                             adapter_status, dartplant_last_error());
@@ -1499,6 +1937,10 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     return DARTPLANT_OK;
 }
 
+DartPlantVmAdapter* dartplant_fixture_dart_api_adapter() {
+    return dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter);
+}
+
 #if defined(__aarch64__)
 extern "C" __attribute__((naked, visibility("default"))) int dartplant_fixture_initialize(void*) {
     __asm__ volatile(
@@ -1537,6 +1979,10 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
         dartplant_unhook(g_forced_stack_closure_hook);
         dartplant_release_hook(g_forced_stack_closure_hook);
     }
+    if (g_type_arguments_closure_hook != nullptr) {
+        dartplant_unhook(g_type_arguments_closure_hook);
+        dartplant_release_hook(g_type_arguments_closure_hook);
+    }
     if (g_echo_object_hook != nullptr) {
         dartplant_unhook(g_echo_object_hook);
         dartplant_release_hook(g_echo_object_hook);
@@ -1561,7 +2007,12 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     if (g_signature_probe != nullptr) dartplant_release_method(g_signature_probe);
     if (g_verified_abi_double != nullptr) dartplant_release_method(g_verified_abi_double);
     if (g_forced_stack_closure != nullptr) dartplant_release_method(g_forced_stack_closure);
+    if (g_type_arguments_closure != nullptr) dartplant_release_method(g_type_arguments_closure);
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
+    if (g_flutter_vm_adapter != nullptr) {
+        dartplant_flutter_vm_adapter_destroy(g_flutter_vm_adapter);
+        g_flutter_vm_adapter = nullptr;
+    }
     g_instrumented_add = nullptr;
     g_add_int = nullptr;
     g_echo_object = nullptr;
@@ -1569,8 +2020,10 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_signature_probe = nullptr;
     g_verified_abi_double = nullptr;
     g_forced_stack_closure = nullptr;
+    g_type_arguments_closure = nullptr;
     g_instrumented_add_hook = nullptr;
     g_forced_stack_closure_hook = nullptr;
+    g_type_arguments_closure_hook = nullptr;
     g_echo_object_hook = nullptr;
     g_negate_bool_hook = nullptr;
     g_verified_abi_double_hook = nullptr;
@@ -1586,6 +2039,7 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
     g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
+    ResetTypeArgumentsProofState();
     dartplant_fixture_reset_null_semantic_probe();
     dartplant_fixture_reset_bool_semantic_probe();
     dartplant_fixture_reset_verified_abi_double_probe();

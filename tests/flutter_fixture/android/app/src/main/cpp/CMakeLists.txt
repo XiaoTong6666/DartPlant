@@ -10,6 +10,9 @@ set(DARTPLANT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(DARTPLANT_BUILD_ANDROID_TESTS OFF CACHE BOOL "" FORCE)
 set(DARTPLANT_BUILD_ANDROID_MODULE OFF CACHE BOOL "" FORCE)
 set(DARTPLANT_BUILD_DOBBY_ADAPTER OFF CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER OFF CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4 ON CACHE BOOL "" FORCE)
+set(DARTPLANT_DART_SDK_ROOT "${DART_SDK_ROOT}" CACHE PATH "" FORCE)
 if(NOT DEFINED DARTPLANT_DOBBY_ROOT)
     set(DARTPLANT_DOBBY_ROOT "${DARTPLANT_ROOT}/third_party/dobby" CACHE PATH "" FORCE)
 endif()
@@ -27,6 +30,10 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/dartplant"
 )
 
+# Keep the root-relocation diagnostics test-only. Production DartPlant builds
+# do not emit per-invocation TypeArguments root logs.
+target_compile_definitions(dartplant_core PRIVATE DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING=1)
+
 add_library(
     dartplant_fixture_bridge
     SHARED
@@ -34,14 +41,7 @@ add_library(
     fixture_host.cpp
     simple_facade_consumer.cpp
     p6_abi_probe.cpp
-    dart_api_adapter.cpp
-    dart_vm_transition.S
-    dart_raw_bridge.cpp
-    "${DART_SDK_ROOT}/runtime/include/dart_api_dl.c"
-)
-set_source_files_properties(
-    "${DART_SDK_ROOT}/runtime/include/dart_api_dl.c"
-    PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter"
+    dart_api_adapter.h
 )
 
 target_compile_features(dartplant_fixture_bridge PRIVATE cxx_std_20)
@@ -65,6 +65,7 @@ target_link_libraries(
     dartplant_fixture_bridge
     PRIVATE
     dartplant_core
+    dartplant_adapter_flutter_vm_3_4_4
     dobby
     log
     dl

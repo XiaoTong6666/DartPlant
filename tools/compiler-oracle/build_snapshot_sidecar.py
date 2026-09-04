@@ -85,6 +85,9 @@ class AbiEvidence:
     has_optional_parameters: bool = False
     has_overrides_with_less_direct_parameters: bool = False
     implicit_parameter_count: int = 0
+    parameter_locations: tuple[str, ...] = ()
+    uses_arguments_descriptor: bool = False
+    loads_entry_stack: bool = False
 
 
 @dataclass(frozen=True)
@@ -418,13 +421,19 @@ def _representation_from_text(text: str) -> str:
 
 
 def _extract_abi(
-    log: str, function_name: str, *, exact_printed_name: str | None = None
+    log: str,
+    function_name: str,
+    *,
+    exact_printed_name: str | None = None,
+    allow_sparse_parameter_indexes: bool = False,
 ) -> AbiEvidence:
     suffixes = (f"_::{function_name}", f"_::_{function_name}")
     in_function = False
     parameters: dict[int, tuple[str, str]] = {}
     values: dict[int, str] = {}
     result = "unknown"
+    uses_arguments_descriptor = False
+    loads_entry_stack = False
     for line in log.splitlines():
         if not in_function:
             match = _CFG_HEADER_RE.match(line)
@@ -439,6 +448,11 @@ def _extract_abi(
             continue
         if line == "*** END CFG":
             break
+
+        if "ArgumentsDescriptor." in line:
+            uses_arguments_descriptor = True
+        if "LoadIndexedUnsafe(fp[" in line:
+            loads_entry_stack = True
 
         parameter = _PARAMETER_RE.match(line)
         if parameter is not None:
@@ -466,7 +480,7 @@ def _extract_abi(
     if not in_function or not parameters:
         raise ValueError(f"optimized CFG did not expose parameters for {function_name!r}")
     ordered_indexes = sorted(parameters)
-    if ordered_indexes != list(range(len(ordered_indexes))):
+    if not allow_sparse_parameter_indexes and ordered_indexes != list(range(len(ordered_indexes))):
         raise ValueError(f"non-contiguous formal parameter indexes: {ordered_indexes}")
     representations = tuple(parameters[index][0] for index in ordered_indexes)
     locations = [parameters[index][1] for index in ordered_indexes]
@@ -477,6 +491,9 @@ def _extract_abi(
         result=result,
         max_parameters_in_registers=max_in_registers,
         must_use_stack_calling_convention=must_use_stack,
+        parameter_locations=tuple(locations),
+        uses_arguments_descriptor=uses_arguments_descriptor,
+        loads_entry_stack=loads_entry_stack,
     )
 
 
@@ -496,6 +513,35 @@ def _derive_closure_abi_from_cfg(
     """
     if not closure_cfg.parameters:
         raise ValueError("compiler closure CFG has no hidden Closure parameter")
+    if parent.has_optional_parameters:
+        # Optional/named synthetic closures do not materialize the hidden
+        # Closure and user formals as Parameter nodes. Instead the VM presents
+        # the ArgumentsDescriptor in r4 and the synthetic body loads the actual
+        # boxed arguments from the entry stack using descriptor-derived offsets.
+        # The parent vm.unboxing-info record remains the source of truth for the
+        # user representations; this CFG proves the closure-specific dispatch
+        # shape and that the result remains boxed/tagged.
+        if closure_cfg.parameters != ("tagged",) or closure_cfg.parameter_locations != ("r4",):
+            raise ValueError(
+                "compiler optional-closure CFG does not expose the ArgumentsDescriptor in r4"
+            )
+        if not closure_cfg.uses_arguments_descriptor or not closure_cfg.loads_entry_stack:
+            raise ValueError(
+                "compiler optional-closure CFG does not derive boxed stack arguments from the ArgumentsDescriptor"
+            )
+        if closure_cfg.result != "tagged":
+            raise ValueError(
+                "compiler closure CFG contradicts the boxed synthetic-closure result contract"
+            )
+        return AbiEvidence(
+            parameters=parent.parameters,
+            result=closure_cfg.result,
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+            has_optional_parameters=True,
+            has_overrides_with_less_direct_parameters=parent.has_overrides_with_less_direct_parameters,
+            implicit_parameter_count=0,
+        )
     if not closure_cfg.must_use_stack_calling_convention or closure_cfg.max_parameters_in_registers != 0:
         raise ValueError("compiler closure CFG does not use the required forced-stack convention")
     if any(parameter != "tagged" for parameter in closure_cfg.parameters):
@@ -1133,7 +1179,10 @@ def main() -> int:
         )
         if closure_call_entry_only:
             closure_cfg = _extract_abi(
-                log, args.function_name, exact_printed_name=machine.printed_name
+                log,
+                args.function_name,
+                exact_printed_name=machine.printed_name,
+                allow_sparse_parameter_indexes=parent_abi.has_optional_parameters,
             )
             abi = _derive_closure_abi_from_cfg(parent_abi, closure_cfg)
         else:

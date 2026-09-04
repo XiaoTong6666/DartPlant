@@ -6,6 +6,7 @@ import argparse
 import io
 import json
 import re
+import struct
 import subprocess as sp
 import tarfile
 import tempfile
@@ -42,6 +43,67 @@ def _dart_version(dart: Path) -> str:
     if match is None:
         raise RuntimeError(f"cannot parse Dart SDK version from: {output.strip()}")
     return match.group("version")
+
+
+def _kernel_format_version(dill: Path) -> int:
+    with dill.open("rb") as stream:
+        header = stream.read(8)
+    if len(header) != 8 or header[:4] != b"\x90\xab\xcd\xef":
+        raise ValueError(f"{dill} is not a Dart kernel component")
+    return struct.unpack_from(">I", header, 4)[0]
+
+
+def _sdk_tag_kernel_format(sdk_repo: Path, sdk_tag: str) -> int | None:
+    result = sp.run(
+        [
+            "git",
+            "-C",
+            str(sdk_repo),
+            "show",
+            f"{sdk_tag}:pkg/kernel/lib/binary/tag.dart",
+        ],
+        check=False,
+        stdout=sp.PIPE,
+        stderr=sp.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = re.search(r"BinaryFormatVersion\s*=\s*(\d+)", result.stdout)
+    return None if match is None else int(match.group(1))
+
+
+def _select_sdk_source_tag(sdk_repo: Path, dart_version: str, dill: Path) -> str:
+    kernel_format = _kernel_format_version(dill)
+    # The Flutter bundle's front end may emit a newer component format than
+    # the first SDK patch tag represented by `dart --version`. The source
+    # language level still must match the executable, so prefer the exact
+    # version tag before considering a format-only fallback.
+    if _sdk_tag_exists(sdk_repo, dart_version):
+        return dart_version
+
+    # Flutter can carry a front-end kernel package newer than the Dart VM
+    # executable used to run flutter_tools. Prefer a checked-in SDK tag with
+    # the component format rather than trying to parse the component with an
+    # older package:kernel. This currently covers Flutter 3.24's format 130.
+    format_tag = {130: "3.12.1"}.get(kernel_format)
+    if format_tag is not None and _sdk_tag_kernel_format(sdk_repo, format_tag) == kernel_format:
+        return format_tag
+    raise RuntimeError(
+        f"no Dart SDK source tag matches kernel format {kernel_format} "
+        f"(Dart executable {dart_version}); pass a matching SDK checkout/tag"
+    )
+
+
+def _sdk_tag_exists(sdk_repo: Path, sdk_tag: str) -> bool:
+    result = sp.run(
+        ["git", "-C", str(sdk_repo), "rev-parse", "--verify", f"{sdk_tag}^{{commit}}"],
+        check=False,
+        stdout=sp.DEVNULL,
+        stderr=sp.DEVNULL,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def _absolute_root_uri(package_config: Path, root_uri: str) -> str:
@@ -145,6 +207,10 @@ def main() -> int:
     parser.add_argument("--app-package-config", type=Path, required=True)
     parser.add_argument("--dill", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--sdk-source-tag",
+        help="override the SDK git tag used for package:kernel and vm sources",
+    )
     args = parser.parse_args()
 
     if not args.dart.is_file() or not args.dill.is_file() or not args.app_package_config.is_file():
@@ -153,12 +219,15 @@ def main() -> int:
         raise FileNotFoundError(f"Dart SDK source checkout is not a git repository: {args.sdk_repo}")
 
     sdk_version = _dart_version(args.dart)
+    sdk_source_tag = args.sdk_source_tag or _select_sdk_source_tag(
+        args.sdk_repo.resolve(), sdk_version, args.dill.resolve()
+    )
     dump_script = Path(__file__).with_name("dump_abi_oracle.dart").resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="dartplant-sdk-oracle-") as temp:
         extracted = Path(temp) / "sdk"
         extracted.mkdir()
-        _extract_internal_packages(args.sdk_repo.resolve(), sdk_version, extracted)
+        _extract_internal_packages(args.sdk_repo.resolve(), sdk_source_tag, extracted)
         package_config = Path(temp) / "package_config.json"
         _write_package_config(package_config, extracted, args.app_package_config.resolve())
         _run(
@@ -170,7 +239,10 @@ def main() -> int:
                 str(args.output.resolve()),
             ]
         )
-    print(f"compiler ABI oracle: Dart {sdk_version} -> {args.output}")
+    print(
+        f"compiler ABI oracle: Dart {sdk_version}, SDK sources {sdk_source_tag} "
+        f"-> {args.output}"
+    )
     return 0
 
 

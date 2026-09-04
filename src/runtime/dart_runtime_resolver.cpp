@@ -681,10 +681,10 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     const bool old_app_mapping_present = ContainsModuleIdentity(modules, old_app);
 
     std::optional<FlutterSnapshotSource> snapshot;
+    std::string snapshot_error;
     if (!app_changed && runtime->snapshot.has_value()) {
         snapshot = runtime->snapshot;
     } else if (new_app.has_value()) {
-        std::string snapshot_error;
         snapshot = DiscoverFlutterSnapshot(*new_app, &snapshot_error);
     }
     const bool snapshot_changed = !SameSnapshotIdentity(runtime->snapshot, snapshot);
@@ -739,7 +739,9 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY,
                               DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
                               DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
-        SetLastError("loaded app module has no usable Flutter snapshot source");
+        SetLastError(snapshot_error.empty()
+                         ? "loaded app module has no usable Flutter snapshot source"
+                         : snapshot_error);
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     if (relevant_identity_changed || runtime->state != DARTPLANT_RUNTIME_READY) {
@@ -920,7 +922,7 @@ void dartplant_runtime_destroy(DartPlantRuntime* runtime) {
     delete runtime;
 }
 
-DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, const char*, void*) {
+DartPlantStatus dartplant_runtime_refresh_modules(DartPlantRuntime* runtime) {
     if (runtime == nullptr) {
         dartplant::SetLastError("runtime is null");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -932,6 +934,28 @@ DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, co
     }
     auto modules = dartplant::EnumerateModules();
     return dartplant::RefreshRuntimeModules(runtime, modules);
+}
+
+DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, const char*, void*) {
+    return dartplant_runtime_refresh_modules(runtime);
+}
+
+DartPlantStatus dartplant_runtime_on_module_unloading(DartPlantRuntime* runtime, const char*,
+                                                      void*) {
+    if (runtime == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) return DARTPLANT_RUNTIME_NOT_READY;
+    runtime->generation->fetch_add(1, std::memory_order_acq_rel);
+    const DartPlantStatus status = dartplant::InvalidateRuntimeHooks(runtime->generation);
+    std::lock_guard lock(runtime->mutex);
+    runtime->entry_targets.Clear();
+    runtime->abi_evidence.clear();
+    runtime->live_vm_context.reset();
+    runtime->live_snapshot_index.reset();
+    runtime->artifact_snapshot_index.reset();
+    runtime->bound_artifact_snapshot_generation = 0;
+    runtime->state = status == DARTPLANT_OK ? DARTPLANT_RUNTIME_CREATED : DARTPLANT_RUNTIME_FAILED;
+    return status;
 }
 
 DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,

@@ -42,9 +42,25 @@ bool GeneratedRootCallbacksAvailable(const DartPlantVmAdapterCallbacks& callback
 }
 
 bool GeneratedTransitionCallbacksAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
-    return callbacks.struct_size >= sizeof(DartPlantVmAdapterCallbacks) &&
+    return callbacks.struct_size >= kVmAdapterCallbacksV2Size +
+                                        sizeof(DartPlantEnterGeneratedToNativeCallback) +
+                                        sizeof(DartPlantLeaveNativeToGeneratedCallback) &&
            callbacks.enter_generated_to_native != nullptr &&
            callbacks.leave_native_to_generated != nullptr;
+}
+
+bool ActiveObjectCallbacksAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >= offsetof(DartPlantVmAdapterCallbacks, read_active_stacktrace) +
+                                        sizeof(DartPlantReadActiveObjectCallback) &&
+           callbacks.read_active_exception != nullptr &&
+           callbacks.read_active_stacktrace != nullptr;
+}
+
+bool TypeArgumentsElementCallbackAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >=
+               offsetof(DartPlantVmAdapterCallbacks, read_type_arguments_element) +
+                   sizeof(DartPlantReadTypeArgumentsElementCallback) &&
+           callbacks.read_type_arguments_element != nullptr;
 }
 
 DartPlantStatus CheckAttachedOwnerLocked(DartPlantVmAdapter* adapter) {
@@ -95,6 +111,10 @@ bool VmAdapterSupportsGeneratedRootBridge(const DartPlantVmAdapter* adapter) {
 bool VmAdapterSupportsGeneratedCallbackBridge(const DartPlantVmAdapter* adapter) {
     return adapter != nullptr && GeneratedRootCallbacksAvailable(adapter->callbacks) &&
            GeneratedTransitionCallbacksAvailable(adapter->callbacks);
+}
+
+bool VmAdapterSupportsTypeArgumentsElementRead(const DartPlantVmAdapter* adapter) {
+    return adapter != nullptr && TypeArgumentsElementCallbackAvailable(adapter->callbacks);
 }
 
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter) {
@@ -272,6 +292,64 @@ DartPlantStatus VmAdapterLeaveNativeToGenerated(DartPlantVmAdapter* adapter,
     if (status != DARTPLANT_OK) return status;
     --adapter->generated_native_transitions;
     return DARTPLANT_OK;
+}
+
+DartPlantStatus ReadActiveObject(DartPlantVmAdapter* adapter,
+                                 DartPlantReadActiveObjectCallback callback, uint64_t* out_raw) {
+    if (adapter == nullptr || out_raw == nullptr) {
+        SetLastError("active object read arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (!ActiveObjectCallbacksAvailable(adapter->callbacks)) {
+        SetLastError("VM adapter has no active exception object bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!adapter->attached) {
+        SetLastError("VM adapter has no attached isolate");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!SameOwner(*adapter)) {
+        SetLastError("VM adapter is owned by another thread");
+        return DARTPLANT_VM_THREAD_MISMATCH;
+    }
+    return callback(adapter->user_data, &adapter->isolate, out_raw);
+}
+
+DartPlantStatus VmAdapterReadActiveException(DartPlantVmAdapter* adapter, uint64_t* out_raw) {
+    return ReadActiveObject(
+        adapter, adapter == nullptr ? nullptr : adapter->callbacks.read_active_exception, out_raw);
+}
+
+DartPlantStatus VmAdapterReadActiveStacktrace(DartPlantVmAdapter* adapter, uint64_t* out_raw) {
+    return ReadActiveObject(
+        adapter, adapter == nullptr ? nullptr : adapter->callbacks.read_active_stacktrace, out_raw);
+}
+
+DartPlantStatus VmAdapterReadTypeArgumentsElementGenerated(DartPlantVmAdapter* adapter,
+                                                           uint64_t type_arguments_raw,
+                                                           uint32_t index, uint64_t* out_raw) {
+    if (adapter == nullptr || out_raw == nullptr) {
+        SetLastError("TypeArguments element read arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::unique_lock lock(adapter->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SetLastError("VM adapter TypeArguments state is busy");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!TypeArgumentsElementCallbackAvailable(adapter->callbacks)) {
+        SetLastError("VM adapter has no TypeArguments element bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
+    if (owner != DARTPLANT_OK) return owner;
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+        SetLastError("TypeArguments elements must be captured while Dart is still generated");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    return adapter->callbacks.read_type_arguments_element(adapter->user_data, &adapter->isolate,
+                                                          type_arguments_raw, index, out_raw);
 }
 
 DartPlantStatus VmAdapterCheckHandle(const DartPlantVmAdapter* adapter,

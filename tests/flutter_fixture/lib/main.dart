@@ -5,8 +5,10 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'dartplant_native.dart';
+import 'package:flutter/services.dart';
 
 const fixture = DartPlantFixture();
+const _launchChannel = MethodChannel('dev.dartplant.fixture/launch');
 
 void movingGcPressure(SendPort port) {
   port.send(1);
@@ -39,6 +41,97 @@ bool negateBool(bool value) => !value;
 @pragma('vm:entry-point')
 @pragma('vm:never-inline')
 T signatureProbe<T>(T value, {required bool enabled, int count = 0}) => value;
+
+typedef SignatureProbeClosure = T Function<T>(
+  T value, {
+  required bool enabled,
+  int count,
+});
+
+// Keep a real generic tear-off alive in PRODUCT. The proof calls it through a
+// generic function-typed parameter so AOT cannot replace the invocation with a
+// direct call to signatureProbe; the closure calling convention must carry x4
+// ArgumentsDescriptor and the explicit TypeArguments vector.
+final SignatureProbeClosure retainedGenericClosure = signatureProbe;
+SignatureProbeClosure? _bootstrapRetainedGenericClosure;
+
+final class TypeArgumentsProofValue {
+  const TypeArgumentsProofValue(this.value);
+
+  final int value;
+
+  @override
+  String toString() => 'TypeArgumentsProofValue($value)';
+}
+
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+List<U> invokeRetainedGenericClosure<U>(
+  SignatureProbeClosure callback,
+  U value,
+) {
+  final argument = <U>[value];
+  return callback<List<U>>(
+    argument,
+    enabled: true,
+    count: 1,
+  );
+}
+
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+int typeArgumentsGcPressure() {
+  // This function is invoked from the native enter callback through Dart_Invoke.
+  // Churn enough young-space allocation to force at least one scavenge while
+  // DartPlant's generated-root lease is the only relocation-safe copy of the
+  // TypeArguments element available to the callback.
+  var checksum = 0;
+  final retained = <List<Object?>>[];
+  for (var round = 0; round < 12; ++round) {
+    for (var index = 0; index < 4096; ++index) {
+      final marker = _GcPressureMarker((round << 12) | index);
+      retained.add(List<Object?>.filled(128, marker));
+      checksum ^= marker.value + retained.last.length;
+      if (retained.length == 192) retained.clear();
+    }
+  }
+  return checksum & 0x7fffffff;
+}
+
+final class _GcPressureMarker {
+  const _GcPressureMarker(this.value);
+
+  final int value;
+}
+
+String _runTypeArgumentsProof(String source) {
+  final callback = _bootstrapRetainedGenericClosure ?? retainedGenericClosure;
+  final prepare = DartPlantNative.typeArgumentsProofPrepare(callback);
+  debugPrint(
+    'DartPlant app TypeArguments proof trigger: source=$source prepare=$prepare explicit=List<TypeArgumentsProofValue>',
+  );
+  if (prepare != 0) {
+    final failed = 'typeargs:$source prepare=$prepare';
+    debugPrint('DartPlant app TypeArguments proof: 0 $failed');
+    return failed;
+  }
+
+  final value = invokeRetainedGenericClosure<TypeArgumentsProofValue>(
+    callback,
+    const TypeArgumentsProofValue(37),
+  );
+  final native = DartPlantNative.typeArgumentsProof();
+  final resultOk = value.length == 1 &&
+      value.single.value == 37 &&
+      value.runtimeType.toString().contains('TypeArgumentsProofValue');
+  final passed = native == 1 && resultOk;
+  final summary =
+      'typeargs:$source native=$native result=${value.single} runtimeType=${value.runtimeType}';
+  debugPrint(
+    'DartPlant app TypeArguments proof: ${passed ? 1 : 0} source=$source native=$native result_ok=${resultOk ? 1 : 0} value=${value.single} runtimeType=${value.runtimeType}',
+  );
+  return summary;
+}
 
 // Keep this as an ordinary direct-call-only optimized AOT body. Without a
 // tear-off the compiler is free to use the unboxed double Dart calling
@@ -137,6 +230,15 @@ int verifiedAbiImmediateCatchProbe() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Top-level tear-offs are lazily initialized. Force this generic implicit
+  // closure into the live object graph before DartPlant builds its VM Function
+  // index, then keep the same object strongly reachable for the later proof.
+  _bootstrapRetainedGenericClosure = retainedGenericClosure;
+  debugPrint(
+    'DartPlant app retained generic closure bootstrap: ${_bootstrapRetainedGenericClosure != null ? 1 : 0}',
+  );
+
   final initializeStartStatus = DartPlantNative.startInitialize();
   runApp(const DartPlantFixtureApp());
 
@@ -323,6 +425,15 @@ Future<void> main() async {
     debugPrint(
       'DartPlant late shared typed fail-close: ${lateSharedPassed ? 1 : 0} transition=$lateSharedTransition values=$ordinaryDirect/$ordinaryAfterShared',
     );
+
+    if (Platform.isAndroid) {
+      final launchProbe =
+          await _launchChannel.invokeMethod<String>('launchProbe');
+      debugPrint('DartPlant app launch probe: ${launchProbe ?? 'none'}');
+      if (launchProbe == 'type_arguments') {
+        _runTypeArgumentsProof('adb');
+      }
+    }
   });
 }
 
@@ -400,6 +511,10 @@ final class _FixtureScreenState extends State<FixtureScreen> {
     _show('instrumented:$value calls=$calls native=$native');
   }
 
+  void _runTypeArgumentsButtonProbe() {
+    _show(_runTypeArgumentsProof('ui'));
+  }
+
   Future<void> _runObjectProbe() async {
     if (Platform.isAndroid) DartPlantNative.beginObjectProbe();
     final first = 'object:${fixture.echoObject(const FixtureObject(9))}';
@@ -438,6 +553,11 @@ final class _FixtureScreenState extends State<FixtureScreen> {
               key: const ValueKey('fixture-instrumented-add'),
               onPressed: _runInstrumentedAdd,
               child: const Text('instrumentedAdd'),
+            ),
+            FilledButton(
+              key: const ValueKey('fixture-type-arguments'),
+              onPressed: _runTypeArgumentsButtonProbe,
+              child: const Text('TypeArguments GC proof'),
             ),
             FilledButton(
               key: const ValueKey('fixture-int'),

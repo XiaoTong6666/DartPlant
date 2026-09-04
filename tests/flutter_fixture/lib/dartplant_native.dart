@@ -18,6 +18,10 @@ typedef _P6AbiProbeNative = Uint64 Function();
 typedef _P6AbiProbeDart = int Function();
 typedef _ForcedStackClosureProbeNative = Uint64 Function();
 typedef _ForcedStackClosureProbeDart = int Function();
+typedef _TypeArgumentsProofPrepareNative = Int32 Function(Handle);
+typedef _TypeArgumentsProofPrepareDart = int Function(Object);
+typedef _TypeArgumentsProofNative = Uint64 Function();
+typedef _TypeArgumentsProofDart = int Function();
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -102,6 +106,17 @@ final class DartPlantNative {
   static final _ForcedStackClosureProbeDart _forcedStackClosureProbe = _library
       .lookup<NativeFunction<_ForcedStackClosureProbeNative>>(
         'dartplant_fixture_forced_stack_closure_probe',
+      )
+      .asFunction();
+  static final _TypeArgumentsProofPrepareDart _typeArgumentsProofPrepare =
+      _library
+          .lookup<NativeFunction<_TypeArgumentsProofPrepareNative>>(
+            'dartplant_fixture_type_arguments_proof_prepare',
+          )
+          .asFunction();
+  static final _TypeArgumentsProofDart _typeArgumentsProof = _library
+      .lookup<NativeFunction<_TypeArgumentsProofNative>>(
+        'dartplant_fixture_type_arguments_proof',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -235,6 +250,11 @@ final class DartPlantNative {
   static int p6AbiProbe() => _p6AbiProbe();
 
   static int forcedStackClosureProbe() => _forcedStackClosureProbe();
+
+  static int typeArgumentsProofPrepare(Object closure) =>
+      _typeArgumentsProofPrepare(closure);
+
+  static int typeArgumentsProof() => _typeArgumentsProof();
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

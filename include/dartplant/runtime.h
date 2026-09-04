@@ -53,6 +53,14 @@ DARTPLANT_EXPORT void dartplant_runtime_destroy(DartPlantRuntime* runtime);
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime,
                                                                     const char* module_name,
                                                                     void* module_handle);
+// Re-enumerates the complete process image set. Hosts should call the unload
+// form before dlclose when possible so active hooks are removed while mappings
+// remain valid. Call refresh_modules after the loader operation; replacement
+// incarnations advance runtime generation and require a new live-VM bootstrap.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_on_module_unloading(DartPlantRuntime* runtime,
+                                                                       const char* module_name,
+                                                                       void* module_handle);
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_refresh_modules(DartPlantRuntime* runtime);
 
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
                                                             DartPlantRuntimeInfo* out_info);

@@ -19,6 +19,7 @@ GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
 SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
 CLOSURE_SIDECAR_HEADER = GENERATED_DIR / "p6_forced_stack_closure_sidecar.h"
+TYPE_ARGUMENTS_CLOSURE_SIDECAR_HEADER = GENERATED_DIR / "type_arguments_closure_sidecar.h"
 P6_SIDECARS = (
     ("verifiedAbiInt64", "DartPlantP6Int64", GENERATED_DIR / "p6_int64_sidecar.h"),
     (
@@ -108,6 +109,15 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
     aot_analyzer = ROOT_DIR / "build" / "host" / "dartplant_aot_abi_analyzer_cli"
     if not aot_analyzer.is_file():
         raise FileNotFoundError(f"DartPlant ARM64 structural analyzer not found: {aot_analyzer}")
+
+    # A release build may reuse .dart_tool/flutter_build entries produced by a
+    # different Flutter/Dart toolchain. Picking the newest app.dill by mtime is
+    # not sufficient in that case: an old Kernel binary can survive while the
+    # APK itself is rebuilt, then fail the exact-version compiler oracle with a
+    # Kernel format mismatch. Clean before recreating DartPlant's generated
+    # sidecar placeholders so both the APK and oracle dill come from this exact
+    # Flutter invocation.
+    run([flutter, "clean"], cwd=FIXTURE_DIR, env=build_env)
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     SIDECAR_HEADER.write_text(
         "// Generated placeholder; replaced after the first AOT build.\n"
@@ -120,6 +130,10 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
             "#pragma once\n"
         )
     CLOSURE_SIDECAR_HEADER.write_text(
+        "// Generated placeholder; replaced after the first AOT build.\n"
+        "#pragma once\n"
+    )
+    TYPE_ARGUMENTS_CLOSURE_SIDECAR_HEADER.write_text(
         "// Generated placeholder; replaced after the first AOT build.\n"
         "#pragma once\n"
     )
@@ -265,6 +279,38 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
             "--class-name",
             "Global",
             "--function-name",
+            "signatureProbe",
+            "--artifact-function-name",
+            "[tear-off] signatureProbe",
+            "--compiler-function-kind",
+            "ImplicitClosureFunction",
+            "--abi-oracle-json",
+            str(ABI_ORACLE_JSON),
+            "--aot-analyzer",
+            str(aot_analyzer),
+            "--symbol-prefix",
+            "DartPlantTypeArgumentsClosure",
+            "--output-header",
+            str(TYPE_ARGUMENTS_CLOSURE_SIDECAR_HEADER),
+        ],
+        cwd=ROOT_DIR,
+        env=os.environ.copy(),
+    )
+    run(
+        [
+            sys.executable,
+            str(ROOT_DIR / "tools" / "compiler-oracle" / "build_snapshot_sidecar.py"),
+            "--gen-snapshot",
+            str(gen_snapshot),
+            "--dill",
+            str(dill),
+            "--libapp",
+            str(libapp),
+            "--library-uri",
+            "package:dartplant_fixture/main.dart",
+            "--class-name",
+            "Global",
+            "--function-name",
             "verifiedAbiDouble",
             "--abi-oracle-json",
             str(ABI_ORACLE_JSON),
@@ -277,10 +323,17 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
         env=os.environ.copy(),
     )
 
-    # The generated header changes only the native fixture bridge. Dart source
-    # and app.dill are unchanged, so deterministic libapp.so remains the exact
-    # artifact to which the sidecar above was bound.
-    run(build_command, cwd=FIXTURE_DIR, env=os.environ.copy())
+    # The generated headers change only the native fixture bridge. Gradle's
+    # externalNativeBuild input snapshot does not reliably notice headers that
+    # are created after the first configure/build, so a second Flutter build can
+    # otherwise reuse the placeholder-built fixture_bridge object and omit the
+    # static ArtifactBundle registrars entirely. Force only the native CMake
+    # intermediates to be regenerated; Dart source/app.dill stay untouched and
+    # deterministic libapp.so remains the exact artifact to which the sidecars
+    # above were bound.
+    shutil.rmtree(FIXTURE_DIR / "android" / "app" / ".cxx", ignore_errors=True)
+    shutil.rmtree(FIXTURE_DIR / "build" / "app" / "intermediates" / "cxx", ignore_errors=True)
+    run(build_command, cwd=FIXTURE_DIR, env=build_env)
     with zipfile.ZipFile(APK_PATH) as archive:
         rebuilt_libapp = archive.read("lib/arm64-v8a/libapp.so")
     if rebuilt_libapp != libapp.read_bytes():
@@ -327,12 +380,14 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
         if (
             "cold bootstrap status=" in latest
             and "DartPlant initialize status:" in latest
+            and "DartPlant Flutter VM adapter profile gate:" in latest
             and "DartPlant local gate real-Dart warmup:" in latest
             and "DartPlant FunctionType semantic probe:" in latest
             and "DartPlant FunctionType named semantic probe:" in latest
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
             and "DartPlant closure receiver probe:" in latest
+            and "DartPlant app TypeArguments proof:" in latest
             and "DartPlant P6 ABI corpus:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
             and "DartPlant late shared typed fail-close:" in latest
@@ -345,7 +400,22 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
 def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> ColdStartResult:
     run(adb_cmd(["logcat", "-c"], device=serial))
     run(adb_cmd(["shell", "am", "force-stop", PACKAGE], device=serial))
-    run(adb_cmd(["shell", "am", "start", "-W", "-n", ACTIVITY], device=serial))
+    run(
+        adb_cmd(
+            [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-n",
+                ACTIVITY,
+                "--es",
+                "dartplant_probe",
+                "type_arguments",
+            ],
+            device=serial,
+        )
+    )
 
     pid = _read_pid(serial)
     if not pid:
@@ -369,6 +439,10 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(f"cold start {round_index}: automatic live Function index was not ready\n{logs}")
     if "DartPlant initialize status: 0" not in logs:
         raise RuntimeError(f"cold start {round_index}: runtime init failed\n{logs}")
+    if "DartPlant Flutter VM adapter profile gate: 1 count=1 dart=3.4.4 flutter=3.22.3" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: fixed Flutter VM adapter profile gate failed\n{logs}"
+        )
     if "DartPlant local gate real-Dart warmup: 1 value=115" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: local-gated real Dart entry/JumpToFrame warmup failed\n{logs}"
@@ -403,6 +477,34 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     if "DartPlant closure receiver probe: 1 value=78 native=1" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: Dart implicit closure invocation failed\n{logs}"
+        )
+    if "DartPlant app launch probe: type_arguments" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: adb TypeArguments launch extra was not delivered\n{logs}"
+        )
+    if "DartPlantTypeArgs: capture vector=" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: DartPlant did not log generated-state TypeArguments capture\n{logs}"
+        )
+    if "DartPlantTypeArgs: root_get element[0]" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: DartPlant did not read the TypeArguments element root\n{logs}"
+        )
+    if (
+        "TypeArguments proof native result dart_api=1" not in logs
+        or "element_relocated=1" not in logs
+        or "passed=1" not in logs
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: TypeArguments element was not proven across Dart API GC\n{logs}"
+        )
+    if "TypeArguments proof native summary enter=1 failures=0" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: native TypeArguments proof summary failed\n{logs}"
+        )
+    if "DartPlant app TypeArguments proof: 1 source=adb native=1 result_ok=1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: Dart-side TypeArguments proof result failed\n{logs}"
         )
     if "simple facade typed install ready=1 status=0" not in logs:
         raise RuntimeError(

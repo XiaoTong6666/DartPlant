@@ -915,8 +915,14 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         (sdk_root / "runtime" / "vm" / "app_snapshot.cc").read_text(),
         source_name="current Dart SDK",
     )
-    if "untag()->entry_point_ = function.entry_point();" not in object_header_text:
-        raise ValueError("Dart Closure no longer caches Function.entry_point on set_function")
+    caches_closure_entry = "untag()->entry_point_ = function.entry_point();" in object_header_text
+    precompiled_closure_entry = (
+        "void set_entry_point(uword entry_point) const" in object_header_text
+        and "closure.ptr()->untag()->entry_point_ = entry_point;" in
+        (sdk_root / "runtime" / "vm" / "app_snapshot.cc").read_text()
+    )
+    if not caches_closure_entry and not precompiled_closure_entry:
+        raise ValueError("Dart Closure no longer exposes a verified entry-point cache contract")
     il_arm64_text = il_arm64.read_text()
     closure_call_start = il_arm64_text.find("void ClosureCallInstr::EmitNativeCode")
     if closure_call_start < 0:

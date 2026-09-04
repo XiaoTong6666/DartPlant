@@ -198,6 +198,8 @@ struct DartPlantListenerRecord {
     std::shared_ptr<DartPlantMethod> requested_method;
     std::atomic_bool active{true};
     std::atomic_uint64_t in_flight{0};
+    std::atomic<DartPlantExceptionCallback> on_exception{nullptr};
+    std::atomic<void*> exception_user_data{nullptr};
 };
 
 struct RuntimeState {

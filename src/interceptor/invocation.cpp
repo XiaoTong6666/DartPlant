@@ -74,15 +74,16 @@ bool AddOffset(uintptr_t base, uint64_t offset, uintptr_t* out_address) {
 
 bool ReadLiveVmHeapBase(const DartPlantInvocation* invocation, uint64_t* out_heap_base) {
     if (invocation == nullptr || invocation->profile == nullptr || invocation->context == nullptr ||
-        out_heap_base == nullptr) {
+        invocation->requested_method == nullptr ||
+        invocation->requested_method->function == nullptr || out_heap_base == nullptr) {
         return false;
     }
     if (invocation->live_vm_heap_base != 0) {
         *out_heap_base = invocation->live_vm_heap_base;
         return true;
     }
-    const auto* profile =
-        dartplant::FindRuntimeProfileByVersion(invocation->profile->profile_version);
+    const auto* profile = dartplant::FindRuntimeProfileByVersion(
+        invocation->requested_method->function->runtime_profile_version);
     if (profile == nullptr || profile->live_vm.thr_register >= 31 ||
         profile->live_vm.thread_heap_base_offset == 0) {
         return false;
@@ -136,18 +137,8 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     }
     uint32_t compressed_name = 0;
     uint32_t raw_position = 0;
-    const bool name_read = ReadSelfValue(name_address, &compressed_name);
-    const bool position_read = ReadSelfValue(position_address, &raw_position);
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-    __android_log_print(
-        ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-        "named_entry[%u] object=0x%llx entry=0x%llx name_addr=0x%llx pos_addr=0x%llx name_read=%u name=0x%08x pos_read=%u pos=0x%08x",
-        index, static_cast<unsigned long long>(object), static_cast<unsigned long long>(entry),
-        static_cast<unsigned long long>(name_address),
-        static_cast<unsigned long long>(position_address), static_cast<unsigned>(name_read),
-        compressed_name, static_cast<unsigned>(position_read), raw_position);
-#endif
-    if (!name_read || !position_read ||
+    if (!ReadSelfValue(name_address, &compressed_name) ||
+        !ReadSelfValue(position_address, &raw_position) ||
         (compressed_name & raw.smi_tag_mask) != raw.heap_object_tag ||
         (raw_position & raw.smi_tag_mask) != raw.smi_tag ||
         raw_position >> raw.smi_tag_shift > UINT32_MAX) {
@@ -155,11 +146,6 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     }
     uint64_t heap_base = 0;
     if (!ReadLiveVmHeapBase(invocation, &heap_base) || heap_base > UINT64_MAX - compressed_name) {
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-        __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-                            "named_entry[%u] heap base read failed heap=0x%llx name=0x%08x", index,
-                            static_cast<unsigned long long>(heap_base), compressed_name);
-#endif
         return false;
     }
     const uint64_t tagged_name = heap_base + compressed_name;
@@ -168,39 +154,11 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     uint64_t tags = 0;
     if (!ReadSelfValue(name_object, &tags) || raw.class_id_tag_bits == 0 ||
         raw.class_id_tag_bits >= 64) {
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-        uint64_t shifted_tags = 0;
-        uint64_t halved_tags = 0;
-        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name << 1) - 1),
-                      &shifted_tags);
-        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name >> 1) - 1), &halved_tags);
-        __android_log_print(
-            ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-            "named_entry[%u] string tags read failed object=0x%llx tags=0x%llx shifted=0x%llx halved=0x%llx",
-            index, static_cast<unsigned long long>(name_object),
-            static_cast<unsigned long long>(tags), static_cast<unsigned long long>(shifted_tags),
-            static_cast<unsigned long long>(halved_tags));
-#endif
         return false;
     }
     const uint64_t class_id_mask = (uint64_t{1} << raw.class_id_tag_bits) - 1;
     name_cid = static_cast<uint32_t>((tags >> raw.class_id_tag_shift) & class_id_mask);
-    if (name_cid != profile->live_vm.cid_one_byte_string) {
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-        uint64_t shifted_tags = 0;
-        uint64_t halved_tags = 0;
-        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name << 1) - 1),
-                      &shifted_tags);
-        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name >> 1) - 1), &halved_tags);
-        __android_log_print(
-            ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-            "named_entry[%u] string cid mismatch cid=%u expected=%u tags=0x%llx shifted=0x%llx halved=0x%llx",
-            index, name_cid, profile->live_vm.cid_one_byte_string,
-            static_cast<unsigned long long>(tags), static_cast<unsigned long long>(shifted_tags),
-            static_cast<unsigned long long>(halved_tags));
-#endif
-        return false;
-    }
+    if (name_cid != profile->live_vm.cid_one_byte_string) return false;
     uintptr_t length_address = 0;
     if (!AddOffset(name_object, profile->live_vm.string_length_offset, &length_address))
         return false;
@@ -550,15 +508,8 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
     for (uint32_t named = 0; named < info.named_count; ++named) {
         uint32_t argument_position = 0;
         std::string name;
-        const bool named_entry_ok =
-            ReadDescriptorNamedEntry(invocation, named, &argument_position, &name);
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-        __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-                            "named_entry[%u] read=%u position=%u name=%s count=%u", named,
-                            static_cast<unsigned>(named_entry_ok), argument_position, name.c_str(),
-                            info.count);
-#endif
-        if (!named_entry_ok || argument_position == 0 || argument_position >= info.count) {
+        if (!ReadDescriptorNamedEntry(invocation, named, &argument_position, &name) ||
+            argument_position == 0 || argument_position >= info.count) {
             dartplant::SetLastError("closure named ArgumentsDescriptor entry is invalid");
             return false;
         }

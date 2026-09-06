@@ -3605,7 +3605,7 @@ TEST_CASE(NamedGenericClosureArgumentsUseDescriptorNamesAndPositions) {
     alignas(8) std::array<uint8_t, 64> descriptor{};
     alignas(8) std::array<uint8_t, 32> name_object{};
     const uint64_t descriptor_tags = uint64_t{90} << 12;
-    const uint64_t string_tags = uint64_t{93} << 12;
+    const uint64_t string_tags = uint64_t{94} << 12;
     std::memcpy(descriptor.data(), &descriptor_tags, sizeof(descriptor_tags));
     std::memcpy(name_object.data(), &string_tags, sizeof(string_tags));
     const uint32_t name_length = 1 << 1;
@@ -3656,20 +3656,22 @@ TEST_CASE(NamedGenericClosureArgumentsUseDescriptorNamesAndPositions) {
 
     DartPlantMethod method{};
     method.function = std::make_shared<dartplant::DartFunctionHandle>();
-    method.function->runtime_profile_version = 1;
+    method.function->runtime_profile_version = 3;
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
     std::array<uint64_t, 4> arguments = {0x40, 0x20, 0, 0x801};
     DartPlantArm64Context context{};
     context.x[4] = reinterpret_cast<uint64_t>(descriptor.data()) + 1;
     context.x[15] = reinterpret_cast<uint64_t>(arguments.data());
+    alignas(8) std::array<uint8_t, 0x60> thread{};
+    std::memcpy(thread.data() + 0x58, &heap_base, sizeof(heap_base));
+    context.x[26] = reinterpret_cast<uint64_t>(thread.data());
     DartPlantInvocation invocation{};
     invocation.profile = &profile;
     invocation.requested_method = &method;
     invocation.call_layout = &layout;
     invocation.context = &context;
     invocation.phase = DARTPLANT_INVOCATION_ENTER;
-    invocation.live_vm_heap_base = heap_base;
 
     DartPlantValue value{};
     EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));

@@ -782,6 +782,18 @@ uint8_t dartplant_hook_handle_is_idle(const DartPlantHookHandle* handle) {
                : 1;
 }
 
+DartPlantStatus dartplant_hook_handle_set_exception_callback(DartPlantHookHandle* handle,
+                                                             DartPlantExceptionCallback callback,
+                                                             void* user_data) {
+    if (handle == nullptr || handle->listener == nullptr || handle->listener->record == nullptr ||
+        handle->removed) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    handle->listener->record->exception_user_data.store(user_data, std::memory_order_release);
+    handle->listener->record->on_exception.store(callback, std::memory_order_release);
+    return DARTPLANT_OK;
+}
+
 void dartplant_release_hook_handle(DartPlantHookHandle* handle) {
     if (handle == nullptr) return;
     if (handle->listener != nullptr && !dartplant_listener_is_idle(handle->listener)) {

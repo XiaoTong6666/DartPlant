@@ -50,6 +50,7 @@ typedef struct DartPlantArm64Context {
 typedef enum DartPlantInvocationPhase {
     DARTPLANT_INVOCATION_ENTER = 0,
     DARTPLANT_INVOCATION_LEAVE,
+    DARTPLANT_INVOCATION_EXCEPTION,
 } DartPlantInvocationPhase;
 
 typedef struct DartPlantMethodIdentityInfo {
@@ -61,8 +62,8 @@ typedef struct DartPlantMethodIdentityInfo {
     DartPlantEntryKind entry_kind;
 } DartPlantMethodIdentityInfo;
 
-// Compatibility alias for dartplant_invocation_requested_method(). On shared
-// Shared entry targets use the method under which the current listener was
+// Compatibility alias for dartplant_invocation_requested_method(). Shared
+// entry targets use the method under which the current listener was
 // registered, not proof of the logical caller that reached the physical entry.
 DARTPLANT_EXPORT const DartPlantMethod* dartplant_invocation_method(
     const DartPlantInvocation* invocation);
@@ -118,9 +119,8 @@ dartplant_invocation_argument_count(const DartPlantInvocation* invocation);
 // These helpers are available only when DartPlant has exact default-entry
 // closure-call evidence (live VM or compiler artifact + SDK contract); a typed
 // DartCallLayout is not required. Access is enter-only, before x0 is repurposed
-// as the result register. Retaining the receiver as a GC-safe Dart object is
-// intentionally not exposed until real Dart hooks have a generated-to-native
-// transition whose register roots are visible to the VM.
+// as the result register. With an exact VM V3 adapter, the receiver may also be
+// retained through the adapter's generated-root lease.
 DARTPLANT_EXPORT uint8_t
 dartplant_invocation_has_closure_receiver(const DartPlantInvocation* invocation);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_receiver(
@@ -140,10 +140,29 @@ typedef struct DartPlantArgumentsDescriptorInfo {
 // raw VM call-shape counters. For closure calls, count/size/positional_count
 // include the hidden Closure receiver as one boxed argument, while
 // dartplant_invocation_argument_count() and get_argument() expose only the
-// FunctionType user formals. Named argument strings/positions remain
-// fail-closed until DartPlant can map them onto optional FunctionType formals.
+// FunctionType user formals. Named argument strings/positions are mapped only
+// when the retained FunctionType and descriptor provide an exact match.
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_arguments_descriptor(
     const DartPlantInvocation* invocation, DartPlantArgumentsDescriptorInfo* out_info);
+// Returns the explicitly passed generic closure TypeArguments vector as one
+// opaque tagged object. Enter phase only. The vector itself is never exposed
+// for arbitrary VM-memory access or mutation.
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_type_arguments(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value);
+// Reads one generic closure TypeArguments element that was captured while the
+// mutator was still in generated state and immediately added to the callback's
+// VM-visible generated-root lease. The callback therefore observes the
+// relocated root after moving GC rather than dereferencing the original vector.
+// Exact VM V3 support is required; element mutation/construction is not exposed.
+// Enter phase only.
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_type_argument(
+    const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_retain_closure_type_arguments(
+    DartPlantInvocation* invocation, DartPlantObjectHandle** out_handle);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_exception(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value);
+DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_stacktrace(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_argument(
     const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocation,

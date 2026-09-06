@@ -533,9 +533,77 @@ After AllocateRegisters
                     must_use_stack_calling_convention=True,
                 ),
             )
-        with self.assertRaisesRegex(ValueError, "formal count"):
+
+    def test_optional_generic_closure_uses_arguments_descriptor_stack_dispatch(self) -> None:
+        log = """*** BEGIN CFG
+After AllocateRegisters
+==== package:fixture/main.dart_::_target_target (ImplicitClosureFunction)
+  2: B1[function entry]:2 {
+      v2 <- Parameter(5 @r4) T{*?}
+}
+  4:     v4 <- LoadField(v2 . ArgumentsDescriptor.count {final}) T{_Smi}
+  6:     v7 <- LoadIndexedUnsafe(fp[v4 + 16]) T{Y0?}
+  8:     v8 <- LoadField(v2 . ArgumentsDescriptor.type_args_len {final}) T{_Smi}
+ 10:     v9 <- StaticCall:8( target<1> v7) T{Y0?}
+ 12:     DartReturn:10(v9)
+*** END CFG
+"""
+        with self.assertRaisesRegex(ValueError, "non-contiguous formal parameter indexes"):
+            _extract_abi(
+                log,
+                "target",
+                exact_printed_name="package:fixture/main.dart_::_target_target",
+            )
+        cfg = _extract_abi(
+            log,
+            "target",
+            exact_printed_name="package:fixture/main.dart_::_target_target",
+            allow_sparse_parameter_indexes=True,
+        )
+        parent = AbiEvidence(
+            parameters=("tagged",),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+            has_optional_parameters=True,
+        )
+        closure = _derive_closure_abi_from_cfg(parent, cfg)
+        self.assertEqual(("tagged",), closure.parameters)
+        self.assertEqual("tagged", closure.result)
+        self.assertTrue(closure.must_use_stack_calling_convention)
+        self.assertEqual(0, closure.max_parameters_in_registers)
+        self.assertTrue(closure.has_optional_parameters)
+
+    def test_optional_closure_rejects_non_r4_dispatch_parameter(self) -> None:
+        parent = AbiEvidence(
+            parameters=("tagged",),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+            has_optional_parameters=True,
+        )
+        with self.assertRaisesRegex(ValueError, "ArgumentsDescriptor in r4"):
             _derive_closure_abi_from_cfg(
                 parent,
+                AbiEvidence(
+                    parameters=("tagged",),
+                    result="tagged",
+                    max_parameters_in_registers=1,
+                    must_use_stack_calling_convention=False,
+                    parameter_locations=("r5",),
+                    uses_arguments_descriptor=True,
+                    loads_entry_stack=True,
+                ),
+            )
+        non_optional_parent = AbiEvidence(
+            parameters=("tagged", "tagged"),
+            result="tagged",
+            max_parameters_in_registers=0,
+            must_use_stack_calling_convention=True,
+        )
+        with self.assertRaisesRegex(ValueError, "formal count"):
+            _derive_closure_abi_from_cfg(
+                non_optional_parent,
                 AbiEvidence(
                     parameters=("tagged", "tagged"),
                     result="tagged",

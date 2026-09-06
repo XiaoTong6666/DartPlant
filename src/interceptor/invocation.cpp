@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+#include <android/log.h>
+#endif
+
 #include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
 #include "vm/runtime_profiles.h"
@@ -55,7 +59,8 @@ bool ReadPositiveCompressedSmi(uintptr_t address, const dartplant::RawObjectLayo
 }
 
 bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
-                          const dartplant::abi::DartAbiLocation& location, uint64_t* out_value);
+                          const dartplant::abi::DartAbiLocation& location, uint64_t* out_value,
+                          bool result_location = false);
 const std::vector<dartplant::abi::DartParameterLayout>* ActiveParameters(
     const DartPlantInvocation* invocation);
 
@@ -131,8 +136,18 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     }
     uint32_t compressed_name = 0;
     uint32_t raw_position = 0;
-    if (!ReadSelfValue(name_address, &compressed_name) ||
-        !ReadSelfValue(position_address, &raw_position) ||
+    const bool name_read = ReadSelfValue(name_address, &compressed_name);
+    const bool position_read = ReadSelfValue(position_address, &raw_position);
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+    __android_log_print(
+        ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+        "named_entry[%u] object=0x%llx entry=0x%llx name_addr=0x%llx pos_addr=0x%llx name_read=%u name=0x%08x pos_read=%u pos=0x%08x",
+        index, static_cast<unsigned long long>(object), static_cast<unsigned long long>(entry),
+        static_cast<unsigned long long>(name_address),
+        static_cast<unsigned long long>(position_address), static_cast<unsigned>(name_read),
+        compressed_name, static_cast<unsigned>(position_read), raw_position);
+#endif
+    if (!name_read || !position_read ||
         (compressed_name & raw.smi_tag_mask) != raw.heap_object_tag ||
         (raw_position & raw.smi_tag_mask) != raw.smi_tag ||
         raw_position >> raw.smi_tag_shift > UINT32_MAX) {
@@ -140,6 +155,11 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     }
     uint64_t heap_base = 0;
     if (!ReadLiveVmHeapBase(invocation, &heap_base) || heap_base > UINT64_MAX - compressed_name) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+        __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+                            "named_entry[%u] heap base read failed heap=0x%llx name=0x%08x", index,
+                            static_cast<unsigned long long>(heap_base), compressed_name);
+#endif
         return false;
     }
     const uint64_t tagged_name = heap_base + compressed_name;
@@ -148,11 +168,39 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     uint64_t tags = 0;
     if (!ReadSelfValue(name_object, &tags) || raw.class_id_tag_bits == 0 ||
         raw.class_id_tag_bits >= 64) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+        uint64_t shifted_tags = 0;
+        uint64_t halved_tags = 0;
+        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name << 1) - 1),
+                      &shifted_tags);
+        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name >> 1) - 1), &halved_tags);
+        __android_log_print(
+            ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+            "named_entry[%u] string tags read failed object=0x%llx tags=0x%llx shifted=0x%llx halved=0x%llx",
+            index, static_cast<unsigned long long>(name_object),
+            static_cast<unsigned long long>(tags), static_cast<unsigned long long>(shifted_tags),
+            static_cast<unsigned long long>(halved_tags));
+#endif
         return false;
     }
     const uint64_t class_id_mask = (uint64_t{1} << raw.class_id_tag_bits) - 1;
     name_cid = static_cast<uint32_t>((tags >> raw.class_id_tag_shift) & class_id_mask);
-    if (name_cid != profile->live_vm.cid_one_byte_string) return false;
+    if (name_cid != profile->live_vm.cid_one_byte_string) {
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+        uint64_t shifted_tags = 0;
+        uint64_t halved_tags = 0;
+        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name << 1) - 1),
+                      &shifted_tags);
+        ReadSelfValue(static_cast<uintptr_t>(heap_base + (compressed_name >> 1) - 1), &halved_tags);
+        __android_log_print(
+            ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+            "named_entry[%u] string cid mismatch cid=%u expected=%u tags=0x%llx shifted=0x%llx halved=0x%llx",
+            index, name_cid, profile->live_vm.cid_one_byte_string,
+            static_cast<unsigned long long>(tags), static_cast<unsigned long long>(shifted_tags),
+            static_cast<unsigned long long>(halved_tags));
+#endif
+        return false;
+    }
     uintptr_t length_address = 0;
     if (!AddOffset(name_object, profile->live_vm.string_length_offset, &length_address))
         return false;
@@ -336,16 +384,16 @@ bool WriteLocation(DartPlantInvocation* invocation, const DartPlantAbiLocation& 
 }
 
 bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
-                          const dartplant::abi::DartAbiLocation& location, uint64_t* out_value) {
+                          const dartplant::abi::DartAbiLocation& location, uint64_t* out_value,
+                          bool result_location) {
     if (invocation == nullptr || invocation->context == nullptr || out_value == nullptr)
         return false;
     if (invocation->generated_vm_bridge_active && invocation->generated_root_lease != nullptr &&
         invocation->vm_adapter != nullptr) {
         const auto root = std::find_if(
             invocation->generated_root_accesses.begin(), invocation->generated_root_accesses.end(),
-            [invocation, &location](const auto& access) {
-                return access.location == location &&
-                       access.is_result == (invocation->phase == DARTPLANT_INVOCATION_LEAVE);
+            [&location, result_location](const auto& access) {
+                return access.location == location && access.is_result == result_location;
             });
         if (root != invocation->generated_root_accesses.end()) {
             return dartplant::VmAdapterGeneratedRootGet(
@@ -385,7 +433,8 @@ bool ReadVerifiedLocation(const DartPlantInvocation* invocation,
 }
 
 bool WriteVerifiedLocation(DartPlantInvocation* invocation,
-                           const dartplant::abi::DartAbiLocation& location, uint64_t value) {
+                           const dartplant::abi::DartAbiLocation& location, uint64_t value,
+                           bool result_location = false) {
     if (invocation == nullptr || invocation->context == nullptr) return false;
     bool written = false;
     switch (location.kind) {
@@ -417,9 +466,8 @@ bool WriteVerifiedLocation(DartPlantInvocation* invocation,
         invocation->vm_adapter != nullptr) {
         const auto root = std::find_if(
             invocation->generated_root_accesses.begin(), invocation->generated_root_accesses.end(),
-            [invocation, &location](const auto& access) {
-                return access.location == location &&
-                       access.is_result == (invocation->phase == DARTPLANT_INVOCATION_LEAVE);
+            [&location, result_location](const auto& access) {
+                return access.location == location && access.is_result == result_location;
             });
         if (root != invocation->generated_root_accesses.end() &&
             dartplant::VmAdapterGeneratedRootSet(invocation->vm_adapter,
@@ -456,9 +504,16 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
 
     DartPlantArgumentsDescriptorInfo info{};
     info.struct_size = sizeof(info);
-    if (dartplant_invocation_get_arguments_descriptor(invocation, &info) != DARTPLANT_OK ||
-        info.count == 0 ||
-        info.size != info.count + static_cast<uint32_t>(info.type_args_len != 0) ||
+    const DartPlantStatus descriptor_status =
+        dartplant_invocation_get_arguments_descriptor(invocation, &info);
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+    __android_log_print(
+        ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+        "ArgumentsDescriptor status=%d type_args=%u count=%u size=%u positional=%u named=%u",
+        descriptor_status, info.type_args_len, info.count, info.size, info.positional_count,
+        info.named_count);
+#endif
+    if (descriptor_status != DARTPLANT_OK || info.count == 0 || info.size != info.count ||
         info.positional_count == 0 || info.positional_count > info.count) {
         dartplant::SetLastError("closure ArgumentsDescriptor shape is unsupported");
         return false;
@@ -495,8 +550,15 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
     for (uint32_t named = 0; named < info.named_count; ++named) {
         uint32_t argument_position = 0;
         std::string name;
-        if (!ReadDescriptorNamedEntry(invocation, named, &argument_position, &name) ||
-            argument_position == 0 || argument_position >= info.count) {
+        const bool named_entry_ok =
+            ReadDescriptorNamedEntry(invocation, named, &argument_position, &name);
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+        __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+                            "named_entry[%u] read=%u position=%u name=%s count=%u", named,
+                            static_cast<unsigned>(named_entry_ok), argument_position, name.c_str(),
+                            info.count);
+#endif
+        if (!named_entry_ok || argument_position == 0 || argument_position >= info.count) {
             dartplant::SetLastError("closure named ArgumentsDescriptor entry is invalid");
             return false;
         }
@@ -580,7 +642,7 @@ const std::vector<dartplant::abi::DartParameterLayout>* ActiveParameters(
 
 DartPlantStatus DecodeVerifiedValue(const DartPlantInvocation* invocation,
                                     const dartplant::abi::DartParameterLayout& layout,
-                                    DartPlantValue* out_value) {
+                                    DartPlantValue* out_value, bool result_location = false) {
     if (layout.representation == dartplant::abi::DartAbiRepresentation::kPairOfTagged) {
         dartplant::SetLastError("pair-of-tagged result requires the pair result API");
         return DARTPLANT_UNSUPPORTED_ABI;
@@ -591,7 +653,7 @@ DartPlantStatus DecodeVerifiedValue(const DartPlantInvocation* invocation,
         return DARTPLANT_PROFILE_MISMATCH;
     }
     uint64_t raw = 0;
-    if (!ReadVerifiedLocation(invocation, layout.location.locations[0], &raw)) {
+    if (!ReadVerifiedLocation(invocation, layout.location.locations[0], &raw, result_location)) {
         dartplant::SetLastError("verified DartCallLayout location is unreadable");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -618,7 +680,7 @@ DartPlantStatus DecodeVerifiedValue(const DartPlantInvocation* invocation,
 
 DartPlantStatus EncodeVerifiedValue(DartPlantInvocation* invocation,
                                     const dartplant::abi::DartParameterLayout& layout,
-                                    const DartPlantValue* value) {
+                                    const DartPlantValue* value, bool result_location = false) {
     if (layout.representation == dartplant::abi::DartAbiRepresentation::kPairOfTagged) {
         dartplant::SetLastError("pair-of-tagged result requires the pair result API");
         return DARTPLANT_UNSUPPORTED_ABI;
@@ -655,7 +717,7 @@ DartPlantStatus EncodeVerifiedValue(DartPlantInvocation* invocation,
         return DARTPLANT_UNSUPPORTED_ABI;
     }
     if (status != DARTPLANT_OK) return status;
-    if (!WriteVerifiedLocation(invocation, layout.location.locations[0], raw)) {
+    if (!WriteVerifiedLocation(invocation, layout.location.locations[0], raw, result_location)) {
         dartplant::SetLastError("verified DartCallLayout location is unwritable");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -664,7 +726,8 @@ DartPlantStatus EncodeVerifiedValue(DartPlantInvocation* invocation,
 
 DartPlantStatus DecodeVerifiedTaggedPair(const DartPlantInvocation* invocation,
                                          const dartplant::abi::DartParameterLayout& layout,
-                                         DartPlantValuePair* out_value) {
+                                         DartPlantValuePair* out_value,
+                                         bool result_location = false) {
     if (invocation == nullptr || out_value == nullptr ||
         layout.representation != dartplant::abi::DartAbiRepresentation::kPairOfTagged ||
         layout.location.count != 2) {
@@ -673,8 +736,10 @@ DartPlantStatus DecodeVerifiedTaggedPair(const DartPlantInvocation* invocation,
     }
     uint64_t first_raw = 0;
     uint64_t second_raw = 0;
-    if (!ReadVerifiedLocation(invocation, layout.location.locations[0], &first_raw) ||
-        !ReadVerifiedLocation(invocation, layout.location.locations[1], &second_raw)) {
+    if (!ReadVerifiedLocation(invocation, layout.location.locations[0], &first_raw,
+                              result_location) ||
+        !ReadVerifiedLocation(invocation, layout.location.locations[1], &second_raw,
+                              result_location)) {
         dartplant::SetLastError("verified pair result location is unreadable");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -689,7 +754,8 @@ DartPlantStatus DecodeVerifiedTaggedPair(const DartPlantInvocation* invocation,
 
 DartPlantStatus EncodeVerifiedTaggedPair(DartPlantInvocation* invocation,
                                          const dartplant::abi::DartParameterLayout& layout,
-                                         const DartPlantValuePair* value) {
+                                         const DartPlantValuePair* value,
+                                         bool result_location = false) {
     if (invocation == nullptr || value == nullptr ||
         layout.representation != dartplant::abi::DartAbiRepresentation::kPairOfTagged ||
         layout.location.count != 2) {
@@ -702,8 +768,10 @@ DartPlantStatus EncodeVerifiedTaggedPair(DartPlantInvocation* invocation,
     if (status != DARTPLANT_OK) return status;
     status = EncodeGpSemanticValue(invocation, &value->second, true, &second_raw);
     if (status != DARTPLANT_OK) return status;
-    if (!WriteVerifiedLocation(invocation, layout.location.locations[0], first_raw) ||
-        !WriteVerifiedLocation(invocation, layout.location.locations[1], second_raw)) {
+    if (!WriteVerifiedLocation(invocation, layout.location.locations[0], first_raw,
+                               result_location) ||
+        !WriteVerifiedLocation(invocation, layout.location.locations[1], second_raw,
+                               result_location)) {
         dartplant::SetLastError("verified pair result location is unwritable");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -946,6 +1014,108 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
     return DARTPLANT_OK;
 }
 
+DartPlantStatus dartplant_invocation_get_closure_type_arguments(
+    const DartPlantInvocation* invocation, DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure type arguments are enter-phase only");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    if (!EnsureClosureArgumentMapping(invocation) ||
+        invocation->closure_type_arguments_location.kind ==
+            dartplant::abi::DartAbiLocationKind::kUnknown) {
+        dartplant::SetLastError("invocation has no verified generic closure type arguments");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    uint64_t raw = 0;
+    if (!ReadVerifiedLocation(invocation, invocation->closure_type_arguments_location, &raw)) {
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_value =
+        RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                  raw, true, ActiveValidatedNullValue(invocation)));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_invocation_retain_closure_type_arguments(
+    DartPlantInvocation* invocation, DartPlantObjectHandle** out_handle) {
+    if (invocation == nullptr || out_handle == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    DartPlantValue value{};
+    const DartPlantStatus status =
+        dartplant_invocation_get_closure_type_arguments(invocation, &value);
+    if (status != DARTPLANT_OK) return status;
+    if (value.kind != DARTPLANT_VALUE_HEAP_OBJECT || invocation->vm_adapter == nullptr ||
+        !invocation->vm_scope_entered || !invocation->generated_vm_bridge_active) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    return dartplant::VmAdapterRetainObject(invocation->vm_adapter, value.raw,
+                                            DARTPLANT_OBJECT_STRONG, out_handle);
+}
+
+DartPlantStatus dartplant_invocation_get_closure_type_argument(
+    const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_ENTER) {
+        dartplant::SetLastError("closure type arguments are enter-phase only");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    if (invocation->closure_type_argument_root_count == 0) {
+        dartplant::SetLastError(
+            "closure TypeArguments elements were not captured by an exact VM bridge");
+        return DARTPLANT_UNSUPPORTED_ABI;
+    }
+    if (index >= invocation->closure_type_argument_root_count) {
+        dartplant::SetLastError("closure TypeArguments element index is unavailable");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (invocation->vm_adapter == nullptr || invocation->generated_root_lease == nullptr ||
+        !invocation->vm_scope_entered || !invocation->generated_vm_bridge_active) {
+        dartplant::SetLastError("generic closure TypeArguments elements are not VM-rooted");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    uint64_t raw = 0;
+    const uint32_t root_index = invocation->closure_type_argument_root_base + index;
+    const DartPlantStatus status = dartplant::VmAdapterGeneratedRootGet(
+        invocation->vm_adapter, invocation->generated_root_lease, root_index, &raw);
+    if (status != DARTPLANT_OK) return status;
+#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
+    __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+                        "root_get element[%u] root_index=%u raw=0x%llx", index, root_index,
+                        static_cast<unsigned long long>(raw));
+#endif
+    *out_value =
+        RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(
+                                                  raw, true, ActiveValidatedNullValue(invocation)));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus ReadActiveExceptionObject(const DartPlantInvocation* invocation, bool stacktrace,
+                                          DartPlantValue* out_value) {
+    if (invocation == nullptr || out_value == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (invocation->phase != DARTPLANT_INVOCATION_EXCEPTION || invocation->vm_adapter == nullptr) {
+        dartplant::SetLastError("exception objects are available only during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
+    uint64_t raw = 0;
+    const DartPlantStatus status =
+        stacktrace ? dartplant::VmAdapterReadActiveStacktrace(invocation->vm_adapter, &raw)
+                   : dartplant::VmAdapterReadActiveException(invocation->vm_adapter, &raw);
+    if (status != DARTPLANT_OK) return status;
+    *out_value =
+        dartplant::dartplant_vm_abi_decode_gp_word(raw, true, ActiveValidatedNullValue(invocation));
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_invocation_get_exception(const DartPlantInvocation* invocation,
+                                                   DartPlantValue* out_value) {
+    return ReadActiveExceptionObject(invocation, false, out_value);
+}
+
+DartPlantStatus dartplant_invocation_get_stacktrace(const DartPlantInvocation* invocation,
+                                                    DartPlantValue* out_value) {
+    return ReadActiveExceptionObject(invocation, true, out_value);
+}
+
 DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* invocation,
                                                   uint32_t index, DartPlantValue* out_value) {
     const uint32_t argument_count = dartplant_invocation_argument_count(invocation);
@@ -1106,7 +1276,7 @@ DartPlantStatus dartplant_invocation_get_result(const DartPlantInvocation* invoc
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
     if (HasVerifiedCallLayout(invocation)) {
-        return DecodeVerifiedValue(invocation, invocation->call_layout->result, out_value);
+        return DecodeVerifiedValue(invocation, invocation->call_layout->result, out_value, true);
     }
     uint64_t raw = 0;
     if (!ReadLocation(invocation, invocation->profile->result_location, &raw)) {
@@ -1129,7 +1299,7 @@ DartPlantStatus dartplant_invocation_set_result(DartPlantInvocation* invocation,
     }
     if (HasVerifiedCallLayout(invocation)) {
         const DartPlantStatus status =
-            EncodeVerifiedValue(invocation, invocation->call_layout->result, value);
+            EncodeVerifiedValue(invocation, invocation->call_layout->result, value, true);
         if (status != DARTPLANT_OK) return status;
     } else {
         uint64_t raw = 0;
@@ -1165,7 +1335,7 @@ DartPlantStatus dartplant_invocation_get_result_pair(const DartPlantInvocation* 
             "pair result is only available during leave or after skipping original");
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
-    return DecodeVerifiedTaggedPair(invocation, invocation->call_layout->result, out_value);
+    return DecodeVerifiedTaggedPair(invocation, invocation->call_layout->result, out_value, true);
 }
 
 DartPlantStatus dartplant_invocation_set_result_pair(DartPlantInvocation* invocation,
@@ -1180,7 +1350,7 @@ DartPlantStatus dartplant_invocation_set_result_pair(DartPlantInvocation* invoca
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
     const DartPlantStatus status =
-        EncodeVerifiedTaggedPair(invocation, invocation->call_layout->result, value);
+        EncodeVerifiedTaggedPair(invocation, invocation->call_layout->result, value, true);
     if (status != DARTPLANT_OK) return status;
     if (invocation->phase == DARTPLANT_INVOCATION_ENTER) {
         invocation->skip_original = true;
@@ -1213,7 +1383,7 @@ DartPlantStatus dartplant_invocation_retain_result_object(DartPlantInvocation* i
     if (HasVerifiedCallLayout(invocation)) {
         const auto& layout = invocation->call_layout->result;
         if (layout.location.count != 1 ||
-            !ReadVerifiedLocation(invocation, layout.location.locations[0], &raw)) {
+            !ReadVerifiedLocation(invocation, layout.location.locations[0], &raw, true)) {
             return DARTPLANT_PROFILE_MISMATCH;
         }
     } else {
@@ -1250,7 +1420,7 @@ DartPlantStatus dartplant_invocation_set_result_object(DartPlantInvocation* invo
     if (HasVerifiedCallLayout(invocation)) {
         const auto& layout = invocation->call_layout->result;
         if (layout.location.count != 1 ||
-            !WriteVerifiedLocation(invocation, layout.location.locations[0], raw)) {
+            !WriteVerifiedLocation(invocation, layout.location.locations[0], raw, true)) {
             return DARTPLANT_PROFILE_MISMATCH;
         }
     } else {

@@ -1,4 +1,5 @@
 #include <elf.h>
+#include <link.h>
 
 #include <algorithm>
 #include <cstring>
@@ -18,6 +19,88 @@ struct ElfSymbol {
     uint64_t size = 0;
     uint64_t file_offset = 0;
 };
+
+struct LoadedSnapshotSymbols {
+    uintptr_t isolate_data = 0;
+    uint64_t isolate_data_size = 0;
+    uintptr_t isolate_instructions = 0;
+    uint64_t isolate_instructions_size = 0;
+    uint64_t isolate_instructions_va = 0;
+};
+
+struct LoadedSnapshotLookup {
+    const ModuleImage* module = nullptr;
+    LoadedSnapshotSymbols symbols{};
+};
+
+uintptr_t DynamicPointer(uintptr_t load_bias, Elf64_Addr pointer) {
+    const uintptr_t value = static_cast<uintptr_t>(pointer);
+    return value < load_bias ? load_bias + value : value;
+}
+
+int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
+    auto* lookup = static_cast<LoadedSnapshotLookup*>(opaque);
+    if (info == nullptr || lookup == nullptr || lookup->module == nullptr ||
+        static_cast<uintptr_t>(info->dlpi_addr) != lookup->module->load_bias) {
+        return 0;
+    }
+    const Elf64_Dyn* dynamic = nullptr;
+    size_t dynamic_count = 0;
+    for (Elf64_Half index = 0; index < info->dlpi_phnum; ++index) {
+        const Elf64_Phdr& phdr = info->dlpi_phdr[index];
+        if (phdr.p_type == PT_DYNAMIC) {
+            dynamic = reinterpret_cast<const Elf64_Dyn*>(info->dlpi_addr + phdr.p_vaddr);
+            dynamic_count = phdr.p_memsz / sizeof(Elf64_Dyn);
+            break;
+        }
+    }
+    if (dynamic == nullptr) return 1;
+
+    const Elf64_Sym* symbols = nullptr;
+    const char* strings = nullptr;
+    const uint32_t* hash = nullptr;
+    size_t symbol_size = sizeof(Elf64_Sym);
+    for (size_t index = 0; index < dynamic_count && dynamic[index].d_tag != DT_NULL; ++index) {
+        switch (dynamic[index].d_tag) {
+        case DT_SYMTAB:
+            symbols = reinterpret_cast<const Elf64_Sym*>(
+                DynamicPointer(info->dlpi_addr, dynamic[index].d_un.d_ptr));
+            break;
+        case DT_STRTAB:
+            strings = reinterpret_cast<const char*>(
+                DynamicPointer(info->dlpi_addr, dynamic[index].d_un.d_ptr));
+            break;
+        case DT_HASH:
+            hash = reinterpret_cast<const uint32_t*>(
+                DynamicPointer(info->dlpi_addr, dynamic[index].d_un.d_ptr));
+            break;
+        case DT_SYMENT:
+            symbol_size = dynamic[index].d_un.d_val;
+            break;
+        default:
+            break;
+        }
+    }
+    if (symbols == nullptr || strings == nullptr || hash == nullptr ||
+        symbol_size != sizeof(Elf64_Sym)) {
+        return 1;
+    }
+    const uint32_t symbol_count = hash[1];
+    for (uint32_t index = 0; index < symbol_count; ++index) {
+        const Elf64_Sym& symbol = symbols[index];
+        if (symbol.st_name == 0 || symbol.st_value == 0) continue;
+        const char* name = strings + symbol.st_name;
+        if (strcmp(name, "_kDartIsolateSnapshotData") == 0) {
+            lookup->symbols.isolate_data = info->dlpi_addr + symbol.st_value;
+            lookup->symbols.isolate_data_size = symbol.st_size;
+        } else if (strcmp(name, "_kDartIsolateSnapshotInstructions") == 0) {
+            lookup->symbols.isolate_instructions = info->dlpi_addr + symbol.st_value;
+            lookup->symbols.isolate_instructions_size = symbol.st_size;
+            lookup->symbols.isolate_instructions_va = symbol.st_value;
+        }
+    }
+    return 1;
+}
 
 std::optional<std::vector<uint8_t>> ReadFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
@@ -98,6 +181,29 @@ std::optional<std::pair<std::string, std::string>> ReadSnapshotHeader(
                           std::string(features, length));
 }
 
+std::optional<std::pair<std::string, std::string>> ReadSnapshotHeader(uintptr_t address,
+                                                                      uint64_t size) {
+    constexpr uint8_t kMagic[] = {0xf5, 0xf5, 0xdc, 0xdc};
+    constexpr size_t kHeaderSize = 20;
+    constexpr size_t kHashSize = 32;
+    if (address == 0 || size < kHeaderSize + kHashSize) return std::nullopt;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(address);
+    if (memcmp(bytes, kMagic, sizeof(kMagic)) != 0) return std::nullopt;
+    const auto* hash = bytes + kHeaderSize;
+    if (!std::all_of(hash, hash + kHashSize, [](uint8_t value) {
+            return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
+                   (value >= 'A' && value <= 'F');
+        })) {
+        return std::nullopt;
+    }
+    const char* features = reinterpret_cast<const char*>(hash + kHashSize);
+    const size_t remaining = size - kHeaderSize - kHashSize;
+    const size_t length = strnlen(features, remaining);
+    if (length == remaining) return std::nullopt;
+    return std::make_pair(std::string(reinterpret_cast<const char*>(hash), kHashSize),
+                          std::string(features, length));
+}
+
 bool HasFeature(std::string_view features, std::string_view feature) {
     return features.find(feature) != std::string_view::npos;
 }
@@ -152,8 +258,39 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
                                                              std::string* error) {
     const auto bytes = ReadFile(module.path);
     if (!bytes.has_value()) {
-        if (error != nullptr) *error = "cannot read loaded Flutter app module";
-        return std::nullopt;
+        LoadedSnapshotLookup lookup{.module = &module};
+        dl_iterate_phdr(FindLoadedSnapshotSymbols, &lookup);
+        const auto& symbols = lookup.symbols;
+        if (symbols.isolate_data == 0 || symbols.isolate_data_size == 0 ||
+            symbols.isolate_instructions == 0 || symbols.isolate_instructions_size == 0) {
+            if (error != nullptr)
+                *error = "cannot read loaded Flutter app module or its dynamic snapshot symbols";
+            return std::nullopt;
+        }
+        const auto header = ReadSnapshotHeader(symbols.isolate_data, symbols.isolate_data_size);
+        if (!header.has_value()) {
+            if (error != nullptr) *error = "loaded Dart isolate snapshot header is not recognized";
+            return std::nullopt;
+        }
+        FlutterSnapshotSource source;
+        source.module_name = module.name;
+        source.module_path = module.path;
+        source.module_build_id = module.build_id;
+        source.snapshot_hash = header->first;
+        source.snapshot_features = header->second;
+        const auto profile = SelectFlutterSnapshotProfile(source.snapshot_features);
+        if (!profile.has_value()) {
+            if (error != nullptr) *error = "Flutter snapshot feature profile is unsupported";
+            return std::nullopt;
+        }
+        source.profile_name = *profile;
+        source.isolate_instructions_va = symbols.isolate_instructions_va;
+        source.isolate_instructions_size = symbols.isolate_instructions_size;
+        source.isolate_instructions_runtime = symbols.isolate_instructions;
+        source.compressed_pointers =
+            HasFeature(source.snapshot_features, "compressed-pointers") &&
+            !HasFeature(source.snapshot_features, "no-compressed-pointers");
+        return source;
     }
     const auto isolate_data = FindSymbol(*bytes, "_kDartIsolateSnapshotData");
     const auto isolate_instr = FindSymbol(*bytes, "_kDartIsolateSnapshotInstructions");

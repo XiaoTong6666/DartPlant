@@ -111,6 +111,18 @@ typedef DartPlantStatus (*DartPlantLeaveNativeToGeneratedCallback)(
     void* user_data, const DartPlantIsolateIdentity* isolate,
     const DartPlantGeneratedTransitionFrame* frame, void* root_lease);
 
+typedef DartPlantStatus (*DartPlantReadActiveObjectCallback)(
+    void* user_data, const DartPlantIsolateIdentity* isolate, uint64_t* out_raw);
+// Optional exact-VM helper used only while the mutator is still in generated
+// state. It may inspect a verified TypeArguments object without allocating,
+// entering a Dart API scope, or reaching a safepoint. DartPlant immediately
+// copies every returned element into the same VM-visible root lease used for
+// the generated/native callback transition; user callbacks never dereference
+// the moving TypeArguments object directly.
+typedef DartPlantStatus (*DartPlantReadTypeArgumentsElementCallback)(
+    void* user_data, const DartPlantIsolateIdentity* isolate, uint64_t type_arguments_raw,
+    uint32_t index, uint64_t* out_raw);
+
 typedef struct DartPlantVmAdapterCallbacks {
     uint32_t struct_size;
     uint32_t adapter_version;
@@ -149,6 +161,12 @@ typedef struct DartPlantVmAdapterCallbacks {
     // scope to user callbacks.
     DartPlantEnterGeneratedToNativeCallback enter_generated_to_native;
     DartPlantLeaveNativeToGeneratedCallback leave_native_to_generated;
+    // Optional V3 exception observation. These return the current raw tagged
+    // VM values while the JumpToFrame hook is executing; they do not create a
+    // scope or retain the objects.
+    DartPlantReadActiveObjectCallback read_active_exception;
+    DartPlantReadActiveObjectCallback read_active_stacktrace;
+    DartPlantReadTypeArgumentsElementCallback read_type_arguments_element;
 } DartPlantVmAdapterCallbacks;
 
 DARTPLANT_EXPORT DartPlantStatus

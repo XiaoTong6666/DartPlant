@@ -2,20 +2,24 @@
 
 #include <android/log.h>
 #include <dlfcn.h>
-#include <elf.h>
-#include <link.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <string_view>
 #include <utility>
+#include <vector>
 
+#include "core/internal.h"
 #include "dart_api_dl.h"
+#include "vm/abi/resolver.h"
+#include "vm/runtime_profiles.h"
 
 namespace {
 
@@ -53,82 +57,32 @@ struct State {
     uint64_t exit_safepoint = 0;
     std::array<RootSlot, kRootSlotCount> roots{};
     std::array<RootLease, kLeaseCount> leases{};
-    const struct AdapterProfile* profile = nullptr;
+    const dartplant::RuntimeProfileRecord* profile = nullptr;
+    dartplant::vm_abi::ArtifactSet artifacts{};
+    uint64_t capabilities = dartplant::vm_abi::kCapabilityNone;
     bool isolate_detached = false;
 };
 
-struct AdapterLayout {
-    uintptr_t heap_base;
-    uintptr_t enter_safepoint_stub;
-    uintptr_t exit_safepoint_stub;
-    uintptr_t isolate;
-    uintptr_t isolate_group;
-    uintptr_t top_exit_frame;
-    uintptr_t vm_tag;
-    uintptr_t execution_state;
-    uintptr_t exit_through_ffi;
-    uintptr_t active_exception;
-    uintptr_t active_stacktrace;
-};
-
-struct TypeArgumentsLayout {
-    uint32_t cid;
-    uintptr_t length;
-    uintptr_t types;
-    uint32_t compressed_word_size;
-    uint8_t heap_object_tag;
-    uint8_t smi_tag_mask;
-    uint8_t smi_tag_shift;
-    uint8_t class_id_tag_shift;
-    uint8_t class_id_tag_bits;
-};
-
-struct AdapterProfile {
-    const char* dart_version;
+struct DescriptorMetadata {
+    uint32_t profile_version;
     const char* flutter_version;
-    const char* snapshot_hash;
-    const char* flutter_build_id;
     const char* descriptor_id;
-    const char* module_name;
-    AdapterLayout layout;
-    TypeArgumentsLayout type_arguments;
 };
 
 struct FlutterVmAdapterImpl {
     State state;
 };
 
-constexpr AdapterProfile kProfiles[] = {
-    {"3.4.4",
-     "3.22.3",
-     "d20a1be77c3d3c41b2a5accaee1ce549",
-     "b4ba48b16f1760763d444d35d5d0106ba554fabd",
-     "flutter-3.22.3-dart-3.4.4-android-arm64-product",
-     "libflutter.so",
-     {0x48, 0x1d0, 0x1d8, 0x6f0, 0x6f8, 0x710, 0x730, 0x770, 0x780, 0x748, 0x750},
-     {46, 0x0c, 0x18, 4, 1, 1, 1, 12, 20}},
+constexpr DescriptorMetadata kDescriptorMetadata[] = {
+    {1, "3.22.3", "flutter-3.22.3-dart-3.4.4-android-arm64-product"},
 #if !defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
-    {"3.5.0",
-     "3.24.0",
-     "80a49c7111088100a233b2ae788e1f48",
-     "d9a7f562e5595e9913262ba4b5026a0df242ccfd",
-     "flutter-3.24.0-dart-3.5.0-android-arm64-product",
-     "libflutter.so",
-     {0x48, 0x1d8, 0x1e0, 0x708, 0x710, 0x728, 0x750, 0x790, 0x7a0, 0x768, 0x770},
-     {46, 0x0c, 0x18, 4, 1, 1, 1, 12, 20}},
-    {"3.12.1",
-     "3.44.1",
-     "ace654289f5abc240509fc941453ebc5",
-     "ca4618220c6646c3546f020f587fef1c75e3c505",
-     "flutter-3.44.1-dart-3.12.1-android-arm64-product",
-     "libflutter.so",
-     {0x58, 0x1e8, 0x1f0, 0x680, 0x688, 0x6a0, 0x6c8, 0x6f8, 0x708, 0x6d0, 0x6d8},
-     {47, 0x0c, 0x18, 4, 1, 1, 1, 12, 20}},
+    {2, "3.24.0", "flutter-3.24.0-dart-3.5.0-android-arm64-product"},
+    {3, "3.44.1", "flutter-3.44.1-dart-3.12.1-android-arm64-product"},
 #endif
 };
 
 #if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
-static_assert(std::size(kProfiles) == 1,
+static_assert(std::size(kDescriptorMetadata) == 1,
               "the version-specific Flutter VM adapter must expose only Dart 3.4.4");
 #endif
 
@@ -140,13 +94,6 @@ DartHandlePredicate g_is_double = nullptr;
 DartHandlePredicate g_is_string = nullptr;
 
 extern "C" void dartplant_flutter_vm_call_safepoint_stub(uint64_t thread, uint64_t entry);
-
-constexpr uintptr_t kCodeEntryPoint = 0x8;
-constexpr uint64_t kVmTagDart = 8;
-constexpr uint64_t kExecutionGenerated = 1;
-constexpr uint64_t kExecutionNative = 2;
-constexpr uint64_t kExitThroughFfi = 1;
-constexpr uint64_t kExitThroughRuntimeCall = 2;
 
 uint64_t& ThreadWord(State& state, uintptr_t offset) {
     return *reinterpret_cast<uint64_t*>(state.thread + offset);
@@ -166,17 +113,48 @@ bool ReadSelf(uintptr_t address, T* out_value) {
 #endif
 }
 
+uintptr_t CanonicalNativePointer(uint64_t pointer) {
+#if defined(__aarch64__)
+    return static_cast<uintptr_t>(pointer & 0x00ffffffffffffffULL);
+#else
+    return static_cast<uintptr_t>(pointer);
+#endif
+}
+
+bool ReadNativePointer(uintptr_t address, uint64_t* out_pointer) {
+    if (out_pointer == nullptr) return false;
+    uint64_t raw = 0;
+    if (!ReadSelf(address, &raw) || raw == 0) return false;
+    *out_pointer = CanonicalNativePointer(raw);
+    return *out_pointer != 0;
+}
+
+bool IsHeapObject(const dartplant::RuntimeProfileRecord& profile, uint64_t tagged) {
+    const auto& raw = profile.raw_object;
+    return (tagged & raw.smi_tag_mask) == raw.heap_object_tag && tagged >= raw.heap_object_tag;
+}
+
+bool TaggedInHeapWindow(const dartplant::RuntimeProfileRecord& profile, uint64_t heap_base,
+                        uint64_t tagged) {
+    const auto& raw = profile.raw_object;
+    return heap_base != 0 && IsHeapObject(profile, tagged) &&
+           heap_base <= UINT64_MAX - raw.heap_object_tag &&
+           tagged >= heap_base + raw.heap_object_tag && tagged - heap_base <= UINT32_MAX;
+}
+
 DartPlantStatus ValidateCurrentOwner(const State& state) {
     if (state.profile == nullptr || state.thread == 0) return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     const Dart_Isolate current_isolate = Dart_CurrentIsolate_DL();
-    if (current_isolate == nullptr ||
-        reinterpret_cast<uint64_t>(current_isolate) != state.identity.isolate) {
+    if (current_isolate == nullptr || CanonicalNativePointer(reinterpret_cast<uint64_t>(
+                                          current_isolate)) != state.identity.isolate) {
         return DARTPLANT_VM_ISOLATE_MISMATCH;
     }
     uint64_t thread_isolate = 0;
     uint64_t isolate_group = 0;
-    if (!ReadSelf(state.thread + state.profile->layout.isolate, &thread_isolate) ||
-        !ReadSelf(state.thread + state.profile->layout.isolate_group, &isolate_group)) {
+    if (!ReadNativePointer(state.thread + state.profile->live_vm.thread_isolate_offset,
+                           &thread_isolate) ||
+        !ReadNativePointer(state.thread + state.profile->live_vm.thread_isolate_group_offset,
+                           &isolate_group)) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     if (thread_isolate != state.identity.isolate || isolate_group != state.identity.isolate_group) {
@@ -185,19 +163,25 @@ DartPlantStatus ValidateCurrentOwner(const State& state) {
     return DARTPLANT_OK;
 }
 
+bool ValidateArtifactLifecycle(const State& state) {
+    if ((state.capabilities & dartplant::vm_abi::kCapabilityArtifactLifecycle) == 0) {
+        return false;
+    }
+    return dartplant::vm_abi::ValidateArtifactSet(state.artifacts, dartplant::EnumerateModules());
+}
+
 bool ValidActiveObjectRaw(const State& state, uint64_t raw, bool allow_smi, bool allow_null) {
     if (raw == state.null_raw) return allow_null;
-    const auto& type_arguments = state.profile->type_arguments;
-    const uint64_t tag = raw & type_arguments.smi_tag_mask;
-    if (tag != type_arguments.heap_object_tag) return tag == 0 && allow_smi;
+    const auto& object = state.profile->raw_object;
+    const uint64_t tag = raw & object.smi_tag_mask;
+    if (tag != object.heap_object_tag) return tag == object.smi_tag && allow_smi;
     uint64_t heap_base = 0;
-    if (!ReadSelf(state.thread + state.profile->layout.heap_base, &heap_base) || heap_base == 0 ||
-        heap_base > UINT64_MAX - type_arguments.heap_object_tag ||
-        raw < heap_base + type_arguments.heap_object_tag || raw - heap_base > UINT32_MAX) {
+    if (!ReadSelf(state.thread + state.profile->live_vm.thread_heap_base_offset, &heap_base) ||
+        !TaggedInHeapWindow(*state.profile, heap_base, raw)) {
         return false;
     }
     uint64_t tags = 0;
-    return ReadSelf(static_cast<uintptr_t>(raw - type_arguments.heap_object_tag), &tags);
+    return ReadSelf(static_cast<uintptr_t>(raw - object.heap_object_tag), &tags);
 }
 
 uint64_t RootRaw(const RootSlot& slot) { return *reinterpret_cast<const uint64_t*>(slot.handle); }
@@ -221,94 +205,6 @@ void ReleaseRoot(State& state, uint32_t index) {
     if (index >= state.roots.size()) return;
     SetRootRaw(state.roots[index], state.null_raw);
     state.roots[index].used.store(false, std::memory_order_release);
-}
-
-uint64_t ResolveStubEntry(State& state, uintptr_t offset) {
-    const uint64_t tagged_code = ThreadWord(state, offset);
-    if ((tagged_code & 1) == 0 || tagged_code <= 1) {
-        __android_log_print(ANDROID_LOG_ERROR, kTag,
-                            "safepoint slot invalid offset=0x%zx raw=0x%llx", offset,
-                            static_cast<unsigned long long>(tagged_code));
-        return 0;
-    }
-    const uint64_t entry = *reinterpret_cast<const uint64_t*>(tagged_code - 1 + kCodeEntryPoint);
-    Dl_info info{};
-    const bool valid = entry != 0 && dladdr(reinterpret_cast<void*>(entry), &info) != 0 &&
-                       info.dli_fname != nullptr &&
-                       std::strstr(info.dli_fname, "libapp.so") != nullptr;
-    __android_log_print(
-        ANDROID_LOG_INFO, kTag,
-        "safepoint offset=0x%zx code=0x%llx entry=0x%llx module=%s valid=%u", offset,
-        static_cast<unsigned long long>(tagged_code), static_cast<unsigned long long>(entry),
-        info.dli_fname == nullptr ? "none" : info.dli_fname, static_cast<unsigned>(valid));
-    return valid ? entry : 0;
-}
-
-int HexValue(char value) {
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
-uintptr_t AlignNote(uintptr_t value) { return (value + 3) & ~uintptr_t{3}; }
-
-struct BuildIdRequest {
-    const char* module_name;
-    const char* build_id;
-    bool matched;
-};
-
-int MatchFlutterBuildId(dl_phdr_info* info, size_t, void* data) {
-    auto* request = static_cast<BuildIdRequest*>(data);
-    if (info == nullptr || request == nullptr || info->dlpi_name == nullptr ||
-        std::strstr(info->dlpi_name, request->module_name) == nullptr) {
-        return 0;
-    }
-    for (uint16_t index = 0; index < info->dlpi_phnum; ++index) {
-        const ElfW(Phdr) & phdr = info->dlpi_phdr[index];
-        if (phdr.p_type != PT_NOTE) continue;
-        uintptr_t cursor = info->dlpi_addr + phdr.p_vaddr;
-        const uintptr_t end = cursor + phdr.p_memsz;
-        while (cursor <= end && end - cursor >= sizeof(ElfW(Nhdr))) {
-            const auto* note = reinterpret_cast<const ElfW(Nhdr)*>(cursor);
-            cursor += sizeof(*note);
-            const uintptr_t name = cursor;
-            cursor = AlignNote(cursor + note->n_namesz);
-            const uintptr_t description = cursor;
-            cursor = AlignNote(cursor + note->n_descsz);
-            if (cursor > end) break;
-            if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 &&
-                std::memcmp(reinterpret_cast<const void*>(name), "GNU", 4) == 0 &&
-                request->build_id != nullptr &&
-                std::strlen(request->build_id) == note->n_descsz * 2) {
-                bool equal = true;
-                for (uint32_t byte = 0; byte < note->n_descsz; ++byte) {
-                    const int high = HexValue(request->build_id[byte * 2]);
-                    const int low = HexValue(request->build_id[byte * 2 + 1]);
-                    if (high < 0 || low < 0 ||
-                        static_cast<uint8_t>((high << 4) | low) !=
-                            reinterpret_cast<const uint8_t*>(description)[byte]) {
-                        equal = false;
-                        break;
-                    }
-                }
-                if (equal) {
-                    request->matched = true;
-                    return 1;
-                }
-            }
-        }
-    }
-    return 1;
-}
-
-bool ExactFlutterBuildMatches(const char* module_name, const char* build_id) {
-    BuildIdRequest request{module_name, build_id, false};
-    dl_iterate_phdr(MatchFlutterBuildId, &request);
-    __android_log_print(ANDROID_LOG_INFO, kTag, "build fingerprint %s match=%u", build_id,
-                        static_cast<unsigned>(request.matched));
-    return request.matched;
 }
 
 void WeakFinalizer(void*, void* peer) {
@@ -447,13 +343,15 @@ DartPlantStatus ObjectAlive(void*, const DartPlantIsolateIdentity*, void* backen
     return DARTPLANT_OK;
 }
 
-bool SelfTestPersistentApi() {
+bool SelfTestPersistentApi(uint64_t* out_null_raw) {
+    if (out_null_raw == nullptr) return false;
     Dart_EnterScope_DL();
     Dart_Handle null_handle = Dart_Null_DL();
     Dart_PersistentHandle strong = Dart_NewPersistentHandle_DL(null_handle);
     Dart_WeakPersistentHandle weak =
         Dart_NewWeakPersistentHandle_DL(null_handle, nullptr, 0, WeakFinalizer);
     const bool valid = strong != nullptr && weak != nullptr;
+    if (strong != nullptr) *out_null_raw = *reinterpret_cast<const uint64_t*>(strong);
     if (weak != nullptr) Dart_DeleteWeakPersistentHandle_DL(weak);
     if (strong != nullptr) Dart_DeletePersistentHandle_DL(strong);
     Dart_ExitScope_DL();
@@ -554,11 +452,19 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         (frame->flags & DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME) == 0) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    const uint64_t execution_state = ThreadWord(*state, state->profile->layout.execution_state);
-    const uint64_t top_exit_frame = ThreadWord(*state, state->profile->layout.top_exit_frame);
-    uint64_t& exit_through_ffi = ThreadWord(*state, state->profile->layout.exit_through_ffi);
-    const uint64_t vm_tag = ThreadWord(*state, state->profile->layout.vm_tag);
-    if (execution_state != kExecutionGenerated || top_exit_frame != 0 || vm_tag != kVmTagDart) {
+    if (!ValidateArtifactLifecycle(*state)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "generated transition rejected: VM artifact incarnation changed");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const auto& bridge = state->profile->thread_bridge;
+    const auto& transition = state->profile->transition;
+    const uint64_t execution_state = ThreadWord(*state, bridge.execution_state_offset);
+    const uint64_t top_exit_frame = ThreadWord(*state, bridge.top_exit_frame_offset);
+    uint64_t& exit_through_ffi = ThreadWord(*state, bridge.exit_through_ffi_offset);
+    const uint64_t vm_tag = ThreadWord(*state, bridge.vm_tag_offset);
+    if (execution_state != transition.execution_generated ||
+        top_exit_frame != transition.exit_none || vm_tag != transition.vm_tag_dart) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     // A Dart runtime call marks Thread::exit_through_ffi with
@@ -571,16 +477,15 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
     // safe to normalize only that state: a live runtime/FFI exit still has a
     // non-generated execution state and/or a non-zero top exit frame and is
     // rejected above.
-    if (exit_through_ffi == kExitThroughRuntimeCall) {
-        exit_through_ffi = 0;
-    } else if (exit_through_ffi != 0) {
+    if (exit_through_ffi == transition.exit_through_runtime_call) {
+        exit_through_ffi = transition.exit_none;
+    } else if (exit_through_ffi != transition.exit_none) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    ThreadWord(*state, state->profile->layout.top_exit_frame) = frame->exit_frame;
-    exit_through_ffi = kExitThroughFfi;
-    ThreadWord(*state, state->profile->layout.vm_tag) =
-        reinterpret_cast<uint64_t>(&EnterGeneratedToNative);
-    ThreadWord(*state, state->profile->layout.execution_state) = kExecutionNative;
+    ThreadWord(*state, bridge.top_exit_frame_offset) = frame->exit_frame;
+    exit_through_ffi = transition.exit_through_ffi;
+    ThreadWord(*state, bridge.vm_tag_offset) = reinterpret_cast<uint64_t>(&EnterGeneratedToNative);
+    ThreadWord(*state, bridge.execution_state_offset) = transition.execution_native;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     dartplant_flutter_vm_call_safepoint_stub(state->thread, state->enter_safepoint);
     return DARTPLANT_OK;
@@ -589,18 +494,27 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
 DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateIdentity* identity,
                                        const DartPlantGeneratedTransitionFrame* frame, void*) {
     auto* state = static_cast<State*>(user_data);
-    if (state == nullptr || identity == nullptr || frame == nullptr ||
-        frame->thread != state->thread ||
-        ThreadWord(*state, state->profile->layout.execution_state) != kExecutionNative ||
-        ThreadWord(*state, state->profile->layout.top_exit_frame) != frame->exit_frame ||
-        ThreadWord(*state, state->profile->layout.exit_through_ffi) != kExitThroughFfi) {
+    if (state == nullptr || identity == nullptr || frame == nullptr || state->profile == nullptr ||
+        frame->thread != state->thread) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!ValidateArtifactLifecycle(*state)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "native return rejected: VM artifact incarnation changed");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const auto& bridge = state->profile->thread_bridge;
+    const auto& transition = state->profile->transition;
+    if (ThreadWord(*state, bridge.execution_state_offset) != transition.execution_native ||
+        ThreadWord(*state, bridge.top_exit_frame_offset) != frame->exit_frame ||
+        ThreadWord(*state, bridge.exit_through_ffi_offset) != transition.exit_through_ffi) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     dartplant_flutter_vm_call_safepoint_stub(state->thread, state->exit_safepoint);
-    ThreadWord(*state, state->profile->layout.vm_tag) = kVmTagDart;
-    ThreadWord(*state, state->profile->layout.execution_state) = kExecutionGenerated;
-    ThreadWord(*state, state->profile->layout.top_exit_frame) = 0;
-    ThreadWord(*state, state->profile->layout.exit_through_ffi) = 0;
+    ThreadWord(*state, bridge.vm_tag_offset) = transition.vm_tag_dart;
+    ThreadWord(*state, bridge.execution_state_offset) = transition.execution_generated;
+    ThreadWord(*state, bridge.top_exit_frame_offset) = transition.exit_none;
+    ThreadWord(*state, bridge.exit_through_ffi_offset) = transition.exit_none;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     return DARTPLANT_OK;
 }
@@ -617,7 +531,7 @@ DartPlantStatus ReadActiveException(void* user_data, const DartPlantIsolateIdent
     const DartPlantStatus owner = ValidateCurrentOwner(*state);
     if (owner != DARTPLANT_OK) return owner;
     uint64_t raw = 0;
-    if (!ReadSelf(state->thread + state->profile->layout.active_exception, &raw) ||
+    if (!ReadSelf(state->thread + state->profile->thread_bridge.active_exception_offset, &raw) ||
         !ValidActiveObjectRaw(*state, raw, true, false)) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
@@ -637,7 +551,7 @@ DartPlantStatus ReadActiveStacktrace(void* user_data, const DartPlantIsolateIden
     const DartPlantStatus owner = ValidateCurrentOwner(*state);
     if (owner != DARTPLANT_OK) return owner;
     uint64_t raw = 0;
-    if (!ReadSelf(state->thread + state->profile->layout.active_stacktrace, &raw) ||
+    if (!ReadSelf(state->thread + state->profile->thread_bridge.active_stacktrace_offset, &raw) ||
         !ValidActiveObjectRaw(*state, raw, false, true)) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
@@ -651,11 +565,14 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
     auto* state = static_cast<State*>(user_data);
     const auto* type_arguments =
         state == nullptr || state->profile == nullptr ? nullptr : &state->profile->type_arguments;
+    const auto* raw =
+        state == nullptr || state->profile == nullptr ? nullptr : &state->profile->raw_object;
     if (state == nullptr || identity == nullptr || out_raw == nullptr ||
-        type_arguments == nullptr || identity->isolate != state->identity.isolate ||
+        type_arguments == nullptr || raw == nullptr ||
+        identity->isolate != state->identity.isolate ||
         identity->isolate_group != state->identity.isolate_group ||
         identity->generation != state->identity.generation ||
-        (type_arguments_raw & type_arguments->smi_tag_mask) != type_arguments->heap_object_tag) {
+        (type_arguments_raw & raw->smi_tag_mask) != raw->heap_object_tag) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
     // This callback is invoked by dartplant_core before Generated->Native and
@@ -663,47 +580,46 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
     // this object while these raw compressed fields are inspected. Every
     // returned element is immediately copied into the generated-root lease;
     // user callbacks never retain or dereference this object address.
-    const uint64_t heap_base = ThreadWord(*state, state->profile->layout.heap_base);
+    const uint64_t heap_base = ThreadWord(*state, state->profile->live_vm.thread_heap_base_offset);
     const uintptr_t tagged_object = static_cast<uintptr_t>(type_arguments_raw);
     // Generated Dart registers/stack slots contain a full tagged ObjectPtr even
     // in compressed-pointer builds. Only fields inside heap objects are stored
     // as 32-bit compressed pointers. Constrain the full pointer to this heap's
     // 4-GiB compression window before reading its header.
-    if (heap_base == 0 || tagged_object < heap_base + 1 || tagged_object - heap_base > UINT32_MAX) {
+    if (!TaggedInHeapWindow(*state->profile, heap_base, tagged_object)) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
-    const uintptr_t object = tagged_object - 1;
+    const uintptr_t object = tagged_object - raw->heap_object_tag;
 
     uint64_t tags = 0;
     if (!ReadSelf(object, &tags)) return DARTPLANT_OBJECT_HANDLE_INVALID;
-    if (type_arguments->class_id_tag_bits == 0 || type_arguments->class_id_tag_bits >= 64) {
+    if (raw->class_id_tag_bits == 0 || raw->class_id_tag_bits >= 64) {
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    const uint64_t class_id_mask = (uint64_t{1} << type_arguments->class_id_tag_bits) - 1;
-    const uint32_t cid =
-        static_cast<uint32_t>((tags >> type_arguments->class_id_tag_shift) & class_id_mask);
+    const uint64_t class_id_mask = (uint64_t{1} << raw->class_id_tag_bits) - 1;
+    const uint32_t cid = static_cast<uint32_t>((tags >> raw->class_id_tag_shift) & class_id_mask);
     if (cid != type_arguments->cid) return DARTPLANT_OBJECT_HANDLE_INVALID;
 
     uint32_t length_raw = 0;
-    if (!ReadSelf(object + type_arguments->length, &length_raw)) {
+    if (!ReadSelf(object + type_arguments->length_offset, &length_raw)) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
-    if ((length_raw & type_arguments->smi_tag_mask) != 0 ||
-        (length_raw >> type_arguments->smi_tag_shift) <= index) {
+    if ((length_raw & raw->smi_tag_mask) != raw->smi_tag ||
+        (length_raw >> raw->smi_tag_shift) <= index) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    if (type_arguments->compressed_word_size != sizeof(uint32_t) ||
-        index >
-            (std::numeric_limits<uintptr_t>::max() - type_arguments->types) / sizeof(uint32_t)) {
+    if (raw->compressed_word_size != sizeof(uint32_t) ||
+        index > (std::numeric_limits<uintptr_t>::max() - type_arguments->types_offset) /
+                    sizeof(uint32_t)) {
         return DARTPLANT_PROFILE_MISMATCH;
     }
     uint32_t compressed_element = 0;
     const uintptr_t element_address =
-        object + type_arguments->types + static_cast<uintptr_t>(index) * sizeof(uint32_t);
+        object + type_arguments->types_offset + static_cast<uintptr_t>(index) * sizeof(uint32_t);
     if (!ReadSelf(element_address, &compressed_element)) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
-    if ((compressed_element & type_arguments->smi_tag_mask) != type_arguments->heap_object_tag) {
+    if ((compressed_element & raw->smi_tag_mask) != raw->heap_object_tag) {
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
     if (heap_base > std::numeric_limits<uintptr_t>::max() - compressed_element) {
@@ -752,24 +668,12 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         options->isolate_generation == 0 || out_instance == nullptr) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const AdapterProfile* profile = nullptr;
-    for (const auto& candidate : kProfiles) {
-        if (std::strcmp(snapshot_hash, candidate.snapshot_hash) == 0) {
-            profile = &candidate;
-            break;
-        }
-    }
-    if (profile == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kTag, "unsupported snapshot fingerprint: %s",
-                            snapshot_hash);
-        return DARTPLANT_PROFILE_MISMATCH;
-    }
-    if (!ExactFlutterBuildMatches(profile->module_name, profile->flutter_build_id)) {
-        __android_log_print(ANDROID_LOG_ERROR, kTag,
-                            "unsupported Flutter build-id for Dart %s / Flutter %s",
-                            profile->dart_version, profile->flutter_version);
-        return DARTPLANT_PROFILE_MISMATCH;
-    }
+
+    dartplant::VmRuntimeFacts facts{};
+    facts.snapshot_hash = snapshot_hash;
+    facts.snapshot_features =
+        options->snapshot_features == nullptr ? "" : options->snapshot_features;
+
     if (Dart_InitializeApiDL(api_dl_data) != 0) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "Dart_InitializeApiDL failed");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -784,12 +688,100 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         __android_log_print(ANDROID_LOG_ERROR, kTag, "Dart_CurrentIsolate_DL is null");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "current isolate=%p", isolate);
-    if (!SelfTestPersistentApi()) {
+    const uint64_t current_isolate = CanonicalNativePointer(reinterpret_cast<uint64_t>(isolate));
+    __android_log_print(ANDROID_LOG_INFO, kTag, "current isolate=%p canonical=0x%llx", isolate,
+                        static_cast<unsigned long long>(current_isolate));
+    uint64_t canonical_null = 0;
+    if (!SelfTestPersistentApi(&canonical_null)) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "Dart persistent handle API self-test failed");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    __android_log_print(ANDROID_LOG_INFO, kTag, "persistent API self-test passed");
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "persistent API self-test passed canonical_null=0x%llx",
+                        static_cast<unsigned long long>(canonical_null));
+
+    const auto modules = dartplant::EnumerateModules();
+    uint32_t engine_module_count = 0;
+    for (const auto& module : modules) {
+        if (module.name != "libflutter.so") continue;
+        ++engine_module_count;
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+                            "observed engine incarnation path=%s build_id=%s load_bias=0x%llx",
+                            module.path.c_str(), module.build_id.c_str(),
+                            static_cast<unsigned long long>(module.load_bias));
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "observed engine module count=%u",
+                        static_cast<unsigned>(engine_module_count));
+
+    dartplant::vm_abi::ResolverInput resolver_input{};
+    resolver_input.facts = facts;
+    resolver_input.thread = thread;
+    resolver_input.current_isolate = current_isolate;
+    resolver_input.canonical_null = canonical_null;
+    resolver_input.modules = &modules;
+#if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
+    resolver_input.only_profile_version = 1;
+#endif
+    const dartplant::vm_abi::ResolverResult resolution =
+        dartplant::vm_abi::ResolveVerifiedBinding(resolver_input);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "ABI resolver snapshot=%s features=%s source_candidates=%zu build_id_gate=disabled",
+        snapshot_hash, options->snapshot_features == nullptr ? "" : options->snapshot_features,
+        resolution.candidates.size());
+    for (size_t index = 0; index < resolution.candidates.size(); ++index) {
+        const auto& diagnostic = resolution.candidates[index];
+        const auto* candidate = diagnostic.profile;
+        const auto& probe = diagnostic.probe;
+        const auto& roots = probe.roots;
+        __android_log_print(
+            probe.passed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
+            "ABI candidate[%zu] profile=%s abi=%s hash_match=%u result=%s stage=%s "
+            "heap=0x%llx isolate=0x%llx group=0x%llx null=0x%llx pool=0x%llx "
+            "class_table=0x%llx cids=%llu object_store=0x%llx libraries=0x%llx "
+            "dart_core=%u register_semantics=%u "
+            "enter_code=0x%llx enter=0x%llx exit_code=0x%llx exit=0x%llx module=%s",
+            index, candidate->live_vm.name, candidate->abi_id,
+            static_cast<unsigned>(diagnostic.snapshot_hash_match), probe.passed ? "pass" : "reject",
+            dartplant::vm_abi::CandidateProbeStageName(probe.stage, roots),
+            static_cast<unsigned long long>(roots.heap_base),
+            static_cast<unsigned long long>(roots.isolate),
+            static_cast<unsigned long long>(roots.isolate_group),
+            static_cast<unsigned long long>(roots.thread_null),
+            static_cast<unsigned long long>(roots.global_object_pool),
+            static_cast<unsigned long long>(roots.class_table),
+            static_cast<unsigned long long>(roots.num_cids),
+            static_cast<unsigned long long>(roots.object_store),
+            static_cast<unsigned long long>(roots.libraries),
+            static_cast<unsigned>(roots.dart_core_found),
+            static_cast<unsigned>(roots.register_semantics_match),
+            static_cast<unsigned long long>(probe.enter_code),
+            static_cast<unsigned long long>(probe.enter_entry),
+            static_cast<unsigned long long>(probe.exit_code),
+            static_cast<unsigned long long>(probe.exit_entry),
+            probe.code_module == nullptr ? "none" : probe.code_module->path.c_str());
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "ABI resolver summary candidates=%zu passed_rows=%zu distinct_abis=%zu",
+                        resolution.candidates.size(), resolution.passed_rows,
+                        resolution.distinct_abis);
+    if (!resolution.passed || resolution.binding.profile == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "VM ABI structural proof rejected: distinct passing ABI count=%zu",
+                            resolution.distinct_abis);
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const auto* profile = resolution.binding.profile;
+    const auto& selected_probe = resolution.binding.probe;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "verified VM binding abi=%s profile=%s app_path=%s app_build_id=%s "
+                        "capabilities=0x%llx engines=%zu engine_build_ids_are_diagnostic_only=1",
+                        profile->abi_id, profile->live_vm.name,
+                        resolution.binding.artifacts.app.path.c_str(),
+                        resolution.binding.artifacts.app.build_id.c_str(),
+                        static_cast<unsigned long long>(resolution.binding.capabilities),
+                        resolution.binding.artifacts.engines.size());
+
     auto* instance = new (std::nothrow) FlutterVmAdapterImpl;
     if (instance == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "adapter allocation failed status=%d",
@@ -798,29 +790,12 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     }
     State& state = instance->state;
     state.profile = profile;
+    state.artifacts = resolution.binding.artifacts;
+    state.capabilities = resolution.binding.capabilities;
     state.isolate_detached = false;
     state.thread = thread;
-    const uint64_t thread_isolate = ThreadWord(state, profile->layout.isolate);
-    const uint64_t group = ThreadWord(state, profile->layout.isolate_group);
-    if (thread_isolate != reinterpret_cast<uint64_t>(isolate) || group == 0) {
-        __android_log_print(
-            ANDROID_LOG_ERROR, kTag,
-            "thread identity mismatch thread_isolate=0x%llx isolate=%p group=0x%llx",
-            static_cast<unsigned long long>(thread_isolate), isolate,
-            static_cast<unsigned long long>(group));
-        delete instance;
-        __android_log_print(ANDROID_LOG_ERROR, kTag, "returning isolate mismatch status=%d",
-                            DARTPLANT_VM_ISOLATE_MISMATCH);
-        return DARTPLANT_VM_ISOLATE_MISMATCH;
-    }
-    state.enter_safepoint = ResolveStubEntry(state, profile->layout.enter_safepoint_stub);
-    state.exit_safepoint = ResolveStubEntry(state, profile->layout.exit_safepoint_stub);
-    if (state.enter_safepoint == 0 || state.exit_safepoint == 0) {
-        delete instance;
-        __android_log_print(ANDROID_LOG_ERROR, kTag, "returning bridge unavailable status=%d",
-                            DARTPLANT_VM_BRIDGE_UNAVAILABLE);
-        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
-    }
+    state.enter_safepoint = selected_probe.enter_entry;
+    state.exit_safepoint = selected_probe.exit_entry;
     Dart_Handle null_handle = Dart_Null_DL();
     for (auto& root : state.roots) {
         root.handle = Dart_NewPersistentHandle_DL(null_handle);
@@ -834,6 +809,16 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         }
     }
     state.null_raw = RootRaw(state.roots[0]);
+    if (state.null_raw != canonical_null || state.null_raw != selected_probe.roots.thread_null) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "verified canonical null changed before root publication expected=0x%llx actual=0x%llx",
+            static_cast<unsigned long long>(canonical_null),
+            static_cast<unsigned long long>(state.null_raw));
+        DeleteRoots(state);
+        delete instance;
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
     for (const auto& root : state.roots) {
         if (RootRaw(root) != state.null_raw) {
             __android_log_print(ANDROID_LOG_ERROR, kTag, "persistent root null mismatch at slot=%u",
@@ -844,8 +829,8 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         }
     }
     const DartPlantIsolateIdentity identity = {
-        .isolate = reinterpret_cast<uint64_t>(isolate),
-        .isolate_group = group,
+        .isolate = current_isolate,
+        .isolate_group = selected_probe.isolate_group,
         .generation = options->isolate_generation,
     };
     state.identity = identity;
@@ -866,8 +851,10 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     }
     *out_instance = reinterpret_cast<DartPlantFlutterVmAdapter*>(instance);
     __android_log_print(
-        ANDROID_LOG_INFO, kTag, "exact Dart %s V3 adapter initialized snapshot=%s thread=0x%llx",
-        profile->dart_version, snapshot_hash, static_cast<unsigned long long>(thread));
+        ANDROID_LOG_INFO, kTag,
+        "source-verified Dart %s V3 adapter initialized abi=%s snapshot=%s thread=0x%llx",
+        profile->live_vm.dart_version, profile->abi_id, snapshot_hash,
+        static_cast<unsigned long long>(thread));
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "isolate identity backend=%s isolate=0x%llx group=0x%llx generation=%llu",
                         "thread-private-layout", static_cast<unsigned long long>(identity.isolate),
@@ -911,59 +898,38 @@ DartPlantVmAdapter* dartplant_flutter_vm_adapter_get(DartPlantFlutterVmAdapter* 
 }
 
 const DartPlantFlutterVmDescriptor* DescriptorAt(uint32_t index) {
-    static const DartPlantFlutterVmDescriptor descriptors[] = {
-        {
-            .struct_size = sizeof(DartPlantFlutterVmDescriptor),
-            .descriptor_version = 1,
-            .vm_adapter_version = 3,
-            .descriptor_id = "flutter-3.22.3-dart-3.4.4-android-arm64-product",
-            .dart_version = "3.4.4",
-            .flutter_version = "3.22.3",
-            .snapshot_hash = "d20a1be77c3d3c41b2a5accaee1ce549",
-            .flutter_module_name = "libflutter.so",
-            .flutter_build_id = "b4ba48b16f1760763d444d35d5d0106ba554fabd",
-            .pointer_size = 8,
-            .compressed_pointers = 1,
-            .product_mode = 1,
-            .reserved = {0, 0},
-        },
-#if !defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
-        {
-            .struct_size = sizeof(DartPlantFlutterVmDescriptor),
-            .descriptor_version = 1,
-            .vm_adapter_version = 3,
-            .descriptor_id = "flutter-3.24.0-dart-3.5.0-android-arm64-product",
-            .dart_version = "3.5.0",
-            .flutter_version = "3.24.0",
-            .snapshot_hash = "80a49c7111088100a233b2ae788e1f48",
-            .flutter_module_name = "libflutter.so",
-            .flutter_build_id = "d9a7f562e5595e9913262ba4b5026a0df242ccfd",
-            .pointer_size = 8,
-            .compressed_pointers = 1,
-            .product_mode = 1,
-            .reserved = {0, 0},
-        },
-        {
-            .struct_size = sizeof(DartPlantFlutterVmDescriptor),
-            .descriptor_version = 1,
-            .vm_adapter_version = 3,
-            .descriptor_id = "flutter-3.44.1-dart-3.12.1-android-arm64-product",
-            .dart_version = "3.12.1",
-            .flutter_version = "3.44.1",
-            .snapshot_hash = "ace654289f5abc240509fc941453ebc5",
-            .flutter_module_name = "libflutter.so",
-            .flutter_build_id = "ca4618220c6646c3546f020f587fef1c75e3c505",
-            .pointer_size = 8,
-            .compressed_pointers = 1,
-            .product_mode = 1,
-            .reserved = {0, 0},
-        },
-#endif
-    };
-    return index < std::size(descriptors) ? &descriptors[index] : nullptr;
+    static const auto descriptors = [] {
+        std::array<DartPlantFlutterVmDescriptor, std::size(kDescriptorMetadata)> result{};
+        for (size_t cursor = 0; cursor < result.size(); ++cursor) {
+            const auto& metadata = kDescriptorMetadata[cursor];
+            const auto* profile = dartplant::FindRuntimeProfileByVersion(metadata.profile_version);
+            if (profile == nullptr) continue;
+            result[cursor] = {
+                .struct_size = sizeof(DartPlantFlutterVmDescriptor),
+                .descriptor_version = 1,
+                .vm_adapter_version = 3,
+                .descriptor_id = metadata.descriptor_id,
+                .dart_version = profile->live_vm.dart_version,
+                .flutter_version = metadata.flutter_version,
+                .snapshot_hash = profile->live_vm.snapshot_hash,
+                .flutter_module_name = "libflutter.so",
+                // Deprecated compatibility field. Engine Build IDs are
+                // observed as artifact-incarnation diagnostics and never
+                // select a private VM ABI.
+                .flutter_build_id = "",
+                .pointer_size = profile->machine.pointer_size,
+                .compressed_pointers =
+                    profile->machine.compressed_pointers ? uint8_t{1} : uint8_t{0},
+                .product_mode = profile->machine.product ? uint8_t{1} : uint8_t{0},
+                .reserved = {0, 0},
+            };
+        }
+        return result;
+    }();
+    return index < descriptors.size() ? &descriptors[index] : nullptr;
 }
 
-uint32_t dartplant_flutter_vm_descriptor_count(void) { return std::size(kProfiles); }
+uint32_t dartplant_flutter_vm_descriptor_count(void) { return std::size(kDescriptorMetadata); }
 
 const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_descriptor_at(uint32_t index) {
     return DescriptorAt(index);
@@ -974,6 +940,11 @@ const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_adapter_descriptor(
     if (instance == nullptr) return nullptr;
     const auto* impl = reinterpret_cast<const FlutterVmAdapterImpl*>(instance);
     if (impl->state.profile == nullptr) return nullptr;
-    const uint32_t index = static_cast<uint32_t>(impl->state.profile - kProfiles);
-    return DescriptorAt(index);
+    for (uint32_t index = 0; index < std::size(kDescriptorMetadata); ++index) {
+        if (kDescriptorMetadata[index].profile_version ==
+            impl->state.profile->live_vm.profile_version) {
+            return DescriptorAt(index);
+        }
+    }
+    return nullptr;
 }

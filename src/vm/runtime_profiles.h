@@ -8,10 +8,52 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 #include "dartplant/advanced/live_vm.h"
 
 namespace dartplant {
+
+enum class VmArchitecture : uint8_t {
+    kArm64 = 0,
+};
+
+struct VmMachineAbi {
+    VmArchitecture architecture;
+    uint8_t pointer_size;
+    bool product;
+    bool compressed_pointers;
+};
+
+// Private Thread fields required by the Flutter VM bridge but not by the
+// public LiveVmProfile prefix. These values are generated from, and verified
+// against, the same Dart SDK source revision as every other private layout.
+struct VmThreadBridgeLayout {
+    uint32_t enter_safepoint_stub_offset;
+    uint32_t exit_safepoint_stub_offset;
+    uint32_t top_exit_frame_offset;
+    uint32_t vm_tag_offset;
+    uint32_t active_exception_offset;
+    uint32_t active_stacktrace_offset;
+    uint32_t execution_state_offset;
+    uint32_t exit_through_ffi_offset;
+};
+
+struct VmTypeArgumentsLayout {
+    uint32_t cid;
+    uint32_t length_offset;
+    uint32_t types_offset;
+};
+
+struct VmTransitionLayout {
+    uint64_t vm_tag_dart;
+    uint64_t execution_vm;
+    uint64_t execution_generated;
+    uint64_t execution_native;
+    uint64_t exit_none;
+    uint64_t exit_through_ffi;
+    uint64_t exit_through_runtime_call;
+};
 
 struct CanonicalBoolLayout {
     uint32_t thread_true_offset;
@@ -74,6 +116,8 @@ struct FunctionKindLayout {
 };
 
 struct RuntimeProfileRecord {
+    const char* abi_id;
+    VmMachineAbi machine;
     DartPlantLiveVmProfile live_vm;
     uint8_t dart_sp_register;
     uint8_t arguments_descriptor_register;
@@ -87,6 +131,22 @@ struct RuntimeProfileRecord {
     RawObjectLayout raw_object;
     ArgumentsDescriptorLayout arguments_descriptor;
     FunctionKindLayout function_kind;
+    VmThreadBridgeLayout thread_bridge;
+    VmTypeArgumentsLayout type_arguments;
+    VmTransitionLayout transition;
+};
+
+// Runtime facts narrow a finite, source-verified ABI registry. They never
+// synthesize offsets. A known snapshot hash is a ranking hint; every compatible
+// machine/mode candidate remains eligible for the caller's read-only structural
+// proof so custom/rebuilt artifacts are not rejected by identity alone.
+struct VmRuntimeFacts {
+    std::string_view snapshot_hash;
+    std::string_view snapshot_features;
+    VmArchitecture architecture = VmArchitecture::kArm64;
+    uint8_t pointer_size = 8;
+    bool product = true;
+    bool compressed_pointers = true;
 };
 
 struct AotCodePayloadRange {
@@ -100,6 +160,8 @@ size_t RuntimeProfileCount();
 const RuntimeProfileRecord* FindRuntimeProfileByVersion(uint32_t profile_version);
 const RuntimeProfileRecord* FindRuntimeProfileBySnapshot(std::string_view snapshot_hash,
                                                          std::string_view snapshot_profile = {});
+std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
+    const VmRuntimeFacts& facts);
 uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash);
 bool IsClosureFunctionKind(uint32_t profile_version, uint32_t function_kind);
 bool ComputeAotCodePayloadStart(uint32_t profile_version, uint64_t normal_entry,

@@ -36,6 +36,9 @@ typedef struct DartPlantFlutterVmDescriptor {
     const char* flutter_version;
     const char* snapshot_hash;
     const char* flutter_module_name;
+    // Deprecated compatibility field. Build IDs no longer select the Dart VM
+    // private ABI. The adapter observes the currently mapped engine/app Build
+    // IDs only as artifact-incarnation diagnostics after structural proof.
     const char* flutter_build_id;
     uint32_t pointer_size;
     uint8_t compressed_pointers;
@@ -51,9 +54,11 @@ DARTPLANT_EXPORT const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_adapte
     const DartPlantFlutterVmAdapter* instance);
 DARTPLANT_EXPORT DartPlantStatus
 dartplant_flutter_vm_adapter_destroy(DartPlantFlutterVmAdapter* instance);
-// Exact descriptors compiled into this adapter. The implementation is
-// process-global because dart_api_dl itself is process-global; create returns
-// VM_ADAPTER_BUSY while another instance is attached.
+// Source-verified ABI descriptors compiled into this adapter. Snapshot identity
+// narrows the candidate set but artifact Build IDs never determine ABI
+// compatibility. The implementation remains process-global because dart_api_dl
+// itself is process-global; create returns VM_ADAPTER_BUSY while another
+// instance is attached.
 DARTPLANT_EXPORT uint32_t dartplant_flutter_vm_descriptor_count(void);
 DARTPLANT_EXPORT const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_descriptor_at(
     uint32_t index);

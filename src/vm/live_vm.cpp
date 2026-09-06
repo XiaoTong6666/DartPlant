@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "runtime/runtime_internal.h"
+#include "vm/abi/proof.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
@@ -1435,15 +1436,10 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
     profile.struct_size = sizeof(profile);
     DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
     if (status != DARTPLANT_OK) return status;
-    const dartplant::RawObjectLayout* raw = dartplant::FindRawObjectLayout(profile.profile_version);
-    const uint64_t max_cids = dartplant::MaxCidCount(profile);
-    if (raw == nullptr || max_cids == 0) {
+    const dartplant::RuntimeProfileRecord* record =
+        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
+    if (record == nullptr) {
         return dartplant::FailProbe("selected live VM raw-object profile is incomplete");
-    }
-
-    dartplant::ProcessMemoryReader reader;
-    if (!reader.Refresh()) {
-        return dartplant::FailProbe("cannot read /proc/self/maps for live VM register validation");
     }
 
     DartPlantLiveVmContext context{};
@@ -1452,132 +1448,34 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
     context.profile_name = profile.name;
     context.thread = dartplant::CanonicalNativePointer(registers->thr);
     context.pp = registers->pp;
-    if (context.thread == 0 ||
-        !reader.Contains(static_cast<uintptr_t>(context.thread),
-                         profile.thread_isolate_group_offset + sizeof(uint64_t))) {
+    if (context.thread == 0) {
         return dartplant::FailProbe("sampled THR is not a readable Dart Thread");
     }
 
-    uint64_t thread_null = 0;
-    uint64_t thread_pool = 0;
-    if (!reader.Read(static_cast<uintptr_t>(context.thread) + profile.thread_heap_base_offset,
-                     &context.heap_base) ||
-        !reader.Read(static_cast<uintptr_t>(context.thread) + profile.thread_object_null_offset,
-                     &thread_null) ||
-        !reader.Read(
-            static_cast<uintptr_t>(context.thread) + profile.thread_global_object_pool_offset,
-            &thread_pool) ||
-        !dartplant::ReadNativePointer(
-            reader, static_cast<uintptr_t>(context.thread) + profile.thread_isolate_offset,
-            &context.isolate) ||
-        !dartplant::ReadNativePointer(
-            reader, static_cast<uintptr_t>(context.thread) + profile.thread_isolate_group_offset,
-            &context.isolate_group)) {
-        return dartplant::FailProbe("sampled Dart Thread fields are unreadable");
+    dartplant::vm_abi::RootProofInput proof_input{};
+    proof_input.profile = record;
+    proof_input.thread = context.thread;
+    proof_input.require_dart_core = true;
+    proof_input.registers = {
+        .available = true,
+        .pp = registers->pp,
+        .heap_bits = registers->heap_bits,
+        .null_value = registers->null_value,
+    };
+    const dartplant::vm_abi::RootProof roots = dartplant::vm_abi::ProveRuntimeRoots(proof_input);
+    if (!roots.passed) {
+        const std::string message = std::string("shared VM root proof failed at ") +
+                                    dartplant::vm_abi::RootProofStageName(roots.stage);
+        return dartplant::FailProbe(message.c_str());
     }
-
-    if (static_cast<uint32_t>(registers->heap_bits) !=
-            static_cast<uint32_t>(context.heap_base >> 32) ||
-        registers->null_value != thread_null || !dartplant::IsHeapObject(profile, thread_pool) ||
-        thread_pool < raw->heap_object_tag || context.pp != thread_pool - raw->heap_object_tag) {
-        return dartplant::FailProbe("sampled THR/PP/HEAP_BITS/NULL_REG semantics do not match");
-    }
-    context.global_object_pool = thread_pool;
-
-    if (context.isolate == 0 || context.isolate_group == 0 ||
-        !reader.Contains(static_cast<uintptr_t>(context.isolate), sizeof(uint64_t)) ||
-        !reader.Contains(static_cast<uintptr_t>(context.isolate_group),
-                         profile.isolate_group_object_store_offset + sizeof(uint64_t)) ||
-        !dartplant::ReadNativePointer(reader,
-                                      static_cast<uintptr_t>(context.isolate_group) +
-                                          profile.isolate_group_class_table_offset,
-                                      &context.class_table) ||
-        !dartplant::ReadNativePointer(reader,
-                                      static_cast<uintptr_t>(context.isolate_group) +
-                                          profile.isolate_group_cached_class_table_table_offset,
-                                      &context.cached_class_table_table) ||
-        !dartplant::ReadNativePointer(reader,
-                                      static_cast<uintptr_t>(context.isolate_group) +
-                                          profile.isolate_group_object_store_offset,
-                                      &context.object_store)) {
-        return dartplant::FailProbe("sampled Isolate/IsolateGroup roots are invalid");
-    }
-
-    if (!dartplant::RequireCid(reader, profile, context.global_object_pool,
-                               profile.cid_object_pool) ||
-        !reader.Read(dartplant::Untag(profile, context.global_object_pool) +
-                         profile.object_pool_length_offset,
-                     &context.object_pool_length) ||
-        context.object_pool_length == 0 ||
-        context.object_pool_length > dartplant::kMaxObjectPoolEntries) {
-        return dartplant::FailProbe("sampled global ObjectPool is invalid");
-    }
-
-    uint64_t num_cids = 0;
-    if (!reader.Read(
-            static_cast<uintptr_t>(context.class_table) + profile.class_table_num_cids_offset,
-            &num_cids) ||
-        num_cids == 0 || num_cids > max_cids) {
-        return dartplant::FailProbe("sampled ClassTable is invalid");
-    }
-    uint64_t class_class = 0;
-    if (profile.cid_class >= num_cids ||
-        !reader.Read(static_cast<uintptr_t>(context.cached_class_table_table) +
-                         static_cast<uintptr_t>(profile.cid_class) * sizeof(uint64_t),
-                     &class_class) ||
-        !dartplant::RequireCid(reader, profile, class_class, profile.cid_class)) {
-        return dartplant::FailProbe("sampled cached ClassTable does not expose Class CID");
-    }
-
-    uint64_t libraries = 0;
-    if (!reader.Read(
-            static_cast<uintptr_t>(context.object_store) + profile.object_store_libraries_offset,
-            &libraries) ||
-        !dartplant::RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
-        return dartplant::FailProbe("sampled ObjectStore.libraries is invalid");
-    }
-    const uintptr_t growable = dartplant::Untag(profile, libraries);
-    uint64_t library_count = 0;
-    uint64_t library_data = 0;
-    if (!dartplant::ReadPositiveCompressedSmi(
-            reader, growable + profile.growable_object_array_length_offset, profile,
-            &library_count) ||
-        library_count == 0 || library_count > dartplant::kMaxClassFunctions ||
-        !dartplant::ReadCompressedObject(reader, growable, profile,
-                                         profile.growable_object_array_data_offset,
-                                         context.heap_base, &library_data)) {
-        return dartplant::FailProbe("sampled ObjectStore library array is invalid");
-    }
-    uint32_t library_data_cid = 0;
-    if (!dartplant::ReadCid(reader, profile, library_data, &library_data_cid) ||
-        (library_data_cid != profile.cid_array &&
-         library_data_cid != profile.cid_immutable_array)) {
-        return dartplant::FailProbe("sampled ObjectStore library backing array is invalid");
-    }
-
-    bool has_library = false;
-    bool has_dart_core = false;
-    const uint64_t scan_count = std::min<uint64_t>(library_count, 4096);
-    for (uint64_t index = 0; index < scan_count; ++index) {
-        uint64_t library = 0;
-        if (!dartplant::ReadArrayElement(reader, profile, context.heap_base, library_data, index,
-                                         &library) ||
-            !dartplant::RequireCid(reader, profile, library, profile.cid_library)) {
-            continue;
-        }
-        has_library = true;
-        if (dartplant::LibraryIdentityMatches(reader, profile, context.heap_base, library,
-                                              "dart:core")) {
-            has_dart_core = true;
-            break;
-        }
-    }
-    if (!has_library) {
-        return dartplant::FailProbe("sampled ObjectStore contains no valid Library roots");
-    }
-    if (!has_dart_core) {
-        return dartplant::FailProbe("sampled ObjectStore does not contain dart:core");
-    }
+    context.heap_base = roots.heap_base;
+    context.isolate = roots.isolate;
+    context.isolate_group = roots.isolate_group;
+    context.global_object_pool = roots.global_object_pool;
+    context.class_table = roots.class_table;
+    context.cached_class_table_table = roots.cached_class_table_table;
+    context.object_store = roots.object_store;
+    context.object_pool_length = roots.object_pool_length;
 
     *out_context = context;
     dartplant::ClearLastError();

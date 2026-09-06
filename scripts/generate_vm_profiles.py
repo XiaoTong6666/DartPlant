@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess as sp
@@ -51,6 +52,14 @@ AOT_OFFSET_BINDINGS = {
     ("thread", "global_object_pool"): "AOT_Thread_global_object_pool_offset",
     ("thread", "isolate"): "AOT_Thread_isolate_offset",
     ("thread", "isolate_group"): "AOT_Thread_isolate_group_offset",
+    ("thread", "enter_safepoint_stub"): "AOT_Thread_enter_safepoint_stub_offset",
+    ("thread", "exit_safepoint_stub"): "AOT_Thread_exit_safepoint_stub_offset",
+    ("thread", "top_exit_frame"): "AOT_Thread_top_exit_frame_info_offset",
+    ("thread", "vm_tag"): "AOT_Thread_vm_tag_offset",
+    ("thread", "active_exception"): "AOT_Thread_active_exception_offset",
+    ("thread", "active_stacktrace"): "AOT_Thread_active_stacktrace_offset",
+    ("thread", "execution_state"): "AOT_Thread_execution_state_offset",
+    ("thread", "exit_through_ffi"): "AOT_Thread_exit_through_ffi_offset",
     ("thread", "jump_to_frame_entry_point"): "AOT_Thread_jump_to_frame_entry_point_offset",
     ("isolate_group", "class_table"): "AOT_IsolateGroup_class_table_offset",
     ("isolate_group", "cached_class_table_table"): (
@@ -96,6 +105,8 @@ AOT_OFFSET_BINDINGS = {
     ("arguments_descriptor", "named_entry_size"): "AOT_ArgumentsDescriptor_named_entry_size",
     ("arguments_descriptor", "name"): "AOT_ArgumentsDescriptor_name_offset",
     ("arguments_descriptor", "position"): "AOT_ArgumentsDescriptor_position_offset",
+    ("type_arguments", "length"): "AOT_TypeArguments_length_offset",
+    ("type_arguments", "types"): "AOT_TypeArguments_types_offset",
 }
 
 # CodeEntryKind order is defined by runtime/vm/code_entry_kind.h:
@@ -276,6 +287,55 @@ def _class_id_map(class_id_text: str) -> dict[str, int]:
     return {name: index for index, name in enumerate(class_ids)}
 
 
+def _abi_payload(profile: dict[str, object]) -> dict[str, object]:
+    """Return only facts that change interpretation of Dart private ABI.
+
+    Artifact identity, Dart/Flutter marketing versions, snapshot hashes, and
+    profile row identifiers deliberately stay out of this payload. Two source
+    profiles with identical private layouts and semantic constants therefore
+    receive the same ABI identity even when their artifacts differ.
+    """
+
+    keys = (
+        "machine",
+        "registers",
+        "thread",
+        "isolate_group",
+        "class_table",
+        "object_store",
+        "instructions",
+        "code",
+        "function",
+        "class",
+        "library",
+        "array",
+        "growable_object_array",
+        "string",
+        "object_pool",
+        "cids",
+        "canonical_bool",
+        "function_type",
+        "raw_object",
+        "arguments_descriptor",
+        "function_kind",
+        "type_arguments",
+        "transition",
+    )
+    return {key: profile[key] for key in keys}
+
+
+def _canonical_abi_id(profile: dict[str, object]) -> str:
+    payload = json.dumps(
+        _abi_payload(profile), sort_keys=True, separators=(",", ":")
+    ).encode()
+    digest = hashlib.sha256(payload).hexdigest()[:24]
+    machine = profile["machine"]
+    architecture = str(machine["architecture"])
+    mode = "product" if bool(machine["product"]) else "nonproduct"
+    compression = "compressed" if bool(machine["compressed_pointers"]) else "uncompressed"
+    return f"dart-vm-{architecture}-{mode}-{compression}/abi-{digest}"
+
+
 def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
     actual = _class_id_map(class_id_text)
     cids = profile["cids"]
@@ -291,6 +351,7 @@ def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
         "GrowableObjectArrayCid": int(cids["growable_object_array"]),
         "OneByteStringCid": int(cids["one_byte_string"]),
         "TwoByteStringCid": int(cids["two_byte_string"]),
+        "TypeArgumentsCid": int(profile["type_arguments"]["cid"]),
         "BoolCid": int(profile["canonical_bool"]["cid"]),
         "TypeCid": int(function_type["cid_type"]),
         "FunctionTypeCid": int(function_type["cid_function_type"]),
@@ -307,6 +368,51 @@ def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
                 f"{profile['name']}: manifest CID {name}={value} disagrees with Dart source "
                 f"value {actual.get(name)}"
             )
+
+
+def _verify_transition_constants(
+    profile: dict[str, object], thread_text: str, tags_text: str, source_name: str
+) -> None:
+    transition = profile["transition"]
+    expected = {
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2,
+    }
+    for field, value in expected.items():
+        if int(transition[field]) != value:
+            raise ValueError(
+                f"{profile['name']}: transition {field}={transition[field]} "
+                f"disagrees with {source_name} value {value}"
+            )
+
+    normalized_thread = " ".join(thread_text.split())
+    execution_evidence = (
+        "enum ExecutionState { kThreadInVM = 0, kThreadInGenerated, kThreadInNative,"
+    )
+    if execution_evidence not in normalized_thread:
+        raise ValueError(f"{source_name}: Dart Thread ExecutionState numbering changed")
+    for evidence in (
+        "kDidNotExit = 0,",
+        "kExitThroughFfi = 1,",
+        "kExitThroughRuntimeCall = 2,",
+    ):
+        if evidence not in thread_text:
+            raise ValueError(f"{source_name}: Dart Thread exit marker changed: {evidence}")
+
+    vm_tags = _extract_v_macro(tags_text, "VM_TAG_LIST")
+    try:
+        dart_tag = vm_tags.index("Dart") + 1  # kInvalidTagId occupies zero.
+    except ValueError as error:
+        raise ValueError(f"{source_name}: Dart VM tag is missing") from error
+    if int(transition["vm_tag_dart"]) != dart_tag:
+        raise ValueError(
+            f"{profile['name']}: vm_tag_dart={transition['vm_tag_dart']} disagrees with "
+            f"{source_name} value {dart_tag}"
+        )
 
 
 def _verify_function_kinds(
@@ -632,6 +738,8 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         app_snapshot = _git_show(sdk_root, version, "runtime/vm/app_snapshot.cc")
         raw_object = _git_show(sdk_root, version, "runtime/vm/raw_object.h")
         class_id = _git_show(sdk_root, version, "runtime/vm/class_id.h")
+        tags = _git_show(sdk_root, version, "runtime/vm/tags.h")
+        thread = _git_show(sdk_root, version, "runtime/vm/thread.h")
         function_impl = _git_show(sdk_root, version, "runtime/vm/object.cc")
         dart_entry = _git_show(sdk_root, version, "runtime/vm/dart_entry.h")
         pointer_tagging = _git_show(sdk_root, version, "runtime/vm/pointer_tagging.h")
@@ -660,6 +768,9 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         )
         _verify_function_kinds(profile, raw_object, object_header)
         _verify_class_ids(profile, class_id)
+        _verify_transition_constants(
+            profile, thread, tags, source_name=f"Dart SDK {version}"
+        )
         _verify_raw_object_layout(
             profile, pointer_tagging, raw_object, runtime_api, platform_globals,
             source_name=f"Dart SDK {version}"
@@ -688,8 +799,8 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
 
 def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
     payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 1:
-        raise ValueError("dart VM profile manifest schema_version must be 1")
+    if payload.get("schema_version") != 2:
+        raise ValueError("dart VM profile manifest schema_version must be 2")
     profiles = payload.get("profiles")
     if not isinstance(profiles, list) or not profiles:
         raise ValueError("dart VM profile manifest must contain profiles")
@@ -708,6 +819,20 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
         hashes.add(snapshot_hash)
         if len(snapshot_hash) != 32 or any(c not in "0123456789abcdef" for c in snapshot_hash):
             raise ValueError(f"invalid snapshot hash for {name}: {snapshot_hash}")
+
+        machine = profile["machine"]
+        if (
+            machine.get("architecture") != "arm64"
+            or int(machine.get("pointer_size", 0)) != 8
+            or machine.get("product") is not True
+            or machine.get("compressed_pointers") is not True
+        ):
+            raise ValueError(f"{name}: unsupported VM machine ABI")
+        expected_abi_id = _canonical_abi_id(profile)
+        if profile.get("abi_id") != expected_abi_id:
+            raise ValueError(
+                f"{name}: abi_id is stale: {profile.get('abi_id')} != {expected_abi_id}"
+            )
 
         registers = profile["registers"]
         for key, expected in EXPECTED_FIXED_REGISTERS.items():
@@ -763,6 +888,24 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
             or int(raw_object["compressed_word_size"]) not in (4, 8)
         ):
             raise ValueError(f"{name}: invalid raw tagged-object layout")
+        type_arguments = profile["type_arguments"]
+        if (
+            int(type_arguments["cid"]) <= 0
+            or int(type_arguments["length"]) <= 0
+            or int(type_arguments["types"]) <= int(type_arguments["length"])
+        ):
+            raise ValueError(f"{name}: invalid TypeArguments layout")
+        transition = profile["transition"]
+        if (
+            int(transition["execution_vm"]) != 0
+            or int(transition["execution_generated"]) != 1
+            or int(transition["execution_native"]) != 2
+            or int(transition["exit_none"]) != 0
+            or int(transition["exit_through_ffi"]) != 1
+            or int(transition["exit_through_runtime_call"]) != 2
+            or int(transition["vm_tag_dart"]) <= 0
+        ):
+            raise ValueError(f"{name}: invalid generated/native transition constants")
     return profiles
 
 
@@ -780,6 +923,7 @@ def verify_sdk_contract(sdk_root: Path) -> None:
     function_impl = sdk_root / "runtime" / "vm" / "object.cc"
     code_entry_kind = sdk_root / "runtime" / "vm" / "code_entry_kind.h"
     raw_object = sdk_root / "runtime" / "vm" / "raw_object.h"
+    tags = sdk_root / "runtime" / "vm" / "tags.h"
     object_header = sdk_root / "runtime" / "vm" / "object.h"
     dart_entry = sdk_root / "runtime" / "vm" / "dart_entry.h"
     pointer_tagging = sdk_root / "runtime" / "vm" / "pointer_tagging.h"
@@ -809,6 +953,7 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         function_impl,
         code_entry_kind,
         raw_object,
+        tags,
         object_header,
         dart_entry,
         pointer_tagging,
@@ -906,6 +1051,13 @@ def verify_sdk_contract(sdk_root: Path) -> None:
             profile, pointer_tagging.read_text(), raw_object_text, runtime_api.read_text(),
             platform_globals.read_text(), source_name="current Dart SDK"
         )
+        # The current checkout may be newer than every checked-in historical
+        # candidate. Verify only that the source still exposes the semantic
+        # anchors; exact per-candidate values are checked against each tag in
+        # verify_historical_profiles().
+    tags_text = tags.read_text()
+    if "Dart" not in _extract_v_macro(tags_text, "VM_TAG_LIST"):
+        raise ValueError("current Dart SDK no longer exposes the Dart VM tag")
 
     object_header_text = object_header.read_text()
     for profile in _load_manifest():
@@ -943,6 +1095,7 @@ def verify_sdk_contract(sdk_root: Path) -> None:
 
 
 def _render_profile(profile: dict[str, object]) -> str:
+    machine = profile["machine"]
     r = profile["registers"]
     thread = profile["thread"]
     isolate_group = profile["isolate_group"]
@@ -963,9 +1116,18 @@ def _render_profile(profile: dict[str, object]) -> str:
     raw_object = profile["raw_object"]
     arguments_descriptor = profile["arguments_descriptor"]
     function_kind = profile["function_kind"]
+    type_arguments = profile["type_arguments"]
+    transition = profile["transition"]
     gp_args = ", ".join(str(value) for value in r["dart_gp_args"])
     fpu_args = ", ".join(str(value) for value in r["dart_fpu_args"])
     return f"""    RuntimeProfileRecord{{
+        .abi_id = {json.dumps(profile['abi_id'])},
+        .machine = {{
+            .architecture = VmArchitecture::kArm64,
+            .pointer_size = {machine['pointer_size']}u,
+            .product = {str(bool(machine['product'])).lower()},
+            .compressed_pointers = {str(bool(machine['compressed_pointers'])).lower()},
+        }},
         .live_vm = {{
             .struct_size = sizeof(DartPlantLiveVmProfile),
             .profile_version = {profile['profile_version']}u,
@@ -1087,6 +1249,30 @@ def _render_profile(profile: dict[str, object]) -> str:
             .implicit_closure = {function_kind['implicit_closure']}u,
             .tag_shift = {function_kind['tag_shift']}u,
             .tag_bits = {function_kind['tag_bits']}u,
+        }},
+        .thread_bridge = {{
+            .enter_safepoint_stub_offset = {_u(int(thread['enter_safepoint_stub']))},
+            .exit_safepoint_stub_offset = {_u(int(thread['exit_safepoint_stub']))},
+            .top_exit_frame_offset = {_u(int(thread['top_exit_frame']))},
+            .vm_tag_offset = {_u(int(thread['vm_tag']))},
+            .active_exception_offset = {_u(int(thread['active_exception']))},
+            .active_stacktrace_offset = {_u(int(thread['active_stacktrace']))},
+            .execution_state_offset = {_u(int(thread['execution_state']))},
+            .exit_through_ffi_offset = {_u(int(thread['exit_through_ffi']))},
+        }},
+        .type_arguments = {{
+            .cid = {type_arguments['cid']}u,
+            .length_offset = {_u(int(type_arguments['length']))},
+            .types_offset = {_u(int(type_arguments['types']))},
+        }},
+        .transition = {{
+            .vm_tag_dart = {transition['vm_tag_dart']}u,
+            .execution_vm = {transition['execution_vm']}u,
+            .execution_generated = {transition['execution_generated']}u,
+            .execution_native = {transition['execution_native']}u,
+            .exit_none = {transition['exit_none']}u,
+            .exit_through_ffi = {transition['exit_through_ffi']}u,
+            .exit_through_runtime_call = {transition['exit_through_runtime_call']}u,
         }},
     }}"""
 

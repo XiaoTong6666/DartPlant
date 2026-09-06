@@ -5,6 +5,13 @@ namespace dartplant {
 
 inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
     RuntimeProfileRecord{
+        .abi_id = "dart-vm-arm64-product-compressed/abi-3249385cbb1dc5c7e3411ecd",
+        .machine = {
+            .architecture = VmArchitecture::kArm64,
+            .pointer_size = 8u,
+            .product = true,
+            .compressed_pointers = true,
+        },
         .live_vm = {
             .struct_size = sizeof(DartPlantLiveVmProfile),
             .profile_version = 1u,
@@ -127,8 +134,39 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .tag_shift = 0u,
             .tag_bits = 5u,
         },
+        .thread_bridge = {
+            .enter_safepoint_stub_offset = 0x1d0u,
+            .exit_safepoint_stub_offset = 0x1d8u,
+            .top_exit_frame_offset = 0x710u,
+            .vm_tag_offset = 0x730u,
+            .active_exception_offset = 0x748u,
+            .active_stacktrace_offset = 0x750u,
+            .execution_state_offset = 0x770u,
+            .exit_through_ffi_offset = 0x780u,
+        },
+        .type_arguments = {
+            .cid = 46u,
+            .length_offset = 0xcu,
+            .types_offset = 0x18u,
+        },
+        .transition = {
+            .vm_tag_dart = 8u,
+            .execution_vm = 0u,
+            .execution_generated = 1u,
+            .execution_native = 2u,
+            .exit_none = 0u,
+            .exit_through_ffi = 1u,
+            .exit_through_runtime_call = 2u,
+        },
     },
     RuntimeProfileRecord{
+        .abi_id = "dart-vm-arm64-product-compressed/abi-e94a0fc870b29c8697c227bf",
+        .machine = {
+            .architecture = VmArchitecture::kArm64,
+            .pointer_size = 8u,
+            .product = true,
+            .compressed_pointers = true,
+        },
         .live_vm = {
             .struct_size = sizeof(DartPlantLiveVmProfile),
             .profile_version = 2u,
@@ -251,8 +289,39 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .tag_shift = 0u,
             .tag_bits = 5u,
         },
+        .thread_bridge = {
+            .enter_safepoint_stub_offset = 0x1d8u,
+            .exit_safepoint_stub_offset = 0x1e0u,
+            .top_exit_frame_offset = 0x728u,
+            .vm_tag_offset = 0x750u,
+            .active_exception_offset = 0x768u,
+            .active_stacktrace_offset = 0x770u,
+            .execution_state_offset = 0x790u,
+            .exit_through_ffi_offset = 0x7a0u,
+        },
+        .type_arguments = {
+            .cid = 46u,
+            .length_offset = 0xcu,
+            .types_offset = 0x18u,
+        },
+        .transition = {
+            .vm_tag_dart = 8u,
+            .execution_vm = 0u,
+            .execution_generated = 1u,
+            .execution_native = 2u,
+            .exit_none = 0u,
+            .exit_through_ffi = 1u,
+            .exit_through_runtime_call = 2u,
+        },
     },
     RuntimeProfileRecord{
+        .abi_id = "dart-vm-arm64-product-compressed/abi-d3e95d99ca5335439cdc4202",
+        .machine = {
+            .architecture = VmArchitecture::kArm64,
+            .pointer_size = 8u,
+            .product = true,
+            .compressed_pointers = true,
+        },
         .live_vm = {
             .struct_size = sizeof(DartPlantLiveVmProfile),
             .profile_version = 3u,
@@ -374,6 +443,30 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .implicit_closure = 2u,
             .tag_shift = 0u,
             .tag_bits = 5u,
+        },
+        .thread_bridge = {
+            .enter_safepoint_stub_offset = 0x1e8u,
+            .exit_safepoint_stub_offset = 0x1f0u,
+            .top_exit_frame_offset = 0x6a0u,
+            .vm_tag_offset = 0x6c8u,
+            .active_exception_offset = 0x6d0u,
+            .active_stacktrace_offset = 0x6d8u,
+            .execution_state_offset = 0x6f8u,
+            .exit_through_ffi_offset = 0x708u,
+        },
+        .type_arguments = {
+            .cid = 47u,
+            .length_offset = 0xcu,
+            .types_offset = 0x18u,
+        },
+        .transition = {
+            .vm_tag_dart = 8u,
+            .execution_vm = 0u,
+            .execution_generated = 1u,
+            .execution_native = 2u,
+            .exit_none = 0u,
+            .exit_through_ffi = 1u,
+            .exit_through_runtime_call = 2u,
         },
     },
 };

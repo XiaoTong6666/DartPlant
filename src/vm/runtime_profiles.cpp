@@ -9,6 +9,42 @@
 #include "vm/generated/runtime_profiles.generated.h"
 
 namespace dartplant {
+namespace {
+
+bool HasSnapshotFeature(std::string_view features, std::string_view expected) {
+    while (!features.empty()) {
+        const size_t separator = features.find(' ');
+        const std::string_view token = features.substr(0, separator);
+        if (token == expected) return true;
+        if (separator == std::string_view::npos) break;
+        features.remove_prefix(separator + 1);
+    }
+    return false;
+}
+
+bool MachineFactsMatch(const RuntimeProfileRecord& profile, const VmRuntimeFacts& facts) {
+    if (profile.machine.architecture != facts.architecture ||
+        profile.machine.pointer_size != facts.pointer_size ||
+        profile.machine.product != facts.product ||
+        profile.machine.compressed_pointers != facts.compressed_pointers) {
+        return false;
+    }
+    // snapshot_features is independent runtime evidence when available. Do
+    // not require it merely to enumerate a candidate: callers may only know
+    // machine facts during early discovery.
+    if (!facts.snapshot_features.empty()) {
+        if (profile.machine.product && !HasSnapshotFeature(facts.snapshot_features, "product")) {
+            return false;
+        }
+        if (profile.machine.compressed_pointers &&
+            !HasSnapshotFeature(facts.snapshot_features, "compressed-pointers")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 const RuntimeProfileRecord* RuntimeProfiles() { return kGeneratedRuntimeProfiles; }
 
@@ -37,6 +73,34 @@ const RuntimeProfileRecord* FindRuntimeProfileBySnapshot(std::string_view snapsh
         return hash == snapshot_hash && (snapshot_profile.empty() || profile == snapshot_profile);
     });
     return found == end ? nullptr : found;
+}
+
+std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
+    const VmRuntimeFacts& facts) {
+    std::vector<const RuntimeProfileRecord*> compatible;
+    compatible.reserve(RuntimeProfileCount());
+
+    for (size_t index = 0; index < RuntimeProfileCount(); ++index) {
+        const RuntimeProfileRecord& profile = RuntimeProfiles()[index];
+        if (!MachineFactsMatch(profile, facts)) continue;
+        compatible.push_back(&profile);
+    }
+
+    // Snapshot identity is a ranking hint, never an ABI gate. Probe exact
+    // aliases first for deterministic diagnostics, then every other finite,
+    // source-verified machine/mode candidate. This also exercises the same
+    // fail-closed path for custom/rebuilt engines whose snapshot identity is
+    // unknown while their private ABI is already in the registry.
+    std::stable_sort(compatible.begin(), compatible.end(),
+                     [&](const RuntimeProfileRecord* left, const RuntimeProfileRecord* right) {
+                         const auto exact = [&](const RuntimeProfileRecord* profile) {
+                             return !facts.snapshot_hash.empty() &&
+                                    profile->live_vm.snapshot_hash != nullptr &&
+                                    facts.snapshot_hash == profile->live_vm.snapshot_hash;
+                         };
+                         return exact(left) && !exact(right);
+                     });
+    return compatible;
 }
 
 uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash) {

@@ -438,6 +438,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
   V(Instance) \
   V(AbstractType) \
   V(Type) \
+  V(TypeArguments) \
   V(FunctionType) \
   V(RecordType) \
   V(TypeParameter) \
@@ -467,6 +468,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
         }
         for field, name in cid_fields.items():
             profile["cids"][field] = actual[name]
+        profile["type_arguments"]["cid"] = actual["TypeArgumentsCid"]
         profile["canonical_bool"]["cid"] = actual["BoolCid"]
         type_fields = {
             "cid_type": "TypeCid",

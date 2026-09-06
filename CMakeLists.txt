@@ -70,6 +70,9 @@ add_library(
     src/runtime/default_runtime.cpp
     src/vm/profiles.cpp
     src/vm/runtime_profiles.cpp
+    src/vm/abi/proof.cpp
+    src/vm/abi/probe.cpp
+    src/vm/abi/resolver.cpp
     src/vm/live_vm.cpp
     src/vm/live_vm_bootstrap.cpp
     src/vm/object_bridge.cpp
@@ -190,7 +193,9 @@ if(ANDROID)
             target_include_directories(
                 ${target_name}
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                PRIVATE "${DARTPLANT_DART_SDK_ROOT}/runtime/include"
+                PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src
+                    "${DARTPLANT_DART_SDK_ROOT}/runtime/include"
             )
             target_link_libraries(${target_name} PUBLIC dartplant_core PRIVATE log dl)
         endfunction()

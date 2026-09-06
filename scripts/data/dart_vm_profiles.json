@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profiles": [
     {
       "profile_version": 1,
@@ -38,7 +38,15 @@
         "global_object_pool": 1880,
         "isolate": 1776,
         "isolate_group": 1784,
-        "jump_to_frame_entry_point": 616
+        "jump_to_frame_entry_point": 616,
+        "enter_safepoint_stub": 464,
+        "exit_safepoint_stub": 472,
+        "top_exit_frame": 1808,
+        "vm_tag": 1840,
+        "active_exception": 1864,
+        "active_stacktrace": 1872,
+        "execution_state": 1904,
+        "exit_through_ffi": 1920
       },
       "isolate_group": {
         "class_table": 16,
@@ -163,7 +171,28 @@
         "implicit_closure": 2,
         "tag_shift": 0,
         "tag_bits": 5
-      }
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": true,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 46,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_id": "dart-vm-arm64-product-compressed/abi-3249385cbb1dc5c7e3411ecd"
     },
     {
       "profile_version": 2,
@@ -202,7 +231,15 @@
         "global_object_pool": 1912,
         "isolate": 1800,
         "isolate_group": 1808,
-        "jump_to_frame_entry_point": 624
+        "jump_to_frame_entry_point": 624,
+        "enter_safepoint_stub": 472,
+        "exit_safepoint_stub": 480,
+        "top_exit_frame": 1832,
+        "vm_tag": 1872,
+        "active_exception": 1896,
+        "active_stacktrace": 1904,
+        "execution_state": 1936,
+        "exit_through_ffi": 1952
       },
       "isolate_group": {
         "class_table": 16,
@@ -327,7 +364,28 @@
         "implicit_closure": 2,
         "tag_shift": 0,
         "tag_bits": 5
-      }
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": true,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 46,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_id": "dart-vm-arm64-product-compressed/abi-e94a0fc870b29c8697c227bf"
     },
     {
       "profile_version": 3,
@@ -366,7 +424,15 @@
         "global_object_pool": 1760,
         "isolate": 1664,
         "isolate_group": 1672,
-        "jump_to_frame_entry_point": 632
+        "jump_to_frame_entry_point": 632,
+        "enter_safepoint_stub": 488,
+        "exit_safepoint_stub": 496,
+        "top_exit_frame": 1696,
+        "vm_tag": 1736,
+        "active_exception": 1744,
+        "active_stacktrace": 1752,
+        "execution_state": 1784,
+        "exit_through_ffi": 1800
       },
       "isolate_group": {
         "class_table": 16,
@@ -491,7 +557,28 @@
         "implicit_closure": 2,
         "tag_shift": 0,
         "tag_bits": 5
-      }
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": true,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 47,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_id": "dart-vm-arm64-product-compressed/abi-d3e95d99ca5335439cdc4202"
     }
   ]
 }

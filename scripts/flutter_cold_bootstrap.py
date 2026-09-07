@@ -443,6 +443,82 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: Flutter VM adapter profile gate failed\n{logs}"
         )
+    dynamic_gate = re.search(
+        r"DartPlant VM dynamic ABI gate: "
+        r"capabilities=0x([0-9a-fA-F]+) required=0x([0-9a-fA-F]+) "
+        r"verified=0x([0-9a-fA-F]+)/0x([0-9a-fA-F]+)/0x([0-9a-fA-F]+) "
+        r"failed=0x([0-9a-fA-F]+)/0x([0-9a-fA-F]+) register_proven=(\d+) "
+        r"artifact_revalidation=(-?\d+) artifact_generation=(\d+)/(\d+)/(\d+)",
+        logs,
+    )
+    if dynamic_gate is None:
+        raise RuntimeError(
+            f"cold start {round_index}: dynamic VM ABI capability/lifecycle gate failed\n{logs}"
+        )
+    (
+        capabilities_hex,
+        required_hex,
+        verified_before_hex,
+        verified_invalidated_hex,
+        verified_revalidated_hex,
+        failed_before_hex,
+        failed_revalidated_hex,
+        register_proven,
+        artifact_revalidation,
+        generation_before,
+        generation_invalidated,
+        generation_revalidated,
+    ) = dynamic_gate.groups()
+    capabilities = int(capabilities_hex, 16)
+    required = int(required_hex, 16)
+    verified_before = int(verified_before_hex, 16)
+    verified_invalidated = int(verified_invalidated_hex, 16)
+    verified_revalidated = int(verified_revalidated_hex, 16)
+    failed_before = int(failed_before_hex, 16)
+    failed_revalidated = int(failed_revalidated_hex, 16)
+    generation_before_value = int(generation_before)
+    generation_invalidated_value = int(generation_invalidated)
+    generation_revalidated_value = int(generation_revalidated)
+    expected_capabilities = 0x3F7
+    # Adapter creation itself runs inside the Dart FFI/native transition, so
+    # Generated->Native state is intentionally lazy-proven on the first real
+    # generated callback. Create/revalidate therefore verify roots, safepoint
+    # stubs and artifact identity (0x237), not transition state (0x40).
+    expected_verified = 0x237
+    expected_invalidated = 0x17
+    if not (
+        capabilities == required == expected_capabilities
+        and verified_before == expected_verified
+        and verified_invalidated == expected_invalidated
+        and verified_revalidated == expected_verified
+        and failed_before == 0
+        and failed_revalidated == 0
+        and int(register_proven) == 0
+        and int(artifact_revalidation) == 0
+        and generation_before_value > 0
+        and generation_invalidated_value == generation_before_value + 1
+        and generation_revalidated_value == generation_invalidated_value
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: dynamic VM ABI capability/lifecycle state mismatch\n{logs}"
+        )
+    if "result=pass stage=complete" not in logs or "dart_core=1" not in logs:
+        raise RuntimeError(
+            f"cold start {round_index}: source-candidate structural root proof missing\n{logs}"
+        )
+    for capability_name in (
+        "generated-transition",
+        "active-exception",
+        "type-arguments-element",
+    ):
+        if f"capability proof name={capability_name} result=verified" not in logs:
+            raise RuntimeError(
+                f"cold start {round_index}: {capability_name} lazy proof was not verified\n{logs}"
+            )
+    if re.search(r"capability proof name=\S+ result=failed", logs):
+        raise RuntimeError(
+            f"cold start {round_index}: a VM capability failed for the active incarnation\n{logs}"
+        )
     if "DartPlant local gate real-Dart warmup: 1 value=115" not in logs:
         raise RuntimeError(
             f"cold start {round_index}: local-gated real Dart entry/JumpToFrame warmup failed\n{logs}"
@@ -651,8 +727,21 @@ def run_flutter_cold_bootstrap_test(
         raise ValueError("timeout must be greater than zero")
 
     flutter_bin = _resolve_flutter(flutter) if build else ""
-    if build:
-        _build_fixture(flutter_bin, dobby_root=dobby_root)
+    lock_path = FIXTURE_DIR / "pubspec.lock"
+    lock_existed = lock_path.is_file()
+    lock_contents = lock_path.read_bytes() if build and lock_existed else None
+    try:
+        if build:
+            _build_fixture(flutter_bin, dobby_root=dobby_root)
+    finally:
+        # flutter pub get rewrites transitive pins to the active Flutter/Dart
+        # SDK. A compatibility-matrix run must not leave that SDK-specific
+        # lockfile drift in the source checkout, even when the build fails.
+        if build:
+            if lock_existed and lock_contents is not None:
+                lock_path.write_bytes(lock_contents)
+            elif not lock_existed:
+                lock_path.unlink(missing_ok=True)
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"missing Flutter fixture APK: {APK_PATH}")
     _assert_no_packaged_runtime_metadata()

@@ -60,6 +60,10 @@ struct State {
     const dartplant::RuntimeProfileRecord* profile = nullptr;
     dartplant::vm_abi::ArtifactSet artifacts{};
     uint64_t capabilities = dartplant::vm_abi::kCapabilityNone;
+    std::atomic<uint64_t> verified_capabilities{dartplant::vm_abi::kCapabilityNone};
+    std::atomic<uint64_t> failed_capabilities{dartplant::vm_abi::kCapabilityNone};
+    std::atomic_bool artifact_valid{false};
+    std::atomic<uint64_t> artifact_generation{1};
     bool isolate_detached = false;
 };
 
@@ -87,6 +91,37 @@ static_assert(std::size(kDescriptorMetadata) == 1,
 #endif
 
 constexpr char kTag[] = "DartPlantFlutterVm";
+constexpr uint64_t kEagerRuntimeProofMask =
+    dartplant::vm_abi::kCapabilityRuntimeRoots | dartplant::vm_abi::kCapabilityOwnerIdentity |
+    dartplant::vm_abi::kCapabilityCanonicalNull | dartplant::vm_abi::kCapabilityRegisterSemantics |
+    dartplant::vm_abi::kCapabilityDartCore | dartplant::vm_abi::kCapabilitySafepointStubs;
+constexpr uint64_t kIncarnationScopedProofMask =
+    dartplant::vm_abi::kCapabilitySafepointStubs |
+    dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
+    dartplant::vm_abi::kCapabilityExceptionLayout |
+    dartplant::vm_abi::kCapabilityTypeArgumentsLayout |
+    dartplant::vm_abi::kCapabilityArtifactLifecycle;
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityRuntimeRoots));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityOwnerIdentity));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityCanonicalNull));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_REGISTER_SEMANTICS_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityRegisterSemantics));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_DART_CORE_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityDartCore));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_SAFEPOINT_STUBS_PROVEN) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilitySafepointStubs));
+static_assert(
+    static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED) ==
+    static_cast<uint64_t>(dartplant::vm_abi::kCapabilityGeneratedTransitionLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_SOURCE_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityExceptionLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityTypeArgumentsLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_ARTIFACT_LIFECYCLE_BOUND) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityArtifactLifecycle));
 using DartHandlePredicate = bool (*)(Dart_Handle);
 DartHandlePredicate g_is_boolean = nullptr;
 DartHandlePredicate g_is_integer = nullptr;
@@ -163,11 +198,106 @@ DartPlantStatus ValidateCurrentOwner(const State& state) {
     return DARTPLANT_OK;
 }
 
-bool ValidateArtifactLifecycle(const State& state) {
+bool ValidateArtifactLifecycle(State& state) {
     if ((state.capabilities & dartplant::vm_abi::kCapabilityArtifactLifecycle) == 0) {
+        state.artifact_valid.store(false, std::memory_order_release);
         return false;
     }
-    return dartplant::vm_abi::ValidateArtifactSet(state.artifacts, dartplant::EnumerateModules());
+    const bool valid =
+        dartplant::vm_abi::ValidateArtifactSet(state.artifacts, dartplant::EnumerateModules());
+    state.artifact_valid.store(valid, std::memory_order_release);
+    return valid;
+}
+
+bool HasCapability(const State& state, uint64_t capability) {
+    return (state.capabilities & capability) == capability;
+}
+
+bool HasVerifiedCapability(const State& state, uint64_t capability) {
+    return (state.verified_capabilities.load(std::memory_order_acquire) & capability) == capability;
+}
+
+bool HasFailedCapability(const State& state, uint64_t capability) {
+    return (state.failed_capabilities.load(std::memory_order_acquire) & capability) != 0;
+}
+
+void MarkCapabilityVerified(State& state, uint64_t capability) {
+    state.failed_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
+    state.verified_capabilities.fetch_or(capability, std::memory_order_acq_rel);
+}
+
+void MarkCapabilityFailed(State& state, uint64_t capability) {
+    state.verified_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
+    state.failed_capabilities.fetch_or(capability, std::memory_order_acq_rel);
+}
+
+void ResetCapabilityProof(State& state, uint64_t capability) {
+    state.verified_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
+    state.failed_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
+}
+
+void LogCapabilityTransition(State& state, uint64_t capability, const char* name,
+                             const char* result) {
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "capability proof name=%s result=%s capability=0x%llx verified=0x%llx failed=0x%llx "
+        "artifact_generation=%llu",
+        name, result, static_cast<unsigned long long>(capability),
+        static_cast<unsigned long long>(
+            state.verified_capabilities.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(state.failed_capabilities.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(state.artifact_generation.load(std::memory_order_acquire)));
+}
+
+bool ProveTransitionCapability(State& state) {
+    constexpr uint64_t capability = dartplant::vm_abi::kCapabilityGeneratedTransitionLayout;
+    if (!HasCapability(state, capability) || state.profile == nullptr) return false;
+    const auto proof =
+        dartplant::vm_abi::ProveGeneratedTransitionState(*state.profile, state.thread);
+    if (!proof.passed) {
+        MarkCapabilityFailed(state, capability);
+        __android_log_print(
+            ANDROID_LOG_WARN, kTag,
+            "transition state proof rejected execution=%llu top_exit=0x%llx vm_tag=0x%llx "
+            "exit_marker=%llu",
+            static_cast<unsigned long long>(proof.execution_state),
+            static_cast<unsigned long long>(proof.top_exit_frame),
+            static_cast<unsigned long long>(proof.vm_tag),
+            static_cast<unsigned long long>(proof.exit_through_ffi));
+        LogCapabilityTransition(state, capability, "generated-transition", "failed");
+        return false;
+    }
+    const bool first = !HasVerifiedCapability(state, capability);
+    MarkCapabilityVerified(state, capability);
+    if (first) {
+        __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "transition state proof passed execution=%llu top_exit=0x%llx vm_tag=0x%llx "
+            "exit_marker=%llu",
+            static_cast<unsigned long long>(proof.execution_state),
+            static_cast<unsigned long long>(proof.top_exit_frame),
+            static_cast<unsigned long long>(proof.vm_tag),
+            static_cast<unsigned long long>(proof.exit_through_ffi));
+        LogCapabilityTransition(state, capability, "generated-transition", "verified");
+    }
+    return true;
+}
+
+bool ValidateHotArtifactBinding(const State& state) {
+    if (!state.artifact_valid.load(std::memory_order_acquire) || state.artifacts.app.path.empty() ||
+        state.artifacts.app.load_bias == 0 || state.enter_safepoint == 0 ||
+        state.exit_safepoint == 0) {
+        return false;
+    }
+    for (uint64_t entry : {state.enter_safepoint, state.exit_safepoint}) {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(entry), &info) == 0 || info.dli_fname == nullptr ||
+            info.dli_fbase == nullptr || state.artifacts.app.path != info.dli_fname ||
+            reinterpret_cast<uintptr_t>(info.dli_fbase) != state.artifacts.app.load_bias) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ValidActiveObjectRaw(const State& state, uint64_t raw, bool allow_smi, bool allow_null) {
@@ -182,6 +312,40 @@ bool ValidActiveObjectRaw(const State& state, uint64_t raw, bool allow_smi, bool
     }
     uint64_t tags = 0;
     return ReadSelf(static_cast<uintptr_t>(raw - object.heap_object_tag), &tags);
+}
+
+DartPlantStatus ReadAndProveActiveExceptionState(State& state, uint64_t* out_exception,
+                                                 uint64_t* out_stacktrace) {
+    constexpr uint64_t capability = dartplant::vm_abi::kCapabilityExceptionLayout;
+    if (out_exception == nullptr || out_stacktrace == nullptr ||
+        !HasCapability(state, capability) || HasFailedCapability(state, capability)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const DartPlantStatus owner = ValidateCurrentOwner(state);
+    if (owner != DARTPLANT_OK) return owner;
+    uint64_t exception = 0;
+    uint64_t stacktrace = 0;
+    if (!ReadSelf(state.thread + state.profile->thread_bridge.active_exception_offset,
+                  &exception) ||
+        !ReadSelf(state.thread + state.profile->thread_bridge.active_stacktrace_offset,
+                  &stacktrace) ||
+        !ValidActiveObjectRaw(state, exception, true, false) ||
+        !ValidActiveObjectRaw(state, stacktrace, false, true)) {
+        const bool first_failure = !HasFailedCapability(state, capability);
+        MarkCapabilityFailed(state, capability);
+        if (first_failure) {
+            LogCapabilityTransition(state, capability, "active-exception", "failed");
+        }
+        return DARTPLANT_OBJECT_HANDLE_INVALID;
+    }
+    const bool first_verification = !HasVerifiedCapability(state, capability);
+    MarkCapabilityVerified(state, capability);
+    if (first_verification) {
+        LogCapabilityTransition(state, capability, "active-exception", "verified");
+    }
+    *out_exception = exception;
+    *out_stacktrace = stacktrace;
+    return DARTPLANT_OK;
 }
 
 uint64_t RootRaw(const RootSlot& slot) { return *reinterpret_cast<const uint64_t*>(slot.handle); }
@@ -452,9 +616,25 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         (frame->flags & DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME) == 0) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    if (!ValidateArtifactLifecycle(*state)) {
+    if (!HasCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
+                                   dartplant::vm_abi::kCapabilitySafepointStubs |
+                                   dartplant::vm_abi::kCapabilityArtifactLifecycle)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (HasFailedCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!HasVerifiedCapability(*state, dartplant::vm_abi::kCapabilitySafepointStubs |
+                                           dartplant::vm_abi::kCapabilityArtifactLifecycle)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!ValidateHotArtifactBinding(*state)) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
                             "generated transition rejected: VM artifact incarnation changed");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!HasVerifiedCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout) &&
+        !ProveTransitionCapability(*state)) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     const auto& bridge = state->profile->thread_bridge;
@@ -462,9 +642,13 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
     const uint64_t execution_state = ThreadWord(*state, bridge.execution_state_offset);
     const uint64_t top_exit_frame = ThreadWord(*state, bridge.top_exit_frame_offset);
     uint64_t& exit_through_ffi = ThreadWord(*state, bridge.exit_through_ffi_offset);
+    const uint64_t previous_exit_marker = exit_through_ffi;
     const uint64_t vm_tag = ThreadWord(*state, bridge.vm_tag_offset);
     if (execution_state != transition.execution_generated ||
         top_exit_frame != transition.exit_none || vm_tag != transition.vm_tag_dart) {
+        MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "generated-transition", "failed-state");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     // A Dart runtime call marks Thread::exit_through_ffi with
@@ -480,6 +664,9 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
     if (exit_through_ffi == transition.exit_through_runtime_call) {
         exit_through_ffi = transition.exit_none;
     } else if (exit_through_ffi != transition.exit_none) {
+        MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "generated-transition", "failed-exit-marker");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     ThreadWord(*state, bridge.top_exit_frame_offset) = frame->exit_frame;
@@ -488,6 +675,21 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
     ThreadWord(*state, bridge.execution_state_offset) = transition.execution_native;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     dartplant_flutter_vm_call_safepoint_stub(state->thread, state->enter_safepoint);
+    if (ThreadWord(*state, bridge.execution_state_offset) != transition.execution_native ||
+        ThreadWord(*state, bridge.top_exit_frame_offset) != frame->exit_frame ||
+        ThreadWord(*state, bridge.exit_through_ffi_offset) != transition.exit_through_ffi ||
+        ThreadWord(*state, bridge.vm_tag_offset) !=
+            reinterpret_cast<uint64_t>(&EnterGeneratedToNative)) {
+        ThreadWord(*state, bridge.vm_tag_offset) = vm_tag;
+        ThreadWord(*state, bridge.execution_state_offset) = execution_state;
+        ThreadWord(*state, bridge.top_exit_frame_offset) = top_exit_frame;
+        ThreadWord(*state, bridge.exit_through_ffi_offset) = previous_exit_marker;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "generated-transition", "failed-post-enter");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
     return DARTPLANT_OK;
 }
 
@@ -498,7 +700,18 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
         frame->thread != state->thread) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    if (!ValidateArtifactLifecycle(*state)) {
+    if (!HasCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
+                                   dartplant::vm_abi::kCapabilitySafepointStubs |
+                                   dartplant::vm_abi::kCapabilityArtifactLifecycle)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!HasVerifiedCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
+                                           dartplant::vm_abi::kCapabilitySafepointStubs |
+                                           dartplant::vm_abi::kCapabilityArtifactLifecycle) ||
+        HasFailedCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!ValidateHotArtifactBinding(*state)) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
                             "native return rejected: VM artifact incarnation changed");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -508,14 +721,35 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
     if (ThreadWord(*state, bridge.execution_state_offset) != transition.execution_native ||
         ThreadWord(*state, bridge.top_exit_frame_offset) != frame->exit_frame ||
         ThreadWord(*state, bridge.exit_through_ffi_offset) != transition.exit_through_ffi) {
+        MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "generated-transition", "failed-native-state");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
+    const uint64_t previous_vm_tag = ThreadWord(*state, bridge.vm_tag_offset);
+    const uint64_t previous_execution_state = ThreadWord(*state, bridge.execution_state_offset);
+    const uint64_t previous_top_exit_frame = ThreadWord(*state, bridge.top_exit_frame_offset);
+    const uint64_t previous_exit_marker = ThreadWord(*state, bridge.exit_through_ffi_offset);
     dartplant_flutter_vm_call_safepoint_stub(state->thread, state->exit_safepoint);
     ThreadWord(*state, bridge.vm_tag_offset) = transition.vm_tag_dart;
     ThreadWord(*state, bridge.execution_state_offset) = transition.execution_generated;
     ThreadWord(*state, bridge.top_exit_frame_offset) = transition.exit_none;
     ThreadWord(*state, bridge.exit_through_ffi_offset) = transition.exit_none;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (ThreadWord(*state, bridge.vm_tag_offset) != transition.vm_tag_dart ||
+        ThreadWord(*state, bridge.execution_state_offset) != transition.execution_generated ||
+        ThreadWord(*state, bridge.top_exit_frame_offset) != transition.exit_none ||
+        ThreadWord(*state, bridge.exit_through_ffi_offset) != transition.exit_none) {
+        ThreadWord(*state, bridge.vm_tag_offset) = previous_vm_tag;
+        ThreadWord(*state, bridge.execution_state_offset) = previous_execution_state;
+        ThreadWord(*state, bridge.top_exit_frame_offset) = previous_top_exit_frame;
+        ThreadWord(*state, bridge.exit_through_ffi_offset) = previous_exit_marker;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "generated-transition", "failed-post-leave");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
     return DARTPLANT_OK;
 }
 
@@ -528,15 +762,13 @@ DartPlantStatus ReadActiveException(void* user_data, const DartPlantIsolateIdent
         identity->generation != state->identity.generation || state->profile == nullptr) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const DartPlantStatus owner = ValidateCurrentOwner(*state);
-    if (owner != DARTPLANT_OK) return owner;
-    uint64_t raw = 0;
-    if (!ReadSelf(state->thread + state->profile->thread_bridge.active_exception_offset, &raw) ||
-        !ValidActiveObjectRaw(*state, raw, true, false)) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
-    }
-    *out_raw = raw;
-    return DARTPLANT_OK;
+    uint64_t exception = 0;
+    uint64_t stacktrace = 0;
+    const DartPlantStatus status =
+        ReadAndProveActiveExceptionState(*state, &exception, &stacktrace);
+    if (status != DARTPLANT_OK) return status;
+    *out_raw = exception;
+    return status;
 }
 
 DartPlantStatus ReadActiveStacktrace(void* user_data, const DartPlantIsolateIdentity* identity,
@@ -548,15 +780,13 @@ DartPlantStatus ReadActiveStacktrace(void* user_data, const DartPlantIsolateIden
         identity->generation != state->identity.generation || state->profile == nullptr) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const DartPlantStatus owner = ValidateCurrentOwner(*state);
-    if (owner != DARTPLANT_OK) return owner;
-    uint64_t raw = 0;
-    if (!ReadSelf(state->thread + state->profile->thread_bridge.active_stacktrace_offset, &raw) ||
-        !ValidActiveObjectRaw(*state, raw, false, true)) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
-    }
-    *out_raw = raw;
-    return DARTPLANT_OK;
+    uint64_t exception = 0;
+    uint64_t stacktrace = 0;
+    const DartPlantStatus status =
+        ReadAndProveActiveExceptionState(*state, &exception, &stacktrace);
+    if (status != DARTPLANT_OK) return status;
+    *out_raw = stacktrace;
+    return status;
 }
 
 DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolateIdentity* identity,
@@ -575,6 +805,18 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
         (type_arguments_raw & raw->smi_tag_mask) != raw->heap_object_tag) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    constexpr uint64_t capability = dartplant::vm_abi::kCapabilityTypeArgumentsLayout;
+    if (!HasCapability(*state, capability) || HasFailedCapability(*state, capability)) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const auto fail_proof = [&](DartPlantStatus status) {
+        const bool first_failure = !HasFailedCapability(*state, capability);
+        MarkCapabilityFailed(*state, capability);
+        if (first_failure) {
+            LogCapabilityTransition(*state, capability, "type-arguments-element", "failed");
+        }
+        return status;
+    };
     // This callback is invoked by dartplant_core before Generated->Native and
     // before any Dart API scope/safepoint. The mutator therefore cannot move
     // this object while these raw compressed fields are inspected. Every
@@ -587,45 +829,52 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
     // as 32-bit compressed pointers. Constrain the full pointer to this heap's
     // 4-GiB compression window before reading its header.
     if (!TaggedInHeapWindow(*state->profile, heap_base, tagged_object)) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
     const uintptr_t object = tagged_object - raw->heap_object_tag;
 
     uint64_t tags = 0;
-    if (!ReadSelf(object, &tags)) return DARTPLANT_OBJECT_HANDLE_INVALID;
+    if (!ReadSelf(object, &tags)) return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     if (raw->class_id_tag_bits == 0 || raw->class_id_tag_bits >= 64) {
-        return DARTPLANT_PROFILE_MISMATCH;
+        return fail_proof(DARTPLANT_PROFILE_MISMATCH);
     }
     const uint64_t class_id_mask = (uint64_t{1} << raw->class_id_tag_bits) - 1;
     const uint32_t cid = static_cast<uint32_t>((tags >> raw->class_id_tag_shift) & class_id_mask);
-    if (cid != type_arguments->cid) return DARTPLANT_OBJECT_HANDLE_INVALID;
+    if (cid != type_arguments->cid) return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
 
     uint32_t length_raw = 0;
     if (!ReadSelf(object + type_arguments->length_offset, &length_raw)) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
-    if ((length_raw & raw->smi_tag_mask) != raw->smi_tag ||
-        (length_raw >> raw->smi_tag_shift) <= index) {
+    if ((length_raw & raw->smi_tag_mask) != raw->smi_tag) {
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
+    }
+    if ((length_raw >> raw->smi_tag_shift) <= index) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
     if (raw->compressed_word_size != sizeof(uint32_t) ||
         index > (std::numeric_limits<uintptr_t>::max() - type_arguments->types_offset) /
                     sizeof(uint32_t)) {
-        return DARTPLANT_PROFILE_MISMATCH;
+        return fail_proof(DARTPLANT_PROFILE_MISMATCH);
     }
     uint32_t compressed_element = 0;
     const uintptr_t element_address =
         object + type_arguments->types_offset + static_cast<uintptr_t>(index) * sizeof(uint32_t);
     if (!ReadSelf(element_address, &compressed_element)) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
     if ((compressed_element & raw->smi_tag_mask) != raw->heap_object_tag) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
     if (heap_base > std::numeric_limits<uintptr_t>::max() - compressed_element) {
-        return DARTPLANT_OBJECT_HANDLE_INVALID;
+        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
     *out_raw = heap_base + compressed_element;
+    const bool first_verification = !HasVerifiedCapability(*state, capability);
+    MarkCapabilityVerified(*state, capability);
+    if (first_verification) {
+        LogCapabilityTransition(*state, capability, "type-arguments-element", "verified");
+    }
     return DARTPLANT_OK;
 }
 
@@ -719,6 +968,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     resolver_input.current_isolate = current_isolate;
     resolver_input.canonical_null = canonical_null;
     resolver_input.modules = &modules;
+    resolver_input.engine_anchor = reinterpret_cast<uintptr_t>(Dart_CurrentIsolate_DL);
 #if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
     resolver_input.only_profile_version = 1;
 #endif
@@ -773,14 +1023,25 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     }
     const auto* profile = resolution.binding.profile;
     const auto& selected_probe = resolution.binding.probe;
+    if ((resolution.binding.capabilities & dartplant::vm_abi::kCapabilityArtifactLifecycle) == 0 ||
+        resolution.binding.artifacts.engines.size() != 1) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "VM ABI proof has no unique API-DL engine incarnation anchor=0x%llx matches=%zu",
+            static_cast<unsigned long long>(resolver_input.engine_anchor),
+            resolution.binding.artifacts.engines.size());
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "verified VM binding abi=%s profile=%s app_path=%s app_build_id=%s "
-                        "capabilities=0x%llx engines=%zu engine_build_ids_are_diagnostic_only=1",
+                        "capabilities=0x%llx engines=%zu engine_anchor=0x%llx "
+                        "engine_build_ids_are_diagnostic_only=1",
                         profile->abi_id, profile->live_vm.name,
                         resolution.binding.artifacts.app.path.c_str(),
                         resolution.binding.artifacts.app.build_id.c_str(),
                         static_cast<unsigned long long>(resolution.binding.capabilities),
-                        resolution.binding.artifacts.engines.size());
+                        resolution.binding.artifacts.engines.size(),
+                        static_cast<unsigned long long>(resolver_input.engine_anchor));
 
     auto* instance = new (std::nothrow) FlutterVmAdapterImpl;
     if (instance == nullptr) {
@@ -792,10 +1053,20 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     state.profile = profile;
     state.artifacts = resolution.binding.artifacts;
     state.capabilities = resolution.binding.capabilities;
+    state.verified_capabilities.store(state.capabilities & kEagerRuntimeProofMask,
+                                      std::memory_order_release);
+    state.failed_capabilities.store(dartplant::vm_abi::kCapabilityNone, std::memory_order_release);
     state.isolate_detached = false;
     state.thread = thread;
     state.enter_safepoint = selected_probe.enter_entry;
     state.exit_safepoint = selected_probe.exit_entry;
+    if (!ValidateArtifactLifecycle(state)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "artifact incarnation changed before adapter publication");
+        delete instance;
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle);
     Dart_Handle null_handle = Dart_Null_DL();
     for (auto& root : state.roots) {
         root.handle = Dart_NewPersistentHandle_DL(null_handle);
@@ -830,7 +1101,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     }
     const DartPlantIsolateIdentity identity = {
         .isolate = current_isolate,
-        .isolate_group = selected_probe.isolate_group,
+        .isolate_group = selected_probe.roots.isolate_group,
         .generation = options->isolate_generation,
     };
     state.identity = identity;
@@ -895,6 +1166,93 @@ DartPlantStatus dartplant_flutter_vm_adapter_destroy(DartPlantFlutterVmAdapter* 
 DartPlantVmAdapter* dartplant_flutter_vm_adapter_get(DartPlantFlutterVmAdapter* instance) {
     return instance == nullptr ? nullptr
                                : reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state.adapter;
+}
+
+uint64_t dartplant_flutter_vm_adapter_capabilities(const DartPlantFlutterVmAdapter* instance) {
+    return instance == nullptr
+               ? 0
+               : reinterpret_cast<const FlutterVmAdapterImpl*>(instance)->state.capabilities;
+}
+
+uint64_t dartplant_flutter_vm_adapter_verified_capabilities(
+    const DartPlantFlutterVmAdapter* instance) {
+    return instance == nullptr ? 0
+                               : reinterpret_cast<const FlutterVmAdapterImpl*>(instance)
+                                     ->state.verified_capabilities.load(std::memory_order_acquire);
+}
+
+uint64_t dartplant_flutter_vm_adapter_failed_capabilities(
+    const DartPlantFlutterVmAdapter* instance) {
+    return instance == nullptr ? 0
+                               : reinterpret_cast<const FlutterVmAdapterImpl*>(instance)
+                                     ->state.failed_capabilities.load(std::memory_order_acquire);
+}
+
+DartPlantFlutterVmProofState dartplant_flutter_vm_adapter_capability_state(
+    const DartPlantFlutterVmAdapter* instance, DartPlantFlutterVmCapability capability) {
+    if (instance == nullptr) return DARTPLANT_FLUTTER_VM_PROOF_UNSUPPORTED;
+    const uint64_t mask = static_cast<uint64_t>(capability);
+    if (mask == 0 || (mask & (mask - 1)) != 0) {
+        return DARTPLANT_FLUTTER_VM_PROOF_UNSUPPORTED;
+    }
+    const State& state = reinterpret_cast<const FlutterVmAdapterImpl*>(instance)->state;
+    if (!HasCapability(state, mask)) return DARTPLANT_FLUTTER_VM_PROOF_UNSUPPORTED;
+    if (HasFailedCapability(state, mask)) {
+        return DARTPLANT_FLUTTER_VM_PROOF_FAILED_FOR_INCARNATION;
+    }
+    return HasVerifiedCapability(state, mask) ? DARTPLANT_FLUTTER_VM_PROOF_VERIFIED
+                                              : DARTPLANT_FLUTTER_VM_PROOF_UNVERIFIED;
+}
+
+uint64_t dartplant_flutter_vm_adapter_artifact_generation(
+    const DartPlantFlutterVmAdapter* instance) {
+    return instance == nullptr ? 0
+                               : reinterpret_cast<const FlutterVmAdapterImpl*>(instance)
+                                     ->state.artifact_generation.load(std::memory_order_acquire);
+}
+
+void dartplant_flutter_vm_adapter_invalidate_artifacts(DartPlantFlutterVmAdapter* instance) {
+    if (instance == nullptr) return;
+    State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
+    state.artifact_valid.store(false, std::memory_order_release);
+    ResetCapabilityProof(state, kIncarnationScopedProofMask);
+    const uint64_t artifact_generation =
+        state.artifact_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "artifact binding invalidated abi=%s isolate_generation=%llu "
+                        "artifact_generation=%llu",
+                        state.profile == nullptr ? "none" : state.profile->abi_id,
+                        static_cast<unsigned long long>(state.identity.generation),
+                        static_cast<unsigned long long>(artifact_generation));
+}
+
+DartPlantStatus dartplant_flutter_vm_adapter_revalidate_artifacts(
+    DartPlantFlutterVmAdapter* instance) {
+    if (instance == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
+    if (state.profile == nullptr || state.adapter == nullptr) {
+        state.artifact_valid.store(false, std::memory_order_release);
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!ValidateArtifactLifecycle(state)) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+                            "artifact binding revalidation rejected abi=%s isolate_generation=%llu "
+                            "artifact_generation=%llu; new resolver required",
+                            state.profile->abi_id,
+                            static_cast<unsigned long long>(state.identity.generation),
+                            static_cast<unsigned long long>(
+                                state.artifact_generation.load(std::memory_order_acquire)));
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle |
+                                      dartplant::vm_abi::kCapabilitySafepointStubs);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "artifact binding revalidated abi=%s isolate_generation=%llu "
+        "artifact_generation=%llu",
+        state.profile->abi_id, static_cast<unsigned long long>(state.identity.generation),
+        static_cast<unsigned long long>(state.artifact_generation.load(std::memory_order_acquire)));
+    return DARTPLANT_OK;
 }
 
 const DartPlantFlutterVmDescriptor* DescriptorAt(uint32_t index) {

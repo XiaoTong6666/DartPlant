@@ -232,15 +232,6 @@ uintptr_t CanonicalNativePointer(uint64_t pointer) {
 #endif
 }
 
-bool ReadNativePointer(const ProcessMemoryReader& reader, uintptr_t address,
-                       uint64_t* out_pointer) {
-    if (out_pointer == nullptr) return false;
-    uint64_t raw = 0;
-    if (!reader.Read(address, &raw) || raw == 0) return false;
-    *out_pointer = CanonicalNativePointer(raw);
-    return *out_pointer != 0;
-}
-
 uint64_t DecompressObject(uint64_t heap_base, uint32_t compressed) {
     return heap_base + static_cast<uint64_t>(compressed);
 }
@@ -1498,7 +1489,11 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
     if (status != DARTPLANT_OK) return status;
     const dartplant::RawObjectLayout* raw = dartplant::FindRawObjectLayout(profile.profile_version);
-    if (raw == nullptr) return dartplant::FailProbe("live VM raw-object profile is unavailable");
+    const dartplant::RuntimeProfileRecord* record =
+        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
+    if (raw == nullptr || record == nullptr) {
+        return dartplant::FailProbe("live VM raw-object profile is unavailable");
+    }
 
     dartplant::ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1517,73 +1512,38 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     const uint64_t heap_bits = context.x[profile.heap_bits_register];
     const uint64_t null_register = context.x[profile.null_register];
 
-    if (info.thread == 0 ||
-        !reader.Contains(static_cast<uintptr_t>(info.thread),
-                         profile.thread_isolate_group_offset + sizeof(uint64_t))) {
+    if (info.thread == 0) {
         return dartplant::FailProbe("THR does not point to a readable Dart Thread layout");
     }
 
-    uint64_t thread_pool = 0;
-    uint64_t thread_null = 0;
-    if (!reader.Read(static_cast<uintptr_t>(info.thread) + profile.thread_heap_base_offset,
-                     &info.heap_base) ||
-        !reader.Read(static_cast<uintptr_t>(info.thread) + profile.thread_object_null_offset,
-                     &thread_null) ||
-        !reader.Read(static_cast<uintptr_t>(info.thread) + profile.thread_global_object_pool_offset,
-                     &thread_pool) ||
-        !dartplant::ReadNativePointer(
-            reader, static_cast<uintptr_t>(info.thread) + profile.thread_isolate_offset,
-            &info.isolate) ||
-        !dartplant::ReadNativePointer(
-            reader, static_cast<uintptr_t>(info.thread) + profile.thread_isolate_group_offset,
-            &info.isolate_group)) {
-        return dartplant::FailProbe("failed to read Dart Thread profile fields");
+    dartplant::vm_abi::RootProofInput root_input{};
+    root_input.profile = record;
+    root_input.thread = info.thread;
+    root_input.require_dart_core = true;
+    root_input.registers = {
+        .available = true,
+        .pp = info.pp,
+        .heap_bits = heap_bits,
+        .null_value = null_register,
+    };
+    const dartplant::vm_abi::RootProof roots = dartplant::vm_abi::ProveRuntimeRoots(root_input);
+    if (!roots.passed) {
+        const std::string message = std::string("shared VM invocation proof failed at ") +
+                                    dartplant::vm_abi::RootProofStageName(roots.stage);
+        return dartplant::FailProbe(message.c_str());
     }
-
-    info.heap_bits_match =
-        static_cast<uint32_t>(heap_bits) == static_cast<uint32_t>(info.heap_base >> 32) ? 1 : 0;
-    info.null_register_match = null_register == thread_null ? 1 : 0;
-    info.thread_pool_match = dartplant::IsHeapObject(profile, thread_pool) &&
-                                     thread_pool >= raw->heap_object_tag &&
-                                     info.pp == thread_pool - raw->heap_object_tag
-                                 ? 1
-                                 : 0;
-    info.global_object_pool = thread_pool;
-    if (!info.heap_bits_match || !info.null_register_match || !info.thread_pool_match) {
-        return dartplant::FailProbe("THR/PP/HEAP_BITS/NULL_REG semantic validation failed");
-    }
-
-    if (info.isolate == 0 || info.isolate_group == 0 ||
-        !reader.Contains(static_cast<uintptr_t>(info.isolate), sizeof(uint64_t)) ||
-        !reader.Contains(static_cast<uintptr_t>(info.isolate_group),
-                         profile.isolate_group_object_store_offset + sizeof(uint64_t))) {
-        return dartplant::FailProbe("Dart isolate or isolate group pointer is not readable");
-    }
-    if (!dartplant::ReadNativePointer(
-            reader,
-            static_cast<uintptr_t>(info.isolate_group) + profile.isolate_group_class_table_offset,
-            &info.class_table) ||
-        !dartplant::ReadNativePointer(reader,
-                                      static_cast<uintptr_t>(info.isolate_group) +
-                                          profile.isolate_group_cached_class_table_table_offset,
-                                      &info.cached_class_table_table) ||
-        !dartplant::ReadNativePointer(
-            reader,
-            static_cast<uintptr_t>(info.isolate_group) + profile.isolate_group_object_store_offset,
-            &info.object_store)) {
-        return dartplant::FailProbe("IsolateGroup raw layout validation failed");
-    }
-
-    if (!dartplant::RequireCid(reader, profile, info.global_object_pool, profile.cid_object_pool)) {
-        return dartplant::FailProbe("THR global object pool does not have ObjectPool CID");
-    }
-    if (!reader.Read(
-            dartplant::Untag(profile, info.global_object_pool) + profile.object_pool_length_offset,
-            &info.object_pool_length) ||
-        info.object_pool_length == 0 ||
-        info.object_pool_length > dartplant::kMaxObjectPoolEntries) {
-        return dartplant::FailProbe("live ObjectPool length is invalid");
-    }
+    const uint64_t thread_null = roots.thread_null;
+    info.heap_base = roots.heap_base;
+    info.isolate = roots.isolate;
+    info.isolate_group = roots.isolate_group;
+    info.global_object_pool = roots.global_object_pool;
+    info.class_table = roots.class_table;
+    info.cached_class_table_table = roots.cached_class_table_table;
+    info.object_store = roots.object_store;
+    info.object_pool_length = roots.object_pool_length;
+    info.heap_bits_match = roots.heap_bits_match ? 1 : 0;
+    info.null_register_match = roots.null_register_match ? 1 : 0;
+    info.thread_pool_match = roots.thread_pool_match ? 1 : 0;
 
     const uintptr_t target_entry = dartplant::MethodTarget(invocation->requested_method);
     if (target_entry == 0) {

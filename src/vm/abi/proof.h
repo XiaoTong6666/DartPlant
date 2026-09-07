@@ -49,6 +49,9 @@ struct RootProof {
     bool passed = false;
     bool owner_match = false;
     bool canonical_null_match = false;
+    bool heap_bits_match = false;
+    bool null_register_match = false;
+    bool thread_pool_match = false;
     bool register_semantics_match = false;
     bool dart_core_found = false;
     uint64_t heap_base = 0;
@@ -65,10 +68,24 @@ struct RootProof {
     uint64_t library_count = 0;
 };
 
+struct GeneratedTransitionProof {
+    bool passed = false;
+    uint64_t execution_state = 0;
+    uint64_t top_exit_frame = 0;
+    uint64_t vm_tag = 0;
+    uint64_t exit_through_ffi = 0;
+};
+
 // Performs bounded, read-only validation of the Dart Thread -> IsolateGroup ->
 // ClassTable/ObjectStore root graph for one source-verified ABI candidate.
 // No offsets are inferred or synthesized by this function.
 RootProof ProveRuntimeRoots(const RootProofInput& input);
+
+// Verifies that a source-verified Thread transition layout is currently in a
+// generated-Dart state that is safe to mutate. This is deliberately read-only;
+// callers must not publish a mutation-capable transition before it passes.
+GeneratedTransitionProof ProveGeneratedTransitionState(const RuntimeProfileRecord& profile,
+                                                       uint64_t thread);
 
 }  // namespace dartplant::vm_abi
 

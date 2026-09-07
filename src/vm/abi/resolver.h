@@ -31,7 +31,7 @@ struct ArtifactIncarnation {
     std::string path;
     std::string build_id;
     uintptr_t load_bias = 0;
-    size_t executable_range_count = 0;
+    std::vector<ExecutableRange> executable_ranges;
 };
 
 struct ArtifactSet {
@@ -52,6 +52,11 @@ struct ResolverInput {
     uint64_t canonical_null = 0;
     RegisterEvidence registers{};
     const std::vector<ModuleImage>* modules = nullptr;
+    // Optional executable address owned by the concrete VM/engine instance
+    // that supplied the runtime API table. When present, artifact lifecycle
+    // binding is scoped to the unique libflutter.so containing this address
+    // instead of every Flutter engine currently mapped in the process.
+    uintptr_t engine_anchor = 0;
     uint32_t only_profile_version = 0;
 };
 
@@ -70,7 +75,20 @@ struct ResolverResult {
     bool passed = false;
 };
 
+struct CandidateSelection {
+    const CandidateDiagnostic* selected = nullptr;
+    size_t passed_rows = 0;
+    size_t distinct_abis = 0;
+};
+
+CandidateSelection SelectUniquePassingCandidate(const std::vector<CandidateDiagnostic>& candidates);
+
 ResolverResult ResolveVerifiedBinding(const ResolverInput& input);
+
+// Binds an API-DL executable anchor to exactly one mapped Flutter engine.
+// Multiple matches are ambiguous and fail closed.
+bool ResolveEngineIncarnationForAnchor(const std::vector<ModuleImage>& modules, uintptr_t anchor,
+                                       ArtifactIncarnation* out_incarnation);
 
 bool ArtifactIncarnationMatches(const ArtifactIncarnation& expected, const ModuleImage& current);
 bool ValidateArtifactSet(const ArtifactSet& expected,

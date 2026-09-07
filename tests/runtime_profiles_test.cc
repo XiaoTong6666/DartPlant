@@ -4,9 +4,11 @@
 #include "vm/runtime_profiles.h"
 
 #include <array>
+#include <cstring>
 #include <string_view>
 
 #include "test_runner.h"
+#include "vm/abi/resolver.h"
 
 TEST_CASE(RuntimeProfilesMatchDartArm64CallingConvention) {
     constexpr std::array<uint8_t, 6> kExpectedGp = {1, 2, 3, 5, 6, 7};
@@ -126,4 +128,198 @@ TEST_CASE(RuntimeProfilesBindSnapshotToAllPrivateLayouts) {
 
     EXPECT_TRUE(dartplant::FindRuntimeProfileBySnapshot("unknown") == nullptr);
     EXPECT_EQ(0U, dartplant::ThreadJumpToFrameOffsetForSnapshot("unknown"));
+}
+
+TEST_CASE(VmArtifactLifecycleTreatsBuildIdAsIncarnationNotCompatibility) {
+    dartplant::ModuleImage app{};
+    app.name = "libapp.so";
+    app.path = "/data/app/example/lib/arm64/libapp.so";
+    app.build_id = "aaaa";
+    app.load_bias = 0x100000;
+    app.executable_ranges.push_back({
+        .start = 0x101000,
+        .end = 0x102000,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x1000,
+    });
+
+    dartplant::ModuleImage engine{};
+    engine.name = "libflutter.so";
+    engine.path = "/data/app/example/lib/arm64/libflutter.so";
+    engine.build_id = "bbbb";
+    engine.load_bias = 0x200000;
+    engine.executable_ranges.push_back({
+        .start = 0x201000,
+        .end = 0x202000,
+        .file_offset = 0x2000,
+        .virtual_address = 0x1000,
+        .file_size = 0x1000,
+    });
+
+    dartplant::vm_abi::ArtifactSet expected{};
+    expected.app = {
+        .name = app.name,
+        .path = app.path,
+        .build_id = app.build_id,
+        .load_bias = app.load_bias,
+        .executable_ranges = app.executable_ranges,
+    };
+    expected.engines.push_back({
+        .name = engine.name,
+        .path = engine.path,
+        .build_id = engine.build_id,
+        .load_bias = engine.load_bias,
+        .executable_ranges = engine.executable_ranges,
+    });
+
+    std::vector<dartplant::ModuleImage> current = {app, engine};
+    EXPECT_TRUE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+
+    // Build ids are intentionally not consulted by ABI candidate selection,
+    // but once a binding is published they identify that concrete mapped
+    // artifact incarnation and must change the lifecycle generation.
+    current[1].build_id = "cccc";
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+    current[1] = engine;
+    current[0].build_id.clear();
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+    current[0] = app;
+    current[0].load_bias += 0x1000;
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+
+    current[0] = app;
+    current[0].executable_ranges[0].end += 0x1000;
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+
+    current[0] = app;
+    current[0].executable_ranges[0].file_offset += 0x1000;
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+
+    // Binding is scoped to the engine that supplied this adapter's API-DL
+    // table. Loading another unrelated Flutter engine must not stale it.
+    dartplant::ModuleImage other_engine = engine;
+    other_engine.path = "/data/app/other/lib/arm64/libflutter.so";
+    other_engine.build_id = "dddd";
+    other_engine.load_bias = 0x300000;
+    other_engine.executable_ranges[0].start = 0x301000;
+    other_engine.executable_ranges[0].end = 0x302000;
+    current = {app, engine, other_engine};
+    EXPECT_TRUE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+
+    // Conversely, two expected engine incarnations cannot both consume the
+    // same current module while an unrelated engine merely satisfies the
+    // process-wide module count.
+    expected.engines.push_back(expected.engines.front());
+    EXPECT_FALSE(dartplant::vm_abi::ValidateArtifactSet(expected, current));
+}
+
+TEST_CASE(VmEngineAnchorBindsExactlyOneFlutterIncarnation) {
+    dartplant::ModuleImage first{};
+    first.name = "libflutter.so";
+    first.path = "/data/app/first/lib/arm64/libflutter.so";
+    first.build_id = "1111";
+    first.load_bias = 0x200000;
+    first.executable_ranges.push_back({
+        .start = 0x201000,
+        .end = 0x202000,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x1000,
+    });
+
+    dartplant::ModuleImage second{};
+    second.name = "libflutter.so";
+    second.path = "/data/app/second/lib/arm64/libflutter.so";
+    second.build_id = "2222";
+    second.load_bias = 0x300000;
+    second.executable_ranges.push_back({
+        .start = 0x301000,
+        .end = 0x302000,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x1000,
+    });
+
+    std::vector<dartplant::ModuleImage> modules = {first, second};
+    dartplant::vm_abi::ArtifactIncarnation resolved{};
+    EXPECT_TRUE(dartplant::vm_abi::ResolveEngineIncarnationForAnchor(modules, 0x201100, &resolved));
+    EXPECT_EQ(first.path, resolved.path);
+    EXPECT_EQ(first.build_id, resolved.build_id);
+    EXPECT_EQ(first.load_bias, resolved.load_bias);
+    EXPECT_EQ(first.executable_ranges.size(), resolved.executable_ranges.size());
+    EXPECT_EQ(first.executable_ranges[0].start, resolved.executable_ranges[0].start);
+    EXPECT_EQ(first.executable_ranges[0].end, resolved.executable_ranges[0].end);
+    EXPECT_EQ(first.executable_ranges[0].file_offset, resolved.executable_ranges[0].file_offset);
+    EXPECT_EQ(first.executable_ranges[0].virtual_address,
+              resolved.executable_ranges[0].virtual_address);
+    EXPECT_EQ(first.executable_ranges[0].file_size, resolved.executable_ranges[0].file_size);
+
+    EXPECT_FALSE(
+        dartplant::vm_abi::ResolveEngineIncarnationForAnchor(modules, 0x401100, &resolved));
+
+    // Overlapping executable ownership is ambiguity, not a score/ranking tie.
+    modules[1].executable_ranges[0] = first.executable_ranges[0];
+    EXPECT_FALSE(
+        dartplant::vm_abi::ResolveEngineIncarnationForAnchor(modules, 0x201100, &resolved));
+}
+
+TEST_CASE(VmAbiCandidateSelectionRequiresOneDistinctAbiIdentity) {
+    const auto* dart344 = dartplant::FindRuntimeProfileByVersion(1);
+    const auto* dart350 = dartplant::FindRuntimeProfileByVersion(2);
+    EXPECT_TRUE(dart344 != nullptr);
+    EXPECT_TRUE(dart350 != nullptr);
+
+    dartplant::vm_abi::CandidateDiagnostic first{};
+    first.profile = dart344;
+    first.probe.passed = true;
+
+    dartplant::vm_abi::CandidateDiagnostic alias = first;
+    alias.snapshot_hash_match = true;
+    std::vector<dartplant::vm_abi::CandidateDiagnostic> aliases = {first, alias};
+    const auto alias_selection = dartplant::vm_abi::SelectUniquePassingCandidate(aliases);
+    EXPECT_EQ(2U, alias_selection.passed_rows);
+    EXPECT_EQ(1U, alias_selection.distinct_abis);
+    EXPECT_TRUE(alias_selection.selected == &aliases[1]);
+
+    dartplant::vm_abi::CandidateDiagnostic different{};
+    different.profile = dart350;
+    different.probe.passed = true;
+    std::vector<dartplant::vm_abi::CandidateDiagnostic> ambiguous = {first, different};
+    const auto ambiguous_selection = dartplant::vm_abi::SelectUniquePassingCandidate(ambiguous);
+    EXPECT_EQ(2U, ambiguous_selection.passed_rows);
+    EXPECT_EQ(2U, ambiguous_selection.distinct_abis);
+    EXPECT_TRUE(ambiguous_selection.selected == nullptr);
+}
+
+TEST_CASE(VmGeneratedTransitionProofIsReadOnlyAndStateSensitive) {
+    const auto* profile = dartplant::FindRuntimeProfileByVersion(1);
+    EXPECT_TRUE(profile != nullptr);
+
+    std::array<uint8_t, 0x1000> thread{};
+    const auto write_word = [&](uint32_t offset, uint64_t value) {
+        EXPECT_TRUE(static_cast<size_t>(offset) + sizeof(value) <= thread.size());
+        std::memcpy(thread.data() + offset, &value, sizeof(value));
+    };
+    const auto& bridge = profile->thread_bridge;
+    const auto& transition = profile->transition;
+    write_word(bridge.execution_state_offset, transition.execution_generated);
+    write_word(bridge.top_exit_frame_offset, transition.exit_none);
+    write_word(bridge.vm_tag_offset, transition.vm_tag_dart);
+    write_word(bridge.exit_through_ffi_offset, transition.exit_none);
+
+    const uint64_t thread_address = reinterpret_cast<uint64_t>(thread.data());
+    const auto generated =
+        dartplant::vm_abi::ProveGeneratedTransitionState(*profile, thread_address);
+    EXPECT_TRUE(generated.passed);
+    EXPECT_EQ(transition.execution_generated, generated.execution_state);
+    EXPECT_EQ(transition.vm_tag_dart, generated.vm_tag);
+
+    write_word(bridge.execution_state_offset, transition.execution_native);
+    write_word(bridge.top_exit_frame_offset, thread_address + 0x800);
+    write_word(bridge.exit_through_ffi_offset, transition.exit_through_ffi);
+    const auto native = dartplant::vm_abi::ProveGeneratedTransitionState(*profile, thread_address);
+    EXPECT_FALSE(native.passed);
+    EXPECT_EQ(transition.execution_native, native.execution_state);
+    EXPECT_EQ(transition.exit_through_ffi, native.exit_through_ffi);
 }

@@ -17,6 +17,7 @@ namespace dartplant::vm_abi {
 namespace {
 
 constexpr uint64_t kMaxObjectPoolEntries = 1ULL << 24;
+constexpr uint64_t kMaxClassFunctions = 1ULL << 20;
 constexpr uint64_t kMaxLibrariesToScan = 4096;
 
 template <typename T>
@@ -258,13 +259,15 @@ RootProof ProveRuntimeRoots(const RootProofInput& input) {
 
     proof.stage = RootProofStage::kRegisterSemantics;
     if (input.registers.available) {
-        proof.register_semantics_match =
-            static_cast<uint32_t>(input.registers.heap_bits) ==
-                static_cast<uint32_t>(proof.heap_base >> 32) &&
-            input.registers.null_value == proof.thread_null &&
+        proof.heap_bits_match = static_cast<uint32_t>(input.registers.heap_bits) ==
+                                static_cast<uint32_t>(proof.heap_base >> 32);
+        proof.null_register_match = input.registers.null_value == proof.thread_null;
+        proof.thread_pool_match =
             IsHeapObject(profile, proof.global_object_pool) &&
             proof.global_object_pool >= profile.raw_object.heap_object_tag &&
             input.registers.pp == proof.global_object_pool - profile.raw_object.heap_object_tag;
+        proof.register_semantics_match =
+            proof.heap_bits_match && proof.null_register_match && proof.thread_pool_match;
         if (!proof.register_semantics_match) return proof;
     }
 
@@ -330,7 +333,7 @@ RootProof ProveRuntimeRoots(const RootProofInput& input) {
     uint64_t library_data = 0;
     if (!ReadPositiveCompressedSmi(profile, growable + vm.growable_object_array_length_offset,
                                    &proof.library_count) ||
-        proof.library_count == 0 || proof.library_count > kMaxObjectPoolEntries ||
+        proof.library_count == 0 || proof.library_count > kMaxClassFunctions ||
         !ReadCompressedObject(profile, proof.heap_base, growable,
                               vm.growable_object_array_data_offset, &library_data)) {
         return proof;
@@ -357,6 +360,32 @@ RootProof ProveRuntimeRoots(const RootProofInput& input) {
 
     proof.stage = RootProofStage::kComplete;
     proof.passed = true;
+    return proof;
+}
+
+GeneratedTransitionProof ProveGeneratedTransitionState(const RuntimeProfileRecord& profile,
+                                                       uint64_t thread) {
+    GeneratedTransitionProof proof{};
+    if (thread == 0) return proof;
+    const VmThreadBridgeLayout& bridge = profile.thread_bridge;
+    const VmTransitionLayout& transition = profile.transition;
+    if (bridge.top_exit_frame_offset == 0 || bridge.vm_tag_offset == 0 ||
+        bridge.execution_state_offset == 0 || bridge.exit_through_ffi_offset == 0 ||
+        transition.vm_tag_dart == 0) {
+        return proof;
+    }
+    const uintptr_t base = static_cast<uintptr_t>(thread);
+    if (!ReadSelf(base + bridge.execution_state_offset, &proof.execution_state) ||
+        !ReadSelf(base + bridge.top_exit_frame_offset, &proof.top_exit_frame) ||
+        !ReadSelf(base + bridge.vm_tag_offset, &proof.vm_tag) ||
+        !ReadSelf(base + bridge.exit_through_ffi_offset, &proof.exit_through_ffi)) {
+        return proof;
+    }
+    proof.passed = proof.execution_state == transition.execution_generated &&
+                   proof.top_exit_frame == transition.exit_none &&
+                   proof.vm_tag == transition.vm_tag_dart &&
+                   (proof.exit_through_ffi == transition.exit_none ||
+                    proof.exit_through_ffi == transition.exit_through_runtime_call);
     return proof;
 }
 

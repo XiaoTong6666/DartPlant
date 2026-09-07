@@ -387,7 +387,11 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             and "DartPlant bool semantic probe:" in latest
             and "DartPlant live VM startup probe:" in latest
             and "DartPlant closure receiver probe:" in latest
-            and "DartPlant app TypeArguments proof:" in latest
+            # The app also runs a UI/bootstrap TypeArguments proof before the
+            # adb-requested probe. Waiting for the generic prefix can therefore
+            # return while the adb proof is still inside its GC pressure loop,
+            # making the later source=adb assertion timing-dependent.
+            and "DartPlant app TypeArguments proof: 1 source=adb native=1 result_ok=1" in latest
             and "DartPlant P6 ABI corpus:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
             and "DartPlant late shared typed fail-close:" in latest

@@ -24,6 +24,7 @@ struct DartPlantVmAdapter {
     uint64_t hook_refs = 0;
     uint64_t generated_root_leases = 0;
     uint32_t generated_native_transitions = 0;
+    std::atomic_bool admission_open{true};
     std::vector<DartPlantObjectHandle*> released_handles;
     bool attached = false;
     bool isolate_entered = false;
@@ -42,6 +43,10 @@ struct DartPlantObjectHandle {
 namespace dartplant {
 
 bool VmAdapterIsEntered(DartPlantVmAdapter* adapter);
+bool VmAdapterAdmissionOpen(const DartPlantVmAdapter* adapter);
+void VmAdapterCloseAdmission(DartPlantVmAdapter* adapter);
+void VmAdapterOpenAdmission(DartPlantVmAdapter* adapter);
+DartPlantStatus VmAdapterCheckQuiescent(DartPlantVmAdapter* adapter);
 bool VmAdapterSupportsGeneratedRootBridge(const DartPlantVmAdapter* adapter);
 bool VmAdapterSupportsGeneratedCallbackBridge(const DartPlantVmAdapter* adapter);
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter);

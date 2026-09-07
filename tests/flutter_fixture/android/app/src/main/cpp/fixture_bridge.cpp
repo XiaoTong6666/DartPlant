@@ -1937,7 +1937,16 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         (adapter_capabilities & kExpectedCreateCapabilities) == kExpectedCreateCapabilities &&
         (adapter_capabilities & DARTPLANT_FLUTTER_VM_CAP_REGISTER_SEMANTICS_PROVEN) == 0 &&
         verified_before == kExpectedVerifiedCreate && failed_before == 0;
-    dartplant_flutter_vm_adapter_invalidate_artifacts(g_flutter_vm_adapter);
+    const DartPlantStatus artifact_quiesce =
+        dartplant_flutter_vm_adapter_quiesce_artifacts(g_flutter_vm_adapter);
+    const uint64_t verified_quiesced =
+        dartplant_flutter_vm_adapter_verified_capabilities(g_flutter_vm_adapter);
+    const uint64_t artifact_generation_quiesced =
+        dartplant_flutter_vm_adapter_artifact_generation(g_flutter_vm_adapter);
+    const DartPlantStatus premature_revalidation =
+        dartplant_flutter_vm_adapter_revalidate_artifacts(g_flutter_vm_adapter);
+    const DartPlantStatus artifact_retirement =
+        dartplant_flutter_vm_adapter_retire_artifacts(g_flutter_vm_adapter);
     const uint64_t verified_invalidated =
         dartplant_flutter_vm_adapter_verified_capabilities(g_flutter_vm_adapter);
     const uint64_t artifact_generation_invalidated =
@@ -1951,9 +1960,12 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     const uint64_t artifact_generation_revalidated =
         dartplant_flutter_vm_adapter_artifact_generation(g_flutter_vm_adapter);
     const bool generation_gate =
-        artifact_generation_before != 0 &&
+        artifact_quiesce == DARTPLANT_OK && artifact_retirement == DARTPLANT_OK &&
+        premature_revalidation == DARTPLANT_VM_ADAPTER_BUSY && artifact_generation_before != 0 &&
+        artifact_generation_quiesced == artifact_generation_before &&
         artifact_generation_invalidated == artifact_generation_before + 1 &&
         artifact_generation_revalidated == artifact_generation_invalidated &&
+        verified_quiesced == kExpectedVerifiedCreate &&
         verified_invalidated == (DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN |
                                  DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN |
                                  DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN |
@@ -1966,7 +1978,8 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         kTag,
         "DartPlant VM dynamic ABI gate: capabilities=0x%llx required=0x%llx "
         "verified=0x%llx/0x%llx/0x%llx failed=0x%llx/0x%llx register_proven=%u "
-        "artifact_revalidation=%d artifact_generation=%llu/%llu/%llu",
+        "artifact_revalidation=%d artifact_generation=%llu/%llu/%llu "
+        "artifact_lifecycle=%d/%d/%d quiesced_verified=0x%llx quiesced_generation=%llu",
         static_cast<unsigned long long>(adapter_capabilities),
         static_cast<unsigned long long>(kExpectedCreateCapabilities),
         static_cast<unsigned long long>(verified_before),
@@ -1978,7 +1991,10 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
             (adapter_capabilities & DARTPLANT_FLUTTER_VM_CAP_REGISTER_SEMANTICS_PROVEN) != 0),
         artifact_revalidation, static_cast<unsigned long long>(artifact_generation_before),
         static_cast<unsigned long long>(artifact_generation_invalidated),
-        static_cast<unsigned long long>(artifact_generation_revalidated));
+        static_cast<unsigned long long>(artifact_generation_revalidated), artifact_quiesce,
+        premature_revalidation, artifact_retirement,
+        static_cast<unsigned long long>(verified_quiesced),
+        static_cast<unsigned long long>(artifact_generation_quiesced));
     if (!capability_gate || !generation_gate || artifact_revalidation != DARTPLANT_OK) {
         g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
         return DARTPLANT_PROFILE_MISMATCH;

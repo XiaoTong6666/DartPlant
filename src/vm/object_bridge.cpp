@@ -104,6 +104,35 @@ bool VmAdapterIsEntered(DartPlantVmAdapter* adapter) {
     return CheckEnteredLocked(*adapter) == DARTPLANT_OK;
 }
 
+bool VmAdapterAdmissionOpen(const DartPlantVmAdapter* adapter) {
+    return adapter != nullptr && adapter->admission_open.load(std::memory_order_acquire);
+}
+
+void VmAdapterCloseAdmission(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr) return;
+    adapter->admission_open.store(false, std::memory_order_release);
+}
+
+void VmAdapterOpenAdmission(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr) return;
+    adapter->admission_open.store(true, std::memory_order_release);
+}
+
+DartPlantStatus VmAdapterCheckQuiescent(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr) {
+        SetLastError("VM adapter is null");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (adapter->hook_refs != 0 || adapter->generated_root_leases != 0 ||
+        adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
+        adapter->isolate_entered || adapter->live_handles != 0) {
+        SetLastError("VM adapter still has active hooks, callbacks, scopes, or object handles");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    return DARTPLANT_OK;
+}
+
 bool VmAdapterSupportsGeneratedRootBridge(const DartPlantVmAdapter* adapter) {
     return adapter != nullptr && GeneratedRootCallbacksAvailable(adapter->callbacks);
 }
@@ -381,6 +410,11 @@ DartPlantStatus VmAdapterRetainObject(DartPlantVmAdapter* adapter, uint64_t raw,
     }
     *out_handle = nullptr;
     std::lock_guard lock(adapter->mutex);
+    if (!adapter->admission_open.load(std::memory_order_acquire) &&
+        adapter->generated_native_transitions == 0) {
+        SetLastError("VM adapter is quiescing and rejects new object retention");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
     const DartPlantStatus entered = CheckEnteredLocked(*adapter);
     if (entered != DARTPLANT_OK) return entered;
 
@@ -475,6 +509,10 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_attach_isolate(
         return DARTPLANT_INVALID_ARGUMENT;
     }
     std::lock_guard lock(adapter->mutex);
+    if (!adapter->admission_open.load(std::memory_order_acquire)) {
+        dartplant::SetLastError("VM adapter is quiescing and rejects new isolate attachment");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
     if (adapter->attached || adapter->entered != 0) {
         dartplant::SetLastError("VM adapter already has an isolate");
         return DARTPLANT_VM_ADAPTER_BUSY;
@@ -513,6 +551,10 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_enter_isolate(DartPlantVmAdapter* 
         return DARTPLANT_INVALID_ARGUMENT;
     }
     std::lock_guard lock(adapter->mutex);
+    if (!adapter->admission_open.load(std::memory_order_acquire)) {
+        dartplant::SetLastError("VM adapter is quiescing and rejects new isolate entry");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
     if (!adapter->attached) {
         dartplant::SetLastError("VM adapter has no attached isolate");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -557,6 +599,11 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_enter_scope(DartPlantVmAdapter* ad
         return DARTPLANT_INVALID_ARGUMENT;
     }
     std::lock_guard lock(adapter->mutex);
+    if (!adapter->admission_open.load(std::memory_order_acquire) &&
+        adapter->generated_native_transitions == 0) {
+        dartplant::SetLastError("VM adapter is quiescing and rejects new scope entry");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
     if (!adapter->attached) {
         dartplant::SetLastError("VM adapter has no attached isolate");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;

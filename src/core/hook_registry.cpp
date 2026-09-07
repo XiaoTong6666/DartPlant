@@ -483,6 +483,32 @@ void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_gen
     }
 }
 
+DartPlantStatus QuiesceVmAdapterHooks(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    // Serialize with callback-hook installation so closing admission and
+    // starting logical unhook form one publication boundary. Existing
+    // invocations remain pinned by HookRecord::in_flight and finish against
+    // the still-valid artifact binding before retirement can complete.
+    std::lock_guard lock(State().mutex);
+    VmAdapterCloseAdmission(adapter);
+    DartPlantStatus status = DARTPLANT_OK;
+    for (const auto& hook : Hooks()) {
+        bool matches = false;
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            matches = hook->vm_adapter == adapter && hook->vm_adapter_retained;
+            if (matches && (hook->state == HookRecordState::kRetired ||
+                            hook->state == HookRecordState::kUnhooked)) {
+                continue;
+            }
+        }
+        if (!matches) continue;
+        const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
+        if (unhook_status != DARTPLANT_OK) status = unhook_status;
+    }
+    return status;
+}
+
 bool IsTargetHooked(uintptr_t target) {
     DartPlantHook* hook = FindHookLocked(target);
     return hook != nullptr && hook->active.load(std::memory_order_acquire);
@@ -662,7 +688,9 @@ bool BeginInvocation(DartPlantHook* hook,
     // never reclaim its backup trampoline underneath executing Dart code.
     ++hook->in_flight;
     listeners->clear();
-    const bool callbacks_enabled = hook->state == HookRecordState::kInstalled &&
+    const bool adapter_admitted =
+        hook->vm_adapter == nullptr || VmAdapterAdmissionOpen(hook->vm_adapter);
+    const bool callbacks_enabled = adapter_admitted && hook->state == HookRecordState::kInstalled &&
                                    !stale_generation &&
                                    hook->active.load(std::memory_order_acquire);
     if (callbacks_enabled) {
@@ -764,6 +792,10 @@ DartPlantStatus InstallCallbackHook(
         host_binding->unhook == nullptr) {
         SetLastError("host hook API is not initialized");
         return DARTPLANT_HOST_API_UNAVAILABLE;
+    }
+    if (options.vm_adapter != nullptr && !VmAdapterAdmissionOpen(options.vm_adapter)) {
+        SetLastError("VM adapter is quiescing and rejects new callback hooks");
+        return DARTPLANT_VM_ADAPTER_BUSY;
     }
     const bool real_dart = method->function->source != DartFunctionSource::kSynthetic;
     if (real_dart && !HostBindingSupportsPublishedHooks(host_binding)) {
@@ -998,6 +1030,10 @@ DartPlantStatus AddCallbackListener(DartPlantHook* hook, const DartPlantMethod* 
         SetLastError(
             "method listener target is shared by multiple Dart Functions; both the physical hook and listener require explicit shared-code opt-in");
         return DARTPLANT_SHARED_CODE_ENTRY;
+    }
+    if (options.vm_adapter != nullptr && !VmAdapterAdmissionOpen(options.vm_adapter)) {
+        SetLastError("VM adapter is quiescing and rejects new callback listeners");
+        return DARTPLANT_VM_ADAPTER_BUSY;
     }
     std::lock_guard lock(hook->mutex);
     if (hook->runtime_generation != runtime_generation ||

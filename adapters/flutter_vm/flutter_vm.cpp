@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string_view>
 #include <utility>
@@ -62,7 +63,9 @@ struct State {
     uint64_t capabilities = dartplant::vm_abi::kCapabilityNone;
     std::atomic<uint64_t> verified_capabilities{dartplant::vm_abi::kCapabilityNone};
     std::atomic<uint64_t> failed_capabilities{dartplant::vm_abi::kCapabilityNone};
+    mutable std::mutex artifact_mutex;
     std::atomic_bool artifact_valid{false};
+    std::atomic_bool artifact_quiescing{false};
     std::atomic<uint64_t> artifact_generation{1};
     bool isolate_detached = false;
 };
@@ -298,6 +301,12 @@ bool ValidateHotArtifactBinding(const State& state) {
         }
     }
     return true;
+}
+
+uint64_t InvalidateArtifactBindingLocked(State& state) {
+    state.artifact_valid.store(false, std::memory_order_release);
+    ResetCapabilityProof(state, kIncarnationScopedProofMask);
+    return state.artifact_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
 bool ValidActiveObjectRaw(const State& state, uint64_t raw, bool allow_smi, bool allow_null) {
@@ -616,6 +625,10 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         (frame->flags & DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME) == 0) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
+    // Serialize the validated artifact identity with every write + safepoint
+    // stub call. Immediate invalidation therefore cannot return while a thread
+    // is still inside old-incarnation executable code.
+    std::lock_guard artifact_lock(state->artifact_mutex);
     if (!HasCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
                                    dartplant::vm_abi::kCapabilitySafepointStubs |
                                    dartplant::vm_abi::kCapabilityArtifactLifecycle)) {
@@ -700,6 +713,7 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
         frame->thread != state->thread) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
+    std::lock_guard artifact_lock(state->artifact_mutex);
     if (!HasCapability(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
                                    dartplant::vm_abi::kCapabilitySafepointStubs |
                                    dartplant::vm_abi::kCapabilityArtifactLifecycle)) {
@@ -1214,10 +1228,10 @@ uint64_t dartplant_flutter_vm_adapter_artifact_generation(
 void dartplant_flutter_vm_adapter_invalidate_artifacts(DartPlantFlutterVmAdapter* instance) {
     if (instance == nullptr) return;
     State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
-    state.artifact_valid.store(false, std::memory_order_release);
-    ResetCapabilityProof(state, kIncarnationScopedProofMask);
-    const uint64_t artifact_generation =
-        state.artifact_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    dartplant::VmAdapterCloseAdmission(state.adapter);
+    std::lock_guard artifact_lock(state.artifact_mutex);
+    state.artifact_quiescing.store(true, std::memory_order_release);
+    const uint64_t artifact_generation = InvalidateArtifactBindingLocked(state);
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "artifact binding invalidated abi=%s isolate_generation=%llu "
                         "artifact_generation=%llu",
@@ -1226,13 +1240,51 @@ void dartplant_flutter_vm_adapter_invalidate_artifacts(DartPlantFlutterVmAdapter
                         static_cast<unsigned long long>(artifact_generation));
 }
 
+DartPlantStatus dartplant_flutter_vm_adapter_quiesce_artifacts(
+    DartPlantFlutterVmAdapter* instance) {
+    if (instance == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
+    if (state.adapter == nullptr) return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    {
+        std::lock_guard artifact_lock(state.artifact_mutex);
+        state.artifact_quiescing.store(true, std::memory_order_release);
+    }
+    const DartPlantStatus hook_status = dartplant::QuiesceVmAdapterHooks(state.adapter);
+    if (hook_status != DARTPLANT_OK) return hook_status;
+    return dartplant::VmAdapterCheckQuiescent(state.adapter);
+}
+
+DartPlantStatus dartplant_flutter_vm_adapter_retire_artifacts(DartPlantFlutterVmAdapter* instance) {
+    if (instance == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
+    const DartPlantStatus quiesce = dartplant_flutter_vm_adapter_quiesce_artifacts(instance);
+    if (quiesce != DARTPLANT_OK) return quiesce;
+
+    std::lock_guard artifact_lock(state.artifact_mutex);
+    if (!state.artifact_valid.load(std::memory_order_acquire)) return DARTPLANT_OK;
+    const uint64_t artifact_generation = InvalidateArtifactBindingLocked(state);
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "artifact binding retired abi=%s isolate_generation=%llu "
+                        "artifact_generation=%llu",
+                        state.profile == nullptr ? "none" : state.profile->abi_id,
+                        static_cast<unsigned long long>(state.identity.generation),
+                        static_cast<unsigned long long>(artifact_generation));
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus dartplant_flutter_vm_adapter_revalidate_artifacts(
     DartPlantFlutterVmAdapter* instance) {
     if (instance == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
+    std::lock_guard artifact_lock(state.artifact_mutex);
     if (state.profile == nullptr || state.adapter == nullptr) {
         state.artifact_valid.store(false, std::memory_order_release);
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (state.artifact_quiescing.load(std::memory_order_acquire) &&
+        state.artifact_valid.load(std::memory_order_acquire)) {
+        dartplant::SetLastError("artifact retirement is still quiescing active work");
+        return DARTPLANT_VM_ADAPTER_BUSY;
     }
     if (!ValidateArtifactLifecycle(state)) {
         __android_log_print(ANDROID_LOG_WARN, kTag,
@@ -1246,6 +1298,8 @@ DartPlantStatus dartplant_flutter_vm_adapter_revalidate_artifacts(
     }
     MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle |
                                       dartplant::vm_abi::kCapabilitySafepointStubs);
+    state.artifact_quiescing.store(false, std::memory_order_release);
+    dartplant::VmAdapterOpenAdmission(state.adapter);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
         "artifact binding revalidated abi=%s isolate_generation=%llu "

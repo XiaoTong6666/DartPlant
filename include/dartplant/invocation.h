@@ -99,7 +99,11 @@ DARTPLANT_EXPORT uint32_t dartplant_invocation_depth(const DartPlantInvocation* 
 // tagged values still decode safely as SMI/HEAP_OBJECT, and writing NULL/BOOL
 // fails closed unless canonical roots were already validated when that physical
 // hook was installed. A later bootstrap does not retroactively upgrade an
-// existing hook. Raw GP/FP context access remains available when this is false.
+// existing hook. Raw GP/FP context access remains available when this is false,
+// except during exception callbacks: the saved entry context may be stale after
+// moving GC while the generated-root lease remains authoritative. Exception
+// callbacks therefore expose only exception/stacktrace and phase-safe metadata,
+// not ordinary argument or raw-register input.
 DARTPLANT_EXPORT uint8_t
 dartplant_invocation_has_verified_abi(const DartPlantInvocation* invocation);
 
@@ -163,6 +167,10 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_exception(
     const DartPlantInvocation* invocation, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_stacktrace(
     const DartPlantInvocation* invocation, DartPlantValue* out_value);
+// Ordinary argument access is unavailable in DARTPLANT_INVOCATION_EXCEPTION.
+// An exception unwind can follow moving GC while the saved entry registers or
+// entry stack still contain pre-relocation ObjectPtr values. Use the dedicated
+// exception/stacktrace APIs in that phase.
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_argument(
     const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_set_argument(DartPlantInvocation* invocation,

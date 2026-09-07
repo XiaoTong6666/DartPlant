@@ -810,6 +810,10 @@ DartPlantStatus dartplant_invocation_get_gp_register(const DartPlantInvocation* 
         dartplant::SetLastError("GP register read arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    if (invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError("raw register input is unavailable during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
     *out_value = invocation->context->x[register_index];
     return DARTPLANT_OK;
 }
@@ -821,6 +825,10 @@ DartPlantStatus dartplant_invocation_get_fp_register(const DartPlantInvocation* 
         dartplant::SetLastError("FP register read arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    if (invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError("raw register input is unavailable during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
     std::memcpy(out_value, invocation->context->v[register_index], sizeof(*out_value));
     return DARTPLANT_OK;
 }
@@ -831,6 +839,10 @@ DartPlantStatus dartplant_invocation_set_fp_register(DartPlantInvocation* invoca
         dartplant::SetLastError("FP register write arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
+    if (invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError("raw registers cannot be changed during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
     std::memcpy(invocation->context->v[register_index], &value, sizeof(value));
     return DARTPLANT_OK;
 }
@@ -840,6 +852,10 @@ DartPlantStatus dartplant_invocation_set_gp_register(DartPlantInvocation* invoca
     if (invocation == nullptr || invocation->context == nullptr || !ValidRegister(register_index)) {
         dartplant::SetLastError("GP register write arguments are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError("raw registers cannot be changed during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
     invocation->context->x[register_index] = value;
     return DARTPLANT_OK;
@@ -1069,6 +1085,11 @@ DartPlantStatus dartplant_invocation_get_stacktrace(const DartPlantInvocation* i
 
 DartPlantStatus dartplant_invocation_get_argument(const DartPlantInvocation* invocation,
                                                   uint32_t index, DartPlantValue* out_value) {
+    if (invocation != nullptr && invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError(
+            "ordinary arguments are unavailable during exception callbacks; use exception APIs");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
     const uint32_t argument_count = dartplant_invocation_argument_count(invocation);
     if (!ArgumentAccessEnabled(invocation) || invocation->context == nullptr ||
         out_value == nullptr || index >= argument_count) {
@@ -1132,6 +1153,11 @@ DartPlantStatus dartplant_invocation_retain_argument_object(DartPlantInvocation*
                                                             uint32_t index,
                                                             DartPlantObjectStrength strength,
                                                             DartPlantObjectHandle** out_handle) {
+    if (invocation != nullptr && invocation->phase == DARTPLANT_INVOCATION_EXCEPTION) {
+        dartplant::SetLastError(
+            "ordinary argument objects cannot be retained during exception callbacks");
+        return DARTPLANT_INVALID_INVOCATION_PHASE;
+    }
     const uint32_t argument_count = dartplant_invocation_argument_count(invocation);
     if (!ArgumentIsTagged(invocation, index) || invocation->context == nullptr ||
         index >= argument_count || out_handle == nullptr) {

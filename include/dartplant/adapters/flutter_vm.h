@@ -83,9 +83,32 @@ DARTPLANT_EXPORT DartPlantFlutterVmProofState dartplant_flutter_vm_adapter_capab
 DARTPLANT_EXPORT uint64_t
 dartplant_flutter_vm_adapter_artifact_generation(const DartPlantFlutterVmAdapter* instance);
 // Marks the current binding unusable before a loader/unload/restart event.
+// This is an immediate poison operation, not a callback/transition quiescence
+// barrier. It closes new VM-adapter admission and serializes with any safepoint
+// stub currently executing, but callers must not treat its return as permission
+// to unmap old AOT code while hooks/callbacks/root leases may still be alive.
+// For loader teardown, prefer quiesce_artifacts() followed by
+// retire_artifacts(), or call retire_artifacts() repeatedly until it returns OK.
 // This never changes the selected ABI or captured artifact identity.
 DARTPLANT_EXPORT void dartplant_flutter_vm_adapter_invalidate_artifacts(
     DartPlantFlutterVmAdapter* instance);
+// Closes new callback/hook/VM-scope admission and starts logical unhook of every
+// hook retaining this adapter. The bound artifact remains valid so already
+// admitted callbacks can finish their generated/native transitions safely.
+// Returns VM_ADAPTER_BUSY until hooks, generated-root leases/transitions,
+// entered VM scopes/isolate ownership, and persistent object handles are idle.
+// The call is idempotent and may be retried; it does not advance generation.
+DARTPLANT_EXPORT DartPlantStatus
+dartplant_flutter_vm_adapter_quiesce_artifacts(DartPlantFlutterVmAdapter* instance);
+// Full unload barrier for the bound AOT artifact: first performs the quiescence
+// step above; only after it reaches zero active work does it poison the binding
+// and advance artifact_generation. DARTPLANT_OK means old AOT artifact code is
+// no longer reachable through DartPlant hooks/transitions and may be unmapped.
+// If libflutter/the isolate itself is being destroyed, release external object
+// handles and destroy/detach this adapter while the engine mapping is still
+// valid before unmapping libflutter.
+DARTPLANT_EXPORT DartPlantStatus
+dartplant_flutter_vm_adapter_retire_artifacts(DartPlantFlutterVmAdapter* instance);
 // Revalidates the exact app/engine incarnation captured at create time. A new
 // path, load bias, executable-range shape, or known Build ID is rejected and
 // requires a new adapter instance; Build ID remains lifecycle identity only.

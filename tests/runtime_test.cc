@@ -876,6 +876,70 @@ TEST_CASE(VmAdapterGeneratedCallbackBridgePinsRootsAcrossSafepointTransition) {
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
 }
 
+TEST_CASE(VmAdapterQuiescenceLetsAdmittedGeneratedTransitionDrain) {
+    FakeVmState state{};
+    DartPlantVmAdapterCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.adapter_version = 3;
+    callbacks.enter_isolate = FakeEnter;
+    callbacks.leave_isolate = FakeLeave;
+    callbacks.enter_scope = FakeEnterScope;
+    callbacks.leave_scope = FakeLeaveScope;
+    callbacks.retain_object = FakeRetain;
+    callbacks.release_object = FakeRelease;
+    callbacks.object_kind = FakeKind;
+    callbacks.object_to_raw = FakeRaw;
+    callbacks.object_is_alive = FakeAlive;
+    callbacks.pin_generated_roots = FakePinGeneratedRoots;
+    callbacks.generated_root_get = FakeGeneratedRootGet;
+    callbacks.generated_root_set = FakeGeneratedRootSet;
+    callbacks.unpin_generated_roots = FakeUnpinGeneratedRoots;
+    callbacks.enter_generated_to_native = FakeEnterGeneratedToNative;
+    callbacks.leave_native_to_generated = FakeLeaveNativeToGenerated;
+
+    DartPlantVmAdapter* adapter = nullptr;
+    const DartPlantIsolateIdentity isolate = {61, 62, 63};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter, &isolate));
+
+    const uint64_t roots[] = {0x101};
+    void* lease = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterPinGeneratedRoots(adapter, roots, 1, &lease));
+    DartPlantGeneratedTransitionFrame frame = {
+        .struct_size = sizeof(frame),
+        .flags = DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME,
+        .thread = 0x1000,
+        .dart_sp = 0x2000,
+        .exit_frame = 0x1ff0,
+        .caller_fp = 0x3000,
+        .caller_lr = 0x4000,
+    };
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterEnterGeneratedToNative(adapter, &frame, lease));
+
+    dartplant::VmAdapterCloseAdmission(adapter);
+    EXPECT_FALSE(dartplant::VmAdapterAdmissionOpen(adapter));
+    EXPECT_EQ(DARTPLANT_VM_ADAPTER_BUSY, dartplant::VmAdapterCheckQuiescent(adapter));
+    // The transition itself is the admission token for an already-entered Dart
+    // callback. It must still be able to create/leave its scope while drain is
+    // in progress; unrelated new scope entries remain closed after it exits.
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_enter_scope(adapter));
+    DartPlantObjectHandle* handle = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_object_retain(adapter, 0x101, DARTPLANT_OBJECT_STRONG, &handle));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_object_release(handle));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_leave_scope(adapter));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterLeaveNativeToGenerated(adapter, &frame, lease));
+    uint64_t refreshed = 0;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterUnpinGeneratedRoots(adapter, lease, &refreshed, 1));
+    EXPECT_EQ(0x101ULL, refreshed);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterCheckQuiescent(adapter));
+    EXPECT_EQ(DARTPLANT_VM_ADAPTER_BUSY, dartplant_vm_enter_scope(adapter));
+
+    dartplant::VmAdapterOpenAdmission(adapter);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter, &isolate));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
 TEST_CASE(VmAdapterDetachAndActiveObjectReadsRequireIdleGeneratedState) {
     FakeVmState state{};
     DartPlantVmAdapterCallbacks callbacks{};
@@ -3200,6 +3264,48 @@ TEST_CASE(InvocationDecodesAndEncodesValidatedDartNull) {
     EXPECT_EQ(DARTPLANT_VALUE_RAW_WORD, value.kind);
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant_invocation_set_argument(&untagged_invocation, 0, &null_value));
+}
+
+TEST_CASE(ExceptionPhaseRejectsOrdinaryArgumentAndRawRegisterAccess) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
+                    DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+    profile.argument_count = 1;
+    profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
+
+    DartPlantArm64Context context{};
+    context.x[1] = 0x7300000001;
+    uint64_t fp = 0x123456789abcdef0ULL;
+    std::memcpy(context.v[2], &fp, sizeof(fp));
+    DartPlantInvocation invocation{};
+    invocation.profile = &profile;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_EXCEPTION;
+
+    uint64_t raw = 0;
+    DartPlantValue value{};
+    DartPlantObjectHandle* handle = nullptr;
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_get_gp_register(&invocation, 1, &raw));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_set_gp_register(&invocation, 1, 0x55));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_get_fp_register(&invocation, 2, &raw));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_set_fp_register(&invocation, 2, 0x66));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_get_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_set_argument(&invocation, 0, &value));
+    EXPECT_EQ(DARTPLANT_INVALID_INVOCATION_PHASE,
+              dartplant_invocation_retain_argument_object(&invocation, 0, DARTPLANT_OBJECT_STRONG,
+                                                          &handle));
+    EXPECT_TRUE(handle == nullptr);
+    EXPECT_EQ(0x7300000001ULL, context.x[1]);
+    uint64_t unchanged_fp = 0;
+    std::memcpy(&unchanged_fp, context.v[2], sizeof(unchanged_fp));
+    EXPECT_EQ(fp, unchanged_fp);
 }
 
 TEST_CASE(VerifiedCallLayoutDoesNotImplyCanonicalSemanticRoots) {

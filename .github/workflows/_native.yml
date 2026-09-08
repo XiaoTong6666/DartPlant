@@ -1,0 +1,112 @@
+# Copyright (C) 2026 XiaoTong6666
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+name: CI / Native
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Host C++ and Rust tests (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [debug, release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/tools
+          key: cargo-${{ runner.os }}-${{ hashFiles('tools/dartplant-indexer/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read NDK version
+        id: config
+        shell: bash
+        run: echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Run host tests
+        run: python3 scripts/main.py test host --force --build-type "${{ matrix.build_type }}"
+
+  android-build:
+    name: Android arm64 ${{ matrix.build_type }} build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [debug, release]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read project configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Build Android standalone targets
+        run: python3 scripts/main.py build android --force --build-type "${{ matrix.build_type }}"
+
+      - name: Upload Android test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dartplant-android-arm64-${{ matrix.build_type }}
+          path: |
+            build/android-arm64/dartplant_device_tests
+            build/android-arm64/libdartplant_device_fixture.so
+          if-no-files-found: error
+          retention-days: 7

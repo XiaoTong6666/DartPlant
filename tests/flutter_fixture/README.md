@@ -1,6 +1,8 @@
 # dartplant_fixture
 
-Fixed Flutter 3.22.3 / Dart 3.4.4 ARM64 release fixture for DartPlant.
+Cross-version Flutter ARM64 release fixture for DartPlant's source-verified VM
+ABI families. CI currently builds it with Flutter 3.22.3 / Dart 3.4.4,
+Flutter 3.24.0 / Dart 3.5.0, and Flutter 3.44.1 / Dart 3.12.1.
 
 ## Runtime contract
 
@@ -35,3 +37,40 @@ python3 scripts/main.py test flutter-cold --flutter /path/to/flutter --rounds 30
 ```
 
 The test rejects an APK that contains DartPlant runtime metadata.
+
+## CI runtime scenarios
+
+The Android activity accepts a `dartplant_test` string extra. Every supported
+value produces one structured `DARTPLANT_CI` scenario result; `all` runs the
+complete matrix sequentially in one Flutter isolate/session:
+
+```bash
+adb shell am start -W \
+  -n dev.dartplant.dartplant_fixture/.MainActivity \
+  --es dartplant_test all
+
+adb shell am start -W \
+  -n dev.dartplant.dartplant_fixture/.MainActivity \
+  --es dartplant_test generic_gc
+```
+
+Supported scenarios are:
+
+- `normal`: baseline live-VM discovery, ordinary typed hook/callback, null/bool
+  semantics, and shared-code fail-close behavior.
+- `arguments_descriptor`: generic closure invocation with positional/named
+  `ArgumentsDescriptor` validation without requiring GC relocation.
+- `closure`: implicit closure receiver and closure-call ABI validation.
+- `generic_closure`: retained generic closure FunctionType/TypeArguments proof
+  without requiring relocation.
+- `generic_gc`: the same generic closure path while Dart API allocation
+  pressure must relocate the authoritative rooted parameter and preserve its
+  value.
+- `exception`: generated exception observation/unwind and self-unhook lifetime
+  behavior.
+- `transition`: lazy source-verified Generated-to-Native transition proof.
+- `artifact_revalidate`: quiesce, retire/invalidate, generation advance, and
+  artifact revalidation proof.
+
+`dartplant_probe=type_arguments` remains accepted as a compatibility alias for
+`dartplant_test=generic_gc`, but new CI should use `dartplant_test`.

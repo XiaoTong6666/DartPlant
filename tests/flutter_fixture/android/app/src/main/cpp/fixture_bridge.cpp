@@ -90,10 +90,15 @@ std::atomic<uint64_t> g_type_arguments_vector_before = 0;
 std::atomic<uint64_t> g_type_arguments_vector_after = 0;
 std::atomic<uint64_t> g_type_arguments_element_before = 0;
 std::atomic<uint64_t> g_type_arguments_element_after = 0;
+std::atomic<uint64_t> g_type_arguments_parameter_before = 0;
+std::atomic<uint64_t> g_type_arguments_parameter_after = 0;
 std::atomic<Dart_Port> g_type_arguments_pressure_port{ILLEGAL_PORT};
 std::atomic_bool g_type_arguments_vector_relocated{false};
 std::atomic_bool g_type_arguments_element_relocated{false};
+std::atomic_bool g_type_arguments_parameter_relocated{false};
 std::atomic_bool g_type_arguments_callback_passed{false};
+std::atomic_bool g_type_arguments_require_relocation{true};
+std::atomic_bool g_artifact_lifecycle_passed{false};
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -183,8 +188,11 @@ void ResetTypeArgumentsProofState() {
     g_type_arguments_vector_after.store(0, std::memory_order_relaxed);
     g_type_arguments_element_before.store(0, std::memory_order_relaxed);
     g_type_arguments_element_after.store(0, std::memory_order_relaxed);
+    g_type_arguments_parameter_before.store(0, std::memory_order_relaxed);
+    g_type_arguments_parameter_after.store(0, std::memory_order_relaxed);
     g_type_arguments_vector_relocated.store(false, std::memory_order_release);
     g_type_arguments_element_relocated.store(false, std::memory_order_release);
+    g_type_arguments_parameter_relocated.store(false, std::memory_order_release);
     g_type_arguments_callback_passed.store(false, std::memory_order_release);
 }
 
@@ -612,6 +620,7 @@ void OnTypeArgumentsProofEnter(DartPlantInvocation* invocation, void*) {
         element_before.kind == DARTPLANT_VALUE_HEAP_OBJECT && element_before.raw != 0;
     g_type_arguments_vector_before.store(vector_before.raw, std::memory_order_relaxed);
     g_type_arguments_element_before.store(element_before.raw, std::memory_order_relaxed);
+    g_type_arguments_parameter_before.store(parameter_before.raw, std::memory_order_relaxed);
     __android_log_print(
         before_ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
         "TypeArguments proof native before descriptor=%d type_args=%u count=%u size=%u positional=%u named=%u parameter=%d/%u/0x%llx vector=%d/%u/0x%llx element=%d/%u/0x%llx",
@@ -625,6 +634,38 @@ void OnTypeArgumentsProofEnter(DartPlantInvocation* invocation, void*) {
         static_cast<unsigned long long>(element_before.raw));
     if (!before_ok) {
         g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const bool require_relocation =
+        g_type_arguments_require_relocation.load(std::memory_order_acquire);
+    if (!require_relocation) {
+        DartPlantValue parameter_after{};
+        DartPlantValue vector_after{};
+        DartPlantValue element_after{};
+        const DartPlantStatus vector_after_status =
+            dartplant_invocation_get_closure_type_arguments(invocation, &vector_after);
+        const DartPlantStatus element_after_status =
+            dartplant_invocation_get_closure_type_argument(invocation, 0, &element_after);
+        const DartPlantStatus parameter_after_status =
+            dartplant_invocation_get_argument(invocation, 0, &parameter_after);
+        const bool passed = parameter_after_status == DARTPLANT_OK &&
+                            parameter_after.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                            parameter_after.raw != 0 && vector_after_status == DARTPLANT_OK &&
+                            vector_after.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                            vector_after.raw != 0 && element_after_status == DARTPLANT_OK &&
+                            element_after.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+                            element_after.raw != 0;
+        g_type_arguments_vector_after.store(vector_after.raw, std::memory_order_relaxed);
+        g_type_arguments_element_after.store(element_after.raw, std::memory_order_relaxed);
+        g_type_arguments_parameter_after.store(parameter_after.raw, std::memory_order_relaxed);
+        g_type_arguments_callback_passed.store(passed, std::memory_order_release);
+        if (!passed) g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
+        __android_log_print(
+            passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+            "TypeArguments proof native result dart_api=1 calls=0 require_relocation=0 parameter_relocated=0 vector_relocated=0 element_relocated=0 before=0x%llx after=0x%llx passed=%u",
+            static_cast<unsigned long long>(parameter_before.raw),
+            static_cast<unsigned long long>(parameter_after.raw), static_cast<unsigned>(passed));
         return;
     }
 
@@ -710,8 +751,10 @@ void OnTypeArgumentsProofEnter(DartPlantInvocation* invocation, void*) {
 
     g_type_arguments_vector_after.store(vector_after.raw, std::memory_order_relaxed);
     g_type_arguments_element_after.store(element_after.raw, std::memory_order_relaxed);
+    g_type_arguments_parameter_after.store(parameter_after.raw, std::memory_order_relaxed);
     g_type_arguments_vector_relocated.store(vector_relocated, std::memory_order_release);
     g_type_arguments_element_relocated.store(element_relocated, std::memory_order_release);
+    g_type_arguments_parameter_relocated.store(parameter_relocated, std::memory_order_release);
     const bool passed = dart_api_ok && parameter_relocated;
     g_type_arguments_callback_passed.store(passed, std::memory_order_release);
     if (!passed) g_type_arguments_failures.fetch_add(1, std::memory_order_relaxed);
@@ -1762,9 +1805,11 @@ dartplant_fixture_enable_forced_stack_closure_hook() {
 }
 
 extern "C" __attribute__((visibility("default"))) int32_t
-dartplant_fixture_type_arguments_proof_prepare(Dart_Handle retained_closure,
-                                               Dart_Handle pressure_send_port) {
+dartplant_fixture_type_arguments_proof_prepare_mode(Dart_Handle retained_closure,
+                                                    Dart_Handle pressure_send_port,
+                                                    uint8_t require_relocation) {
     ResetTypeArgumentsProofState();
+    g_type_arguments_require_relocation.store(require_relocation != 0, std::memory_order_release);
     if (pressure_send_port == nullptr || Dart_SendPortGetId_DL == nullptr ||
         Dart_IsError_DL == nullptr) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -1780,6 +1825,13 @@ dartplant_fixture_type_arguments_proof_prepare(Dart_Handle retained_closure,
     return InstallTypeArgumentsProofHook(retained_closure);
 }
 
+extern "C" __attribute__((visibility("default"))) int32_t
+dartplant_fixture_type_arguments_proof_prepare(Dart_Handle retained_closure,
+                                               Dart_Handle pressure_send_port) {
+    return dartplant_fixture_type_arguments_proof_prepare_mode(retained_closure, pressure_send_port,
+                                                               1);
+}
+
 extern "C" __attribute__((visibility("default"))) uint64_t
 dartplant_fixture_type_arguments_proof() {
     const uint64_t enter = g_type_arguments_enter.load(std::memory_order_relaxed);
@@ -1789,10 +1841,18 @@ dartplant_fixture_type_arguments_proof() {
     const uint64_t vector_after = g_type_arguments_vector_after.load(std::memory_order_relaxed);
     const uint64_t element_before = g_type_arguments_element_before.load(std::memory_order_relaxed);
     const uint64_t element_after = g_type_arguments_element_after.load(std::memory_order_relaxed);
+    const uint64_t parameter_before =
+        g_type_arguments_parameter_before.load(std::memory_order_relaxed);
+    const uint64_t parameter_after =
+        g_type_arguments_parameter_after.load(std::memory_order_relaxed);
     const bool vector_relocated = g_type_arguments_vector_relocated.load(std::memory_order_acquire);
     const bool element_relocated =
         g_type_arguments_element_relocated.load(std::memory_order_acquire);
+    const bool parameter_relocated =
+        g_type_arguments_parameter_relocated.load(std::memory_order_acquire);
     const bool callback_passed = g_type_arguments_callback_passed.load(std::memory_order_acquire);
+    const bool require_relocation =
+        g_type_arguments_require_relocation.load(std::memory_order_acquire);
     const DartPlantFlutterVmProofState type_arguments_state =
         dartplant_flutter_vm_adapter_capability_state(
             g_flutter_vm_adapter, DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED);
@@ -1801,22 +1861,54 @@ dartplant_fixture_type_arguments_proof() {
     const bool active =
         g_type_arguments_closure_hook != nullptr && g_type_arguments_closure_hook->active;
     const bool passed =
-        enter == 1 && failures == 0 && calls >= 1 && vector_before != 0 && vector_after != 0 &&
-        element_before != 0 && element_after != 0 && callback_passed && active &&
-        type_arguments_state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
+        enter == 1 && failures == 0 && (!require_relocation || calls >= 1) && vector_before != 0 &&
+        vector_after != 0 && element_before != 0 && element_after != 0 && callback_passed &&
+        active && type_arguments_state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
         (capability_failed & DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED) == 0;
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u capability_state=%u capability_failed=0x%llx passed=%u",
+        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu require_relocation=%u vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u capability_state=%u capability_failed=0x%llx passed=%u",
         static_cast<unsigned long long>(enter), static_cast<unsigned long long>(failures),
-        static_cast<unsigned long long>(calls), static_cast<unsigned long long>(vector_before),
+        static_cast<unsigned long long>(calls), static_cast<unsigned>(require_relocation),
+        static_cast<unsigned long long>(vector_before),
         static_cast<unsigned long long>(vector_after),
         static_cast<unsigned long long>(element_before),
         static_cast<unsigned long long>(element_after), static_cast<unsigned>(vector_relocated),
         static_cast<unsigned>(element_relocated), static_cast<unsigned>(active),
         static_cast<unsigned>(type_arguments_state),
         static_cast<unsigned long long>(capability_failed), static_cast<unsigned>(passed));
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DARTPLANT_CI {\"event\":\"type_arguments\",\"state\":\"%s\","
+        "\"require_relocation\":%s,\"dart_api_calls\":%llu,"
+        "\"parameter_before\":\"0x%llx\",\"parameter_after\":\"0x%llx\","
+        "\"parameter_relocated\":%s,\"vector_before\":\"0x%llx\","
+        "\"vector_after\":\"0x%llx\",\"element_before\":\"0x%llx\","
+        "\"element_after\":\"0x%llx\"}",
+        passed ? "pass" : "fail", require_relocation ? "true" : "false",
+        static_cast<unsigned long long>(calls), static_cast<unsigned long long>(parameter_before),
+        static_cast<unsigned long long>(parameter_after), parameter_relocated ? "true" : "false",
+        static_cast<unsigned long long>(vector_before),
+        static_cast<unsigned long long>(vector_after),
+        static_cast<unsigned long long>(element_before),
+        static_cast<unsigned long long>(element_after));
     return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_transition_proof() {
+    if (g_flutter_vm_adapter == nullptr) return 0;
+    const DartPlantFlutterVmProofState state = dartplant_flutter_vm_adapter_capability_state(
+        g_flutter_vm_adapter, DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED);
+    const uint64_t failed = dartplant_flutter_vm_adapter_failed_capabilities(g_flutter_vm_adapter);
+    return state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
+                   (failed & DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED) == 0
+               ? 1
+               : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_artifact_lifecycle_proof() {
+    return g_artifact_lifecycle_passed.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 extern "C" __attribute__((visibility("default"))) int32_t
@@ -1891,12 +1983,13 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    constexpr uint64_t kFixtureIsolateGeneration = 1;
     const DartPlantFlutterVmAdapterOptions adapter_options = {
         .struct_size = sizeof(DartPlantFlutterVmAdapterOptions),
         .api_version = DARTPLANT_FLUTTER_VM_ADAPTER_API_VERSION,
         .api_dl_data = api_dl_data,
         .thread = thr,
-        .isolate_generation = 1,
+        .isolate_generation = kFixtureIsolateGeneration,
         .snapshot_hash = snapshot_info.snapshot_hash,
         .snapshot_features = snapshot_info.snapshot_features,
     };
@@ -1971,6 +2064,9 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
                                  DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN |
                                  DARTPLANT_FLUTTER_VM_CAP_DART_CORE_PROVEN) &&
         verified_revalidated == kExpectedVerifiedCreate && failed_revalidated == 0;
+    g_artifact_lifecycle_passed.store(
+        capability_gate && generation_gate && artifact_revalidation == DARTPLANT_OK,
+        std::memory_order_release);
     __android_log_print(
         capability_gate && generation_gate && artifact_revalidation == DARTPLANT_OK
             ? ANDROID_LOG_INFO
@@ -1995,6 +2091,35 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         premature_revalidation, artifact_retirement,
         static_cast<unsigned long long>(verified_quiesced),
         static_cast<unsigned long long>(artifact_generation_quiesced));
+    __android_log_print(
+        capability_gate && generation_gate && artifact_revalidation == DARTPLANT_OK
+            ? ANDROID_LOG_INFO
+            : ANDROID_LOG_ERROR,
+        kTag,
+        "DARTPLANT_CI {\"event\":\"artifact_lifecycle\",\"state\":\"%s\","
+        "\"capabilities\":\"0x%llx\",\"required\":\"0x%llx\","
+        "\"verified_before\":\"0x%llx\",\"verified_invalidated\":\"0x%llx\","
+        "\"verified_revalidated\":\"0x%llx\",\"failed_before\":\"0x%llx\","
+        "\"failed_revalidated\":\"0x%llx\",\"generation_before\":%llu,"
+        "\"generation_quiesced\":%llu,\"generation_invalidated\":%llu,"
+        "\"generation_revalidated\":%llu,\"isolate_generation\":%llu,\"quiesce_status\":%d,"
+        "\"premature_revalidation_status\":%d,\"retire_status\":%d,"
+        "\"revalidation_status\":%d}",
+        capability_gate && generation_gate && artifact_revalidation == DARTPLANT_OK ? "pass"
+                                                                                    : "fail",
+        static_cast<unsigned long long>(adapter_capabilities),
+        static_cast<unsigned long long>(kExpectedCreateCapabilities),
+        static_cast<unsigned long long>(verified_before),
+        static_cast<unsigned long long>(verified_invalidated),
+        static_cast<unsigned long long>(verified_revalidated),
+        static_cast<unsigned long long>(failed_before),
+        static_cast<unsigned long long>(failed_revalidated),
+        static_cast<unsigned long long>(artifact_generation_before),
+        static_cast<unsigned long long>(artifact_generation_quiesced),
+        static_cast<unsigned long long>(artifact_generation_invalidated),
+        static_cast<unsigned long long>(artifact_generation_revalidated),
+        static_cast<unsigned long long>(kFixtureIsolateGeneration), artifact_quiesce,
+        premature_revalidation, artifact_retirement, artifact_revalidation);
     if (!capability_gate || !generation_gate || artifact_revalidation != DARTPLANT_OK) {
         g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
         return DARTPLANT_PROFILE_MISMATCH;

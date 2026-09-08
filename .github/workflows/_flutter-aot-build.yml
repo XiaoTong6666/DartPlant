@@ -1,0 +1,124 @@
+# Copyright (C) 2026 XiaoTong6666
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+name: CI / Flutter AOT build
+
+on:
+  workflow_call:
+    inputs:
+      family:
+        required: true
+        type: string
+      flutter_version:
+        required: true
+        type: string
+      dart_version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.family }} release AOT
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout DartPlant
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            tests/flutter_fixture/android/**/*.gradle*
+            tests/flutter_fixture/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Flutter ${{ inputs.flutter_version }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read NDK version
+        id: config
+        shell: bash
+        run: echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "cmake;3.22.1" \
+            "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Cache host ABI analyzer build
+        uses: actions/cache@v4
+        with:
+          path: build/host
+          key: dartplant-host-analyzer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'include/**', 'src/**', 'tools/aot-abi-analyzer/**', 'third_party/capstone/**', 'project-config.json') }}
+          restore-keys: |
+            dartplant-host-analyzer-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Materialize exact Dart SDK sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ../sdk
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            --depth=1 \
+            --branch "${{ inputs.dart_version }}" \
+            https://github.com/dart-lang/sdk.git \
+            ../sdk
+          git -C ../sdk sparse-checkout init --cone
+          git -C ../sdk sparse-checkout set runtime/include
+          git -C ../sdk checkout --detach "${{ inputs.dart_version }}"
+          test -f ../sdk/runtime/include/dart_api_dl.c
+
+      - name: Verify Flutter/Dart family
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+
+      - name: Build release ARM64 fixture
+        run: |
+          python3 scripts/ci/build_flutter_fixture.py \
+            --flutter "$(command -v flutter)" \
+            --expected-flutter "${{ inputs.flutter_version }}" \
+            --expected-dart "${{ inputs.dart_version }}" \
+            --family "${{ inputs.family }}" \
+            --out "build/ci/flutter/${{ inputs.family }}"
+
+      - name: Upload release AOT fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: dartplant-${{ inputs.family }}
+          path: build/ci/flutter/${{ inputs.family }}/
+          if-no-files-found: error
+          retention-days: 7

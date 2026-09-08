@@ -1,0 +1,191 @@
+# Copyright (C) 2026 XiaoTong6666
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+name: CI / Quality
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Audit, lint, and CI analyzers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Flutter baseline
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read project configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ndk=$(python3 -c 'import json; print(json.load(open("project-config.json"))["ndkVer"])')" >> "$GITHUB_OUTPUT"
+          echo "platform=$(python3 -c 'import json; print(json.load(open("project-config.json"))["platform"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "ndk;${{ steps.config.outputs.ndk }}"
+
+      - name: Cache host lint build
+        uses: actions/cache@v4
+        with:
+          path: build/host
+          key: dartplant-host-analyzer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'include/**', 'src/**', 'tools/aot-abi-analyzer/**', 'third_party/capstone/**', 'project-config.json') }}
+          restore-keys: |
+            dartplant-host-analyzer-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Use NDK LLVM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm_bin="$(find "$ANDROID_HOME/ndk/${{ steps.config.outputs.ndk }}/toolchains/llvm/prebuilt" -mindepth 2 -maxdepth 2 -type d -name bin -print -quit)"
+          test -n "$llvm_bin"
+          echo "$llvm_bin" >> "$GITHUB_PATH"
+
+      - name: Doctor
+        run: python3 scripts/main.py doctor
+
+      - name: Verify generated VM profiles
+        run: python3 scripts/main.py profiles --check
+
+      - name: Compile Flutter VM adapter for ARM64
+        shell: bash
+        env:
+          NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/${{ steps.config.outputs.ndk }}
+          DART_INCLUDE: ${{ env.FLUTTER_ROOT }}/bin/cache/dart-sdk/include
+          ANDROID_PLATFORM: ${{ steps.config.outputs.platform }}
+        run: |
+          set -euo pipefail
+          api="${ANDROID_PLATFORM#android-}"
+          llvm_root="$(find "$NDK_ROOT/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$llvm_root"
+          "$llvm_root/bin/aarch64-linux-android${api}-clang++" \
+            -std=c++20 -fsyntax-only -Wall -Wextra -Werror \
+            -Iinclude -Isrc -I"$DART_INCLUDE" \
+            adapters/flutter_vm/flutter_vm.cpp
+
+      - name: Resolve Dart formatting dependencies
+        working-directory: tests/dart
+        run: dart pub get
+
+      - name: Resolve Flutter formatting dependencies
+        working-directory: tests/flutter_fixture
+        run: flutter pub get
+
+      - name: Check formatting
+        run: python3 scripts/main.py format --check
+
+      - name: Audit source tree
+        run: python3 scripts/main.py audit
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Lint source tree
+        run: python3 scripts/main.py lint
+
+      - name: Test CI log analyzer
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
+  dart-fixture:
+    name: Dart fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('tests/dart/pubspec.yaml') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Resolve dependencies
+        working-directory: tests/dart
+        run: dart pub get
+
+      - name: Analyze
+        working-directory: tests/dart
+        run: dart analyze
+
+      - name: Test
+        working-directory: tests/dart
+        run: dart test
+
+  flutter-fixture:
+    name: Flutter fixture static tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Flutter baseline
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        working-directory: tests/flutter_fixture
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: tests/flutter_fixture
+        run: flutter analyze
+
+      - name: Test
+        working-directory: tests/flutter_fixture
+        run: flutter test

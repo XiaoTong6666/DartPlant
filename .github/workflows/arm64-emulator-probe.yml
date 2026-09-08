@@ -1,0 +1,81 @@
+# Copyright (C) 2026 XiaoTong6666
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+name: ARM64 Android emulator probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-emulator-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: ubuntu-24.04-arm software/native boot probe
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache ARM64 Android SDK and emulator
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dartplant/android-arm64-sdk
+          key: dartplant-android-arm64-sdk-${{ runner.os }}-${{ runner.arch }}-emu35.6.3-67ce4f57-api31-aosp-atd-cmdline15859902-v1
+          restore-keys: |
+            dartplant-android-arm64-sdk-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Probe ARM64 Android boot
+        env:
+          DARTPLANT_EMULATOR_LOG_DIR: build/ci/emulator
+          DARTPLANT_EMULATOR_BOOT_TIMEOUT: '1800'
+          DARTPLANT_ANDROID_API: '31'
+          DARTPLANT_ANDROID_TAG: aosp_atd
+        run: |
+          export DARTPLANT_ANDROID_HOME="$HOME/.cache/dartplant/android-arm64-sdk"
+          bash scripts/ci/start_arm64_android.sh
+
+      - name: Publish probe summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## ARM64 Android emulator probe" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f build/ci/emulator/guest.txt ]]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat build/ci/emulator/guest.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Guest did not reach the provenance stage; inspect probe.log and emulator.log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload emulator probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-emulator-probe
+          path: build/ci/emulator/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop emulator
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f build/ci/emulator/serial ]]; then
+            adb -s "$(cat build/ci/emulator/serial)" emu kill || true
+          fi

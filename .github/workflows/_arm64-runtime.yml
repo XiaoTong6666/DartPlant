@@ -1,0 +1,187 @@
+# Copyright (C) 2026 XiaoTong6666
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+name: CI / Native ARM64 Flutter runtime
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Native ARM64 Android runtime gate (authoritative if available)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Flutter family APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dartplant-flutter-*
+          path: build/ci/downloads
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache ARM64 Android SDK and emulator
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dartplant/android-arm64-sdk
+          key: dartplant-android-arm64-sdk-${{ runner.os }}-${{ runner.arch }}-emu35.6.3-67ce4f57-api31-aosp-atd-cmdline15859902-v1
+          restore-keys: |
+            dartplant-android-arm64-sdk-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Start native ARM64 Android guest
+        id: emulator
+        continue-on-error: true
+        env:
+          DARTPLANT_EMULATOR_LOG_DIR: build/ci/emulator
+          DARTPLANT_EMULATOR_BOOT_TIMEOUT: '1800'
+          DARTPLANT_ANDROID_API: '31'
+          DARTPLANT_ANDROID_TAG: aosp_atd
+        run: |
+          export DARTPLANT_ANDROID_HOME="$HOME/.cache/dartplant/android-arm64-sdk"
+          bash scripts/ci/start_arm64_android.sh
+
+      - name: Record ARM64 infrastructure availability
+        if: always()
+        shell: bash
+        env:
+          EMULATOR_OUTCOME: ${{ steps.emulator.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci/emulator
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          outcome = os.environ['EMULATOR_OUTCOME']
+          available = outcome == 'success'
+          Path('build/ci/emulator/infrastructure.json').write_text(
+              json.dumps(
+                  {
+                      'tier': 'native-arm64',
+                      'available': available,
+                      'emulator_step_outcome': outcome,
+                      'runtime_gate_executed': available,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              ) + '\n'
+          )
+          PY
+          if [[ "$EMULATOR_OUTCOME" == "success" ]]; then
+            echo "### Native ARM64 infrastructure: AVAILABLE" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "The authoritative ARM64 DartPlant runtime gate will execute." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Native ARM64 infrastructure: UNAVAILABLE" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "The hosted-runner Android guest could not be provisioned. This infrastructure failure does not fail the main CI; inspect the uploaded emulator evidence." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run all Flutter families and gate logcat
+        if: ${{ steps.emulator.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build/ci/logcat build/ci/reports build/ci/runner
+          serial="$(cat build/ci/emulator/serial)"
+          expected_count="$(python3 -c 'import json; print(len(json.load(open("scripts/ci/flutter_families.json"))))')"
+          mapfile -t manifests < <(find build/ci/downloads -name manifest.json -type f | sort)
+          actual_count="${#manifests[@]}"
+          if [[ "$actual_count" -ne "$expected_count" ]]; then
+            echo "expected $expected_count Flutter family artifacts, found $actual_count" >&2
+            exit 2
+          fi
+          status=0
+
+          # Materialize the manifest list before launching adb. Commands spawned
+          # by run_flutter_device.py inherit stdin; using a while-read process
+          # substitution here lets an adb child consume the remaining manifest
+          # paths and silently truncates the runtime matrix after one family.
+          for manifest in "${manifests[@]}"; do
+            family="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["family"])' "$manifest")"
+            flutter="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["flutter"])' "$manifest")"
+            dart="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dart"])' "$manifest")"
+            apk="$(dirname "$manifest")/app-release.apk"
+
+            echo "=== $family ==="
+            if ! python3 scripts/ci/run_flutter_device.py \
+              --serial "$serial" \
+              --apk "$apk" \
+              --test all \
+              --runtime-tier native \
+              --log "build/ci/logcat/$family.log" \
+              --metadata "build/ci/runner/$family.json" \
+              --timeout 600; then
+              status=1
+            fi
+
+            if ! python3 scripts/ci/analyze_logcat.py \
+              --log "build/ci/logcat/$family.log" \
+              --metadata "build/ci/runner/$family.json" \
+              --flutter "$flutter" \
+              --dart "$dart" \
+              --test all \
+              --runtime-tier native \
+              --report-json "build/ci/reports/$family.json" \
+              --summary-md "build/ci/reports/$family.md" \
+              --junit "build/ci/reports/$family.xml"; then
+              status=1
+            fi
+          done
+
+          exit "$status"
+
+      - name: Publish ARM64 runtime summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d build/ci/reports ]] && find build/ci/reports -maxdepth 1 -name '*.json' -print -quit | grep -q .; then
+            python3 scripts/ci/aggregate_runtime_reports.py \
+              --reports build/ci/reports \
+              --output build/ci/reports/summary.md \
+              --title 'DartPlant native ARM64 runtime matrix'
+            cat build/ci/reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo >> "$GITHUB_STEP_SUMMARY"
+            if [[ -f build/ci/emulator/infrastructure.json ]] && \
+               python3 -c 'import json; raise SystemExit(0 if json.load(open("build/ci/emulator/infrastructure.json")).get("available") else 1)'; then
+              echo "No authoritative runtime report was produced because the ARM64 runtime gate failed before a report could be completed. Inspect runner metadata and raw logcat evidence." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "No authoritative runtime report was produced because the ARM64 Android infrastructure was unavailable." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      - name: Upload raw ARM64 runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-native-arm64-runtime-evidence
+          path: |
+            build/ci/emulator/**
+            build/ci/logcat/**
+            build/ci/runner/**
+            build/ci/reports/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop emulator
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f build/ci/emulator/serial ]]; then
+            adb -s "$(cat build/ci/emulator/serial)" emu kill || true
+          fi

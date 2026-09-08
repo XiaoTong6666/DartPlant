@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "core/internal.h"
+#include "vm/runtime_profiles.h"
 
 namespace {
 
@@ -61,6 +62,41 @@ bool TypeArgumentsElementCallbackAvailable(const DartPlantVmAdapterCallbacks& ca
                offsetof(DartPlantVmAdapterCallbacks, read_type_arguments_element) +
                    sizeof(DartPlantReadTypeArgumentsElementCallback) &&
            callbacks.read_type_arguments_element != nullptr;
+}
+
+bool CapabilityProofCallbackAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >= offsetof(DartPlantVmAdapterCallbacks, prove_capability) +
+                                        sizeof(DartPlantProveCapabilityCallback) &&
+           callbacks.prove_capability != nullptr;
+}
+
+uint64_t CapabilityForEvidence(DartPlantVmCapabilityEvidenceKind kind) {
+    switch (kind) {
+    case DARTPLANT_VM_EVIDENCE_FUNCTION_CODE:
+        return DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT;
+    case DARTPLANT_VM_EVIDENCE_AOT_ENTRY:
+        return DARTPLANT_VM_CAP_AOT_ENTRY_LAYOUT;
+    case DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR:
+        return DARTPLANT_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT;
+    case DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE:
+        return DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT;
+    case DARTPLANT_VM_EVIDENCE_CLOSURE_CALL:
+        return DARTPLANT_VM_CAP_CLOSURE_CALL_LAYOUT;
+    case DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI:
+        return DARTPLANT_VM_CAP_INVOCATION_CALL_ABI;
+    }
+    return 0;
+}
+
+size_t CapabilityIndex(uint64_t capability) {
+    if (capability == 0 || (capability & (capability - 1)) != 0) return 16;
+    size_t index = 0;
+    while ((capability >>= 1) != 0) ++index;
+    return index;
+}
+
+void ResetAbiBindingLocked(DartPlantVmAdapter* adapter) {
+    if (adapter != nullptr) adapter->abi_binding = {};
 }
 
 DartPlantStatus CheckAttachedOwnerLocked(DartPlantVmAdapter* adapter) {
@@ -144,6 +180,115 @@ bool VmAdapterSupportsGeneratedCallbackBridge(const DartPlantVmAdapter* adapter)
 
 bool VmAdapterSupportsTypeArgumentsElementRead(const DartPlantVmAdapter* adapter) {
     return adapter != nullptr && TypeArgumentsElementCallbackAvailable(adapter->callbacks);
+}
+
+bool VmAdapterSupportsCapabilityProof(const DartPlantVmAdapter* adapter) {
+    return adapter != nullptr && CapabilityProofCallbackAvailable(adapter->callbacks);
+}
+
+DartPlantStatus VmAdapterProveCapability(DartPlantVmAdapter* adapter,
+                                         const DartPlantVmCapabilityEvidence& evidence,
+                                         DartPlantVmCapabilityProof* out_proof) {
+    if (adapter == nullptr || out_proof == nullptr ||
+        evidence.struct_size < sizeof(DartPlantVmCapabilityEvidence) ||
+        evidence.kind < DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ||
+        evidence.kind > DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI ||
+        out_proof->struct_size < sizeof(DartPlantVmCapabilityProof)) {
+        SetLastError("VM capability proof arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::unique_lock lock(adapter->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        SetLastError("VM adapter capability proof state is busy");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!CapabilityProofCallbackAvailable(adapter->callbacks)) {
+        SetLastError("VM adapter has no capability proof bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!adapter->admission_open.load(std::memory_order_acquire)) {
+        SetLastError("VM adapter is quiescing and rejects capability proof");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const bool transient_owner = adapter->owner_thread == std::thread::id{};
+    const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
+    if (owner != DARTPLANT_OK) return owner;
+    const DartPlantStatus status = adapter->callbacks.prove_capability(
+        adapter->user_data, &adapter->isolate, &evidence, out_proof);
+    if (transient_owner && !adapter->isolate_entered && adapter->entered == 0 &&
+        adapter->generated_root_leases == 0 && adapter->generated_native_transitions == 0) {
+        adapter->owner_thread = {};
+    }
+    if (status != DARTPLANT_OK) return status;
+    const uint64_t expected_capability = CapabilityForEvidence(evidence.kind);
+    const size_t capability_index = CapabilityIndex(expected_capability);
+    if (capability_index >= adapter->abi_binding.capabilities.size() ||
+        out_proof->capability != expected_capability || out_proof->profile_version == 0 ||
+        out_proof->artifact_generation == 0 ||
+        out_proof->isolate_generation != adapter->isolate.generation) {
+        SetLastError("VM capability proof returned an invalid binding record");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(out_proof->profile_version);
+    if (profile == nullptr) {
+        SetLastError("VM capability proof selected an unknown runtime profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (adapter->abi_binding.artifact_generation != 0 &&
+        (adapter->abi_binding.artifact_generation != out_proof->artifact_generation ||
+         adapter->abi_binding.isolate_generation != out_proof->isolate_generation)) {
+        ResetAbiBindingLocked(adapter);
+    }
+    adapter->abi_binding.artifact_generation = out_proof->artifact_generation;
+    adapter->abi_binding.isolate_generation = out_proof->isolate_generation;
+    auto& established = adapter->abi_binding.capabilities[capability_index];
+    if (established.proof.capability == expected_capability &&
+        established.proof.profile_version != out_proof->profile_version) {
+        SetLastError("VM capability proof changed profile within one generation");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    established.proof = *out_proof;
+    established.profile = profile;
+    return status;
+}
+
+DartPlantStatus VmAdapterGetCapabilityBinding(const DartPlantVmAdapter* adapter,
+                                              uint64_t capability,
+                                              DartPlantVmCapabilityProof* out_proof,
+                                              const RuntimeProfileRecord** out_profile) {
+    if (adapter == nullptr || out_proof == nullptr ||
+        out_proof->struct_size < sizeof(DartPlantVmCapabilityProof)) {
+        SetLastError("VM capability binding arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (!adapter->attached || !adapter->admission_open.load(std::memory_order_acquire)) {
+        SetLastError("VM capability binding is unavailable");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const size_t index = CapabilityIndex(capability);
+    if (index >= adapter->abi_binding.capabilities.size()) {
+        SetLastError("VM capability binding is invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const auto& binding = adapter->abi_binding.capabilities[index];
+    const auto& proof = binding.proof;
+    if (proof.capability != capability || proof.profile_version == 0 ||
+        proof.artifact_generation != adapter->abi_binding.artifact_generation ||
+        proof.isolate_generation != adapter->abi_binding.isolate_generation ||
+        proof.isolate_generation != adapter->isolate.generation || binding.profile == nullptr) {
+        SetLastError("VM capability has not been verified for the current generation");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    *out_proof = proof;
+    if (out_profile != nullptr) *out_profile = binding.profile;
+    return DARTPLANT_OK;
+}
+
+void VmAdapterInvalidateAbiBinding(DartPlantVmAdapter* adapter) {
+    if (adapter == nullptr) return;
+    std::lock_guard lock(adapter->mutex);
+    ResetAbiBindingLocked(adapter);
 }
 
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter) {
@@ -471,7 +616,8 @@ extern "C" {
 DARTPLANT_EXPORT DartPlantStatus
 dartplant_vm_adapter_create(const DartPlantVmAdapterCallbacks* callbacks, void* user_data,
                             DartPlantVmAdapter** out_adapter) {
-    if (callbacks == nullptr || out_adapter == nullptr || !ValidAdapterCallbacks(*callbacks)) {
+    if (callbacks == nullptr || out_adapter == nullptr || !ValidAdapterCallbacks(*callbacks) ||
+        (callbacks->adapter_version >= 4 && !CapabilityProofCallbackAvailable(*callbacks))) {
         dartplant::SetLastError("VM adapter callbacks are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
@@ -518,6 +664,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_attach_isolate(
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
     adapter->isolate = *isolate;
+    ResetAbiBindingLocked(adapter);
     adapter->attached = true;
     return DARTPLANT_OK;
 }
@@ -540,6 +687,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_detach_isolate(
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
     adapter->attached = false;
+    ResetAbiBindingLocked(adapter);
     adapter->isolate = {};
     adapter->owner_thread = {};
     return DARTPLANT_OK;

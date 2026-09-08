@@ -13,6 +13,8 @@
 #include "abi/value_codec.h"
 #include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
+#include "vm/abi/resolver.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
@@ -247,20 +249,21 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
         SetLastError("live Function index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
+    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(index.vm_profile_version);
+    if (index.vm_profile_version != 0 && profile == nullptr) {
+        SetLastError("live Function index has no selected candidate ABI profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
     function->function_object = record->function_object;
     function->code_object = record->code_object;
     function->source = DartFunctionSource::kLiveVm;
     function->function_kind = record->function_kind;
-    if (const RuntimeProfileRecord* profile = FindRuntimeProfileBySnapshot(index.snapshot_hash);
-        profile != nullptr) {
-        function->runtime_profile_version = profile->live_vm.profile_version;
-    }
-    function->closure_call_entry_only =
-        IsClosureFunctionKind(function->runtime_profile_version, record->function_kind);
+    function->runtime_profile_version = profile == nullptr ? 0 : profile->live_vm.profile_version;
+    function->closure_call_entry_only = record->closure_call_entry_only;
     function->thread_jump_to_frame_entry_point_offset =
-        ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
+        profile == nullptr ? 0 : profile->thread_jump_to_frame_entry_point_offset;
     function->code_target = code_target;
     code_target->AddAlias(function->identity);
 
@@ -655,6 +658,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->abi_evidence.clear();
         runtime->snapshot.reset();
         runtime->live_vm_context.reset();
+        runtime->live_vm_core_candidates.clear();
         runtime->live_vm_null_value = 0;
         runtime->live_vm_bool_true_value = 0;
         runtime->live_vm_bool_false_value = 0;
@@ -709,6 +713,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->abi_evidence.clear();
         runtime->snapshot = std::move(snapshot);
         runtime->live_vm_context.reset();
+        runtime->live_vm_core_candidates.clear();
         runtime->live_vm_null_value = 0;
         runtime->live_vm_bool_true_value = 0;
         runtime->live_vm_bool_false_value = 0;
@@ -835,10 +840,28 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     DartPlantFlutterSnapshotInfo snapshot_info{};
     snapshot_info.struct_size = sizeof(snapshot_info);
     FillSnapshotInfo(snapshot, &snapshot_info);
-    DartPlantLiveVmProfile profile{};
-    profile.struct_size = sizeof(profile);
-    DartPlantStatus status = dartplant_live_vm_select_profile(&snapshot_info, &profile);
-    if (status != DARTPLANT_OK) return status;
+    VmRuntimeFacts facts{};
+    facts.snapshot_hash = snapshot_info.snapshot_hash == nullptr ? "" : snapshot_info.snapshot_hash;
+    facts.snapshot_features =
+        snapshot_info.snapshot_features == nullptr ? "" : snapshot_info.snapshot_features;
+    facts.compressed_pointers = snapshot_info.compressed_pointers != 0;
+    vm_abi::ResolverInput resolver_input{};
+    resolver_input.facts = facts;
+    resolver_input.thread = context.thread;
+    resolver_input.current_isolate = context.isolate;
+    resolver_input.canonical_null = validated_null_value;
+    resolver_input.registers = {.available = false};
+    resolver_input.modules = &runtime->modules;
+    const vm_abi::ResolverResult resolver = vm_abi::ResolveVerifiedBinding(resolver_input);
+    if (!resolver.passed || resolver.binding.core.representative == nullptr) {
+        SetLastError(resolver.distinct_abis > 1
+                         ? "live VM runtime-root capability is ambiguous across candidate profiles"
+                         : "live VM runtime-root capability rejected every candidate profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const RuntimeProfileRecord* selected_profile = resolver.binding.core.representative;
+    const DartPlantLiveVmProfile profile = selected_profile->live_vm;
+    DartPlantStatus status = DARTPLANT_OK;
     uint64_t bool_true_value = 0;
     uint64_t bool_false_value = 0;
     status = ResolveLiveVmCanonicalBoolRoots(context, profile, &bool_true_value, &bool_false_value);
@@ -847,7 +870,8 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     DartPlantLiveVmFunctionIndexInfo index_info{};
     index_info.struct_size = sizeof(index_info);
     std::string error;
-    auto index = BuildLiveSnapshotIndex(context, snapshot_info, &index_info, &error);
+    auto index =
+        BuildLiveSnapshotIndex(context, snapshot_info, *selected_profile, &index_info, &error);
     if (!index.has_value()) {
         SetLastError(error.empty() ? "failed to build live Function index" : error);
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -866,6 +890,7 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         }
     }
     runtime->live_vm_context = context;
+    runtime->live_vm_core_candidates = resolver.binding.core.candidates.profiles;
     runtime->live_vm_null_value = validated_null_value;
     runtime->live_vm_bool_true_value = bool_true_value;
     runtime->live_vm_bool_false_value = bool_false_value;
@@ -1070,16 +1095,6 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         return status;
     }
 
-    DartPlantLiveVmProfile profile{};
-    profile.struct_size = sizeof(profile);
-    status = dartplant_live_vm_select_profile(&snapshot_info, &profile);
-    if (status != DARTPLANT_OK) {
-        dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_VM_PROFILE,
-                                         DARTPLANT_RESOLVE_REJECTED, status,
-                                         DARTPLANT_REJECT_PROFILE_UNSUPPORTED);
-        return status;
-    }
-
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
     status = dartplant_live_vm_context_from_probe(&probe, &context);
@@ -1089,8 +1104,15 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
                                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
         return status;
     }
-    status = dartplant::BuildLiveIndexForContext(runtime, context, *runtime->snapshot,
-                                                 invocation->context->x[profile.null_register]);
+    const dartplant::RuntimeProfileRecord* probe_profile =
+        dartplant::FindRuntimeProfileByVersion(probe.profile_version);
+    if (probe_profile == nullptr || probe_profile->live_vm.null_register >= 31) {
+        dartplant::SetLastError("live VM probe selected an invalid candidate profile");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    status = dartplant::BuildLiveIndexForContext(
+        runtime, context, *runtime->snapshot,
+        invocation->context->x[probe_profile->live_vm.null_register]);
     if (status != DARTPLANT_OK) {
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
                                          DARTPLANT_RESOLVE_REJECTED, status,

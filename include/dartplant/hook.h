@@ -33,7 +33,7 @@ typedef struct DartPlantHookOptions {
     DartPlantInvocationCallback on_enter;
     DartPlantInvocationCallback on_leave;
     void* user_data;
-    // Advanced/optional VM object bridge. Adapter V3 supplies the GC-safe
+    // Advanced/optional VM object bridge. Adapter V4 supplies the GC-safe
     // Generated<->Native transition and VM-visible roots required by real
     // Dart-entry callbacks. Normal scalar-only consumers leave this null.
     DartPlantVmAdapter* vm_adapter;
@@ -52,7 +52,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_unhook_handle(DartPlantHookHandle* ha
 DARTPLANT_EXPORT uint8_t dartplant_hook_handle_is_active(const DartPlantHookHandle* handle);
 DARTPLANT_EXPORT uint8_t dartplant_hook_handle_is_idle(const DartPlantHookHandle* handle);
 // Installs a read-only notification for Dart exceptions that unwind out of the
-// hooked invocation. With an exact VM V3 adapter it may also inspect the active
+// hooked invocation. With an exact VM V4 adapter it may also inspect the active
 // exception and stacktrace through dartplant_invocation_get_exception() /
 // dartplant_invocation_get_stacktrace(). Those values remain read-only:
 // retention, replacement/suppression, and async-frame mutation are not exposed.

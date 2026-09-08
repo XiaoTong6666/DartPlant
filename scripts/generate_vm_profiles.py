@@ -12,6 +12,9 @@ from util import ROOT_DIR
 
 MANIFEST = ROOT_DIR / "scripts" / "data" / "dart_vm_profiles.json"
 GENERATED = ROOT_DIR / "src" / "vm" / "generated" / "runtime_profiles.generated.h"
+GENERATED_FINGERPRINTS = (
+    ROOT_DIR / "src" / "vm" / "generated" / "capability_fingerprints.generated.h"
+)
 
 EXPECTED_GP_ARGS = [1, 2, 3, 5, 6, 7]
 EXPECTED_FPU_ARGS = [0, 1, 2, 3, 4, 5]
@@ -287,53 +290,371 @@ def _class_id_map(class_id_text: str) -> dict[str, int]:
     return {name: index for index, name in enumerate(class_ids)}
 
 
+ABI_PROFILE_SECTIONS = (
+    "machine",
+    "registers",
+    "thread",
+    "isolate_group",
+    "class_table",
+    "object_store",
+    "instructions",
+    "code",
+    "function",
+    "class",
+    "library",
+    "array",
+    "growable_object_array",
+    "string",
+    "object_pool",
+    "cids",
+    "canonical_bool",
+    "function_type",
+    "raw_object",
+    "arguments_descriptor",
+    "function_kind",
+    "type_arguments",
+    "transition",
+)
+
+ABI_DOMAIN_FIELDS = {
+    "core": (
+        "machine.architecture", "machine.pointer_size", "machine.product",
+        "machine.compressed_pointers", "thread.heap_base", "thread.object_null",
+        "thread.global_object_pool", "thread.isolate", "thread.isolate_group",
+        "isolate_group.class_table", "isolate_group.cached_class_table_table",
+        "isolate_group.object_store", "class_table.num_cids", "object_store.libraries",
+        "code.object_pool", "code.owner", "code.instructions_length", "function.name",
+        "function.owner", "function.code", "class.name", "class.functions",
+        "class.library", "library.url", "library.toplevel_class",
+    ),
+    "call": (
+        "registers.thr", "registers.pp", "registers.code", "registers.heap_bits",
+        "registers.null", "registers.spreg", "registers.args_desc",
+        "registers.dart_gp_args", "registers.dart_fpu_args",
+        "instructions.monomorphic_entry_offset_aot",
+        "instructions.polymorphic_entry_offset_aot", "code.entry_point",
+        "code.unchecked_entry_point", "code.monomorphic_entry_point",
+        "code.monomorphic_unchecked_entry_point", "function.entry_point",
+        "function.unchecked_entry_point", "function.kind_tag",
+        "arguments_descriptor.type_args_len", "arguments_descriptor.count",
+        "arguments_descriptor.size", "arguments_descriptor.positional_count",
+        "arguments_descriptor.first_named_entry", "arguments_descriptor.named_entry_size",
+        "arguments_descriptor.name", "arguments_descriptor.position",
+        "function_kind.regular", "function_kind.closure", "function_kind.implicit_closure",
+        "function_kind.tag_shift", "function_kind.tag_bits",
+    ),
+    "object": (
+        "function.signature", "array.length", "array.elements",
+        "growable_object_array.length", "growable_object_array.data", "string.length",
+        "string.data", "object_pool.length", "object_pool.elements", "cids.class",
+        "cids.function", "cids.library", "cids.code", "cids.object_pool", "cids.array",
+        "cids.immutable_array", "cids.growable_object_array", "cids.one_byte_string",
+        "cids.two_byte_string", "canonical_bool.thread_true",
+        "canonical_bool.thread_false", "canonical_bool.value", "canonical_bool.cid",
+        "function_type.abstract_type_flags", "function_type.type_parameters",
+        "function_type.result_type", "function_type.parameter_types",
+        "function_type.named_parameter_names", "function_type.packed_parameter_counts",
+        "function_type.packed_type_parameter_counts", "function_type.cid_type",
+        "function_type.cid_function_type", "function_type.cid_record_type",
+        "function_type.cid_type_parameter", "function_type.cid_null",
+        "function_type.cid_dynamic", "function_type.cid_void", "function_type.cid_never",
+        "function_type.type_parameter_base", "function_type.type_parameter_index",
+        "function_type.nullability_bits", "function_type.type_class_id_shift",
+        "function_type.type_parameter_function_bit", "raw_object.heap_object_tag",
+        "raw_object.smi_tag", "raw_object.smi_tag_mask", "raw_object.smi_tag_shift",
+        "raw_object.class_id_tag_shift", "raw_object.class_id_tag_bits",
+        "raw_object.compressed_word_size", "type_arguments.cid", "type_arguments.length",
+        "type_arguments.types",
+    ),
+    "transition": (
+        "thread.enter_safepoint_stub", "thread.exit_safepoint_stub",
+        "thread.top_exit_frame", "thread.vm_tag", "thread.execution_state",
+        "thread.exit_through_ffi", "transition.vm_tag_dart", "transition.execution_vm",
+        "transition.execution_generated", "transition.execution_native",
+        "transition.exit_none", "transition.exit_through_ffi",
+        "transition.exit_through_runtime_call",
+    ),
+    "exception": (
+        "thread.jump_to_frame_entry_point", "thread.active_exception",
+        "thread.active_stacktrace",
+    ),
+}
+
+# This is the single declaration of the profile fields consumed by each
+# capability proof. The C++ appenders and mutation-coverage tests are derived
+# from this table; keep it isomorphic with the readers in src/vm/abi/proof.cpp
+# and adapters/flutter_vm/flutter_vm.cpp.
+_RUNTIME_ROOT_FIELDS = (
+    ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+    ("raw_object.smi_tag", "profile.raw_object.smi_tag"),
+    ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+    ("raw_object.smi_tag_shift", "profile.raw_object.smi_tag_shift"),
+    ("raw_object.class_id_tag_shift", "profile.raw_object.class_id_tag_shift"),
+    ("raw_object.class_id_tag_bits", "profile.raw_object.class_id_tag_bits"),
+    ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
+    ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+    ("thread.object_null", "profile.live_vm.thread_object_null_offset"),
+    ("thread.global_object_pool", "profile.live_vm.thread_global_object_pool_offset"),
+    ("thread.isolate", "profile.live_vm.thread_isolate_offset"),
+    ("thread.isolate_group", "profile.live_vm.thread_isolate_group_offset"),
+    ("isolate_group.class_table", "profile.live_vm.isolate_group_class_table_offset"),
+    (
+        "isolate_group.cached_class_table_table",
+        "profile.live_vm.isolate_group_cached_class_table_table_offset",
+    ),
+    ("isolate_group.object_store", "profile.live_vm.isolate_group_object_store_offset"),
+    ("class_table.num_cids", "profile.live_vm.class_table_num_cids_offset"),
+    ("object_store.libraries", "profile.live_vm.object_store_libraries_offset"),
+    ("array.length", "profile.live_vm.array_length_offset"),
+    ("array.elements", "profile.live_vm.array_elements_offset"),
+    ("growable_object_array.length", "profile.live_vm.growable_object_array_length_offset"),
+    ("growable_object_array.data", "profile.live_vm.growable_object_array_data_offset"),
+    ("library.url", "profile.live_vm.library_url_offset"),
+    ("string.length", "profile.live_vm.string_length_offset"),
+    ("string.data", "profile.live_vm.string_data_offset"),
+    ("object_pool.length", "profile.live_vm.object_pool_length_offset"),
+    ("cids.class", "profile.live_vm.cid_class"),
+    ("cids.library", "profile.live_vm.cid_library"),
+    ("cids.object_pool", "profile.live_vm.cid_object_pool"),
+    ("cids.array", "profile.live_vm.cid_array"),
+    ("cids.immutable_array", "profile.live_vm.cid_immutable_array"),
+    ("cids.growable_object_array", "profile.live_vm.cid_growable_object_array"),
+    ("cids.one_byte_string", "profile.live_vm.cid_one_byte_string"),
+    ("cids.two_byte_string", "profile.live_vm.cid_two_byte_string"),
+    ("function_type.cid_null", "profile.function_type.cid_null"),
+)
+
+_FUNCTION_CODE_FIELDS = (
+    ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+    ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+    ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
+    ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+    ("function.code", "profile.live_vm.function_code_offset"),
+    ("function.entry_point", "profile.live_vm.function_entry_point_offset"),
+    ("function.unchecked_entry_point", "profile.live_vm.function_unchecked_entry_point_offset"),
+    ("code.entry_point", "profile.live_vm.code_entry_point_offset"),
+    ("code.unchecked_entry_point", "profile.live_vm.code_unchecked_entry_point_offset"),
+    ("code.monomorphic_entry_point", "profile.live_vm.code_monomorphic_entry_point_offset"),
+    (
+        "code.monomorphic_unchecked_entry_point",
+        "profile.live_vm.code_monomorphic_unchecked_entry_point_offset",
+    ),
+    ("code.owner", "profile.live_vm.code_owner_offset"),
+    ("cids.function", "profile.live_vm.cid_function"),
+    ("cids.code", "profile.live_vm.cid_code"),
+)
+
+CAPABILITY_FINGERPRINT_FIELDS = {
+    "runtime_roots": _RUNTIME_ROOT_FIELDS,
+    "owner_identity": (
+        ("thread.isolate", "profile.live_vm.thread_isolate_offset"),
+        ("thread.isolate_group", "profile.live_vm.thread_isolate_group_offset"),
+    ),
+    "canonical_null": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("thread.object_null", "profile.live_vm.thread_object_null_offset"),
+        ("function_type.cid_null", "profile.function_type.cid_null"),
+    ),
+    "register_semantics": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("thread.global_object_pool", "profile.live_vm.thread_global_object_pool_offset"),
+    ),
+    "dart_core": _RUNTIME_ROOT_FIELDS,
+    "safepoint_stubs": _RUNTIME_ROOT_FIELDS
+    + (
+        ("thread.enter_safepoint_stub", "profile.thread_bridge.enter_safepoint_stub_offset"),
+        ("thread.exit_safepoint_stub", "profile.thread_bridge.exit_safepoint_stub_offset"),
+        ("code.entry_point", "profile.live_vm.code_entry_point_offset"),
+        ("cids.code", "profile.live_vm.cid_code"),
+    ),
+    "generated_transition_layout": (
+        ("thread.top_exit_frame", "profile.thread_bridge.top_exit_frame_offset"),
+        ("thread.vm_tag", "profile.thread_bridge.vm_tag_offset"),
+        ("thread.execution_state", "profile.thread_bridge.execution_state_offset"),
+        ("thread.exit_through_ffi", "profile.thread_bridge.exit_through_ffi_offset"),
+        ("transition.vm_tag_dart", "profile.transition.vm_tag_dart"),
+        ("transition.execution_vm", "profile.transition.execution_vm"),
+        ("transition.execution_generated", "profile.transition.execution_generated"),
+        ("transition.execution_native", "profile.transition.execution_native"),
+        ("transition.exit_none", "profile.transition.exit_none"),
+        ("transition.exit_through_ffi", "profile.transition.exit_through_ffi"),
+        ("transition.exit_through_runtime_call", "profile.transition.exit_through_runtime_call"),
+    ),
+    "exception_layout": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("thread.jump_to_frame_entry_point", "profile.thread_jump_to_frame_entry_point_offset"),
+        ("thread.active_exception", "profile.thread_bridge.active_exception_offset"),
+        ("thread.active_stacktrace", "profile.thread_bridge.active_stacktrace_offset"),
+    ),
+    "type_arguments_layout": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("raw_object.smi_tag_shift", "profile.raw_object.smi_tag_shift"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("type_arguments.cid", "profile.type_arguments.cid"),
+        ("type_arguments.length", "profile.type_arguments.length_offset"),
+        ("type_arguments.types", "profile.type_arguments.types_offset"),
+    ),
+    "arguments_descriptor_layout": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag", "profile.raw_object.smi_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("raw_object.smi_tag_shift", "profile.raw_object.smi_tag_shift"),
+        ("raw_object.class_id_tag_shift", "profile.raw_object.class_id_tag_shift"),
+        ("raw_object.class_id_tag_bits", "profile.raw_object.class_id_tag_bits"),
+        ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("arguments_descriptor.type_args_len", "profile.arguments_descriptor.type_args_len_offset"),
+        ("arguments_descriptor.count", "profile.arguments_descriptor.count_offset"),
+        ("arguments_descriptor.size", "profile.arguments_descriptor.size_offset"),
+        (
+            "arguments_descriptor.positional_count",
+            "profile.arguments_descriptor.positional_count_offset",
+        ),
+        (
+            "arguments_descriptor.first_named_entry",
+            "profile.arguments_descriptor.first_named_entry_offset",
+        ),
+        ("arguments_descriptor.named_entry_size", "profile.arguments_descriptor.named_entry_size"),
+        ("arguments_descriptor.name", "profile.arguments_descriptor.name_offset"),
+        ("arguments_descriptor.position", "profile.arguments_descriptor.position_offset"),
+        ("cids.array", "profile.live_vm.cid_array"),
+        ("cids.immutable_array", "profile.live_vm.cid_immutable_array"),
+        ("array.length", "profile.live_vm.array_length_offset"),
+        ("array.elements", "profile.live_vm.array_elements_offset"),
+        ("cids.one_byte_string", "profile.live_vm.cid_one_byte_string"),
+        ("cids.two_byte_string", "profile.live_vm.cid_two_byte_string"),
+        ("string.length", "profile.live_vm.string_length_offset"),
+        ("string.data", "profile.live_vm.string_data_offset"),
+    ),
+    "invocation_call_abi": _FUNCTION_CODE_FIELDS + (
+        ("registers.args_desc", "profile.arguments_descriptor_register"),
+    ),
+    "function_code_layout": _FUNCTION_CODE_FIELDS,
+    "aot_entry_layout": _FUNCTION_CODE_FIELDS + (
+        ("instructions.monomorphic_entry_offset_aot", "profile.instructions_monomorphic_entry_offset_aot"),
+        ("instructions.polymorphic_entry_offset_aot", "profile.instructions_polymorphic_entry_offset_aot"),
+        ("code.instructions_length", "profile.live_vm.code_instructions_length_offset"),
+    ),
+    "function_type_layout": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag", "profile.raw_object.smi_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("raw_object.smi_tag_shift", "profile.raw_object.smi_tag_shift"),
+        ("raw_object.class_id_tag_shift", "profile.raw_object.class_id_tag_shift"),
+        ("raw_object.class_id_tag_bits", "profile.raw_object.class_id_tag_bits"),
+        ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
+        ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
+        ("function.signature", "profile.function_type.function_signature_offset"),
+        ("array.length", "profile.live_vm.array_length_offset"),
+        ("array.elements", "profile.live_vm.array_elements_offset"),
+        ("string.length", "profile.live_vm.string_length_offset"),
+        ("string.data", "profile.live_vm.string_data_offset"),
+        ("cids.function", "profile.live_vm.cid_function"),
+        ("cids.array", "profile.live_vm.cid_array"),
+        ("cids.immutable_array", "profile.live_vm.cid_immutable_array"),
+        ("cids.one_byte_string", "profile.live_vm.cid_one_byte_string"),
+        ("cids.two_byte_string", "profile.live_vm.cid_two_byte_string"),
+        ("function_type.abstract_type_flags", "profile.function_type.abstract_type_flags_offset"),
+        ("function_type.result_type", "profile.function_type.result_type_offset"),
+        ("function_type.parameter_types", "profile.function_type.parameter_types_offset"),
+        ("function_type.named_parameter_names", "profile.function_type.named_parameter_names_offset"),
+        ("function_type.packed_parameter_counts", "profile.function_type.packed_parameter_counts_offset"),
+        (
+            "function_type.packed_type_parameter_counts",
+            "profile.function_type.packed_type_parameter_counts_offset",
+        ),
+        ("function_type.cid_type", "profile.function_type.cid_type"),
+        ("function_type.cid_function_type", "profile.function_type.cid_function_type"),
+        ("function_type.cid_record_type", "profile.function_type.cid_record_type"),
+        ("function_type.cid_type_parameter", "profile.function_type.cid_type_parameter"),
+        ("function_type.cid_null", "profile.function_type.cid_null"),
+        ("function_type.cid_dynamic", "profile.function_type.cid_dynamic"),
+        ("function_type.cid_void", "profile.function_type.cid_void"),
+        ("function_type.cid_never", "profile.function_type.cid_never"),
+        ("function_type.type_parameter_base", "profile.function_type.type_parameter_base_offset"),
+        ("function_type.type_parameter_index", "profile.function_type.type_parameter_index_offset"),
+        ("function_type.nullability_bits", "profile.function_type.nullability_bits"),
+        ("function_type.type_class_id_shift", "profile.function_type.type_class_id_shift"),
+        (
+            "function_type.type_parameter_function_bit",
+            "profile.function_type.type_parameter_function_bit",
+        ),
+    ),
+}
+
+
+def _abi_domain_payload(profile: dict[str, object], domain: str) -> dict[str, object]:
+    """Return the explicit private-ABI facts owned by one compatibility domain."""
+
+    payload: dict[str, object] = {}
+    for path in ABI_DOMAIN_FIELDS[domain]:
+        section, field = path.split(".")
+        payload[path] = profile[section][field]
+    return payload
+
+
 def _abi_payload(profile: dict[str, object]) -> dict[str, object]:
-    """Return only facts that change interpretation of Dart private ABI.
+    """Return all five canonical private-ABI domain payloads."""
 
-    Artifact identity, Dart/Flutter marketing versions, snapshot hashes, and
-    profile row identifiers deliberately stay out of this payload. Two source
-    profiles with identical private layouts and semantic constants therefore
-    receive the same ABI identity even when their artifacts differ.
-    """
-
-    keys = (
-        "machine",
-        "registers",
-        "thread",
-        "isolate_group",
-        "class_table",
-        "object_store",
-        "instructions",
-        "code",
-        "function",
-        "class",
-        "library",
-        "array",
-        "growable_object_array",
-        "string",
-        "object_pool",
-        "cids",
-        "canonical_bool",
-        "function_type",
-        "raw_object",
-        "arguments_descriptor",
-        "function_kind",
-        "type_arguments",
-        "transition",
-    )
-    return {key: profile[key] for key in keys}
+    return {domain: _abi_domain_payload(profile, domain) for domain in ABI_DOMAIN_FIELDS}
 
 
-def _canonical_abi_id(profile: dict[str, object]) -> str:
-    payload = json.dumps(
-        _abi_payload(profile), sort_keys=True, separators=(",", ":")
-    ).encode()
+def _canonical_abi_id(profile: dict[str, object], domain: str = "full") -> str:
+    if domain == "full":
+        abi_payload = _abi_payload(profile)
+    else:
+        if domain not in ABI_DOMAIN_FIELDS:
+            raise ValueError(f"unknown VM ABI identity domain: {domain}")
+        abi_payload = _abi_domain_payload(profile, domain)
+    payload = json.dumps(abi_payload, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(payload).hexdigest()[:24]
     machine = profile["machine"]
     architecture = str(machine["architecture"])
     mode = "product" if bool(machine["product"]) else "nonproduct"
     compression = "compressed" if bool(machine["compressed_pointers"]) else "uncompressed"
-    return f"dart-vm-{architecture}-{mode}-{compression}/abi-{digest}"
+    domain_label = "" if domain == "full" else f"{domain}-"
+    return f"dart-vm-{architecture}-{mode}-{compression}/abi-{domain_label}{digest}"
+
+
+def _verify_abi_domain_coverage(profile: dict[str, object]) -> None:
+    expected = {
+        f"{section}.{field}"
+        for section in ABI_PROFILE_SECTIONS
+        for field in profile[section]
+    }
+    paths = [path for fields in ABI_DOMAIN_FIELDS.values() for path in fields]
+    duplicates = sorted(path for path in set(paths) if paths.count(path) != 1)
+    missing = sorted(expected - set(paths))
+    unknown = sorted(set(paths) - expected)
+    if duplicates or missing or unknown:
+        raise ValueError(
+            "VM ABI domain field coverage is invalid: "
+            f"duplicates={duplicates}, missing={missing}, unknown={unknown}"
+        )
+
+
+def _verify_capability_fingerprint_coverage(profile: dict[str, object]) -> None:
+    expected = {
+        f"{section}.{field}"
+        for section in ABI_PROFILE_SECTIONS
+        for field in profile[section]
+    }
+    for capability, fields in CAPABILITY_FINGERPRINT_FIELDS.items():
+        paths = [path for path, _ in fields]
+        if len(paths) != len(set(paths)):
+            raise ValueError(f"{capability}: capability fingerprint fields contain duplicates")
+        unknown = sorted(set(paths) - expected)
+        if unknown:
+            raise ValueError(
+                f"{capability}: capability fingerprint fields are unknown: {unknown}"
+            )
 
 
 def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
@@ -799,8 +1120,8 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
 
 def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
     payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2:
-        raise ValueError("dart VM profile manifest schema_version must be 2")
+    if payload.get("schema_version") != 3:
+        raise ValueError("dart VM profile manifest schema_version must be 3")
     profiles = payload.get("profiles")
     if not isinstance(profiles, list) or not profiles:
         raise ValueError("dart VM profile manifest must contain profiles")
@@ -828,10 +1149,21 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
             or machine.get("compressed_pointers") is not True
         ):
             raise ValueError(f"{name}: unsupported VM machine ABI")
-        expected_abi_id = _canonical_abi_id(profile)
-        if profile.get("abi_id") != expected_abi_id:
+        _verify_abi_domain_coverage(profile)
+        _verify_capability_fingerprint_coverage(profile)
+        expected_identities = {
+            domain: _canonical_abi_id(profile, domain)
+            for domain in ("full", *ABI_DOMAIN_FIELDS)
+        }
+        identities = profile.get("abi_identity")
+        if identities != expected_identities:
             raise ValueError(
-                f"{name}: abi_id is stale: {profile.get('abi_id')} != {expected_abi_id}"
+                f"{name}: abi_identity is stale: {identities} != {expected_identities}"
+            )
+        if profile.get("abi_id") != expected_identities["full"]:
+            raise ValueError(
+                f"{name}: abi_id is stale: {profile.get('abi_id')} != "
+                f"{expected_identities['full']}"
             )
 
         registers = profile["registers"]
@@ -1122,6 +1454,14 @@ def _render_profile(profile: dict[str, object]) -> str:
     fpu_args = ", ".join(str(value) for value in r["dart_fpu_args"])
     return f"""    RuntimeProfileRecord{{
         .abi_id = {json.dumps(profile['abi_id'])},
+        .abi_identity = {{
+            .full = {json.dumps(profile['abi_identity']['full'])},
+            .core = {json.dumps(profile['abi_identity']['core'])},
+            .call = {json.dumps(profile['abi_identity']['call'])},
+            .object = {json.dumps(profile['abi_identity']['object'])},
+            .transition = {json.dumps(profile['abi_identity']['transition'])},
+            .exception = {json.dumps(profile['abi_identity']['exception'])},
+        }},
         .machine = {{
             .architecture = VmArchitecture::kArm64,
             .pointer_size = {machine['pointer_size']}u,
@@ -1277,6 +1617,76 @@ def _render_profile(profile: dict[str, object]) -> str:
     }}"""
 
 
+def _fingerprint_function_name(capability: str) -> str:
+    return "".join(part.capitalize() for part in capability.split("_"))
+
+
+def render_capability_fingerprints() -> str:
+    functions: list[str] = []
+    compositions = {
+        "invocation_call_abi": ("function_code_layout",),
+        "aot_entry_layout": ("function_code_layout",),
+    }
+    emitted: set[str] = set()
+
+    def emit(capability: str) -> None:
+        if capability in emitted:
+            return
+        dependencies = compositions.get(capability, ())
+        for dependency in dependencies:
+            emit(dependency)
+        inherited = {
+            field
+            for dependency in dependencies
+            for field in CAPABILITY_FINGERPRINT_FIELDS[dependency]
+        }
+        fields = [field for field in CAPABILITY_FINGERPRINT_FIELDS[capability] if field not in inherited]
+        body_lines = [
+            f"    Append{_fingerprint_function_name(dependency)}Fields(key, profile);"
+            for dependency in dependencies
+        ]
+        body_lines.extend(
+            f"    AppendCapabilityValue(key, {expression});  // {path}"
+            for path, expression in fields
+        )
+        body = "\n".join(body_lines)
+        functions.append(
+            f"inline void Append{_fingerprint_function_name(capability)}Fields("
+            "std::string& key, const RuntimeProfileRecord& profile) {\n"
+            f"{body}\n"
+            "}"
+        )
+        emitted.add(capability)
+
+    for capability in CAPABILITY_FINGERPRINT_FIELDS:
+        emit(capability)
+    return f"""// Generated by scripts/generate_vm_profiles.py. Do not edit.
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <string>
+
+#include "vm/runtime_profiles.h"
+
+namespace dartplant::vm_abi::generated {{
+
+template <typename T>
+inline void AppendCapabilityValue(std::string& key, const T& value) {{
+    key.append(reinterpret_cast<const char*>(&value), sizeof(value));
+}}
+
+template <typename T, size_t N>
+inline void AppendCapabilityValue(std::string& key, const std::array<T, N>& values) {{
+    for (const T& value : values) AppendCapabilityValue(key, value);
+}}
+
+{chr(10).join(functions)}
+
+}}  // namespace dartplant::vm_abi::generated
+"""
+
+
 def render(path: Path = MANIFEST) -> str:
     profiles = _load_manifest(path)
     body = ",\n".join(_render_profile(profile) for profile in profiles)
@@ -1296,20 +1706,35 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {{
 def run(*, check: bool, sdk_root: Path | None = None) -> None:
     profiles = _load_manifest()
     expected = render()
+    expected_fingerprints = render_capability_fingerprints()
     if sdk_root is not None:
         verify_sdk_contract(sdk_root)
         verify_historical_profiles(sdk_root, profiles)
     if check:
-        if not GENERATED.is_file() or GENERATED.read_text() != expected:
+        if (
+            not GENERATED.is_file()
+            or GENERATED.read_text() != expected
+            or not GENERATED_FINGERPRINTS.is_file()
+            or GENERATED_FINGERPRINTS.read_text() != expected_fingerprints
+        ):
             raise RuntimeError(
                 "generated Dart VM profiles are stale; run "
                 "python3 scripts/main.py profiles"
             )
-        print(f"VM profiles verified: {GENERATED.relative_to(ROOT_DIR)}")
+        print(
+            "VM profiles and capability fingerprints verified: "
+            f"{GENERATED.relative_to(ROOT_DIR)}, "
+            f"{GENERATED_FINGERPRINTS.relative_to(ROOT_DIR)}"
+        )
         return
     GENERATED.parent.mkdir(parents=True, exist_ok=True)
     GENERATED.write_text(expected)
-    print(f"VM profiles generated: {GENERATED.relative_to(ROOT_DIR)}")
+    GENERATED_FINGERPRINTS.write_text(expected_fingerprints)
+    print(
+        "VM profiles and capability fingerprints generated: "
+        f"{GENERATED.relative_to(ROOT_DIR)}, "
+        f"{GENERATED_FINGERPRINTS.relative_to(ROOT_DIR)}"
+    )
 
 
 def main() -> None:

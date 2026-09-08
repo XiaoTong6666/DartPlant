@@ -18,6 +18,8 @@
 
 #include "abi/value_codec.h"
 #include "runtime/runtime_internal.h"
+#include "vm/abi/resolver.h"
+#include "vm/dart_string.h"
 #include "vm/runtime_profiles.h"
 
 namespace {
@@ -37,6 +39,19 @@ bool ReadSelfValue(uintptr_t address, T* out_value) {
            static_cast<ssize_t>(sizeof(T));
 }
 
+bool ReadInvocationMemory(uintptr_t address, void* output, size_t size) {
+    if (output == nullptr || size == 0) return false;
+    if (size == sizeof(uint8_t)) return ReadSelfValue(address, static_cast<uint8_t*>(output));
+    if (size == sizeof(uint16_t)) return ReadSelfValue(address, static_cast<uint16_t*>(output));
+    if (size == sizeof(uint32_t)) return ReadSelfValue(address, static_cast<uint32_t*>(output));
+    if (size == sizeof(uint64_t)) return ReadSelfValue(address, static_cast<uint64_t*>(output));
+    auto* bytes = static_cast<uint8_t*>(output);
+    for (size_t index = 0; index < size; ++index) {
+        if (!ReadSelfValue(address + index, &bytes[index])) return false;
+    }
+    return true;
+}
+
 bool ReadPositiveCompressedSmi(uintptr_t address, const dartplant::RawObjectLayout& layout,
                                uint32_t* out_value) {
     if (out_value == nullptr || layout.compressed_word_size == 0 || layout.smi_tag_shift >= 64)
@@ -45,14 +60,15 @@ bool ReadPositiveCompressedSmi(uintptr_t address, const dartplant::RawObjectLayo
     if (layout.compressed_word_size == sizeof(uint32_t)) {
         uint32_t compressed = 0;
         if (!ReadSelfValue(address, &compressed)) return false;
-        raw = compressed;
+        return dartplant::vm_abi::DecodePositiveCompressedSmi(compressed, layout, out_value);
     } else if (layout.compressed_word_size == sizeof(uint64_t)) {
         if (!ReadSelfValue(address, &raw)) return false;
     } else {
         return false;
     }
     if ((raw & layout.smi_tag_mask) != layout.smi_tag) return false;
-    const uint64_t value = raw >> layout.smi_tag_shift;
+    const int64_t value = static_cast<int64_t>(raw) >> layout.smi_tag_shift;
+    if (value < 0) return false;
     if (value > UINT32_MAX) return false;
     *out_value = static_cast<uint32_t>(value);
     return true;
@@ -82,8 +98,8 @@ bool ReadLiveVmHeapBase(const DartPlantInvocation* invocation, uint64_t* out_hea
         *out_heap_base = invocation->live_vm_heap_base;
         return true;
     }
-    const auto* profile = dartplant::FindRuntimeProfileByVersion(
-        invocation->requested_method->function->runtime_profile_version);
+    const auto* profile =
+        invocation->call_layout == nullptr ? nullptr : invocation->call_layout->vm_call_profile;
     if (profile == nullptr || profile->live_vm.thr_register >= 31 ||
         profile->live_vm.thread_heap_base_offset == 0) {
         return false;
@@ -105,16 +121,21 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
         out_name == nullptr) {
         return false;
     }
-    const auto* profile = dartplant::FindRuntimeProfileByVersion(
-        invocation->requested_method->function->runtime_profile_version);
-    if (profile == nullptr || profile->arguments_descriptor.named_entry_size == 0) return false;
+    const auto* call_profile =
+        invocation->call_layout == nullptr ? nullptr : invocation->call_layout->vm_call_profile;
+    const auto* object_profile =
+        invocation->call_layout == nullptr ? nullptr : invocation->call_layout->vm_object_profile;
+    if (call_profile == nullptr || object_profile == nullptr ||
+        call_profile->arguments_descriptor.named_entry_size == 0) {
+        return false;
+    }
     uint64_t descriptor_raw = 0;
     if (!ReadVerifiedLocation(invocation, invocation->call_layout->arguments_descriptor_location,
                               &descriptor_raw)) {
         return false;
     }
-    const auto& raw = profile->raw_object;
-    const auto& descriptor = profile->arguments_descriptor;
+    const auto& raw = object_profile->raw_object;
+    const auto& descriptor = call_profile->arguments_descriptor;
     if (raw.compressed_word_size != sizeof(uint32_t) ||
         (descriptor_raw & raw.smi_tag_mask) != raw.heap_object_tag ||
         descriptor_raw < raw.heap_object_tag) {
@@ -139,48 +160,23 @@ bool ReadDescriptorNamedEntry(const DartPlantInvocation* invocation, uint32_t in
     uint32_t raw_position = 0;
     if (!ReadSelfValue(name_address, &compressed_name) ||
         !ReadSelfValue(position_address, &raw_position) ||
-        (compressed_name & raw.smi_tag_mask) != raw.heap_object_tag ||
-        (raw_position & raw.smi_tag_mask) != raw.smi_tag ||
-        raw_position >> raw.smi_tag_shift > UINT32_MAX) {
+        (compressed_name & raw.smi_tag_mask) != raw.heap_object_tag) {
         return false;
     }
+    uint32_t position = 0;
+    if (!dartplant::vm_abi::DecodePositiveCompressedSmi(raw_position, raw, &position)) return false;
     uint64_t heap_base = 0;
     if (!ReadLiveVmHeapBase(invocation, &heap_base) || heap_base > UINT64_MAX - compressed_name) {
         return false;
     }
     const uint64_t tagged_name = heap_base + compressed_name;
-    uint32_t name_cid = 0;
-    const uintptr_t name_object = static_cast<uintptr_t>(tagged_name - raw.heap_object_tag);
-    uint64_t tags = 0;
-    if (!ReadSelfValue(name_object, &tags) || raw.class_id_tag_bits == 0 ||
-        raw.class_id_tag_bits >= 64) {
+    char name[DARTPLANT_DART_PARAMETER_NAME_MAX] = {};
+    if (!dartplant::vm_abi::ReadDartStringUtf8(*object_profile, tagged_name, ReadInvocationMemory,
+                                               name, sizeof(name))) {
         return false;
     }
-    const uint64_t class_id_mask = (uint64_t{1} << raw.class_id_tag_bits) - 1;
-    name_cid = static_cast<uint32_t>((tags >> raw.class_id_tag_shift) & class_id_mask);
-    if (name_cid != profile->live_vm.cid_one_byte_string) return false;
-    uintptr_t length_address = 0;
-    if (!AddOffset(name_object, profile->live_vm.string_length_offset, &length_address))
-        return false;
-    uint32_t raw_length = 0;
-    if (!ReadSelfValue(length_address, &raw_length) ||
-        (raw_length & raw.smi_tag_mask) != raw.smi_tag) {
-        return false;
-    }
-    const uint64_t length = raw_length >> raw.smi_tag_shift;
-    if (length > DARTPLANT_DART_PARAMETER_NAME_MAX - 1) return false;
-    uintptr_t data_address = 0;
-    if (!AddOffset(name_object, profile->live_vm.string_data_offset, &data_address)) return false;
-    std::vector<char> bytes(static_cast<size_t>(length));
-    for (size_t cursor = 0; cursor < bytes.size(); ++cursor) {
-        uintptr_t byte_address = 0;
-        if (!AddOffset(data_address, cursor, &byte_address) ||
-            !ReadSelfValue(byte_address, &bytes[cursor])) {
-            return false;
-        }
-    }
-    *out_position = raw_position >> raw.smi_tag_shift;
-    *out_name = std::string(bytes.begin(), bytes.end());
+    *out_position = position;
+    *out_name = name;
     return true;
 }
 
@@ -545,6 +541,60 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
         }
     }
 
+    uint64_t type_arguments = 0;
+    if (info.type_args_len != 0) {
+        const uint64_t offset = static_cast<uint64_t>(info.count) * 8;
+        if (offset > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+            dartplant::SetLastError("closure type-argument stack offset is out of range");
+            return false;
+        }
+        invocation->closure_type_arguments_location = {
+            .kind = dartplant::abi::DartAbiLocationKind::kEntryStack,
+            .stack_offset = static_cast<int32_t>(offset),
+        };
+        if (!ReadVerifiedLocation(invocation, invocation->closure_type_arguments_location,
+                                  &type_arguments)) {
+            dartplant::SetLastError("closure TypeArguments object is unreadable");
+            return false;
+        }
+    }
+    if (invocation->vm_adapter != nullptr &&
+        dartplant::VmAdapterSupportsCapabilityProof(invocation->vm_adapter) &&
+        invocation->requested_method->function != nullptr &&
+        invocation->requested_method->function->source == dartplant::DartFunctionSource::kLiveVm) {
+        DartPlantVmCapabilityEvidence evidence{};
+        evidence.struct_size = sizeof(evidence);
+        evidence.kind = DARTPLANT_VM_EVIDENCE_CLOSURE_CALL;
+        evidence.function = invocation->requested_method->function->function_object;
+        evidence.code = invocation->requested_method->function->code_object;
+        evidence.expected_entry =
+            invocation->code_target == nullptr ? 0 : invocation->code_target->entry;
+        evidence.descriptor = info.raw_descriptor;
+        evidence.type_arguments = type_arguments;
+        DartPlantVmCapabilityProof proof{};
+        proof.struct_size = sizeof(proof);
+        const DartPlantStatus proof_status =
+            dartplant::VmAdapterProveCapability(invocation->vm_adapter, evidence, &proof);
+        if (proof_status != DARTPLANT_OK ||
+            proof.capability != dartplant::vm_abi::kCapabilityClosureCallLayout) {
+            dartplant::SetLastError("closure call composite proof was rejected");
+            return false;
+        }
+        DartPlantVmCapabilityProof bound{};
+        bound.struct_size = sizeof(bound);
+        if (dartplant::VmAdapterGetCapabilityBinding(invocation->vm_adapter,
+                                                     DARTPLANT_VM_CAP_CLOSURE_CALL_LAYOUT,
+                                                     &bound) != DARTPLANT_OK ||
+            bound.profile_version != proof.profile_version ||
+            bound.artifact_generation != proof.artifact_generation ||
+            bound.isolate_generation != proof.isolate_generation ||
+            bound.artifact_generation != invocation->call_layout->vm_artifact_generation ||
+            bound.isolate_generation != invocation->call_layout->vm_isolate_generation) {
+            dartplant::SetLastError("closure call proof was not published to the VM ABI binding");
+            return false;
+        }
+    }
+
     invocation->mapped_parameters = layout.parameters;
     for (uint32_t formal = 0; formal < actual_for_formal.size(); ++formal) {
         const int32_t actual = actual_for_formal[formal];
@@ -562,18 +612,6 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
             .stack_offset = static_cast<int32_t>(offset),
         };
         parameter.location.count = 1;
-    }
-    if (info.type_args_len != 0) {
-        const uint64_t offset = static_cast<uint64_t>(info.count) * 8;
-        if (offset > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
-            dartplant::SetLastError("closure type-argument stack offset is out of range");
-            invocation->mapped_parameters.clear();
-            return false;
-        }
-        invocation->closure_type_arguments_location = {
-            .kind = dartplant::abi::DartAbiLocationKind::kEntryStack,
-            .stack_offset = static_cast<int32_t>(offset),
-        };
     }
     invocation->closure_argument_mapping_valid = true;
     dartplant::ClearLastError();
@@ -908,21 +946,71 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
         dartplant::SetLastError("closure ArgumentsDescriptor is only available during enter");
         return DARTPLANT_INVALID_INVOCATION_PHASE;
     }
-    const auto* profile = dartplant::FindRuntimeProfileByVersion(
-        invocation->requested_method->function->runtime_profile_version);
-    if (profile == nullptr) {
-        dartplant::SetLastError("closure ArgumentsDescriptor has no exact runtime profile");
+    const auto* call_profile = invocation->call_layout->vm_call_profile;
+    const auto* object_profile = invocation->call_layout->vm_object_profile;
+    if (call_profile == nullptr || object_profile == nullptr) {
+        dartplant::SetLastError("closure ArgumentsDescriptor has no call/object ABI binding");
         return DARTPLANT_PROFILE_MISMATCH;
     }
     uint64_t raw = 0;
-    const auto& raw_layout = profile->raw_object;
+    const auto& initial_raw_layout = object_profile->raw_object;
     if (!ReadVerifiedLocation(invocation, invocation->call_layout->arguments_descriptor_location,
                               &raw) ||
-        raw == 0 || (raw & raw_layout.smi_tag_mask) != raw_layout.heap_object_tag ||
-        raw < raw_layout.heap_object_tag) {
+        raw == 0 || (raw & initial_raw_layout.smi_tag_mask) != initial_raw_layout.heap_object_tag ||
+        raw < initial_raw_layout.heap_object_tag) {
         dartplant::SetLastError("closure ArgumentsDescriptor register is not a tagged object");
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    if (invocation->vm_adapter != nullptr &&
+        dartplant::VmAdapterSupportsCapabilityProof(invocation->vm_adapter) &&
+        invocation->requested_method->function->source == dartplant::DartFunctionSource::kLiveVm) {
+        DartPlantVmCapabilityEvidence evidence{};
+        evidence.struct_size = sizeof(evidence);
+        evidence.kind = DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR;
+        evidence.descriptor = raw;
+        DartPlantVmCapabilityProof proof{};
+        proof.struct_size = sizeof(proof);
+        const DartPlantStatus proof_status =
+            dartplant::VmAdapterProveCapability(invocation->vm_adapter, evidence, &proof);
+        if (proof_status != DARTPLANT_OK ||
+            proof.capability != dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout ||
+            proof.profile_version == 0) {
+            dartplant::SetLastError("ArgumentsDescriptor structural proof was rejected");
+            return proof_status == DARTPLANT_OK ? DARTPLANT_PROFILE_MISMATCH : proof_status;
+        }
+        DartPlantVmCapabilityProof bound{};
+        const dartplant::RuntimeProfileRecord* proof_profile = nullptr;
+        bound.struct_size = sizeof(bound);
+        if (dartplant::VmAdapterGetCapabilityBinding(invocation->vm_adapter,
+                                                     DARTPLANT_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT,
+                                                     &bound, &proof_profile) != DARTPLANT_OK ||
+            bound.profile_version != proof.profile_version ||
+            bound.artifact_generation != proof.artifact_generation ||
+            bound.isolate_generation != proof.isolate_generation ||
+            bound.artifact_generation != invocation->call_layout->vm_artifact_generation ||
+            bound.isolate_generation != invocation->call_layout->vm_isolate_generation) {
+            dartplant::SetLastError(
+                "ArgumentsDescriptor proof was not published to the VM ABI binding");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        auto expected_profile = *call_profile;
+        expected_profile.raw_object = object_profile->raw_object;
+        expected_profile.live_vm.cid_one_byte_string = object_profile->live_vm.cid_one_byte_string;
+        expected_profile.live_vm.cid_two_byte_string = object_profile->live_vm.cid_two_byte_string;
+        expected_profile.live_vm.string_length_offset =
+            object_profile->live_vm.string_length_offset;
+        expected_profile.live_vm.string_data_offset = object_profile->live_vm.string_data_offset;
+        if (proof_profile == nullptr ||
+            dartplant::vm_abi::BuildCapabilityAbiKey(
+                *proof_profile, dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout) !=
+                dartplant::vm_abi::BuildCapabilityAbiKey(
+                    expected_profile, dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout)) {
+            dartplant::SetLastError(
+                "ArgumentsDescriptor proof does not match the hook capability binding");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+    }
+    const auto& raw_layout = object_profile->raw_object;
     if (raw_layout.class_id_tag_bits == 0 || raw_layout.class_id_tag_bits >= 64 ||
         raw_layout.class_id_tag_shift >= 64 - raw_layout.class_id_tag_bits) {
         dartplant::SetLastError("closure ArgumentsDescriptor raw-object profile is invalid");
@@ -937,14 +1025,15 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
     }
     const uint32_t cid =
         static_cast<uint32_t>((tags >> raw_layout.class_id_tag_shift) & class_id_mask);
-    if (cid != profile->live_vm.cid_array && cid != profile->live_vm.cid_immutable_array) {
+    if (cid != object_profile->live_vm.cid_array &&
+        cid != object_profile->live_vm.cid_immutable_array) {
         dartplant::SetLastError("closure ArgumentsDescriptor is not a Dart Array");
         return DARTPLANT_PROFILE_MISMATCH;
     }
     DartPlantArgumentsDescriptorInfo info{};
     info.struct_size = sizeof(info);
     info.raw_descriptor = raw;
-    const auto& layout = profile->arguments_descriptor;
+    const auto& layout = call_profile->arguments_descriptor;
     if (!ReadPositiveCompressedSmi(object + layout.type_args_len_offset, raw_layout,
                                    &info.type_args_len) ||
         !ReadPositiveCompressedSmi(object + layout.count_offset, raw_layout, &info.count) ||

@@ -21,6 +21,7 @@
 #include "runtime/default_runtime.h"
 #include "runtime/runtime_internal.h"
 #include "test_runner.h"
+#include "vm/runtime_profiles.h"
 
 namespace {
 
@@ -86,6 +87,11 @@ struct FakeVmState {
     int type_argument_reads = 0;
     int exception_reads = 0;
     int stacktrace_reads = 0;
+    int capability_proofs = 0;
+    uint64_t proof_capability = DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT;
+    uint64_t proof_artifact_generation = 7;
+    uint64_t proof_isolate_generation = 0;
+    DartPlantStatus proof_status = DARTPLANT_OK;
     bool fail_generated_leave = false;
     std::array<uint64_t, 2> type_arguments = {0x901, 0xa01};
     uint64_t active_exception = 0xb01;
@@ -250,6 +256,25 @@ DartPlantStatus FakeReadActiveStacktrace(void* user_data, const DartPlantIsolate
     if (state == nullptr || out_raw == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     ++state->stacktrace_reads;
     *out_raw = state->active_stacktrace;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus FakeProveCapability(void* user_data, const DartPlantIsolateIdentity* isolate,
+                                    const DartPlantVmCapabilityEvidence*,
+                                    DartPlantVmCapabilityProof* out_proof) {
+    auto* state = static_cast<FakeVmState*>(user_data);
+    if (state == nullptr || isolate == nullptr || out_proof == nullptr) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ++state->capability_proofs;
+    if (state->proof_status != DARTPLANT_OK) return state->proof_status;
+    out_proof->struct_size = sizeof(*out_proof);
+    out_proof->capability = state->proof_capability;
+    out_proof->profile_version = 1;
+    out_proof->artifact_generation = state->proof_artifact_generation;
+    out_proof->isolate_generation = state->proof_isolate_generation == 0
+                                        ? isolate->generation
+                                        : state->proof_isolate_generation;
     return DARTPLANT_OK;
 }
 
@@ -775,6 +800,7 @@ TEST_CASE(VmAdapterOwnsOpaqueObjectLifetime) {
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
+        .prove_capability = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     DartPlantObjectHandle* handle = nullptr;
@@ -1142,6 +1168,79 @@ TEST_CASE(VmAdapterV3PrefixDoesNotReadFutureTypeArgumentsCallback) {
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
 }
 
+TEST_CASE(VmAdapterV4RequiresAndValidatesCapabilityProofBridge) {
+    FakeVmState state{};
+    DartPlantVmAdapterCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.adapter_version = 4;
+    callbacks.enter_isolate = FakeEnter;
+    callbacks.leave_isolate = FakeLeave;
+    callbacks.enter_scope = FakeEnterScope;
+    callbacks.leave_scope = FakeLeaveScope;
+    callbacks.retain_object = FakeRetain;
+    callbacks.release_object = FakeRelease;
+    callbacks.object_kind = FakeKind;
+    callbacks.object_to_raw = FakeRaw;
+    callbacks.object_is_alive = FakeAlive;
+
+    DartPlantVmAdapter* adapter = nullptr;
+    EXPECT_EQ(DARTPLANT_INVALID_ARGUMENT,
+              dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    callbacks.prove_capability = FakeProveCapability;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    const DartPlantIsolateIdentity isolate = {31, 32, 33};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter, &isolate));
+
+    DartPlantVmCapabilityEvidence evidence{};
+    evidence.struct_size = sizeof(evidence);
+    evidence.kind = DARTPLANT_VM_EVIDENCE_FUNCTION_CODE;
+    DartPlantVmCapabilityProof proof{};
+    proof.struct_size = sizeof(proof);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterProveCapability(adapter, evidence, &proof));
+    EXPECT_EQ(1, state.capability_proofs);
+    EXPECT_EQ(DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT, proof.capability);
+    EXPECT_EQ(7ULL, proof.artifact_generation);
+    EXPECT_EQ(33ULL, proof.isolate_generation);
+    DartPlantVmCapabilityProof bound{};
+    bound.struct_size = sizeof(bound);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterGetCapabilityBinding(
+                                adapter, DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT, &bound));
+    EXPECT_EQ(proof.profile_version, bound.profile_version);
+    EXPECT_EQ(proof.artifact_generation, bound.artifact_generation);
+    dartplant::VmAdapterInvalidateAbiBinding(adapter);
+    bound.struct_size = sizeof(bound);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant::VmAdapterGetCapabilityBinding(
+                  adapter, DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT, &bound));
+    proof.struct_size = sizeof(proof);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterProveCapability(adapter, evidence, &proof));
+
+    state.proof_status = DARTPLANT_VM_ADAPTER_BUSY;
+    EXPECT_EQ(DARTPLANT_VM_ADAPTER_BUSY,
+              dartplant::VmAdapterProveCapability(adapter, evidence, &proof));
+    state.proof_status = DARTPLANT_OK;
+    state.proof_isolate_generation = 34;
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant::VmAdapterProveCapability(adapter, evidence, &proof));
+    state.proof_isolate_generation = 0;
+    state.proof_capability = DARTPLANT_VM_CAP_AOT_ENTRY_LAYOUT;
+    state.proof_artifact_generation = 8;
+    evidence.kind = DARTPLANT_VM_EVIDENCE_AOT_ENTRY;
+    proof.struct_size = sizeof(proof);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterProveCapability(adapter, evidence, &proof));
+    bound.struct_size = sizeof(bound);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant::VmAdapterGetCapabilityBinding(
+                  adapter, DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT, &bound));
+    bound.struct_size = sizeof(bound);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterGetCapabilityBinding(
+                                adapter, DARTPLANT_VM_CAP_AOT_ENTRY_LAYOUT, &bound));
+    EXPECT_EQ(8ULL, bound.artifact_generation);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter, &isolate));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
 TEST_CASE(VmAdapterRejectsWrongThreadAndIsolateGeneration) {
     FakeVmState state{};
     const DartPlantVmAdapterCallbacks callbacks = {
@@ -1165,6 +1264,7 @@ TEST_CASE(VmAdapterRejectsWrongThreadAndIsolateGeneration) {
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
+        .prove_capability = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     DartPlantObjectHandle* handle = nullptr;
@@ -1211,6 +1311,7 @@ TEST_CASE(InvocationObjectBridgeUsesActiveVmScope) {
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
+        .prove_capability = nullptr,
     };
     DartPlantVmAdapter* adapter = nullptr;
     const DartPlantIsolateIdentity isolate = {21, 22, 23};
@@ -3602,6 +3703,8 @@ TEST_CASE(VerifiedClosureArgumentsDescriptorIncludesHiddenClosureReceiver) {
     write_smi(28, 3);  // all fixed-arity call arguments are positional.
 
     dartplant::abi::DartCallLayout layout;
+    layout.vm_call_profile = dartplant::FindRuntimeProfileByVersion(1);
+    layout.vm_object_profile = layout.vm_call_profile;
     layout.parameters.resize(2);
     layout.has_closure_receiver = true;
     layout.closure_receiver_location = {
@@ -3642,6 +3745,28 @@ TEST_CASE(VerifiedClosureArgumentsDescriptorIncludesHiddenClosureReceiver) {
               dartplant_invocation_get_arguments_descriptor(&invocation, &info));
 }
 
+TEST_CASE(InvocationDoesNotRediscoverCallProfileFromFunctionVersion) {
+    dartplant::abi::DartCallLayout layout;
+    layout.has_arguments_descriptor = true;
+    layout.arguments_descriptor_location = {
+        .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+        .register_index = 4,
+    };
+    DartPlantMethod method{};
+    method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    method.function->runtime_profile_version = 1;
+    DartPlantArm64Context context{};
+    DartPlantInvocation invocation{};
+    invocation.requested_method = &method;
+    invocation.call_layout = &layout;
+    invocation.context = &context;
+    invocation.phase = DARTPLANT_INVOCATION_ENTER;
+    DartPlantArgumentsDescriptorInfo info{};
+    info.struct_size = sizeof(info);
+    EXPECT_EQ(DARTPLANT_PROFILE_MISMATCH,
+              dartplant_invocation_get_arguments_descriptor(&invocation, &info));
+}
+
 TEST_CASE(OptionalPositionalClosureArgumentsMapOnlySuppliedFormals) {
     alignas(8) std::array<uint8_t, 64> descriptor{};
     const uint64_t tags = uint64_t{90} << 12;
@@ -3656,6 +3781,8 @@ TEST_CASE(OptionalPositionalClosureArgumentsMapOnlySuppliedFormals) {
     write_smi(28, 3);
 
     dartplant::abi::DartCallLayout layout;
+    layout.vm_call_profile = dartplant::FindRuntimeProfileByVersion(1);
+    layout.vm_object_profile = layout.vm_call_profile;
     layout.parameters.resize(3);
     for (auto& parameter : layout.parameters) {
         parameter.representation = dartplant::abi::DartAbiRepresentation::kTagged;
@@ -3733,6 +3860,8 @@ TEST_CASE(NamedGenericClosureArgumentsUseDescriptorNamesAndPositions) {
     write_smi(36, 2);  // Actual call position, including the hidden receiver.
 
     dartplant::abi::DartCallLayout layout;
+    layout.vm_call_profile = dartplant::FindRuntimeProfileByVersion(3);
+    layout.vm_object_profile = layout.vm_call_profile;
     layout.parameters.resize(3);
     for (auto& parameter : layout.parameters) {
         parameter.representation = dartplant::abi::DartAbiRepresentation::kTagged;

@@ -85,12 +85,6 @@ std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
         if (!MachineFactsMatch(profile, facts)) continue;
         compatible.push_back(&profile);
     }
-
-    // Snapshot identity is a ranking hint, never an ABI gate. Probe exact
-    // aliases first for deterministic diagnostics, then every other finite,
-    // source-verified machine/mode candidate. This also exercises the same
-    // fail-closed path for custom/rebuilt engines whose snapshot identity is
-    // unknown while their private ABI is already in the registry.
     std::stable_sort(compatible.begin(), compatible.end(),
                      [&](const RuntimeProfileRecord* left, const RuntimeProfileRecord* right) {
                          const auto exact = [&](const RuntimeProfileRecord* profile) {

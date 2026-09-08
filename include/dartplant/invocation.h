@@ -123,7 +123,7 @@ dartplant_invocation_argument_count(const DartPlantInvocation* invocation);
 // These helpers are available only when DartPlant has exact default-entry
 // closure-call evidence (live VM or compiler artifact + SDK contract); a typed
 // DartCallLayout is not required. Access is enter-only, before x0 is repurposed
-// as the result register. With an exact VM V3 adapter, the receiver may also be
+// as the result register. With an exact VM V4 adapter, the receiver may also be
 // retained through the adapter's generated-root lease.
 DARTPLANT_EXPORT uint8_t
 dartplant_invocation_has_closure_receiver(const DartPlantInvocation* invocation);
@@ -157,7 +157,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_type_arguments
 // mutator was still in generated state and immediately added to the callback's
 // VM-visible generated-root lease. The callback therefore observes the
 // relocated root after moving GC rather than dereferencing the original vector.
-// Exact VM V3 support is required; element mutation/construction is not exposed.
+// Exact VM V4 support is required; element mutation/construction is not exposed.
 // Enter phase only.
 DARTPLANT_EXPORT DartPlantStatus dartplant_invocation_get_closure_type_argument(
     const DartPlantInvocation* invocation, uint32_t index, DartPlantValue* out_value);

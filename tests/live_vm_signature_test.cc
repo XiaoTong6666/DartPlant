@@ -8,6 +8,8 @@
 
 #include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
+#include "vm/abi/proof.h"
+#include "vm/runtime_profiles.h"
 
 namespace {
 
@@ -131,6 +133,7 @@ SyntheticSignatureFixture BuildSignatureFixture(const SignatureProfileCase& item
     constexpr size_t kParameterTypes = 0x300;
     constexpr size_t kNamedNames = 0x380;
     constexpr size_t kResultType = 0x500;
+    constexpr size_t kTypeParameters = 0xd80;
     constexpr std::array<size_t, 8> kParameterTypeOffsets = {
         0x580, 0x600, 0x680, 0x700, 0x780, 0x800, 0x880, 0x900,
     };
@@ -143,6 +146,7 @@ SyntheticSignatureFixture BuildSignatureFixture(const SignatureProfileCase& item
 
     fixture.heap.SetAbstractType(fixture.signature_offset, item.cid_function_type, 1);
     fixture.heap.SetCompressedPointer(fixture.signature_offset, 0x24, kResultType);
+    fixture.heap.SetCompressedPointer(fixture.signature_offset, 0x20, kTypeParameters);
     fixture.heap.SetCompressedPointer(fixture.signature_offset, 0x28, kParameterTypes);
     fixture.heap.SetCompressedPointer(fixture.signature_offset, 0x2c, kNamedNames);
     const uint32_t packed_counts = 1U | (1U << 1) | (2U << 2) | (6U << 16);
@@ -180,6 +184,7 @@ SyntheticSignatureFixture BuildSignatureFixture(const SignatureProfileCase& item
     fixture.heap.SetArraySmi(kNamedNames, 6, 0b010101);
 
     fixture.heap.SetCid(fixture.null_object_offset, item.cid_null);
+    fixture.heap.SetCid(kTypeParameters, fixture.profile.cid_array);
     return fixture;
 }
 
@@ -305,5 +310,60 @@ TEST_CASE(LiveVmFunctionTypeFailsClosedWhenAotDroppedSignature) {
         EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
                   dartplant_live_vm_read_function_signature(&fixture.context, &fixture.snapshot,
                                                             fixture.function, &signature));
+    }
+}
+
+TEST_CASE(VmAbiProofClosesFunctionTypeDescriptorAndClosureRelations) {
+    for (const auto& item : kSignatureProfiles) {
+        auto fixture = BuildSignatureFixture(item);
+        const auto* record = dartplant::FindRuntimeProfileByVersion(item.profile_version);
+        EXPECT_TRUE(record != nullptr);
+
+        const auto function_type = dartplant::vm_abi::ProveFunctionTypeLayout(
+            *record, fixture.heap.base(), fixture.function);
+        EXPECT_TRUE(function_type.passed);
+        EXPECT_EQ(8U, function_type.parameter_count);
+        EXPECT_EQ(3U, function_type.type_parameter_count);
+
+        constexpr size_t kDescriptor = 0xc00;
+        constexpr size_t kTypeArguments = 0xd00;
+        constexpr std::array<size_t, 3> kRequiredNames = {0xa00, 0xa80, 0xb00};
+        fixture.heap.SetCid(kDescriptor, fixture.profile.cid_array);
+        fixture.heap.SetCompressedSmi(
+            kDescriptor + record->arguments_descriptor.type_args_len_offset, 3);
+        fixture.heap.SetCompressedSmi(kDescriptor + record->arguments_descriptor.count_offset, 5);
+        fixture.heap.SetCompressedSmi(kDescriptor + record->arguments_descriptor.size_offset, 5);
+        fixture.heap.SetCompressedSmi(
+            kDescriptor + record->arguments_descriptor.positional_count_offset, 2);
+        for (uint32_t index = 0; index < kRequiredNames.size(); ++index) {
+            const uint32_t entry = record->arguments_descriptor.first_named_entry_offset +
+                                   index * record->arguments_descriptor.named_entry_size;
+            fixture.heap.SetCompressedPointer(kDescriptor,
+                                              entry + record->arguments_descriptor.name_offset,
+                                              kRequiredNames[index]);
+            fixture.heap.SetCompressedSmi(
+                kDescriptor + entry + record->arguments_descriptor.position_offset, 2 + index);
+        }
+        fixture.heap.SetCid(kTypeArguments, record->type_arguments.cid);
+        fixture.heap.SetCompressedSmi(kTypeArguments + record->type_arguments.length_offset, 3);
+
+        const uint64_t descriptor = fixture.heap.Tagged(kDescriptor);
+        const uint64_t type_arguments = fixture.heap.Tagged(kTypeArguments);
+        const auto descriptor_proof = dartplant::vm_abi::ProveArgumentsDescriptorLayout(
+            *record, fixture.heap.base(), descriptor);
+        EXPECT_TRUE(descriptor_proof.passed);
+        EXPECT_EQ(3U, descriptor_proof.named_count);
+        EXPECT_TRUE(dartplant::vm_abi::ProveClosureCallRelation(
+            *record, fixture.heap.base(), fixture.function, descriptor, type_arguments));
+
+        fixture.heap.SetCompressedPointer(kDescriptor,
+                                          record->arguments_descriptor.first_named_entry_offset +
+                                              record->arguments_descriptor.name_offset,
+                                          0xa40);
+        EXPECT_TRUE(dartplant::vm_abi::ProveArgumentsDescriptorLayout(*record, fixture.heap.base(),
+                                                                      descriptor)
+                        .passed);
+        EXPECT_FALSE(dartplant::vm_abi::ProveClosureCallRelation(
+            *record, fixture.heap.base(), fixture.function, descriptor, type_arguments));
     }
 }

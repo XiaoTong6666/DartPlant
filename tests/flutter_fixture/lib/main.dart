@@ -332,6 +332,7 @@ Future<void> main() async {
       } else if (legacyProbe == 'type_arguments') {
         requestedTest = 'generic_gc';
       }
+      debugPrint('DartPlant app launch probe: $requestedTest');
     }
     final validRequestedTest =
         requestedTest == 'all' || _ciRuntimeTests.contains(requestedTest);

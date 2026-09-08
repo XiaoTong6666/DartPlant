@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "core/internal.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
@@ -11,7 +12,7 @@ namespace {
 
 struct LiveSnapshotBuildState {
     SnapshotIndex* index = nullptr;
-    uint32_t profile_version = 0;
+    const RuntimeProfileRecord* profile = nullptr;
     bool failed = false;
 };
 
@@ -46,7 +47,9 @@ uint64_t EntryVaForKind(const DartPlantLiveVmFunctionInfo& function, DartPlantEn
 uint8_t AppendLiveSnapshotFunction(const DartPlantLiveVmFunctionInfo* function, void* user_data) {
     auto* state = static_cast<LiveSnapshotBuildState*>(user_data);
     if (function == nullptr || state == nullptr || state->index == nullptr) return 0;
-    if (!AppendLiveSnapshotFunctionRecord(*function, state->profile_version, state->index)) {
+    if (state->profile == nullptr ||
+        !AppendLiveSnapshotFunctionRecord(*function, state->profile->live_vm.profile_version,
+                                          state->index)) {
         state->failed = true;
         return 0;
     }
@@ -243,6 +246,7 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
 
 std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext& context,
                                                     const DartPlantFlutterSnapshotInfo& snapshot,
+                                                    const RuntimeProfileRecord& profile,
                                                     DartPlantLiveVmFunctionIndexInfo* out_info,
                                                     std::string* error) {
     SnapshotIndex index;
@@ -250,21 +254,16 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
     index.module_path = snapshot.module_path == nullptr ? "" : snapshot.module_path;
     index.build_id = snapshot.module_build_id == nullptr ? "" : snapshot.module_build_id;
     index.snapshot_hash = snapshot.snapshot_hash == nullptr ? "" : snapshot.snapshot_hash;
-    DartPlantLiveVmProfile profile{};
-    profile.struct_size = sizeof(profile);
-    const DartPlantStatus profile_status = dartplant_live_vm_select_profile(&snapshot, &profile);
-    if (profile_status != DARTPLANT_OK) {
-        if (error != nullptr) *error = dartplant_last_error();
-        return std::nullopt;
-    }
-    index.dart_version = profile.dart_version == nullptr ? "" : profile.dart_version;
-    index.profile_version = profile.name == nullptr ? "" : profile.name;
+    index.dart_version =
+        profile.live_vm.dart_version == nullptr ? "" : profile.live_vm.dart_version;
+    index.profile_version = profile.live_vm.name == nullptr ? "" : profile.live_vm.name;
+    index.vm_profile_version = profile.live_vm.profile_version;
 
-    LiveSnapshotBuildState state{.index = &index, .profile_version = profile.profile_version};
+    LiveSnapshotBuildState state{.index = &index, .profile = &profile};
     DartPlantLiveVmFunctionIndexInfo local_info{};
     local_info.struct_size = sizeof(local_info);
-    const DartPlantStatus status = dartplant_live_vm_visit_functions(
-        &context, &snapshot, AppendLiveSnapshotFunction, &state, &local_info);
+    const DartPlantStatus status = VisitLiveVmFunctionsForProfile(
+        context, snapshot, profile, AppendLiveSnapshotFunction, &state, &local_info);
     if (status != DARTPLANT_OK || state.failed || index.functions.empty()) {
         if (error != nullptr) {
             *error = status != DARTPLANT_OK ? dartplant_last_error()

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "vm/abi/candidate_set.h"
 #include "vm/abi/probe.h"
 
 namespace dartplant::vm_abi {
@@ -24,7 +25,33 @@ enum VmCapability : uint64_t {
     kCapabilityExceptionLayout = 1ULL << 7,
     kCapabilityTypeArgumentsLayout = 1ULL << 8,
     kCapabilityArtifactLifecycle = 1ULL << 9,
+    kCapabilityArgumentsDescriptorLayout = 1ULL << 10,
+    kCapabilityInvocationCallAbi = 1ULL << 11,
+    kCapabilityFunctionCodeLayout = 1ULL << 12,
+    kCapabilityAotEntryLayout = 1ULL << 13,
+    kCapabilityFunctionTypeLayout = 1ULL << 14,
+    kCapabilityClosureCallLayout = 1ULL << 15,
 };
+
+enum class ProofState : uint8_t {
+    kUnavailable = 0,
+    kUnverified,
+    kVerified,
+    kFailedForIncarnation,
+    kAmbiguous,
+};
+
+struct CapabilityProofRecord {
+    uint64_t capability = kCapabilityNone;
+    ProofState state = ProofState::kUnavailable;
+    std::string abi_domain_key;
+    AbiDomainMask abi_domains = 0;
+    uint64_t artifact_generation = 0;
+    uint64_t isolate_generation = 0;
+};
+
+AbiDomainMask CapabilityDomains(uint64_t capability);
+std::string BuildCapabilityAbiKey(const RuntimeProfileRecord& profile, uint64_t capability);
 
 struct ArtifactIncarnation {
     std::string name;
@@ -60,7 +87,18 @@ struct ResolverInput {
     uint32_t only_profile_version = 0;
 };
 
+struct VerifiedCoreBinding {
+    AbiCandidateSet candidates{};
+    const RuntimeProfileRecord* representative = nullptr;
+    std::string_view core_abi_id;
+    CandidateProbe core_probe{};
+    uint64_t capabilities = kCapabilityNone;
+};
+
 struct VerifiedBinding {
+    VerifiedCoreBinding core{};
+    // Compatibility projection. New private-layout consumers must resolve the
+    // owning domain from core.candidates rather than trust this whole row.
     const RuntimeProfileRecord* profile = nullptr;
     CandidateProbe probe{};
     uint64_t capabilities = kCapabilityNone;
@@ -82,6 +120,26 @@ struct CandidateSelection {
 };
 
 CandidateSelection SelectUniquePassingCandidate(const std::vector<CandidateDiagnostic>& candidates);
+CandidateSelection SelectUniquePassingCandidate(const std::vector<CandidateDiagnostic>& candidates,
+                                                AbiDomain domain);
+
+struct DomainSetSelection {
+    const RuntimeProfileRecord* representative = nullptr;
+    std::string abi_domain_key;
+    size_t compatible_rows = 0;
+    size_t distinct_domain_sets = 0;
+
+    bool passed() const { return representative != nullptr && distinct_domain_sets == 1; }
+    bool ambiguous() const { return distinct_domain_sets > 1; }
+};
+
+DomainSetSelection SelectDomainAbiSet(const AbiCandidateSet& candidates,
+                                      const std::vector<AbiDomain>& domains,
+                                      const std::vector<bool>& compatible);
+DomainSetSelection SelectDomainAbiSet(const AbiCandidateSet& candidates, AbiDomainMask domains,
+                                      const std::vector<bool>& compatible);
+DomainSetSelection SelectCapabilityAbiSet(const AbiCandidateSet& candidates, uint64_t capability,
+                                          const std::vector<bool>& compatible);
 
 ResolverResult ResolveVerifiedBinding(const ResolverInput& input);
 

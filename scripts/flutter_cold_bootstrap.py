@@ -541,13 +541,16 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     generation_before_value = int(generation_before)
     generation_invalidated_value = int(generation_invalidated)
     generation_revalidated_value = int(generation_revalidated)
-    expected_capabilities = 0x3F7
+    expected_capabilities = 0xFFF7
     # Adapter creation itself runs inside the Dart FFI/native transition, so
     # Generated->Native state is intentionally lazy-proven on the first real
     # generated callback. Create/revalidate therefore verify roots, safepoint
     # stubs and artifact identity (0x237), not transition state (0x40).
     expected_verified = 0x237
-    expected_invalidated = 0x17
+    # Every private-ABI proof is bound to both artifact and isolate generation;
+    # retirement clears the complete verified set before revalidation re-runs
+    # eager core/object/stub proof.
+    expected_invalidated = 0
     if not (
         capabilities == required == expected_capabilities
         and verified_before == expected_verified
@@ -616,9 +619,9 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: Dart implicit closure invocation failed\n{logs}"
         )
-    if "DartPlant app launch probe: type_arguments" not in logs:
+    if "DartPlant app launch probe: all" not in logs:
         raise RuntimeError(
-            f"cold start {round_index}: adb TypeArguments launch extra was not delivered\n{logs}"
+            f"cold start {round_index}: all-test launch extra was not delivered\n{logs}"
         )
     if "capture vector=" not in logs:
         raise RuntimeError(

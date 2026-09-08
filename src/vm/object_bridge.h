@@ -6,12 +6,28 @@
 
 #include <stdint.h>
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "dartplant/vm_adapter.h"
+
+namespace dartplant {
+struct RuntimeProfileRecord;
+}
+
+struct VmAbiCapabilityBinding {
+    DartPlantVmCapabilityProof proof{};
+    const dartplant::RuntimeProfileRecord* profile = nullptr;
+};
+
+struct VmAbiBindingState {
+    std::array<VmAbiCapabilityBinding, 16> capabilities{};
+    uint64_t artifact_generation = 0;
+    uint64_t isolate_generation = 0;
+};
 
 struct DartPlantVmAdapter {
     mutable std::mutex mutex;
@@ -25,6 +41,7 @@ struct DartPlantVmAdapter {
     uint64_t generated_root_leases = 0;
     uint32_t generated_native_transitions = 0;
     std::atomic_bool admission_open{true};
+    VmAbiBindingState abi_binding;
     std::vector<DartPlantObjectHandle*> released_handles;
     bool attached = false;
     bool isolate_entered = false;
@@ -71,6 +88,15 @@ bool VmAdapterSupportsTypeArgumentsElementRead(const DartPlantVmAdapter* adapter
 DartPlantStatus VmAdapterReadTypeArgumentsElementGenerated(DartPlantVmAdapter* adapter,
                                                            uint64_t type_arguments_raw,
                                                            uint32_t index, uint64_t* out_raw);
+bool VmAdapterSupportsCapabilityProof(const DartPlantVmAdapter* adapter);
+DartPlantStatus VmAdapterProveCapability(DartPlantVmAdapter* adapter,
+                                         const DartPlantVmCapabilityEvidence& evidence,
+                                         DartPlantVmCapabilityProof* out_proof);
+DartPlantStatus VmAdapterGetCapabilityBinding(const DartPlantVmAdapter* adapter,
+                                              uint64_t capability,
+                                              DartPlantVmCapabilityProof* out_proof,
+                                              const RuntimeProfileRecord** out_profile = nullptr);
+void VmAdapterInvalidateAbiBinding(DartPlantVmAdapter* adapter);
 DartPlantStatus VmAdapterRetainObject(DartPlantVmAdapter* adapter, uint64_t raw,
                                       DartPlantObjectStrength strength,
                                       DartPlantObjectHandle** out_handle);

@@ -115,8 +115,19 @@ struct FunctionKindLayout {
     uint8_t tag_bits;
 };
 
+struct VmAbiIdentity {
+    const char* full;
+    const char* core;
+    const char* call;
+    const char* object;
+    const char* transition;
+    const char* exception;
+};
+
 struct RuntimeProfileRecord {
+    // Compatibility alias for abi_identity.full.
     const char* abi_id;
+    VmAbiIdentity abi_identity;
     VmMachineAbi machine;
     DartPlantLiveVmProfile live_vm;
     uint8_t dart_sp_register;
@@ -137,9 +148,8 @@ struct RuntimeProfileRecord {
 };
 
 // Runtime facts narrow a finite, source-verified ABI registry. They never
-// synthesize offsets. A known snapshot hash is a ranking hint; every compatible
-// machine/mode candidate remains eligible for the caller's read-only structural
-// proof so custom/rebuilt artifacts are not rejected by identity alone.
+// synthesize offsets. Snapshot identity ranks candidates; every compatible
+// machine/mode row remains eligible for read-only structural proof.
 struct VmRuntimeFacts {
     std::string_view snapshot_hash;
     std::string_view snapshot_features;

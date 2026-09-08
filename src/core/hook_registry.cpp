@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <vector>
 
 #include "core/internal.h"
+#include "vm/abi/resolver.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 namespace {
@@ -50,6 +53,168 @@ bool ValidCallbackOptions(const DartPlantHookOptions& options) {
 
 bool AllowsSharedCode(const DartPlantHookOptions& options) {
     return (options.flags & DARTPLANT_HOOK_ALLOW_SHARED_CODE) != 0;
+}
+
+bool HasSharedCodeEvidence(const DartPlantMethod& method);
+
+struct VmMethodBinding {
+    DartPlantVmCapabilityProof call{};
+    DartPlantVmCapabilityProof object{};
+    const RuntimeProfileRecord* call_profile = nullptr;
+    const RuntimeProfileRecord* object_profile = nullptr;
+};
+
+DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlantVmAdapter* adapter,
+                                         uintptr_t expected_entry, bool allow_shared,
+                                         VmMethodBinding* out_binding) {
+    if (adapter == nullptr || method.function == nullptr ||
+        method.function->source != DartFunctionSource::kLiveVm) {
+        return DARTPLANT_OK;
+    }
+    if (!VmAdapterSupportsCapabilityProof(adapter)) return DARTPLANT_OK;
+    if (out_binding == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    if (method.function->function_object == 0) {
+        SetLastError("live Dart hook requires the exact VM capability proof bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    uint64_t artifact_generation = 0;
+    uint64_t isolate_generation = 0;
+    const auto prove = [&](DartPlantVmCapabilityEvidenceKind kind) {
+        DartPlantVmCapabilityEvidence evidence{};
+        evidence.struct_size = sizeof(evidence);
+        evidence.kind = kind;
+        evidence.function = method.function->function_object;
+        evidence.code = method.function->code_object;
+        evidence.expected_entry = expected_entry;
+        evidence.entry_kind = method.record.entry_kind;
+        evidence.flags = allow_shared && HasSharedCodeEvidence(method)
+                             ? DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER
+                             : 0;
+        DartPlantVmCapabilityProof proof{};
+        proof.struct_size = sizeof(proof);
+        const DartPlantStatus status = VmAdapterProveCapability(adapter, evidence, &proof);
+        if (status != DARTPLANT_OK) return status;
+        const uint64_t expected_capability =
+            kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ? vm_abi::kCapabilityFunctionCodeLayout
+            : kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI
+                ? vm_abi::kCapabilityInvocationCallAbi
+            : kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY ? vm_abi::kCapabilityAotEntryLayout
+                                                      : vm_abi::kCapabilityFunctionTypeLayout;
+        if (proof.capability != expected_capability || proof.profile_version == 0 ||
+            proof.artifact_generation == 0 || proof.isolate_generation == 0) {
+            SetLastError("VM capability proof returned an invalid binding record");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        if (artifact_generation == 0) {
+            artifact_generation = proof.artifact_generation;
+            isolate_generation = proof.isolate_generation;
+        } else if (artifact_generation != proof.artifact_generation ||
+                   isolate_generation != proof.isolate_generation) {
+            SetLastError("VM capability proofs crossed an artifact or isolate generation");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        return DARTPLANT_OK;
+    };
+    const std::array<DartPlantVmCapabilityEvidenceKind, 3> ordinary_kinds = {
+        DARTPLANT_VM_EVIDENCE_FUNCTION_CODE,
+        DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI,
+        DARTPLANT_VM_EVIDENCE_AOT_ENTRY,
+    };
+    for (DartPlantVmCapabilityEvidenceKind kind : ordinary_kinds) {
+        const DartPlantStatus status = prove(kind);
+        if (status != DARTPLANT_OK) return status;
+    }
+    if (method.function->closure_call_entry_only) {
+        const DartPlantStatus status = prove(DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE);
+        if (status != DARTPLANT_OK) return status;
+    }
+    out_binding->call.struct_size = sizeof(out_binding->call);
+    const DartPlantStatus call_status =
+        VmAdapterGetCapabilityBinding(adapter, DARTPLANT_VM_CAP_INVOCATION_CALL_ABI,
+                                      &out_binding->call, &out_binding->call_profile);
+    if (call_status != DARTPLANT_OK) return call_status;
+    if (method.function->closure_call_entry_only) {
+        out_binding->object.struct_size = sizeof(out_binding->object);
+        const DartPlantStatus object_status =
+            VmAdapterGetCapabilityBinding(adapter, DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
+                                          &out_binding->object, &out_binding->object_profile);
+        if (object_status != DARTPLANT_OK) return object_status;
+        if (out_binding->call.artifact_generation != out_binding->object.artifact_generation ||
+            out_binding->call.isolate_generation != out_binding->object.isolate_generation) {
+            SetLastError("call and object ABI bindings belong to different generations");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+    }
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus BindCallLayoutProfile(const DartPlantMethod& method, DartPlantVmAdapter* adapter,
+                                      const VmMethodBinding& binding,
+                                      std::shared_ptr<const abi::DartCallLayout>* call_layout) {
+    if (call_layout == nullptr || *call_layout == nullptr) return DARTPLANT_OK;
+    const RuntimeProfileRecord* signature_profile = (*call_layout)->vm_object_profile;
+    if (method.function->source == DartFunctionSource::kLiveVm &&
+        !VmAdapterSupportsCapabilityProof(adapter)) {
+        if ((*call_layout)->has_arguments_descriptor ||
+            (*call_layout)->closure_signature.has_value()) {
+            SetLastError("live closure layout requires a generation-scoped VM ABI binding");
+            return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+        }
+        return DARTPLANT_OK;
+    }
+    const RuntimeProfileRecord* call_profile = nullptr;
+    const RuntimeProfileRecord* object_profile = nullptr;
+    if (method.function->source == DartFunctionSource::kLiveVm &&
+        VmAdapterSupportsCapabilityProof(adapter)) {
+        call_profile = binding.call_profile;
+        object_profile = binding.object_profile;
+    } else if ((*call_layout)->vm_call_profile != nullptr &&
+               (*call_layout)->vm_object_profile != nullptr) {
+        call_profile = (*call_layout)->vm_call_profile;
+        object_profile = (*call_layout)->vm_object_profile;
+    } else {
+        call_profile = FindRuntimeProfileByVersion(method.function->runtime_profile_version);
+        object_profile = call_profile;
+    }
+    if (call_profile == nullptr || call_profile->arguments_descriptor_register >= 31) {
+        SetLastError("DartCallLayout has no compatible call/object-domain binding");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    if (method.function->source == DartFunctionSource::kLiveVm &&
+        (*call_layout)->closure_signature.has_value()) {
+        if (object_profile == nullptr || signature_profile == nullptr ||
+            vm_abi::BuildCapabilityAbiKey(*signature_profile,
+                                          vm_abi::kCapabilityFunctionTypeLayout) !=
+                vm_abi::BuildCapabilityAbiKey(*object_profile,
+                                              vm_abi::kCapabilityFunctionTypeLayout)) {
+            SetLastError("retained FunctionType evidence does not match the object ABI binding");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+    }
+    try {
+        auto resolved = std::make_shared<abi::DartCallLayout>(**call_layout);
+        resolved->vm_call_profile = call_profile;
+        resolved->vm_object_profile = object_profile;
+        resolved->vm_artifact_generation = binding.call.artifact_generation;
+        resolved->vm_isolate_generation = binding.call.isolate_generation;
+        if (resolved->has_arguments_descriptor) {
+            resolved->arguments_descriptor_location = {
+                .kind = abi::DartAbiLocationKind::kGpRegister,
+                .register_index = call_profile->arguments_descriptor_register,
+            };
+        }
+        *call_layout = std::move(resolved);
+    } catch (...) {
+        SetLastError("failed to bind DartCallLayout to the verified call ABI");
+        return DARTPLANT_HOOK_FAILED;
+    }
+    return DARTPLANT_OK;
+}
+
+bool HasSharedCodeEvidence(const DartPlantMethod& method) {
+    if (method.function == nullptr || method.function->code_target == nullptr) return false;
+    return method.function->code_target->IsShared() &&
+           method.function->code_target->HasAlias(method.function->identity);
 }
 
 std::shared_ptr<DartPlantListenerRecord> MakeListenerLocked(DartPlantHook* hook,
@@ -690,9 +855,34 @@ bool BeginInvocation(DartPlantHook* hook,
     listeners->clear();
     const bool adapter_admitted =
         hook->vm_adapter == nullptr || VmAdapterAdmissionOpen(hook->vm_adapter);
-    const bool callbacks_enabled = adapter_admitted && hook->state == HookRecordState::kInstalled &&
-                                   !stale_generation &&
-                                   hook->active.load(std::memory_order_acquire);
+    bool abi_binding_current = true;
+    if (adapter_admitted && hook->vm_adapter != nullptr && hook->call_layout != nullptr &&
+        hook->call_layout->vm_artifact_generation != 0) {
+        DartPlantVmCapabilityProof call_binding{};
+        DartPlantVmCapabilityProof object_binding{};
+        const RuntimeProfileRecord* call_profile = nullptr;
+        const RuntimeProfileRecord* object_profile = nullptr;
+        call_binding.struct_size = sizeof(call_binding);
+        abi_binding_current =
+            VmAdapterGetCapabilityBinding(hook->vm_adapter, DARTPLANT_VM_CAP_INVOCATION_CALL_ABI,
+                                          &call_binding, &call_profile) == DARTPLANT_OK &&
+            call_profile == hook->call_layout->vm_call_profile &&
+            call_binding.artifact_generation == hook->call_layout->vm_artifact_generation &&
+            call_binding.isolate_generation == hook->call_layout->vm_isolate_generation;
+        if (abi_binding_current && hook->call_layout->closure_signature.has_value()) {
+            object_binding.struct_size = sizeof(object_binding);
+            abi_binding_current =
+                VmAdapterGetCapabilityBinding(hook->vm_adapter,
+                                              DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
+                                              &object_binding, &object_profile) == DARTPLANT_OK &&
+                object_profile == hook->call_layout->vm_object_profile &&
+                object_binding.artifact_generation == hook->call_layout->vm_artifact_generation &&
+                object_binding.isolate_generation == hook->call_layout->vm_isolate_generation;
+        }
+    }
+    const bool callbacks_enabled =
+        adapter_admitted && abi_binding_current && hook->state == HookRecordState::kInstalled &&
+        !stale_generation && hook->active.load(std::memory_order_acquire);
     if (callbacks_enabled) {
         *listeners = hook->listeners;
         for (const auto& listener : *listeners) {
@@ -755,6 +945,15 @@ DartPlantStatus InstallCallbackHook(
         SetLastError("verified DartCallLayout has an invalid Dart SP register");
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    if (method->function->code_target->IsShared() && !AllowsSharedCode(options)) {
+        SetLastError(
+            "method callback target is shared by multiple Dart Functions; explicit shared-code opt-in is required");
+        return DARTPLANT_SHARED_CODE_ENTRY;
+    }
+    if (method->function->code_target->IsShared() && !HasSharedCodeEvidence(*method)) {
+        SetLastError("shared-code callback has no complete logical alias evidence");
+        return DARTPLANT_SHARED_CODE_ENTRY;
+    }
     if (options.vm_adapter != nullptr &&
         method->function->source != DartFunctionSource::kSynthetic) {
         // A real Dart callback may expose the VM adapter only when every tagged
@@ -768,16 +967,22 @@ DartPlantStatus InstallCallbackHook(
                 "VM-adapter callbacks on Dart code require a verified DartCallLayout and a GC-safe generated/native bridge");
             return DARTPLANT_UNSUPPORTED_ABI;
         }
+        VmMethodBinding binding{};
+        const DartPlantStatus proof_status = ProveLiveFunctionBinding(
+            *method, options.vm_adapter, target, AllowsSharedCode(options), &binding);
+        if (proof_status != DARTPLANT_OK) return proof_status;
+        const DartPlantStatus layout_status =
+            BindCallLayoutProfile(*method, options.vm_adapter, binding, &call_layout);
+        if (layout_status != DARTPLANT_OK) return layout_status;
+    } else if (call_layout != nullptr) {
+        const DartPlantStatus layout_status =
+            BindCallLayoutProfile(*method, nullptr, {}, &call_layout);
+        if (layout_status != DARTPLANT_OK) return layout_status;
     }
     if (method->function->source != DartFunctionSource::kSynthetic &&
         method->function->thread_jump_to_frame_entry_point_offset == 0) {
         SetLastError("Dart callback hook requires an exact exception-unwind Thread profile");
         return DARTPLANT_UNSUPPORTED_ABI;
-    }
-    if (method->function->code_target->IsShared() && !AllowsSharedCode(options)) {
-        SetLastError(
-            "method callback target is shared by multiple Dart Functions; explicit shared-code opt-in is required");
-        return DARTPLANT_SHARED_CODE_ENTRY;
     }
     if (method->function->code_target->IsShared() && call_layout != nullptr) {
         // A physical shared Code entry cannot prove which logical Function

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,43 @@ import generate_vm_profiles  # noqa: E402
 
 
 class VmProfilesGeneratorTest(unittest.TestCase):
+    def test_domain_abi_identity_is_exhaustive_deterministic_and_sensitive(self) -> None:
+        profile = copy.deepcopy(generate_vm_profiles._load_manifest()[0])
+        generate_vm_profiles._verify_abi_domain_coverage(profile)
+        original = {
+            domain: generate_vm_profiles._canonical_abi_id(profile, domain)
+            for domain in ("full", *generate_vm_profiles.ABI_DOMAIN_FIELDS)
+        }
+        reordered = dict(reversed(list(profile.items())))
+        self.assertEqual(
+            original,
+            {
+                domain: generate_vm_profiles._canonical_abi_id(reordered, domain)
+                for domain in ("full", *generate_vm_profiles.ABI_DOMAIN_FIELDS)
+            },
+        )
+
+        profile["function_type"]["parameter_types"] += 4
+        mutated = {
+            domain: generate_vm_profiles._canonical_abi_id(profile, domain)
+            for domain in ("full", *generate_vm_profiles.ABI_DOMAIN_FIELDS)
+        }
+        self.assertNotEqual(original["full"], mutated["full"])
+        self.assertNotEqual(original["object"], mutated["object"])
+        self.assertEqual(original["core"], mutated["core"])
+        self.assertEqual(original["transition"], mutated["transition"])
+        self.assertEqual(original["call"], mutated["call"])
+        self.assertEqual(original["exception"], mutated["exception"])
+
+    def test_manifest_rejects_stale_domain_identity(self) -> None:
+        manifest = json.loads(generate_vm_profiles.MANIFEST.read_text())
+        manifest["profiles"][0]["abi_identity"]["object"] = "stale"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "abi_identity is stale"):
+                generate_vm_profiles._load_manifest(path)
+
     def test_selects_aot_product_arm64_compressed_block(self) -> None:
         text = r"""
 #if defined(PRODUCT) && defined(TARGET_ARCH_ARM64) && \

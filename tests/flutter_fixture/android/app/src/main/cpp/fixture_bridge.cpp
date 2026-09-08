@@ -943,6 +943,16 @@ DartPlantStatus InstallTypeArgumentsProofHook(Dart_Handle retained_closure) {
     g_type_arguments_closure->function->function_object = retained_function_raw;
     g_type_arguments_closure->function->source = dartplant::DartFunctionSource::kLiveVm;
 
+#if defined(DARTPLANT_DART_PLANT_TYPE_ARGUMENTS_CLOSURE_ABI_EVIDENCE_AVAILABLE)
+    const DartPlantStatus evidence_status = dartplant_runtime_register_compiler_abi_evidence(
+        g_runtime, g_type_arguments_closure, &kDartPlantTypeArgumentsClosureAbiEvidence);
+    __android_log_print(evidence_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                        kTag, "TypeArguments closure compiler evidence status=%d error=%s",
+                        evidence_status,
+                        evidence_status == DARTPLANT_OK ? "none" : dartplant_last_error());
+    if (evidence_status != DARTPLANT_OK) return evidence_status;
+#endif
+
     DartPlantMethodAbiInfo abi_info{};
     abi_info.struct_size = sizeof(abi_info);
     const DartPlantStatus abi_status =
@@ -1858,16 +1868,28 @@ dartplant_fixture_type_arguments_proof() {
             g_flutter_vm_adapter, DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED);
     const uint64_t capability_failed =
         dartplant_flutter_vm_adapter_failed_capabilities(g_flutter_vm_adapter);
+    const uint64_t capability_verified =
+        dartplant_flutter_vm_adapter_verified_capabilities(g_flutter_vm_adapter);
+    constexpr uint64_t kExpectedInvocationCapabilities =
+        DARTPLANT_FLUTTER_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_INVOCATION_CALL_ABI_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_FUNCTION_CODE_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_AOT_ENTRY_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_FUNCTION_TYPE_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_CLOSURE_CALL_LAYOUT_VERIFIED;
     const bool active =
         g_type_arguments_closure_hook != nullptr && g_type_arguments_closure_hook->active;
     const bool passed =
         enter == 1 && failures == 0 && (!require_relocation || calls >= 1) && vector_before != 0 &&
         vector_after != 0 && element_before != 0 && element_after != 0 && callback_passed &&
         active && type_arguments_state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
-        (capability_failed & DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED) == 0;
+        (capability_verified & kExpectedInvocationCapabilities) ==
+            kExpectedInvocationCapabilities &&
+        (capability_failed & (DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED |
+                              kExpectedInvocationCapabilities)) == 0;
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu require_relocation=%u vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u capability_state=%u capability_failed=0x%llx passed=%u",
+        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu require_relocation=%u vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u capability_state=%u capability_verified=0x%llx capability_required=0x%llx capability_failed=0x%llx passed=%u",
         static_cast<unsigned long long>(enter), static_cast<unsigned long long>(failures),
         static_cast<unsigned long long>(calls), static_cast<unsigned>(require_relocation),
         static_cast<unsigned long long>(vector_before),
@@ -1876,6 +1898,8 @@ dartplant_fixture_type_arguments_proof() {
         static_cast<unsigned long long>(element_after), static_cast<unsigned>(vector_relocated),
         static_cast<unsigned>(element_relocated), static_cast<unsigned>(active),
         static_cast<unsigned>(type_arguments_state),
+        static_cast<unsigned long long>(capability_verified),
+        static_cast<unsigned long long>(kExpectedInvocationCapabilities),
         static_cast<unsigned long long>(capability_failed), static_cast<unsigned>(passed));
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
@@ -1998,7 +2022,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     DartPlantVmAdapter* vm_adapter = dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter);
     if (adapter_status != DARTPLANT_OK || vm_adapter == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
-                            "exact V3 VM adapter initialization failed status=%d error=%s",
+                            "exact V4 VM adapter initialization failed status=%d error=%s",
                             adapter_status, dartplant_last_error());
         g_cold_bootstrap_status.store(adapter_status, std::memory_order_release);
         return adapter_status;
@@ -2011,6 +2035,12 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_SOURCE_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_INVOCATION_CALL_ABI_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_FUNCTION_CODE_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_AOT_ENTRY_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_FUNCTION_TYPE_LAYOUT_VERIFIED |
+        DARTPLANT_FLUTTER_VM_CAP_CLOSURE_CALL_LAYOUT_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_ARTIFACT_LIFECYCLE_BOUND;
     const uint64_t adapter_capabilities =
         dartplant_flutter_vm_adapter_capabilities(g_flutter_vm_adapter);
@@ -2058,11 +2088,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         artifact_generation_quiesced == artifact_generation_before &&
         artifact_generation_invalidated == artifact_generation_before + 1 &&
         artifact_generation_revalidated == artifact_generation_invalidated &&
-        verified_quiesced == kExpectedVerifiedCreate &&
-        verified_invalidated == (DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN |
-                                 DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN |
-                                 DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN |
-                                 DARTPLANT_FLUTTER_VM_CAP_DART_CORE_PROVEN) &&
+        verified_quiesced == kExpectedVerifiedCreate && verified_invalidated == 0 &&
         verified_revalidated == kExpectedVerifiedCreate && failed_revalidated == 0;
     g_artifact_lifecycle_passed.store(
         capability_gate && generation_gate && artifact_revalidation == DARTPLANT_OK,

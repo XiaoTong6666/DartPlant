@@ -123,6 +123,62 @@ typedef DartPlantStatus (*DartPlantReadTypeArgumentsElementCallback)(
     void* user_data, const DartPlantIsolateIdentity* isolate, uint64_t type_arguments_raw,
     uint32_t index, uint64_t* out_raw);
 
+typedef enum DartPlantVmCapability {
+    DARTPLANT_VM_CAP_RUNTIME_ROOTS = 1u << 0,
+    DARTPLANT_VM_CAP_OWNER_IDENTITY = 1u << 1,
+    DARTPLANT_VM_CAP_CANONICAL_NULL = 1u << 2,
+    DARTPLANT_VM_CAP_REGISTER_SEMANTICS = 1u << 3,
+    DARTPLANT_VM_CAP_DART_CORE = 1u << 4,
+    DARTPLANT_VM_CAP_SAFEPOINT_STUBS = 1u << 5,
+    DARTPLANT_VM_CAP_GENERATED_TRANSITION_LAYOUT = 1u << 6,
+    DARTPLANT_VM_CAP_EXCEPTION_LAYOUT = 1u << 7,
+    DARTPLANT_VM_CAP_TYPE_ARGUMENTS_LAYOUT = 1u << 8,
+    DARTPLANT_VM_CAP_ARTIFACT_LIFECYCLE = 1u << 9,
+    DARTPLANT_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT = 1u << 10,
+    DARTPLANT_VM_CAP_INVOCATION_CALL_ABI = 1u << 11,
+    DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT = 1u << 12,
+    DARTPLANT_VM_CAP_AOT_ENTRY_LAYOUT = 1u << 13,
+    DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT = 1u << 14,
+    DARTPLANT_VM_CAP_CLOSURE_CALL_LAYOUT = 1u << 15,
+} DartPlantVmCapability;
+
+typedef enum DartPlantVmCapabilityEvidenceKind {
+    DARTPLANT_VM_EVIDENCE_FUNCTION_CODE = 1,
+    DARTPLANT_VM_EVIDENCE_AOT_ENTRY = 2,
+    DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR = 3,
+    DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE = 4,
+    DARTPLANT_VM_EVIDENCE_CLOSURE_CALL = 5,
+    DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI = 6,
+} DartPlantVmCapabilityEvidenceKind;
+
+typedef enum DartPlantVmCapabilityEvidenceFlags {
+    DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER = 1u << 0,
+} DartPlantVmCapabilityEvidenceFlags;
+
+typedef struct DartPlantVmCapabilityEvidence {
+    uint32_t struct_size;
+    DartPlantVmCapabilityEvidenceKind kind;
+    uint32_t flags;
+    DartPlantEntryKind entry_kind;
+    uint64_t function;
+    uint64_t code;
+    uint64_t expected_entry;
+    uint64_t descriptor;
+    uint64_t type_arguments;
+} DartPlantVmCapabilityEvidence;
+
+typedef struct DartPlantVmCapabilityProof {
+    uint32_t struct_size;
+    uint64_t capability;
+    uint32_t profile_version;
+    uint64_t artifact_generation;
+    uint64_t isolate_generation;
+} DartPlantVmCapabilityProof;
+
+typedef DartPlantStatus (*DartPlantProveCapabilityCallback)(
+    void* user_data, const DartPlantIsolateIdentity* isolate,
+    const DartPlantVmCapabilityEvidence* evidence, DartPlantVmCapabilityProof* out_proof);
+
 typedef struct DartPlantVmAdapterCallbacks {
     uint32_t struct_size;
     uint32_t adapter_version;
@@ -167,6 +223,10 @@ typedef struct DartPlantVmAdapterCallbacks {
     DartPlantReadActiveObjectCallback read_active_exception;
     DartPlantReadActiveObjectCallback read_active_stacktrace;
     DartPlantReadTypeArgumentsElementCallback read_type_arguments_element;
+    // Optional append-only capability proof bridge for V1-V3 adapters and
+    // required for V4+. The exact VM adapter resolves evidence against its
+    // retained source-verified candidates and publishes only owning domains.
+    DartPlantProveCapabilityCallback prove_capability;
 } DartPlantVmAdapterCallbacks;
 
 DARTPLANT_EXPORT DartPlantStatus

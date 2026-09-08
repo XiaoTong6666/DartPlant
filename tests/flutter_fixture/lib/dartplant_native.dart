@@ -20,8 +20,18 @@ typedef _ForcedStackClosureProbeNative = Uint64 Function();
 typedef _ForcedStackClosureProbeDart = int Function();
 typedef _TypeArgumentsProofPrepareNative = Int32 Function(Handle, Handle);
 typedef _TypeArgumentsProofPrepareDart = int Function(Object, Object);
+typedef _TypeArgumentsProofPrepareModeNative = Int32 Function(
+  Handle,
+  Handle,
+  Uint8,
+);
+typedef _TypeArgumentsProofPrepareModeDart = int Function(Object, Object, int);
 typedef _TypeArgumentsProofNative = Uint64 Function();
 typedef _TypeArgumentsProofDart = int Function();
+typedef _TransitionProofNative = Uint64 Function();
+typedef _TransitionProofDart = int Function();
+typedef _ArtifactLifecycleProofNative = Uint64 Function();
+typedef _ArtifactLifecycleProofDart = int Function();
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -114,9 +124,25 @@ final class DartPlantNative {
             'dartplant_fixture_type_arguments_proof_prepare',
           )
           .asFunction();
+  static final _TypeArgumentsProofPrepareModeDart
+      _typeArgumentsProofPrepareMode = _library
+          .lookup<NativeFunction<_TypeArgumentsProofPrepareModeNative>>(
+            'dartplant_fixture_type_arguments_proof_prepare_mode',
+          )
+          .asFunction();
   static final _TypeArgumentsProofDart _typeArgumentsProof = _library
       .lookup<NativeFunction<_TypeArgumentsProofNative>>(
         'dartplant_fixture_type_arguments_proof',
+      )
+      .asFunction();
+  static final _TransitionProofDart _transitionProof = _library
+      .lookup<NativeFunction<_TransitionProofNative>>(
+        'dartplant_fixture_transition_proof',
+      )
+      .asFunction();
+  static final _ArtifactLifecycleProofDart _artifactLifecycleProof = _library
+      .lookup<NativeFunction<_ArtifactLifecycleProofNative>>(
+        'dartplant_fixture_artifact_lifecycle_proof',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -205,19 +231,25 @@ final class DartPlantNative {
   }
 
   static Future<int> waitForInitialization() async {
+    const timeout = Duration(minutes: 3);
+    final stopwatch = Stopwatch()..start();
     var heartbeat = 1;
-    for (var attempt = 0; attempt < 1000; ++attempt) {
+    while (stopwatch.elapsed < timeout) {
       // Keep the UI isolate executing ordinary AOT Dart while the native
-      // The live-VM sampler validates THR/PP/HEAP_BITS/NULL. This supplies
+      // live-VM sampler validates THR/PP/HEAP_BITS/NULL. This supplies
       // mutator activity only; no method address or metadata crosses the FFI.
       for (var burst = 0; burst < 32; ++burst) {
         heartbeat = _bootstrapHeartbeat(heartbeat + burst);
       }
       final status = _coldBootstrapStatus();
+      // -1 is the fixture's only in-progress state. Any real DartPlant status
+      // is terminal and must still fail closed immediately. A wall-clock
+      // deadline is required here because pure ARM64 TCG makes each heartbeat
+      // burst substantially slower than it is on KVM or physical devices.
       if (status >= 0) return status;
       await Future<void>.delayed(const Duration(milliseconds: 1));
     }
-    return heartbeat == -1 ? heartbeat : 14; // DARTPLANT_RUNTIME_NOT_READY
+    return 14; // DARTPLANT_RUNTIME_NOT_READY
   }
 
   static Future<int> initialize() async {
@@ -254,7 +286,22 @@ final class DartPlantNative {
   static int typeArgumentsProofPrepare(Object closure, Object pressurePort) =>
       _typeArgumentsProofPrepare(closure, pressurePort);
 
+  static int typeArgumentsProofPrepareMode(
+    Object closure,
+    Object pressurePort, {
+    required bool requireRelocation,
+  }) =>
+      _typeArgumentsProofPrepareMode(
+        closure,
+        pressurePort,
+        requireRelocation ? 1 : 0,
+      );
+
   static int typeArgumentsProof() => _typeArgumentsProof();
+
+  static int transitionProof() => _transitionProof();
+
+  static int artifactLifecycleProof() => _artifactLifecycleProof();
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

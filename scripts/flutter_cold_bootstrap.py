@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -66,6 +67,12 @@ class ColdStartResult:
     dart_pc: int
 
 
+@dataclass(frozen=True)
+class FlutterToolchain:
+    flutter_version: str
+    dart_version: str
+
+
 def _capture(cmd: list[str], *, timeout: float | None = None) -> str:
     result = sp.run(
         cmd,
@@ -89,7 +96,33 @@ def _resolve_flutter(flutter: str | None) -> str:
     return str(Path(candidate).expanduser())
 
 
-def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
+def _detect_flutter_toolchain(flutter: str) -> FlutterToolchain:
+    try:
+        output = _capture([flutter, "--version", "--machine"])
+        json_start = output.find("{")
+        if json_start < 0:
+            raise json.JSONDecodeError("missing JSON object", output, 0)
+        machine, _ = json.JSONDecoder().raw_decode(output[json_start:])
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError("Flutter --version --machine did not return valid JSON") from error
+    flutter_version = str(machine.get("frameworkVersion", "")).strip()
+    dart_text = str(machine.get("dartSdkVersion", "")).strip()
+    dart_match = re.search(r"\d+\.\d+\.\d+", dart_text)
+    if not flutter_version or dart_match is None:
+        raise RuntimeError(
+            "Flutter toolchain version metadata is incomplete: "
+            f"frameworkVersion={flutter_version!r} dartSdkVersion={dart_text!r}"
+        )
+    return FlutterToolchain(
+        flutter_version=flutter_version,
+        dart_version=dart_match.group(0),
+    )
+
+
+def _build_fixture(
+    flutter: str, *, dobby_root: Path | None = None
+) -> FlutterToolchain:
+    toolchain = _detect_flutter_toolchain(flutter)
     build_env = os.environ.copy()
     resolved_dobby_root = (
         dobby_root.expanduser().resolve()
@@ -145,6 +178,9 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
         "--release",
         "--target-platform",
         "android-arm64",
+        f"--dart-define=DARTPLANT_CI_FLUTTER_VERSION={toolchain.flutter_version}",
+        f"--dart-define=DARTPLANT_CI_DART_VERSION={toolchain.dart_version}",
+        "--dart-define=DARTPLANT_CI_TARGET_ABI=arm64-v8a",
     ]
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
     if not APK_PATH.is_file():
@@ -340,6 +376,26 @@ def _build_fixture(flutter: str, *, dobby_root: Path | None = None) -> None:
         raise RuntimeError(
             "second-stage native fixture rebuild changed libapp.so; generated sidecar is stale"
         )
+    return toolchain
+
+
+def build_flutter_fixture(
+    *, flutter: str | None, dobby_root: Path | None = None
+) -> FlutterToolchain:
+    flutter_bin = _resolve_flutter(flutter)
+    lock_path = FIXTURE_DIR / "pubspec.lock"
+    lock_existed = lock_path.is_file()
+    lock_contents = lock_path.read_bytes() if lock_existed else None
+    try:
+        return _build_fixture(flutter_bin, dobby_root=dobby_root)
+    finally:
+        # Compatibility builds intentionally resolve the dependency graph with
+        # the active Flutter/Dart SDK. Do not leave those SDK-specific pins in
+        # the source checkout after the fixture APK has been produced.
+        if lock_existed and lock_contents is not None:
+            lock_path.write_bytes(lock_contents)
+        elif not lock_existed:
+            lock_path.unlink(missing_ok=True)
 
 
 def _assert_no_packaged_runtime_metadata() -> None:
@@ -391,10 +447,12 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
             # adb-requested probe. Waiting for the generic prefix can therefore
             # return while the adb proof is still inside its GC pressure loop,
             # making the later source=adb assertion timing-dependent.
-            and "DartPlant app TypeArguments proof: 1 source=adb native=1 result_ok=1" in latest
+            and "DartPlant app TypeArguments proof: 1 source=adb native=1 require_relocation=1 result_ok=1"
+            in latest
             and "DartPlant P6 ABI corpus:" in latest
             and "DartPlant ordinary AOT typed probe:" in latest
             and "DartPlant late shared typed fail-close:" in latest
+            and 'DARTPLANT_CI {"event":"suite","state":"pass","test":"all"}' in latest
         ):
             return latest
         time.sleep(0.05)
@@ -414,8 +472,8 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
                 "-n",
                 ACTIVITY,
                 "--es",
-                "dartplant_probe",
-                "type_arguments",
+                "dartplant_test",
+                "all",
             ],
             device=serial,
         )
@@ -582,7 +640,10 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: native TypeArguments proof summary failed\n{logs}"
         )
-    if "DartPlant app TypeArguments proof: 1 source=adb native=1 result_ok=1" not in logs:
+    if (
+        "DartPlant app TypeArguments proof: 1 source=adb native=1 require_relocation=1 result_ok=1"
+        not in logs
+    ):
         raise RuntimeError(
             f"cold start {round_index}: Dart-side TypeArguments proof result failed\n{logs}"
         )
@@ -643,7 +704,11 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: generic/named FunctionType semantic probe failed\n{logs}"
         )
-    if "DartPlant bool semantic probe: 1 values=false/true" not in logs:
+    if (
+        'DARTPLANT_CI {"event":"scenario","name":"bool_semantics","state":"pass"'
+        not in logs
+        and "DartPlant bool semantic probe: 1 values=false/true" not in logs
+    ):
         raise RuntimeError(f"cold start {round_index}: bool semantic probe failed\n{logs}")
     if "DartPlant ordinary AOT discovery: 1" not in logs:
         raise RuntimeError(
@@ -730,22 +795,8 @@ def run_flutter_cold_bootstrap_test(
     if timeout_seconds <= 0:
         raise ValueError("timeout must be greater than zero")
 
-    flutter_bin = _resolve_flutter(flutter) if build else ""
-    lock_path = FIXTURE_DIR / "pubspec.lock"
-    lock_existed = lock_path.is_file()
-    lock_contents = lock_path.read_bytes() if build and lock_existed else None
-    try:
-        if build:
-            _build_fixture(flutter_bin, dobby_root=dobby_root)
-    finally:
-        # flutter pub get rewrites transitive pins to the active Flutter/Dart
-        # SDK. A compatibility-matrix run must not leave that SDK-specific
-        # lockfile drift in the source checkout, even when the build fails.
-        if build:
-            if lock_existed and lock_contents is not None:
-                lock_path.write_bytes(lock_contents)
-            elif not lock_existed:
-                lock_path.unlink(missing_ok=True)
+    if build:
+        build_flutter_fixture(flutter=flutter, dobby_root=dobby_root)
     if not APK_PATH.is_file():
         raise FileNotFoundError(f"missing Flutter fixture APK: {APK_PATH}")
     _assert_no_packaged_runtime_metadata()

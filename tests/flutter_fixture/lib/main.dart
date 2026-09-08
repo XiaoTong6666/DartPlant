@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -8,6 +10,44 @@ import 'package:flutter/services.dart';
 
 const fixture = DartPlantFixture();
 const _launchChannel = MethodChannel('dev.dartplant.fixture/launch');
+const _ciFlutterVersion = String.fromEnvironment(
+  'DARTPLANT_CI_FLUTTER_VERSION',
+  defaultValue: 'unknown',
+);
+const _ciDartVersion = String.fromEnvironment(
+  'DARTPLANT_CI_DART_VERSION',
+  defaultValue: 'unknown',
+);
+const _ciTargetAbi = String.fromEnvironment(
+  'DARTPLANT_CI_TARGET_ABI',
+  defaultValue: 'unknown',
+);
+const _ciRuntimeTests = <String>{
+  'normal',
+  'arguments_descriptor',
+  'closure',
+  'generic_closure',
+  'generic_gc',
+  'exception',
+  'transition',
+  'artifact_revalidate',
+};
+final _ciScenarioResults = <String, bool>{};
+
+void _ciEvent(String event, Map<String, Object?> fields) {
+  final payload = <String, Object?>{'event': event, ...fields};
+  debugPrint('DARTPLANT_CI ${jsonEncode(payload)}', wrapWidth: 4096);
+}
+
+void _ciScenario(String name, bool passed,
+    [Map<String, Object?> fields = const {}]) {
+  _ciScenarioResults[name] = passed;
+  _ciEvent('scenario', <String, Object?>{
+    'name': name,
+    'state': passed ? 'pass' : 'fail',
+    ...fields,
+  });
+}
 
 void movingGcPressure(SendPort port) {
   port.send(1);
@@ -103,20 +143,30 @@ final class _GcPressureMarker {
   final int value;
 }
 
-String _runTypeArgumentsProof(String source) {
+String _runTypeArgumentsProof(
+  String source, {
+  String scenario = 'generic_gc',
+  bool requireRelocation = true,
+}) {
   final callback = _bootstrapRetainedGenericClosure ?? retainedGenericClosure;
   final pressurePort = ReceivePort();
   try {
-    final prepare = DartPlantNative.typeArgumentsProofPrepare(
+    final prepare = DartPlantNative.typeArgumentsProofPrepareMode(
       callback,
       pressurePort.sendPort,
+      requireRelocation: requireRelocation,
     );
     debugPrint(
-      'DartPlant app TypeArguments proof trigger: source=$source prepare=$prepare explicit=List<TypeArgumentsProofValue>',
+      'DartPlant app TypeArguments proof trigger: source=$source prepare=$prepare require_relocation=${requireRelocation ? 1 : 0} explicit=List<TypeArgumentsProofValue>',
     );
     if (prepare != 0) {
       final failed = 'typeargs:$source prepare=$prepare';
       debugPrint('DartPlant app TypeArguments proof: 0 $failed');
+      _ciScenario(scenario, false, <String, Object?>{
+        'source': source,
+        'prepare': prepare,
+        'require_relocation': requireRelocation,
+      });
       return failed;
     }
 
@@ -132,8 +182,14 @@ String _runTypeArgumentsProof(String source) {
     final summary =
         'typeargs:$source native=$native result=${value.single} runtimeType=${value.runtimeType}';
     debugPrint(
-      'DartPlant app TypeArguments proof: ${passed ? 1 : 0} source=$source native=$native result_ok=${resultOk ? 1 : 0} value=${value.single} runtimeType=${value.runtimeType}',
+      'DartPlant app TypeArguments proof: ${passed ? 1 : 0} source=$source native=$native require_relocation=${requireRelocation ? 1 : 0} result_ok=${resultOk ? 1 : 0} value=${value.single} runtimeType=${value.runtimeType}',
     );
+    _ciScenario(scenario, passed, <String, Object?>{
+      'source': source,
+      'native': native,
+      'require_relocation': requireRelocation,
+      'result_ok': resultOk,
+    });
     return summary;
   } finally {
     pressurePort.close();
@@ -237,6 +293,13 @@ int verifiedAbiImmediateCatchProbe() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  _ciEvent('runtime', <String, Object?>{
+    'flutter': _ciFlutterVersion,
+    'dart': _ciDartVersion,
+    'dart_runtime': Platform.version.split(' ').first,
+    'abi': _ciTargetAbi,
+    'dart_ffi_abi': Abi.current().toString(),
+  });
 
   // Top-level tear-offs are lazily initialized. Force this generic implicit
   // closure into the live object graph before DartPlant builds its VM Function
@@ -258,7 +321,38 @@ Future<void> main() async {
     final initializeStatus = initializeStartStatus == 0
         ? await DartPlantNative.waitForInitialization()
         : initializeStartStatus;
+    var requestedTest = 'all';
+    if (Platform.isAndroid) {
+      final explicitTest =
+          await _launchChannel.invokeMethod<String>('launchTest');
+      final legacyProbe =
+          await _launchChannel.invokeMethod<String>('launchProbe');
+      if (explicitTest != null && explicitTest.isNotEmpty) {
+        requestedTest = explicitTest;
+      } else if (legacyProbe == 'type_arguments') {
+        requestedTest = 'generic_gc';
+      }
+    }
+    final validRequestedTest =
+        requestedTest == 'all' || _ciRuntimeTests.contains(requestedTest);
+    _ciEvent('test_begin', <String, Object?>{
+      'name': requestedTest,
+      'state': validRequestedTest ? 'accepted' : 'rejected',
+    });
+    if (!validRequestedTest) {
+      _ciEvent('suite', <String, Object?>{
+        'state': 'fail',
+        'test': requestedTest,
+        'reason': 'unknown dartplant_test',
+      });
+      return;
+    }
+    bool wants(String name) => requestedTest == 'all' || requestedTest == name;
+
     debugPrint('DartPlant initialize status: $initializeStatus');
+    _ciScenario('initialization', initializeStatus == 0, <String, Object?>{
+      'status': initializeStatus,
+    });
 
     // The advanced runtime is intentionally initialized with DartPlant's local
     // publication-gate policy. Exercise one real Dart call before the simple
@@ -271,6 +365,9 @@ Future<void> main() async {
     debugPrint(
       'DartPlant local gate real-Dart warmup: ${localGateWarmupPassed ? 1 : 0} value=$localGateWarmup',
     );
+    _ciScenario('local_gate', localGateWarmupPassed, <String, Object?>{
+      'value': localGateWarmup,
+    });
 
     // The first two calls are owned only by the simple-facade consumer TU.
     // It lazy-bootstraps its own default runtime, consumes the embedded
@@ -290,6 +387,11 @@ Future<void> main() async {
     debugPrint(
       'DartPlant simple facade typed hook: ${simpleFacadePassed ? 1 : 0} values=$simpleFacadeFirst/$simpleFacadeSecond stages=$simpleFacadeStage1/$simpleFacadeStage2',
     );
+    _ciScenario('simple_facade', simpleFacadePassed, <String, Object?>{
+      'install': simpleFacadeInstall,
+      'stage1': simpleFacadeStage1,
+      'stage2': simpleFacadeStage2,
+    });
 
     final p6BaselineInt64 = verifiedAbiInt64(100000000, 7);
     final p6BaselineStack = verifiedAbiEntryStack(1, 2, 3, 4, 5, 6, 7, 8);
@@ -346,6 +448,11 @@ Future<void> main() async {
     debugPrint(
       'DartPlant P6 ABI corpus: ${p6Passed ? 1 : 0} install=$p6Install probe=$p6Probe int64=$p6BaselineInt64/$p6HookedInt64 stack=$p6BaselineStack/$p6HookedStack odd=$p6BaselineOdd/$p6HookedOdd forced=$p6BaselineForced/$p6HookedForced pair=${p6BaselinePair.$1},${p6BaselinePair.$2}/${p6HookedPair.$1},${p6HookedPair.$2}',
     );
+    _ciScenario('p6_abi', p6Passed, <String, Object?>{
+      'install': p6Install,
+      'probe': p6Probe,
+      'throw_path': p6ThrowPath,
+    });
 
     // Run the exception-bridge lifetime race with exactly one real-Dart hook
     // consumer. Its enter callback requests unhook while in flight, then the
@@ -367,6 +474,11 @@ Future<void> main() async {
     debugPrint(
       'DartPlant exception bridge lifetime: ${exceptionLifetimePassed ? 1 : 0} install=$exceptionLifetimeInstall catch=$exceptionLifetimeCatch probe=$exceptionLifetimeProbe',
     );
+    _ciScenario('exception_bridge', exceptionLifetimePassed, <String, Object?>{
+      'install': exceptionLifetimeInstall,
+      'catch': exceptionLifetimeCatch,
+      'probe': exceptionLifetimeProbe,
+    });
 
     // Every independent artifact consumer above has now removed its physical
     // hooks and shut down. The advanced runtime already prebound the pristine
@@ -385,6 +497,11 @@ Future<void> main() async {
     debugPrint(
       'DartPlant closure receiver probe: ${forcedStackClosurePassed ? 1 : 0} value=$forcedStackClosureValue native=$forcedStackClosureProbe install=$forcedStackClosureInstall',
     );
+    _ciScenario('closure_receiver', forcedStackClosurePassed, <String, Object?>{
+      'install': forcedStackClosureInstall,
+      'native': forcedStackClosureProbe,
+      'value': forcedStackClosureValue,
+    });
 
     // Only after the simple consumer has removed its final subscription and
     // the P6/exception consumers have removed all artifact-first hooks and
@@ -393,6 +510,10 @@ Future<void> main() async {
     final advancedOrdinaryHook = DartPlantNative.enableAdvancedOrdinaryHook();
     debugPrint(
         'DartPlant advanced ordinary hook enable: $advancedOrdinaryHook');
+    _ciScenario(
+        'advanced_ordinary', advancedOrdinaryHook == 0, <String, Object?>{
+      'status': advancedOrdinaryHook,
+    });
 
     DartPlantNative.resetNullSemanticProbe();
     final canonicalNull = nullableEchoObject(null);
@@ -401,12 +522,38 @@ Future<void> main() async {
     debugPrint(
       'DartPlant null semantic probe: $nullProbe values=$canonicalNull/$rewrittenToNull',
     );
+    _ciScenario(
+      'null_semantics',
+      nullProbe == 1 && canonicalNull == null && rewrittenToNull == null,
+      <String, Object?>{'native': nullProbe},
+    );
     DartPlantNative.resetBoolSemanticProbe();
-    final boolTrue = negateBool(false);
-    final boolFalse = negateBool(true);
+    // Keep the caller-side expectation runtime-dependent. PRODUCT AOT is free
+    // to reason about constant arguments even when the callee is never-inline;
+    // this proof must validate the architectural return value written by the
+    // leave callback rather than a caller constant-folding opportunity.
+    final boolSeed = Platform.numberOfProcessors > 0;
+    final boolFirstInput = !boolSeed;
+    final boolSecondInput = boolSeed;
+    final boolFirst = negateBool(boolFirstInput);
+    final boolSecond = negateBool(boolSecondInput);
     final boolProbe = DartPlantNative.boolSemanticProbe();
+    final boolSemanticPassed = boolProbe == 1 &&
+        boolFirst == boolFirstInput &&
+        boolSecond == boolSecondInput;
     debugPrint(
-      'DartPlant bool semantic probe: $boolProbe values=$boolTrue/$boolFalse',
+      'DartPlant bool semantic probe: $boolProbe inputs=$boolFirstInput/$boolSecondInput values=$boolFirst/$boolSecond',
+    );
+    _ciScenario(
+      'bool_semantics',
+      boolSemanticPassed,
+      <String, Object?>{
+        'native': boolProbe,
+        'first_input': boolFirstInput,
+        'second_input': boolSecondInput,
+        'first_result': boolFirst,
+        'second_result': boolSecond,
+      },
     );
     DartPlantNative.resetInstrumentedAddProbe();
     for (var index = 0; index < 5; ++index) {
@@ -414,6 +561,9 @@ Future<void> main() async {
     }
     final startupProbe = DartPlantNative.instrumentedAddProbe();
     debugPrint('DartPlant live VM startup probe: $startupProbe');
+    _ciScenario('live_vm_startup', startupProbe == 115, <String, Object?>{
+      'value': startupProbe,
+    });
     DartPlantNative.resetVerifiedAbiDoubleProbe();
     final ordinaryDirect = verifiedAbiDouble(1.25, 2.5);
     final lateSharedTransition = DartPlantNative.markVerifiedAbiDoubleShared();
@@ -425,22 +575,96 @@ Future<void> main() async {
     debugPrint(
       'DartPlant ordinary AOT typed probe: $ordinaryProbe values=$ordinaryDirect/$ordinaryAfterShared',
     );
-    final lateSharedPassed = lateSharedTransition == 1 &&
-        ordinaryProbe == 1 &&
+    final ordinaryPassed = ordinaryProbe == 1 &&
         ordinaryDirect == 16.125 &&
         ordinaryAfterShared == 6.25;
+    _ciScenario('ordinary_aot', ordinaryPassed, <String, Object?>{
+      'native': ordinaryProbe,
+    });
+    final lateSharedPassed = lateSharedTransition == 1 && ordinaryPassed;
     debugPrint(
       'DartPlant late shared typed fail-close: ${lateSharedPassed ? 1 : 0} transition=$lateSharedTransition values=$ordinaryDirect/$ordinaryAfterShared',
     );
+    _ciScenario('late_shared', lateSharedPassed, <String, Object?>{
+      'transition': lateSharedTransition,
+    });
 
-    if (Platform.isAndroid) {
-      final launchProbe =
-          await _launchChannel.invokeMethod<String>('launchProbe');
-      debugPrint('DartPlant app launch probe: ${launchProbe ?? 'none'}');
-      if (launchProbe == 'type_arguments') {
-        _runTypeArgumentsProof('adb');
-      }
+    final normalPassed = initializeStatus == 0 &&
+        localGateWarmupPassed &&
+        simpleFacadePassed &&
+        advancedOrdinaryHook == 0 &&
+        nullProbe == 1 &&
+        canonicalNull == null &&
+        rewrittenToNull == null &&
+        boolSemanticPassed &&
+        startupProbe == 115 &&
+        ordinaryPassed;
+    if (wants('normal')) {
+      _ciScenario('normal', normalPassed, <String, Object?>{
+        'initialize': initializeStatus,
+        'startup': startupProbe,
+        'ordinary': ordinaryProbe,
+      });
     }
+
+    if (wants('closure')) {
+      _ciScenario('closure', forcedStackClosurePassed, <String, Object?>{
+        'install': forcedStackClosureInstall,
+        'native': forcedStackClosureProbe,
+      });
+    }
+
+    if (wants('exception')) {
+      _ciScenario(
+        'exception',
+        exceptionLifetimePassed && p6ThrowPath == 2,
+        <String, Object?>{
+          'lifetime': exceptionLifetimeProbe,
+          'catch_path': exceptionLifetimeCatch,
+          'throw_path': p6ThrowPath,
+        },
+      );
+    }
+
+    if (wants('arguments_descriptor')) {
+      _runTypeArgumentsProof(
+        'ci_arguments_descriptor',
+        scenario: 'arguments_descriptor',
+        requireRelocation: false,
+      );
+    }
+    if (wants('generic_closure')) {
+      _runTypeArgumentsProof(
+        'ci_generic_closure',
+        scenario: 'generic_closure',
+        requireRelocation: false,
+      );
+    }
+    if (wants('generic_gc')) {
+      _runTypeArgumentsProof(
+        'adb',
+        scenario: 'generic_gc',
+        requireRelocation: true,
+      );
+    }
+
+    final transitionPassed = DartPlantNative.transitionProof() == 1;
+    if (wants('transition')) {
+      _ciScenario('transition', transitionPassed);
+    }
+    final artifactRevalidatePassed =
+        DartPlantNative.artifactLifecycleProof() == 1;
+    if (wants('artifact_revalidate')) {
+      _ciScenario('artifact_revalidate', artifactRevalidatePassed);
+    }
+
+    final selectedNativeProofPassed = requestedTest == 'all'
+        ? _ciRuntimeTests.every((name) => _ciScenarioResults[name] == true)
+        : _ciScenarioResults[requestedTest] == true;
+    _ciEvent('suite', <String, Object?>{
+      'state': selectedNativeProofPassed ? 'pass' : 'fail',
+      'test': requestedTest,
+    });
   });
 }
 

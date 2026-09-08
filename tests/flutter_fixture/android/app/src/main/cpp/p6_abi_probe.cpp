@@ -226,6 +226,8 @@ void ThrowingStackException(DartPlantInvocation* invocation, void*) {
     }
     DartPlantValue exception{};
     DartPlantValue stacktrace{};
+    DartPlantValue ordinary_argument{};
+    uint64_t raw_gp = 0;
     if (dartplant_invocation_get_exception(invocation, &exception) != DARTPLANT_OK ||
         dartplant_invocation_get_stacktrace(invocation, &stacktrace) != DARTPLANT_OK ||
         exception.kind != DARTPLANT_VALUE_HEAP_OBJECT ||
@@ -233,6 +235,18 @@ void ThrowingStackException(DartPlantInvocation* invocation, void*) {
         Fail("throwing exception object observation");
         return;
     }
+    const DartPlantStatus argument_status =
+        dartplant_invocation_get_argument(invocation, 0, &ordinary_argument);
+    const DartPlantStatus raw_gp_status =
+        dartplant_invocation_get_gp_register(invocation, 0, &raw_gp);
+    if (argument_status != DARTPLANT_INVALID_INVOCATION_PHASE ||
+        raw_gp_status != DARTPLANT_INVALID_INVOCATION_PHASE) {
+        Fail("throwing exception phase access isolation");
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "exception callback phase-safe access exception=1 stacktrace=1 "
+                        "argument_rejected=1 raw_gp_rejected=1");
     State().exception_object_observed.fetch_add(1, std::memory_order_relaxed);
     State().throwing_stack_exception.fetch_add(1, std::memory_order_relaxed);
 }

@@ -241,15 +241,25 @@ void ResetCapabilityProof(State& state, uint64_t capability) {
 
 void LogCapabilityTransition(State& state, uint64_t capability, const char* name,
                              const char* result) {
+    const uint64_t verified = state.verified_capabilities.load(std::memory_order_acquire);
+    const uint64_t failed = state.failed_capabilities.load(std::memory_order_acquire);
+    const uint64_t artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
         "capability proof name=%s result=%s capability=0x%llx verified=0x%llx failed=0x%llx "
         "artifact_generation=%llu",
         name, result, static_cast<unsigned long long>(capability),
-        static_cast<unsigned long long>(
-            state.verified_capabilities.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(state.failed_capabilities.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(state.artifact_generation.load(std::memory_order_acquire)));
+        static_cast<unsigned long long>(verified), static_cast<unsigned long long>(failed),
+        static_cast<unsigned long long>(artifact_generation));
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "DARTPLANT_CI {\"event\":\"capability\",\"name\":\"%s\",\"state\":\"%s\","
+                        "\"capability\":\"0x%llx\",\"verified\":\"0x%llx\",\"failed\":\"0x%llx\","
+                        "\"artifact_generation\":%llu,\"isolate_generation\":%llu}",
+                        name, result, static_cast<unsigned long long>(capability),
+                        static_cast<unsigned long long>(verified),
+                        static_cast<unsigned long long>(failed),
+                        static_cast<unsigned long long>(artifact_generation),
+                        static_cast<unsigned long long>(state.identity.generation));
 }
 
 bool ProveTransitionCapability(State& state) {
@@ -1029,6 +1039,14 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
                         "ABI resolver summary candidates=%zu passed_rows=%zu distinct_abis=%zu",
                         resolution.candidates.size(), resolution.passed_rows,
                         resolution.distinct_abis);
+    __android_log_print(
+        resolution.passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DARTPLANT_CI {\"event\":\"core_binding\",\"state\":\"%s\","
+        "\"candidate_count\":%zu,\"passing_count\":%zu,\"distinct_abis\":%zu,"
+        "\"abi\":\"%s\"}",
+        resolution.passed ? "verified" : "rejected", resolution.candidates.size(),
+        resolution.passed_rows, resolution.distinct_abis,
+        resolution.binding.profile == nullptr ? "none" : resolution.binding.profile->abi_id);
     if (!resolution.passed || resolution.binding.profile == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
                             "VM ABI structural proof rejected: distinct passing ABI count=%zu",

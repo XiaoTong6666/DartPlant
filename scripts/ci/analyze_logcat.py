@@ -11,15 +11,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from common import RUNTIME_SCENARIOS
+try:
+    from .capability_registry import mask as capability_mask
+    from .capability_registry import required_event_capabilities
+    from .common import RUNTIME_SCENARIOS
+except ImportError:
+    from capability_registry import mask as capability_mask
+    from capability_registry import required_event_capabilities
+    from common import RUNTIME_SCENARIOS
 
 
 CI_PREFIX = "DARTPLANT_CI "
-REQUIRED_CAPABILITIES = (
-    "generated-transition",
-    "active-exception",
-    "type-arguments-element",
-)
 LEGACY_PROOFS = {
     "Source structural proof": (
         "result=pass stage=complete",
@@ -116,6 +118,19 @@ def _event_group(
     return [event for event in events if event.get("event") == event_name]
 
 
+def _capability_event_detail(event: dict[str, object]) -> str:
+    return (
+        f"capability={event.get('capability')} state={event.get('state')} "
+        f"source_rows={event.get('source_rows')} "
+        f"root_compatible={event.get('root_compatible')} "
+        f"relational_passed={event.get('relational_passed')} "
+        f"distinct_keys={event.get('distinct_keys')} "
+        f"selected_rows={event.get('selected_rows')} "
+        f"artifact_generation={event.get('artifact_generation')} "
+        f"isolate_generation={event.get('isolate_generation')}"
+    )
+
+
 def _check_runtime(
     events: list[dict[str, object]], expected_flutter: str, expected_dart: str
 ) -> Check:
@@ -207,6 +222,7 @@ def _select_lifecycle(
             verified_revalidated = _hex(event["verified_revalidated"])
             failed_before = _hex(event["failed_before"])
             failed_revalidated = _hex(event["failed_revalidated"])
+            expected_verified = capability_mask(verified_after_create=True)
             generation_before = _int(event["generation_before"])
             generation_quiesced = _int(event["generation_quiesced"])
             generation_invalidated = _int(event["generation_invalidated"])
@@ -214,9 +230,11 @@ def _select_lifecycle(
             isolate_generation = _int(event["isolate_generation"])
             relational = (
                 event.get("state") == "pass"
-                and capabilities == required
-                and verified_before == verified_revalidated
-                and verified_invalidated & ~verified_before == 0
+                and required == capability_mask(cold_required=True)
+                and (capabilities & required) == required
+                and verified_before == expected_verified
+                and verified_revalidated == expected_verified
+                and verified_invalidated == 0
                 and failed_before == 0
                 and failed_revalidated == 0
                 and generation_before > 0
@@ -253,22 +271,42 @@ def _check_capabilities(
     events: list[dict[str, object]], generation: int | None, isolate_generation: int | None
 ) -> list[Check]:
     capability_events = _event_group(events, "capability")
-    failed_events = [event for event in capability_events if event.get("state") == "failed"]
+    failure_states = {
+        "predicate_failed",
+        "ambiguous",
+        "generation_stale",
+        "dependency_mismatch",
+    }
+    failed_events = [event for event in capability_events if event.get("state") in failure_states]
     checks = [
         Check(
             "Capability failures",
             not failed_events,
-            f"failed_events={len(failed_events)}",
+            f"failed_events={len(failed_events)}"
+            + (f" first={_capability_event_detail(failed_events[0])}" if failed_events else ""),
         )
     ]
-    for name in REQUIRED_CAPABILITIES:
-        named = [event for event in capability_events if event.get("name") == name]
+    for capability in required_event_capabilities():
+        named = [
+            event
+            for event in capability_events
+            if event.get("capability") == capability.diagnostic_name
+        ]
         generation_matches = []
         for event in named:
             try:
+                selected_rows = event.get("selected_rows")
+                relational_passed = _int(event.get("relational_passed", -1))
                 generation_matches.append(
-                    event.get("state") == "verified"
+                    _int(event.get("schema_version", 0)) >= 2
+                    and event.get("state") == "verified"
+                    and _hex(event.get("capability_bit", "0x0")) == capability.bit
                     and _hex(event.get("failed", "0x1")) == 0
+                    and _int(event.get("source_rows", 0)) >= 1
+                    and _int(event.get("root_compatible", 0)) >= relational_passed >= 1
+                    and _int(event.get("distinct_keys", 0)) == 1
+                    and isinstance(selected_rows, list)
+                    and len(selected_rows) == relational_passed
                     and generation is not None
                     and _int(event.get("artifact_generation", -1)) == generation
                     and isolate_generation is not None
@@ -278,10 +316,11 @@ def _check_capabilities(
                 generation_matches.append(False)
         checks.append(
             Check(
-                f"Capability {name}",
+                f"Capability {capability.diagnostic_name}",
                 any(generation_matches),
                 f"events={len(named)} artifact_generation={generation} "
-                f"isolate_generation={isolate_generation} matching={sum(generation_matches)}",
+                f"isolate_generation={isolate_generation} matching={sum(generation_matches)}"
+                + (f" last={_capability_event_detail(named[-1])}" if named else ""),
             )
         )
     return checks

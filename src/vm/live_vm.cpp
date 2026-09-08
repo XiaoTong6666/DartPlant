@@ -21,7 +21,11 @@
 #include <vector>
 
 #include "runtime/runtime_internal.h"
+#include "vm/abi/probe.h"
 #include "vm/abi/proof.h"
+#include "vm/abi/resolver.h"
+#include "vm/dart_string.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
@@ -300,53 +304,17 @@ bool ReadPositiveCompressedSmi(const ProcessMemoryReader& reader, uintptr_t addr
 
 bool ReadDartString(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                     uint64_t tagged, char* output, size_t capacity) {
-    if (output == nullptr || capacity == 0 || !IsHeapObject(profile, tagged)) return false;
-    output[0] = '\0';
-    uint32_t cid = 0;
-    if (!ReadCid(reader, profile, tagged, &cid) ||
-        (cid != profile.cid_one_byte_string && cid != profile.cid_two_byte_string)) {
-        return false;
-    }
-    const uintptr_t object = Untag(profile, tagged);
-    uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, object + profile.string_length_offset, profile,
-                                   &length) ||
-        length >= capacity) {
-        return false;
-    }
-    if (cid == profile.cid_one_byte_string) {
-        if (!reader.ReadBytes(object + profile.string_data_offset, output,
-                              static_cast<size_t>(length))) {
-            return false;
-        }
-        output[length] = '\0';
-        return true;
-    }
-
-    if (length > (std::numeric_limits<size_t>::max() / sizeof(uint16_t))) return false;
-    std::vector<uint16_t> units(static_cast<size_t>(length));
-    if (!reader.ReadBytes(object + profile.string_data_offset, units.data(),
-                          units.size() * sizeof(uint16_t))) {
-        return false;
-    }
-    size_t cursor = 0;
-    for (uint16_t unit : units) {
-        if (unit <= 0x7f) {
-            if (cursor + 1 >= capacity) return false;
-            output[cursor++] = static_cast<char>(unit);
-        } else if (unit <= 0x7ff) {
-            if (cursor + 2 >= capacity) return false;
-            output[cursor++] = static_cast<char>(0xc0 | (unit >> 6));
-            output[cursor++] = static_cast<char>(0x80 | (unit & 0x3f));
-        } else {
-            if (cursor + 3 >= capacity) return false;
-            output[cursor++] = static_cast<char>(0xe0 | (unit >> 12));
-            output[cursor++] = static_cast<char>(0x80 | ((unit >> 6) & 0x3f));
-            output[cursor++] = static_cast<char>(0x80 | (unit & 0x3f));
-        }
-    }
-    output[cursor] = '\0';
-    return true;
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr) return false;
+    RuntimeProfileRecord record{};
+    record.live_vm = profile;
+    record.raw_object = *raw;
+    return vm_abi::ReadDartStringUtf8(
+        record, tagged,
+        [&reader](uintptr_t address, void* output_bytes, size_t size) {
+            return reader.ReadBytes(address, output_bytes, size);
+        },
+        output, capacity);
 }
 
 bool ReadArrayElement(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
@@ -1394,6 +1362,241 @@ DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& co
     return DARTPLANT_OK;
 }
 
+DartPlantStatus ReadLiveVmFunctionSignatureForProfile(
+    const DartPlantLiveVmContext& context, const RuntimeProfileRecord& profile, uint64_t function,
+    DartPlantDartFunctionSignatureInfo* out_signature) {
+    if (out_signature == nullptr ||
+        out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo) ||
+        context.heap_base == 0 || function == 0) {
+        SetLastError("live VM FunctionType profile parser arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ProcessMemoryReader reader;
+    if (!reader.Refresh()) {
+        SetLastError("cannot inspect process mappings for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    ParsedFunctionSignature parsed{};
+    const DartPlantStatus status = ParseRetainedFunctionSignature(
+        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+
+    DartPlantDartFunctionSignatureInfo signature{};
+    signature.struct_size = sizeof(signature);
+    signature.parameter_count = parsed.parameter_count;
+    signature.implicit_parameter_count = parsed.implicit_parameter_count;
+    signature.fixed_parameter_count = parsed.fixed_parameter_count;
+    signature.optional_parameter_count = parsed.optional_parameter_count;
+    signature.type_parameter_count = parsed.type_parameter_count;
+    signature.parent_type_argument_count = parsed.parent_type_argument_count;
+    signature.has_named_optional_parameters = parsed.has_named_optional_parameters ? 1 : 0;
+    signature.result_type = parsed.result_type;
+    *out_signature = signature;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmContext& context,
+                                                      const RuntimeProfileRecord& profile,
+                                                      uint64_t function, uint32_t index,
+                                                      DartPlantDartParameterInfo* out_parameter) {
+    if (out_parameter == nullptr ||
+        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo) || context.heap_base == 0 ||
+        function == 0) {
+        SetLastError("live VM FunctionType parameter profile parser arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ProcessMemoryReader reader;
+    if (!reader.Refresh()) {
+        SetLastError("cannot inspect process mappings for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    ParsedFunctionSignature parsed{};
+    DartPlantStatus status = ParseRetainedFunctionSignature(
+        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+    if (index >= parsed.parameter_count) {
+        SetLastError("FunctionType parameter index is out of range");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    uint64_t tagged_type = 0;
+    if (!ReadArrayElement(reader, profile.live_vm, context.heap_base, parsed.parameter_types, index,
+                          &tagged_type)) {
+        return FailProbe("FunctionType parameter type is unreadable");
+    }
+    DartPlantDartParameterInfo parameter{};
+    parameter.struct_size = sizeof(parameter);
+    parameter.index = index;
+    if (!DecodeDartType(reader, profile.live_vm, profile.function_type, tagged_type,
+                        &parameter.type)) {
+        return FailProbe("FunctionType parameter type is invalid");
+    }
+    if (index < parsed.implicit_parameter_count) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_IMPLICIT;
+    } else if (index < parsed.fixed_parameter_count) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_REQUIRED_POSITIONAL;
+        parameter.is_required = 1;
+    } else if (!parsed.has_named_optional_parameters) {
+        parameter.kind = DARTPLANT_DART_PARAMETER_OPTIONAL_POSITIONAL;
+    } else {
+        parameter.kind = DARTPLANT_DART_PARAMETER_NAMED;
+        const uint32_t named_index = index - parsed.fixed_parameter_count;
+        uint64_t tagged_name = 0;
+        if (!ReadArrayElement(reader, profile.live_vm, context.heap_base,
+                              parsed.named_parameter_names, named_index, &tagged_name) ||
+            !ReadDartString(reader, profile.live_vm, tagged_name, parameter.name,
+                            sizeof(parameter.name))) {
+            return FailProbe("FunctionType named parameter name is invalid");
+        }
+        const uint32_t flag_index =
+            parsed.optional_parameter_count + named_index / kNamedParameterFlagsPerSmi;
+        uint64_t named_slot_count = 0;
+        uint32_t raw_flags = 0;
+        if (!ReadArrayLength(reader, profile.live_vm, parsed.named_parameter_names,
+                             &named_slot_count) ||
+            flag_index >= named_slot_count ||
+            !ReadArrayRawElement(reader, profile.live_vm, parsed.named_parameter_names, flag_index,
+                                 &raw_flags) ||
+            (raw_flags & profile.raw_object.smi_tag_mask) != profile.raw_object.smi_tag) {
+            return FailProbe("FunctionType required-named flags are invalid");
+        }
+        const uint32_t flags = raw_flags >> profile.raw_object.smi_tag_shift;
+        parameter.is_required =
+            (flags & (1U << (named_index % kNamedParameterFlagsPerSmi))) != 0 ? 1 : 0;
+    }
+    *out_parameter = parameter;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+LiveVmCandidateResolution ResolveLiveVmCandidateForArm64ContextInternal(
+    const DartPlantFlutterSnapshotInfo& snapshot, const DartPlantArm64Context& context) {
+    VmRuntimeFacts facts{};
+    facts.snapshot_hash = snapshot.snapshot_hash == nullptr ? "" : snapshot.snapshot_hash;
+    facts.snapshot_features =
+        snapshot.snapshot_features == nullptr ? "" : snapshot.snapshot_features;
+    facts.compressed_pointers = snapshot.compressed_pointers != 0;
+    const auto profiles = ResolveRuntimeProfileCandidates(facts);
+    vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = profiles;
+    std::vector<vm_abi::RootProof> roots;
+    roots.reserve(profiles.size());
+    std::vector<bool> compatible;
+    compatible.reserve(profiles.size());
+    for (const auto* profile : profiles) {
+        vm_abi::RootProof root{};
+        if (profile != nullptr && profile->live_vm.thr_register < 31 &&
+            profile->live_vm.pp_register < 31 && profile->live_vm.heap_bits_register < 31 &&
+            profile->live_vm.null_register < 31) {
+            vm_abi::RootProofInput input{};
+            input.profile = profile;
+            input.thread = CanonicalNativePointer(context.x[profile->live_vm.thr_register]);
+            input.require_dart_core = true;
+            input.registers = {
+                .available = true,
+                .pp = context.x[profile->live_vm.pp_register],
+                .heap_bits = context.x[profile->live_vm.heap_bits_register],
+                .null_value = context.x[profile->live_vm.null_register],
+            };
+            root = vm_abi::ProveRuntimeRoots(input);
+        }
+        roots.push_back(root);
+        compatible.push_back(root.passed);
+    }
+    const auto selection =
+        vm_abi::SelectCapabilityAbiSet(candidates, vm_abi::kCapabilityRuntimeRoots, compatible);
+    if (!selection.passed()) {
+        SetLastError(selection.ambiguous()
+                         ? "live VM runtime-root capability is ambiguous across candidate profiles"
+                         : "live VM runtime-root capability rejected every candidate profile");
+        return {};
+    }
+    const auto found = std::find(profiles.begin(), profiles.end(), selection.representative);
+    if (found == profiles.end()) {
+        SetLastError("live VM runtime-root capability selected an unknown profile");
+        return {};
+    }
+    return {
+        .profile = selection.representative,
+        .probe = {.roots = roots[static_cast<size_t>(std::distance(profiles.begin(), found))]},
+    };
+}
+
+DartPlantStatus ResolveLiveVmCandidateForArm64Context(const DartPlantFlutterSnapshotInfo& snapshot,
+                                                      const DartPlantArm64Context& context,
+                                                      LiveVmCandidateResolution* out_resolution) {
+    if (out_resolution == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    *out_resolution = ResolveLiveVmCandidateForArm64ContextInternal(snapshot, context);
+    if (out_resolution->profile == nullptr) return DARTPLANT_PROFILE_MISMATCH;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus ResolveLiveVmCandidateForRegisters(const DartPlantFlutterSnapshotInfo& snapshot,
+                                                   const DartPlantLiveVmArm64Registers& registers,
+                                                   LiveVmCandidateResolution* out_resolution,
+                                                   DartPlantLiveVmContext* out_context) {
+    if (out_resolution == nullptr || out_context == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    DartPlantArm64Context context{};
+    context.pc = registers.pc;
+    context.sp = registers.sp;
+    context.x[22] = registers.null_value;
+    context.x[26] = registers.thr;
+    context.x[27] = registers.pp;
+    context.x[28] = registers.heap_bits;
+    const DartPlantStatus status =
+        ResolveLiveVmCandidateForArm64Context(snapshot, context, out_resolution);
+    if (status != DARTPLANT_OK) return status;
+    const auto& profile = *out_resolution->profile;
+    const auto& roots = out_resolution->probe.roots;
+    DartPlantLiveVmContext result{};
+    result.struct_size = sizeof(result);
+    result.profile_version = profile.live_vm.profile_version;
+    result.profile_name = profile.live_vm.name;
+    result.thread = CanonicalNativePointer(registers.thr);
+    result.isolate = roots.isolate;
+    result.isolate_group = roots.isolate_group;
+    result.class_table = roots.class_table;
+    result.cached_class_table_table = roots.cached_class_table_table;
+    result.object_store = roots.object_store;
+    result.heap_base = roots.heap_base;
+    result.pp = registers.pp;
+    result.global_object_pool = roots.global_object_pool;
+    result.object_pool_length = roots.object_pool_length;
+    *out_context = result;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus VisitLiveVmFunctionsForProfile(const DartPlantLiveVmContext& context,
+                                               const DartPlantFlutterSnapshotInfo& snapshot,
+                                               const RuntimeProfileRecord& profile_record,
+                                               DartPlantLiveVmFunctionVisitor visitor,
+                                               void* user_data,
+                                               DartPlantLiveVmFunctionIndexInfo* out_info) {
+    if (visitor == nullptr || out_info == nullptr) {
+        SetLastError("live VM function enumeration callback arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ProcessMemoryReader reader;
+    if (!reader.Refresh()) {
+        return FailProbe("cannot read /proc/self/maps for live Function index");
+    }
+    std::vector<CollectedLiveFunction> functions;
+    DartPlantLiveVmFunctionIndexInfo info{};
+    info.struct_size = sizeof(info);
+    if (!CollectAllLiveFunctions(reader, profile_record.live_vm, context, snapshot, &functions,
+                                 &info)) {
+        return FailProbe("failed to enumerate live Dart Function graph");
+    }
+    for (const auto& function : functions) {
+        if (!visitor(&function.info, user_data)) break;
+    }
+    *out_info = info;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
 }  // namespace dartplant
 
 extern "C" DartPlantStatus dartplant_live_vm_select_profile(
@@ -1423,52 +1626,10 @@ extern "C" DartPlantStatus dartplant_live_vm_context_from_arm64_registers(
         return DARTPLANT_INVALID_ARGUMENT;
     }
 
-    DartPlantLiveVmProfile profile{};
-    profile.struct_size = sizeof(profile);
-    DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
+    dartplant::LiveVmCandidateResolution resolution{};
+    const DartPlantStatus status = dartplant::ResolveLiveVmCandidateForRegisters(
+        *snapshot, *registers, &resolution, out_context);
     if (status != DARTPLANT_OK) return status;
-    const dartplant::RuntimeProfileRecord* record =
-        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
-    if (record == nullptr) {
-        return dartplant::FailProbe("selected live VM raw-object profile is incomplete");
-    }
-
-    DartPlantLiveVmContext context{};
-    context.struct_size = sizeof(context);
-    context.profile_version = profile.profile_version;
-    context.profile_name = profile.name;
-    context.thread = dartplant::CanonicalNativePointer(registers->thr);
-    context.pp = registers->pp;
-    if (context.thread == 0) {
-        return dartplant::FailProbe("sampled THR is not a readable Dart Thread");
-    }
-
-    dartplant::vm_abi::RootProofInput proof_input{};
-    proof_input.profile = record;
-    proof_input.thread = context.thread;
-    proof_input.require_dart_core = true;
-    proof_input.registers = {
-        .available = true,
-        .pp = registers->pp,
-        .heap_bits = registers->heap_bits,
-        .null_value = registers->null_value,
-    };
-    const dartplant::vm_abi::RootProof roots = dartplant::vm_abi::ProveRuntimeRoots(proof_input);
-    if (!roots.passed) {
-        const std::string message = std::string("shared VM root proof failed at ") +
-                                    dartplant::vm_abi::RootProofStageName(roots.stage);
-        return dartplant::FailProbe(message.c_str());
-    }
-    context.heap_base = roots.heap_base;
-    context.isolate = roots.isolate;
-    context.isolate_group = roots.isolate_group;
-    context.global_object_pool = roots.global_object_pool;
-    context.class_table = roots.class_table;
-    context.cached_class_table_table = roots.cached_class_table_table;
-    context.object_store = roots.object_store;
-    context.object_pool_length = roots.object_pool_length;
-
-    *out_context = context;
     dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
@@ -1484,16 +1645,13 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
         return DARTPLANT_INVALID_ARGUMENT;
     }
 
-    DartPlantLiveVmProfile profile{};
-    profile.struct_size = sizeof(profile);
-    DartPlantStatus status = dartplant::SelectProfile(*snapshot, &profile);
+    dartplant::LiveVmCandidateResolution resolution{};
+    DartPlantStatus status = dartplant::ResolveLiveVmCandidateForArm64Context(
+        *snapshot, *invocation->context, &resolution);
     if (status != DARTPLANT_OK) return status;
-    const dartplant::RawObjectLayout* raw = dartplant::FindRawObjectLayout(profile.profile_version);
-    const dartplant::RuntimeProfileRecord* record =
-        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
-    if (raw == nullptr || record == nullptr) {
-        return dartplant::FailProbe("live VM raw-object profile is unavailable");
-    }
+    const dartplant::RuntimeProfileRecord* record = resolution.profile;
+    DartPlantLiveVmProfile profile = record->live_vm;
+    const dartplant::RawObjectLayout* raw = &record->raw_object;
 
     dartplant::ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1509,29 +1667,12 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     info.thread = dartplant::CanonicalNativePointer(context.x[profile.thr_register]);
     info.pp = context.x[profile.pp_register];
     info.code_register = context.x[profile.code_register];
-    const uint64_t heap_bits = context.x[profile.heap_bits_register];
-    const uint64_t null_register = context.x[profile.null_register];
 
     if (info.thread == 0) {
         return dartplant::FailProbe("THR does not point to a readable Dart Thread layout");
     }
 
-    dartplant::vm_abi::RootProofInput root_input{};
-    root_input.profile = record;
-    root_input.thread = info.thread;
-    root_input.require_dart_core = true;
-    root_input.registers = {
-        .available = true,
-        .pp = info.pp,
-        .heap_bits = heap_bits,
-        .null_value = null_register,
-    };
-    const dartplant::vm_abi::RootProof roots = dartplant::vm_abi::ProveRuntimeRoots(root_input);
-    if (!roots.passed) {
-        const std::string message = std::string("shared VM invocation proof failed at ") +
-                                    dartplant::vm_abi::RootProofStageName(roots.stage);
-        return dartplant::FailProbe(message.c_str());
-    }
+    const dartplant::vm_abi::RootProof& roots = resolution.probe.roots;
     const uint64_t thread_null = roots.thread_null;
     info.heap_base = roots.heap_base;
     info.isolate = roots.isolate;
@@ -1592,6 +1733,12 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     }
 
     info.code = function_code;
+    const auto function_code_entry_proof = dartplant::vm_abi::ProveFunctionCodeEntry(
+        *record, info.heap_base, info.function, info.code, target_entry,
+        dartplant::HasSnapshotFeature(snapshot->snapshot_features, "dedup_instructions"));
+    if (!function_code_entry_proof.passed) {
+        return dartplant::FailProbe("Function -> Code -> entry relational proof failed");
+    }
     if (!dartplant::RequireCid(reader, profile, info.code, profile.cid_code)) {
         return dartplant::FailProbe("Function.code is not a Dart Code object");
     }
@@ -1740,6 +1887,11 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
         dartplant::SetLastError("live VM context profile does not match snapshot profile");
         return DARTPLANT_PROFILE_MISMATCH;
     }
+    const dartplant::RuntimeProfileRecord* record =
+        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
+    if (record == nullptr) {
+        return dartplant::FailProbe("live VM method has no source-verified ABI record");
+    }
 
     dartplant::ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1841,6 +1993,12 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
         !reader.Read(code + profile.code_instructions_length_offset, &method.code_size) ||
         method.code_size == 0) {
         return dartplant::FailProbe("failed to reconstruct live VM Code");
+    }
+    const auto function_code_entry_proof = dartplant::vm_abi::ProveFunctionCodeEntry(
+        *record, context->heap_base, method.function, method.code, method.function_entry_point,
+        dartplant::HasSnapshotFeature(snapshot->snapshot_features, "dedup_instructions"));
+    if (!function_code_entry_proof.passed) {
+        return dartplant::FailProbe("Function -> Code -> entry relational proof failed");
     }
     method.function_code_owner_match = method.code_owner == method.function ? 1 : 0;
     method.code_owner_is_function =
@@ -2019,24 +2177,13 @@ extern "C" DartPlantStatus dartplant_live_vm_visit_functions(
         dartplant::SetLastError("live VM context profile does not match function index profile");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-
-    dartplant::ProcessMemoryReader reader;
-    if (!reader.Refresh()) {
-        return dartplant::FailProbe("cannot read /proc/self/maps for live Function index");
+    const dartplant::RuntimeProfileRecord* record =
+        dartplant::FindRuntimeProfileByVersion(profile.profile_version);
+    if (record == nullptr) {
+        return dartplant::FailProbe("live VM function index has no source-verified ABI record");
     }
-    std::vector<dartplant::CollectedLiveFunction> functions;
-    DartPlantLiveVmFunctionIndexInfo info{};
-    info.struct_size = sizeof(info);
-    if (!dartplant::CollectAllLiveFunctions(reader, profile, *context, *snapshot, &functions,
-                                            &info)) {
-        return dartplant::FailProbe("failed to enumerate live Dart Function graph");
-    }
-    for (const auto& function : functions) {
-        if (!visitor(&function.info, user_data)) break;
-    }
-    *out_info = info;
-    dartplant::ClearLastError();
-    return DARTPLANT_OK;
+    return dartplant::VisitLiveVmFunctionsForProfile(*context, *snapshot, *record, visitor,
+                                                     user_data, out_info);
 }
 
 extern "C" DartPlantStatus dartplant_live_vm_object_pool_offset_from_index(

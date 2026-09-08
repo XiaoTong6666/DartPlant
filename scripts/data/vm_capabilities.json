@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "capabilities": [
+    {
+      "key": "runtime_roots",
+      "cpp_symbol": "kCapabilityRuntimeRoots",
+      "diagnostic_name": "RuntimeRoots",
+      "bit": 1,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "owner_identity",
+      "cpp_symbol": "kCapabilityOwnerIdentity",
+      "diagnostic_name": "OwnerIdentity",
+      "bit": 2,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "canonical_null",
+      "cpp_symbol": "kCapabilityCanonicalNull",
+      "diagnostic_name": "CanonicalNull",
+      "bit": 4,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "register_semantics",
+      "cpp_symbol": "kCapabilityRegisterSemantics",
+      "diagnostic_name": "RegisterSemantics",
+      "bit": 8,
+      "cold_required": false,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "dart_core",
+      "cpp_symbol": "kCapabilityDartCore",
+      "diagnostic_name": "DartCore",
+      "bit": 16,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "safepoint_stubs",
+      "cpp_symbol": "kCapabilitySafepointStubs",
+      "diagnostic_name": "SafepointStubs",
+      "bit": 32,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "generated_transition_layout",
+      "cpp_symbol": "kCapabilityGeneratedTransitionLayout",
+      "diagnostic_name": "GeneratedTransition",
+      "bit": 64,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": true
+    },
+    {
+      "key": "exception_layout",
+      "cpp_symbol": "kCapabilityExceptionLayout",
+      "diagnostic_name": "ActiveException",
+      "bit": 128,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": true
+    },
+    {
+      "key": "type_arguments_layout",
+      "cpp_symbol": "kCapabilityTypeArgumentsLayout",
+      "diagnostic_name": "TypeArguments",
+      "bit": 256,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": true
+    },
+    {
+      "key": "artifact_lifecycle",
+      "cpp_symbol": "kCapabilityArtifactLifecycle",
+      "diagnostic_name": "ArtifactLifecycle",
+      "bit": 512,
+      "cold_required": true,
+      "verified_after_create": true,
+      "ci_required_event": false
+    },
+    {
+      "key": "arguments_descriptor_layout",
+      "cpp_symbol": "kCapabilityArgumentsDescriptorLayout",
+      "diagnostic_name": "ArgumentsDescriptor",
+      "bit": 1024,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "invocation_call_abi",
+      "cpp_symbol": "kCapabilityInvocationCallAbi",
+      "diagnostic_name": "InvocationCallAbi",
+      "bit": 2048,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "function_code_layout",
+      "cpp_symbol": "kCapabilityFunctionCodeLayout",
+      "diagnostic_name": "FunctionCode",
+      "bit": 4096,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "aot_entry_layout",
+      "cpp_symbol": "kCapabilityAotEntryLayout",
+      "diagnostic_name": "AotEntry",
+      "bit": 8192,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "function_type_layout",
+      "cpp_symbol": "kCapabilityFunctionTypeLayout",
+      "diagnostic_name": "FunctionType",
+      "bit": 16384,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "closure_call_layout",
+      "cpp_symbol": "kCapabilityClosureCallLayout",
+      "diagnostic_name": "ClosureCall",
+      "bit": 32768,
+      "cold_required": true,
+      "verified_after_create": false,
+      "ci_required_event": false
+    },
+    {
+      "key": "exception_bridge_layout",
+      "cpp_symbol": "kCapabilityExceptionBridgeLayout",
+      "diagnostic_name": "ExceptionBridge",
+      "bit": 65536,
+      "cold_required": false,
+      "verified_after_create": false,
+      "ci_required_event": false
+    }
+  ]
+}

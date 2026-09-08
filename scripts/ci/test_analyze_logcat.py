@@ -5,6 +5,8 @@ import json
 import unittest
 
 import analyze_logcat
+from capability_registry import mask as capability_mask
+from capability_registry import required_event_capabilities
 from common import RUNTIME_SCENARIOS
 
 
@@ -24,6 +26,9 @@ def _metadata() -> dict[str, object]:
 
 
 def _passing_lines() -> list[str]:
+    required_mask = capability_mask(cold_required=True)
+    available_mask = required_mask | 0x10000
+    verified_after_create = capability_mask(verified_after_create=True)
     lines = [
         _event(
             event="runtime",
@@ -43,11 +48,11 @@ def _passing_lines() -> list[str]:
         _event(
             event="artifact_lifecycle",
             state="pass",
-            capabilities="0x3f7",
-            required="0x3f7",
-            verified_before="0x237",
-            verified_invalidated="0x17",
-            verified_revalidated="0x237",
+            capabilities=hex(available_mask),
+            required=hex(required_mask),
+            verified_before=hex(verified_after_create),
+            verified_invalidated="0x0",
+            verified_revalidated=hex(verified_after_create),
             failed_before="0x0",
             failed_revalidated="0x0",
             generation_before=1,
@@ -61,14 +66,20 @@ def _passing_lines() -> list[str]:
             revalidation_status=0,
         ),
     ]
-    for name in analyze_logcat.REQUIRED_CAPABILITIES:
+    for capability in required_event_capabilities():
         lines.append(
             _event(
                 event="capability",
-                name=name,
+                schema_version=2,
+                capability=capability.diagnostic_name,
+                capability_bit=hex(capability.bit),
                 state="verified",
-                capability="0x40",
-                verified="0x3f7",
+                source_rows=3,
+                root_compatible=2,
+                relational_passed=2,
+                distinct_keys=1,
+                selected_rows=["A", "B"],
+                verified=hex(available_mask),
                 failed="0x0",
                 artifact_generation=2,
                 isolate_generation=1,
@@ -118,8 +129,9 @@ class AnalyzeLogcatTest(unittest.TestCase):
 
     def test_stale_capability_generation_fails(self) -> None:
         lines = _passing_lines()
+        capability_name = required_event_capabilities()[0].diagnostic_name
         for index, line in enumerate(lines):
-            if '"event":"capability"' in line and '"name":"generated-transition"' in line:
+            if '"event":"capability"' in line and f'"capability":"{capability_name}"' in line:
                 event = json.loads(line.split(analyze_logcat.CI_PREFIX, 1)[1])
                 event["artifact_generation"] = 1
                 lines[index] = "I/DartPlant: DARTPLANT_CI " + json.dumps(
@@ -129,12 +141,13 @@ class AnalyzeLogcatTest(unittest.TestCase):
         analysis = self._analyze(lines)
         self.assertFalse(analysis.passed)
         failed = {check.name for check in analysis.checks if not check.passed}
-        self.assertIn("Capability generated-transition", failed)
+        self.assertIn(f"Capability {capability_name}", failed)
 
     def test_stale_isolate_generation_fails(self) -> None:
         lines = _passing_lines()
+        capability_name = required_event_capabilities()[1].diagnostic_name
         for index, line in enumerate(lines):
-            if '"event":"capability"' in line and '"name":"active-exception"' in line:
+            if '"event":"capability"' in line and f'"capability":"{capability_name}"' in line:
                 event = json.loads(line.split(analyze_logcat.CI_PREFIX, 1)[1])
                 event["isolate_generation"] = 2
                 lines[index] = "I/DartPlant: DARTPLANT_CI " + json.dumps(
@@ -144,7 +157,83 @@ class AnalyzeLogcatTest(unittest.TestCase):
         analysis = self._analyze(lines)
         self.assertFalse(analysis.passed)
         failed = {check.name for check in analysis.checks if not check.passed}
-        self.assertIn("Capability active-exception", failed)
+        self.assertIn(f"Capability {capability_name}", failed)
+
+    def test_capability_superset_is_accepted(self) -> None:
+        analysis = self._analyze(_passing_lines())
+        lifecycle = next(check for check in analysis.checks if check.name == "Artifact lifecycle")
+        self.assertTrue(lifecycle.passed, lifecycle.detail)
+
+    def test_capability_ambiguity_is_distinguished(self) -> None:
+        lines = _passing_lines()
+        capability_name = required_event_capabilities()[0].diagnostic_name
+        for index, line in enumerate(lines):
+            if '"event":"capability"' in line and f'"capability":"{capability_name}"' in line:
+                event = json.loads(line.split(analyze_logcat.CI_PREFIX, 1)[1])
+                event.update(
+                    state="ambiguous",
+                    distinct_keys=2,
+                    selected_rows=[],
+                    failed=hex(required_event_capabilities()[0].bit),
+                )
+                lines[index] = "I/DartPlant: DARTPLANT_CI " + json.dumps(
+                    event, separators=(",", ":")
+                )
+                break
+        analysis = self._analyze(lines)
+        failures = [check for check in analysis.checks if not check.passed]
+        self.assertTrue(any("ambiguous" in check.detail for check in failures), failures)
+
+    def test_capability_failure_states_remain_distinguishable(self) -> None:
+        capability = required_event_capabilities()[0]
+        for state in ("predicate_failed", "dependency_mismatch", "generation_stale"):
+            with self.subTest(state=state):
+                lines = _passing_lines()
+                for index, line in enumerate(lines):
+                    if (
+                        '"event":"capability"' in line
+                        and f'"capability":"{capability.diagnostic_name}"' in line
+                    ):
+                        event = json.loads(line.split(analyze_logcat.CI_PREFIX, 1)[1])
+                        event["state"] = state
+                        event["failed"] = hex(capability.bit)
+                        if state == "predicate_failed":
+                            event["relational_passed"] = 0
+                            event["distinct_keys"] = 0
+                            event["selected_rows"] = []
+                        lines[index] = "I/DartPlant: DARTPLANT_CI " + json.dumps(
+                            event, separators=(",", ":")
+                        )
+                        break
+                analysis = self._analyze(lines)
+                failure = next(
+                    check for check in analysis.checks if check.name == "Capability failures"
+                )
+                self.assertFalse(failure.passed)
+                self.assertIn(f"state={state}", failure.detail)
+
+    def test_unknown_future_capability_event_is_ignored(self) -> None:
+        lines = _passing_lines()
+        lines.append(
+            _event(
+                event="capability",
+                schema_version=2,
+                capability="FutureCapability",
+                capability_bit="0x20000",
+                state="verified",
+                source_rows=3,
+                root_compatible=1,
+                relational_passed=1,
+                distinct_keys=1,
+                selected_rows=["A"],
+                verified="0x3ffff",
+                failed="0x0",
+                artifact_generation=2,
+                isolate_generation=1,
+            )
+        )
+        analysis = self._analyze(lines)
+        self.assertTrue(analysis.passed, [check for check in analysis.checks if not check.passed])
 
     def test_process_scoped_crash_fails(self) -> None:
         lines = _passing_lines()

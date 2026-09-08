@@ -10,6 +10,7 @@
 
 #include "dartplant/advanced/flutter_snapshot.h"
 #include "dartplant/advanced/live_vm.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 
@@ -52,6 +53,7 @@ struct SnapshotIndex {
     std::string build_id;
     std::string dart_version;
     std::string profile_version;
+    uint32_t vm_profile_version = 0;
     std::vector<SnapshotFunction> functions;
 
     const SnapshotFunction* FindSnapshotFunction(std::string_view library_uri,
@@ -70,6 +72,7 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
                                                 std::string* error);
 std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext& context,
                                                     const DartPlantFlutterSnapshotInfo& snapshot,
+                                                    const RuntimeProfileRecord& profile,
                                                     DartPlantLiveVmFunctionIndexInfo* out_info,
                                                     std::string* error);
 

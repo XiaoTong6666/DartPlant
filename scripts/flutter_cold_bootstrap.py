@@ -11,6 +11,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ci.capability_registry import mask as capability_mask
+from ci.capability_registry import required_event_capabilities
 from util import ROOT_DIR, adb_cmd, find_arm64_device, run
 
 
@@ -459,6 +461,22 @@ def _wait_for_logs(serial: str, pid: str, timeout_seconds: float) -> str:
     raise RuntimeError(f"timed out waiting for cold-bootstrap logs for pid {pid}\n{latest}")
 
 
+def _structured_events(logs: str, event_name: str) -> list[dict[str, object]]:
+    prefix = "DARTPLANT_CI "
+    events: list[dict[str, object]] = []
+    for line in logs.splitlines():
+        position = line.find(prefix)
+        if position < 0:
+            continue
+        try:
+            event = json.loads(line[position + len(prefix) :].strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event") == event_name:
+            events.append(event)
+    return events
+
+
 def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> ColdStartResult:
     run(adb_cmd(["logcat", "-c"], device=serial))
     run(adb_cmd(["shell", "am", "force-stop", PACKAGE], device=serial))
@@ -541,15 +559,28 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
     generation_before_value = int(generation_before)
     generation_invalidated_value = int(generation_invalidated)
     generation_revalidated_value = int(generation_revalidated)
-    expected_capabilities = 0x3F7
+    lifecycle_events = _structured_events(logs, "artifact_lifecycle")
+    lifecycle_isolate_generations = [
+        int(event.get("isolate_generation", 0))
+        for event in lifecycle_events
+        if int(event.get("generation_revalidated", -1)) == generation_revalidated_value
+    ]
+    current_isolate_generation = (
+        lifecycle_isolate_generations[-1] if lifecycle_isolate_generations else 0
+    )
+    expected_capabilities = capability_mask(cold_required=True)
     # Adapter creation itself runs inside the Dart FFI/native transition, so
     # Generated->Native state is intentionally lazy-proven on the first real
     # generated callback. Create/revalidate therefore verify roots, safepoint
-    # stubs and artifact identity (0x237), not transition state (0x40).
-    expected_verified = 0x237
-    expected_invalidated = 0x17
+    # stubs and artifact identity, not the lazy transition state.
+    expected_verified = capability_mask(verified_after_create=True)
+    # Every private-ABI proof is bound to both artifact and isolate generation;
+    # retirement clears the complete verified set before revalidation re-runs
+    # eager core/object/stub proof.
+    expected_invalidated = 0
     if not (
-        capabilities == required == expected_capabilities
+        required == expected_capabilities
+        and (capabilities & required) == required
         and verified_before == expected_verified
         and verified_invalidated == expected_invalidated
         and verified_revalidated == expected_verified
@@ -560,6 +591,7 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         and generation_before_value > 0
         and generation_invalidated_value == generation_before_value + 1
         and generation_revalidated_value == generation_invalidated_value
+        and current_isolate_generation > 0
     ):
         raise RuntimeError(
             f"cold start {round_index}: dynamic VM ABI capability/lifecycle state mismatch\n{logs}"
@@ -568,16 +600,28 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: source-candidate structural root proof missing\n{logs}"
         )
-    for capability_name in (
-        "generated-transition",
-        "active-exception",
-        "type-arguments-element",
-    ):
-        if f"capability proof name={capability_name} result=verified" not in logs:
+    capability_events = _structured_events(logs, "capability")
+    for capability in required_event_capabilities():
+        matching = [
+            event
+            for event in capability_events
+            if event.get("capability") == capability.diagnostic_name
+            and event.get("state") == "verified"
+            and int(event.get("schema_version", 0)) >= 2
+            and int(str(event.get("capability_bit", "0")), 0) == capability.bit
+            and int(event.get("artifact_generation", -1)) == generation_revalidated_value
+            and int(event.get("isolate_generation", -1)) == current_isolate_generation
+        ]
+        if not matching:
             raise RuntimeError(
-                f"cold start {round_index}: {capability_name} lazy proof was not verified\n{logs}"
+                f"cold start {round_index}: {capability.diagnostic_name} lazy proof was not "
+                f"verified for the current generation\n{logs}"
             )
-    if re.search(r"capability proof name=\S+ result=failed", logs):
+    if any(
+        event.get("state")
+        in {"predicate_failed", "ambiguous", "generation_stale", "dependency_mismatch"}
+        for event in capability_events
+    ):
         raise RuntimeError(
             f"cold start {round_index}: a VM capability failed for the active incarnation\n{logs}"
         )
@@ -616,9 +660,9 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: Dart implicit closure invocation failed\n{logs}"
         )
-    if "DartPlant app launch probe: type_arguments" not in logs:
+    if "DartPlant app launch probe: all" not in logs:
         raise RuntimeError(
-            f"cold start {round_index}: adb TypeArguments launch extra was not delivered\n{logs}"
+            f"cold start {round_index}: all-test launch extra was not delivered\n{logs}"
         )
     if "capture vector=" not in logs:
         raise RuntimeError(

@@ -5,7 +5,15 @@ namespace dartplant {
 
 inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-3249385cbb1dc5c7e3411ecd",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-54c9f8f6445a5fbffa415e8c",
+        .abi_identity = {
+            .full = "dart-vm-arm64-product-compressed/abi-54c9f8f6445a5fbffa415e8c",
+            .core = "dart-vm-arm64-product-compressed/abi-core-2f32075ce84808b0ab60c406",
+            .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
+            .object = "dart-vm-arm64-product-compressed/abi-object-d33d204969c0855db9521564",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
+            .exception = "dart-vm-arm64-product-compressed/abi-exception-8dfdfa0cfa1b4e788769f837",
+        },
         .machine = {
             .architecture = VmArchitecture::kArm64,
             .pointer_size = 8u,
@@ -160,7 +168,15 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-e94a0fc870b29c8697c227bf",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-97249511cf5d71730aded562",
+        .abi_identity = {
+            .full = "dart-vm-arm64-product-compressed/abi-97249511cf5d71730aded562",
+            .core = "dart-vm-arm64-product-compressed/abi-core-67fe74003c2ab7329e3e6429",
+            .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
+            .object = "dart-vm-arm64-product-compressed/abi-object-72d1859c927336e07e234119",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-16277c21148bf7ba2a41fca9",
+            .exception = "dart-vm-arm64-product-compressed/abi-exception-f458cbc09509db7e9046a128",
+        },
         .machine = {
             .architecture = VmArchitecture::kArm64,
             .pointer_size = 8u,
@@ -315,7 +331,15 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-d3e95d99ca5335439cdc4202",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-c62ee85628f83b613230f9e9",
+        .abi_identity = {
+            .full = "dart-vm-arm64-product-compressed/abi-c62ee85628f83b613230f9e9",
+            .core = "dart-vm-arm64-product-compressed/abi-core-8ce3336409530be1f2925730",
+            .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
+            .object = "dart-vm-arm64-product-compressed/abi-object-83270ceaeb08cbb569ceab3b",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
+            .exception = "dart-vm-arm64-product-compressed/abi-exception-36b6aa25e8ddf9ce95925268",
+        },
         .machine = {
             .architecture = VmArchitecture::kArm64,
             .pointer_size = 8u,

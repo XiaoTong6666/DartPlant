@@ -4,8 +4,12 @@
 #include "vm/abi/resolver.h"
 
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <string_view>
+
+#include "vm/generated/capability_fingerprints.generated.h"
+#include "vm/generated/capability_registry.generated.h"
 
 namespace dartplant::vm_abi {
 namespace {
@@ -42,26 +46,184 @@ uint64_t CapabilitiesFor(const RuntimeProfileRecord& profile, const CandidatePro
     if (bridge.active_exception_offset != 0 && bridge.active_stacktrace_offset != 0) {
         capabilities |= kCapabilityExceptionLayout;
     }
+    if (profile.thread_jump_to_frame_entry_point_offset != 0 && profile.live_vm.cid_code != 0 &&
+        profile.live_vm.code_entry_point_offset != 0 && profile.live_vm.code_owner_offset != 0) {
+        capabilities |= kCapabilityExceptionBridgeLayout;
+    }
     if (profile.type_arguments.cid != 0 && profile.type_arguments.length_offset != 0 &&
         profile.type_arguments.types_offset != 0) {
         capabilities |= kCapabilityTypeArgumentsLayout;
+    }
+    if (profile.arguments_descriptor.count_offset != 0 &&
+        profile.arguments_descriptor.size_offset != 0 &&
+        profile.arguments_descriptor.positional_count_offset != 0) {
+        capabilities |= kCapabilityArgumentsDescriptorLayout;
+    }
+    if (profile.dart_sp_register < 31 && profile.arguments_descriptor_register < 31 &&
+        profile.dart_gp_argument_registers[0] < 31) {
+        capabilities |= kCapabilityInvocationCallAbi;
+    }
+    if (profile.live_vm.function_entry_point_offset != 0 &&
+        profile.live_vm.function_code_offset != 0 && profile.live_vm.code_entry_point_offset != 0 &&
+        profile.live_vm.code_owner_offset != 0) {
+        capabilities |= kCapabilityFunctionCodeLayout;
+    }
+    if (profile.instructions_monomorphic_entry_offset_aot != 0 &&
+        profile.instructions_polymorphic_entry_offset_aot != 0) {
+        capabilities |= kCapabilityAotEntryLayout;
+    }
+    if (profile.function_type.function_signature_offset != 0 &&
+        profile.function_type.parameter_types_offset != 0 &&
+        profile.function_type.result_type_offset != 0) {
+        capabilities |= kCapabilityFunctionTypeLayout;
+    }
+    if (profile.function_kind.closure != profile.function_kind.regular &&
+        profile.arguments_descriptor.named_entry_size != 0) {
+        capabilities |= kCapabilityClosureCallLayout;
     }
     return capabilities;
 }
 
 }  // namespace
 
+const CapabilityDescriptor* CapabilityRegistry() { return generated::kCapabilityRegistry; }
+
+size_t CapabilityRegistrySize() { return std::size(generated::kCapabilityRegistry); }
+
+const CapabilityDescriptor* FindCapabilityDescriptor(uint64_t capability) {
+    const auto* begin = std::begin(generated::kCapabilityRegistry);
+    const auto* end = std::end(generated::kCapabilityRegistry);
+    const auto* found = std::find_if(begin, end, [capability](const CapabilityDescriptor& item) {
+        return item.capability == capability;
+    });
+    return found == end ? nullptr : found;
+}
+
+uint64_t ColdRequiredCapabilityMask() { return generated::kColdRequiredCapabilityMask; }
+
+uint64_t VerifiedAfterCreateCapabilityMask() {
+    return generated::kVerifiedAfterCreateCapabilityMask;
+}
+
+AbiDomainMask CapabilityDomains(uint64_t capability) {
+    constexpr AbiDomainMask core = AbiDomainBit(AbiDomain::kCore);
+    constexpr AbiDomainMask call = AbiDomainBit(AbiDomain::kCall);
+    constexpr AbiDomainMask object = AbiDomainBit(AbiDomain::kObject);
+    constexpr AbiDomainMask transition = AbiDomainBit(AbiDomain::kTransition);
+    constexpr AbiDomainMask exception = AbiDomainBit(AbiDomain::kException);
+    switch (capability) {
+    case kCapabilityRuntimeRoots:
+    case kCapabilityCanonicalNull:
+    case kCapabilityTypeArgumentsLayout:
+    case kCapabilityFunctionTypeLayout:
+        return core | object;
+    case kCapabilityOwnerIdentity:
+    case kCapabilityRegisterSemantics:
+    case kCapabilityDartCore:
+        return core;
+    case kCapabilitySafepointStubs:
+        return core | object | transition;
+    case kCapabilityArgumentsDescriptorLayout:
+        return call | object;
+    case kCapabilityInvocationCallAbi:
+    case kCapabilityFunctionCodeLayout:
+    case kCapabilityAotEntryLayout:
+    case kCapabilityClosureCallLayout:
+        return core | call | object;
+    case kCapabilityGeneratedTransitionLayout:
+        return core | transition;
+    case kCapabilityExceptionLayout:
+        return core | object | exception;
+    case kCapabilityExceptionBridgeLayout:
+        return core | exception;
+    case kCapabilityArtifactLifecycle:
+    case kCapabilityNone:
+        return 0;
+    }
+    return 0;
+}
+
+std::string BuildCapabilityAbiKey(const RuntimeProfileRecord& profile, uint64_t capability) {
+    std::string key;
+    generated::AppendCapabilityValue(key, capability);
+    switch (capability) {
+    case kCapabilityRuntimeRoots:
+        generated::AppendRuntimeRootsFields(key, profile);
+        break;
+    case kCapabilityDartCore:
+        generated::AppendDartCoreFields(key, profile);
+        break;
+    case kCapabilityOwnerIdentity:
+        generated::AppendOwnerIdentityFields(key, profile);
+        break;
+    case kCapabilityCanonicalNull:
+        generated::AppendCanonicalNullFields(key, profile);
+        break;
+    case kCapabilityRegisterSemantics:
+        generated::AppendRegisterSemanticsFields(key, profile);
+        break;
+    case kCapabilitySafepointStubs:
+        generated::AppendSafepointStubsFields(key, profile);
+        break;
+    case kCapabilityGeneratedTransitionLayout:
+        generated::AppendGeneratedTransitionLayoutFields(key, profile);
+        break;
+    case kCapabilityExceptionLayout:
+        generated::AppendExceptionLayoutFields(key, profile);
+        break;
+    case kCapabilityExceptionBridgeLayout:
+        generated::AppendExceptionBridgeLayoutFields(key, profile);
+        break;
+    case kCapabilityTypeArgumentsLayout:
+        generated::AppendTypeArgumentsLayoutFields(key, profile);
+        break;
+    case kCapabilityArgumentsDescriptorLayout:
+        generated::AppendArgumentsDescriptorLayoutFields(key, profile);
+        break;
+    case kCapabilityInvocationCallAbi:
+        generated::AppendInvocationCallAbiFields(key, profile);
+        break;
+    case kCapabilityFunctionCodeLayout:
+        generated::AppendFunctionCodeLayoutFields(key, profile);
+        break;
+    case kCapabilityAotEntryLayout:
+        generated::AppendAotEntryLayoutFields(key, profile);
+        break;
+    case kCapabilityFunctionTypeLayout:
+        generated::AppendFunctionTypeLayoutFields(key, profile);
+        break;
+    case kCapabilityClosureCallLayout:
+        generated::AppendInvocationCallAbiFields(key, profile);
+        generated::AppendArgumentsDescriptorLayoutFields(key, profile);
+        generated::AppendFunctionTypeLayoutFields(key, profile);
+        generated::AppendTypeArgumentsLayoutFields(key, profile);
+        break;
+    case kCapabilityArtifactLifecycle:
+    case kCapabilityNone:
+        return {};
+    default:
+        return {};
+    }
+    return key;
+}
+
 CandidateSelection SelectUniquePassingCandidate(
     const std::vector<CandidateDiagnostic>& candidates) {
+    return SelectUniquePassingCandidate(candidates, AbiDomain::kCore);
+}
+
+CandidateSelection SelectUniquePassingCandidate(const std::vector<CandidateDiagnostic>& candidates,
+                                                AbiDomain domain) {
     CandidateSelection selection{};
     std::set<std::string_view> passed_abis;
     for (const CandidateDiagnostic& candidate : candidates) {
-        if (!candidate.probe.passed || candidate.profile == nullptr ||
-            candidate.profile->abi_id == nullptr) {
+        if (!candidate.probe.passed || candidate.profile == nullptr) {
             continue;
         }
+        const std::string_view abi_id = DomainAbiId(*candidate.profile, domain);
+        if (abi_id.empty()) continue;
         ++selection.passed_rows;
-        passed_abis.insert(candidate.profile->abi_id);
+        passed_abis.insert(abi_id);
     }
     selection.distinct_abis = passed_abis.size();
     if (selection.distinct_abis != 1) return selection;
@@ -69,12 +231,119 @@ CandidateSelection SelectUniquePassingCandidate(
     const std::string_view selected_abi = *passed_abis.begin();
     for (const CandidateDiagnostic& candidate : candidates) {
         if (!candidate.probe.passed || candidate.profile == nullptr ||
-            candidate.profile->abi_id != selected_abi) {
+            DomainAbiId(*candidate.profile, domain) != selected_abi) {
             continue;
         }
         if (selection.selected == nullptr ||
             (!selection.selected->snapshot_hash_match && candidate.snapshot_hash_match)) {
             selection.selected = &candidate;
+        }
+    }
+    return selection;
+}
+
+DomainSetSelection SelectDomainAbiSet(const AbiCandidateSet& candidates,
+                                      const std::vector<AbiDomain>& domains,
+                                      const std::vector<bool>& compatible) {
+    DomainSetSelection selection{};
+    if (domains.empty() || compatible.size() != candidates.profiles.size()) return selection;
+    std::set<std::string> keys;
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr) continue;
+        std::string key;
+        for (AbiDomain domain : domains) {
+            const std::string_view id = DomainAbiId(*profile, domain);
+            if (id.empty()) {
+                key.clear();
+                break;
+            }
+            key.append(id);
+            key.push_back('\x1f');
+        }
+        if (key.empty()) continue;
+        ++selection.compatible_rows;
+        keys.insert(key);
+    }
+    selection.distinct_domain_sets = keys.size();
+    if (selection.distinct_domain_sets != 1) return selection;
+    selection.abi_domain_key = *keys.begin();
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr) continue;
+        std::string key;
+        for (AbiDomain domain : domains) {
+            const std::string_view id = DomainAbiId(*profile, domain);
+            if (id.empty()) {
+                key.clear();
+                break;
+            }
+            key.append(id);
+            key.push_back('\x1f');
+        }
+        if (key == selection.abi_domain_key && selection.representative == nullptr) {
+            selection.representative = profile;
+        }
+    }
+    return selection;
+}
+
+DomainSetSelection SelectDomainAbiSet(const AbiCandidateSet& candidates, AbiDomainMask domains,
+                                      const std::vector<bool>& compatible) {
+    DomainSetSelection selection{};
+    if (domains == 0 || compatible.size() != candidates.profiles.size()) return selection;
+    std::set<std::string> keys;
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr) continue;
+        const std::string key = BuildDomainAbiKey(*profile, domains);
+        if (key.empty()) continue;
+        ++selection.compatible_rows;
+        keys.insert(key);
+    }
+    selection.distinct_domain_sets = keys.size();
+    if (keys.size() != 1) return selection;
+    selection.abi_domain_key = *keys.begin();
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr ||
+            BuildDomainAbiKey(*profile, domains) != selection.abi_domain_key) {
+            continue;
+        }
+        if (selection.representative == nullptr || profile == candidates.representative) {
+            selection.representative = profile;
+        }
+    }
+    return selection;
+}
+
+DomainSetSelection SelectCapabilityAbiSet(const AbiCandidateSet& candidates, uint64_t capability,
+                                          const std::vector<bool>& compatible) {
+    DomainSetSelection selection{};
+    if (capability == kCapabilityNone || compatible.size() != candidates.profiles.size()) {
+        return selection;
+    }
+    std::set<std::string> keys;
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr) continue;
+        const std::string key = BuildCapabilityAbiKey(*profile, capability);
+        if (key.empty()) continue;
+        ++selection.compatible_rows;
+        keys.insert(key);
+    }
+    selection.distinct_domain_sets = keys.size();
+    if (keys.size() != 1) return selection;
+    selection.abi_domain_key = *keys.begin();
+    for (size_t index = 0; index < candidates.profiles.size(); ++index) {
+        const RuntimeProfileRecord* profile = candidates.profiles[index];
+        if (!compatible[index] || profile == nullptr ||
+            BuildCapabilityAbiKey(*profile, capability) != selection.abi_domain_key) {
+            continue;
+        }
+        selection.selected_rows.push_back(profile);
+        if (selection.representative == nullptr || profile == candidates.representative) {
+            selection.representative = profile;
         }
     }
     return selection;
@@ -93,6 +362,7 @@ bool ResolveEngineIncarnationForAnchor(const std::vector<ModuleImage>& modules, 
         matched = &module;
     }
     if (matched == nullptr) return false;
+    if (matched->build_id.empty()) return false;
     *out_incarnation = CaptureIncarnation(*matched);
     return true;
 }
@@ -130,10 +400,24 @@ ResolverResult ResolveVerifiedBinding(const ResolverInput& input) {
     result.passed_rows = selection.passed_rows;
     result.distinct_abis = selection.distinct_abis;
     const CandidateDiagnostic* selected = selection.selected;
-    if (selected == nullptr || selected->probe.code_module == nullptr) return result;
+    if (selected == nullptr || selected->probe.code_module == nullptr ||
+        selected->probe.code_module->build_id.empty()) {
+        return result;
+    }
 
     result.binding.profile = selected->profile;
     result.binding.probe = selected->probe;
+    result.binding.core.representative = selected->profile;
+    result.binding.core.core_abi_id = selected->profile->abi_identity.core;
+    result.binding.core.core_probe = selected->probe;
+    for (const CandidateDiagnostic& candidate : result.candidates) {
+        if (candidate.probe.passed && candidate.profile != nullptr &&
+            DomainAbiId(*candidate.profile, AbiDomain::kCore) == result.binding.core.core_abi_id) {
+            result.binding.core.candidates.profiles.push_back(candidate.profile);
+        }
+    }
+    result.binding.core.candidates.representative = selected->profile;
+    result.binding.core.candidates.core_abi_id = result.binding.core.core_abi_id;
     result.binding.artifacts.app = CaptureIncarnation(*selected->probe.code_module);
     if (input.engine_anchor != 0) {
         ArtifactIncarnation engine{};
@@ -142,13 +426,18 @@ ResolverResult ResolveVerifiedBinding(const ResolverInput& input) {
         }
     } else {
         for (const ModuleImage& module : *input.modules) {
-            if (module.name == "libflutter.so") {
+            if (module.name == "libflutter.so" && !module.build_id.empty()) {
                 result.binding.artifacts.engines.push_back(CaptureIncarnation(module));
             }
         }
     }
+    if (result.binding.artifacts.engines.empty()) return result;
     result.binding.capabilities = CapabilitiesFor(*result.binding.profile, result.binding.probe,
                                                   input.registers, result.binding.artifacts);
+    result.binding.core.capabilities =
+        result.binding.capabilities &
+        (kCapabilityRuntimeRoots | kCapabilityOwnerIdentity | kCapabilityCanonicalNull |
+         kCapabilityRegisterSemantics | kCapabilityDartCore | kCapabilitySafepointStubs);
     result.passed = true;
     return result;
 }
@@ -159,7 +448,10 @@ bool ArtifactIncarnationMatches(const ArtifactIncarnation& expected, const Modul
         expected.executable_ranges.size() != current.executable_ranges.size()) {
         return false;
     }
-    if (expected.build_id != current.build_id) return false;
+    if (expected.build_id.empty() || current.build_id.empty() ||
+        expected.build_id != current.build_id) {
+        return false;
+    }
     for (size_t index = 0; index < expected.executable_ranges.size(); ++index) {
         const ExecutableRange& left = expected.executable_ranges[index];
         const ExecutableRange& right = current.executable_ranges[index];

@@ -890,6 +890,11 @@ def _write_header(
         if symbol_prefix == "DartPlantOrdinaryAot"
         else ""
     )
+    evidence_macro = (
+        "#define DARTPLANT_"
+        + re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", symbol_prefix).upper()
+        + "_ABI_EVIDENCE_AVAILABLE 1\n"
+    )
     structural = record.get("structural_analysis")
     if isinstance(structural, dict):
         structural_schema_version = 1
@@ -928,7 +933,7 @@ def _write_header(
 
 #include \"dartplant/advanced/artifact.h\"
 
-{compatibility_macro}
+ {compatibility_macro}{evidence_macro}
 
 inline constexpr DartPlantSnapshotFunctionInfo {functions_symbol}[] = {{{{
     .struct_size = sizeof(DartPlantSnapshotFunctionInfo),

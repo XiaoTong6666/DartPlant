@@ -375,6 +375,15 @@ struct DartPlantHook {
     std::vector<uintptr_t> payload_return_sites;
     std::vector<dartplant::ManagedCodePatch> managed_backend_patches;
     bool exception_bridge_consumer = false;
+    struct ExceptionBridgeBinding {
+        bool verified = false;
+        uintptr_t target = 0;
+        uint32_t thread_offset = 0;
+        uint64_t artifact_generation = 0;
+        uint64_t isolate_generation = 0;
+        uint32_t profile_version = 0;
+        std::string abi_domain_key;
+    } exception_bridge_binding;
     bool vm_adapter_retained = false;
 };
 

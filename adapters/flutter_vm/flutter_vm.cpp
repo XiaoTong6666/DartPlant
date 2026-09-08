@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -49,6 +50,12 @@ struct RootLease {
     struct State* owner = nullptr;
 };
 
+struct SafepointBinding {
+    const dartplant::RuntimeProfileRecord* profile = nullptr;
+    uint64_t enter = 0;
+    uint64_t exit = 0;
+};
+
 struct State {
     DartPlantVmAdapter* adapter = nullptr;
     DartPlantIsolateIdentity identity{};
@@ -58,15 +65,27 @@ struct State {
     uint64_t exit_safepoint = 0;
     std::array<RootSlot, kRootSlotCount> roots{};
     std::array<RootLease, kLeaseCount> leases{};
+    dartplant::vm_abi::AbiCandidateSet abi_candidates{};
+    size_t source_candidate_count = 0;
+    size_t root_compatible_count = 0;
+    std::vector<bool> root_compatible_candidates;
+    std::vector<SafepointBinding> safepoint_bindings;
     const dartplant::RuntimeProfileRecord* profile = nullptr;
+    const dartplant::RuntimeProfileRecord* transition_profile = nullptr;
+    const dartplant::RuntimeProfileRecord* exception_profile = nullptr;
+    const dartplant::RuntimeProfileRecord* call_profile = nullptr;
+    const dartplant::RuntimeProfileRecord* object_profile = nullptr;
     dartplant::vm_abi::ArtifactSet artifacts{};
     uint64_t capabilities = dartplant::vm_abi::kCapabilityNone;
     std::atomic<uint64_t> verified_capabilities{dartplant::vm_abi::kCapabilityNone};
     std::atomic<uint64_t> failed_capabilities{dartplant::vm_abi::kCapabilityNone};
-    mutable std::mutex artifact_mutex;
+    mutable std::recursive_mutex artifact_mutex;
     std::atomic_bool artifact_valid{false};
     std::atomic_bool artifact_quiescing{false};
     std::atomic<uint64_t> artifact_generation{1};
+    std::vector<dartplant::vm_abi::CapabilityProofRecord> proof_records =
+        std::vector<dartplant::vm_abi::CapabilityProofRecord>(
+            dartplant::vm_abi::CapabilityRegistrySize());
     bool isolate_detached = false;
 };
 
@@ -98,12 +117,6 @@ constexpr uint64_t kEagerRuntimeProofMask =
     dartplant::vm_abi::kCapabilityRuntimeRoots | dartplant::vm_abi::kCapabilityOwnerIdentity |
     dartplant::vm_abi::kCapabilityCanonicalNull | dartplant::vm_abi::kCapabilityRegisterSemantics |
     dartplant::vm_abi::kCapabilityDartCore | dartplant::vm_abi::kCapabilitySafepointStubs;
-constexpr uint64_t kIncarnationScopedProofMask =
-    dartplant::vm_abi::kCapabilitySafepointStubs |
-    dartplant::vm_abi::kCapabilityGeneratedTransitionLayout |
-    dartplant::vm_abi::kCapabilityExceptionLayout |
-    dartplant::vm_abi::kCapabilityTypeArgumentsLayout |
-    dartplant::vm_abi::kCapabilityArtifactLifecycle;
 static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN) ==
               static_cast<uint64_t>(dartplant::vm_abi::kCapabilityRuntimeRoots));
 static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN) ==
@@ -125,6 +138,21 @@ static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOUR
               static_cast<uint64_t>(dartplant::vm_abi::kCapabilityTypeArgumentsLayout));
 static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_ARTIFACT_LIFECYCLE_BOUND) ==
               static_cast<uint64_t>(dartplant::vm_abi::kCapabilityArtifactLifecycle));
+static_assert(
+    static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT_VERIFIED) ==
+    static_cast<uint64_t>(dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_INVOCATION_CALL_ABI_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityInvocationCallAbi));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_FUNCTION_CODE_LAYOUT_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityFunctionCodeLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_AOT_ENTRY_LAYOUT_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityAotEntryLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_FUNCTION_TYPE_LAYOUT_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityFunctionTypeLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_CLOSURE_CALL_LAYOUT_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityClosureCallLayout));
+static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_BRIDGE_LAYOUT_VERIFIED) ==
+              static_cast<uint64_t>(dartplant::vm_abi::kCapabilityExceptionBridgeLayout));
 using DartHandlePredicate = bool (*)(Dart_Handle);
 DartHandlePredicate g_is_boolean = nullptr;
 DartHandlePredicate g_is_integer = nullptr;
@@ -216,27 +244,739 @@ bool HasCapability(const State& state, uint64_t capability) {
     return (state.capabilities & capability) == capability;
 }
 
+size_t CapabilityIndex(uint64_t capability);
+
 bool HasVerifiedCapability(const State& state, uint64_t capability) {
-    return (state.verified_capabilities.load(std::memory_order_acquire) & capability) == capability;
+    std::lock_guard proof_lock(state.artifact_mutex);
+    if ((state.verified_capabilities.load(std::memory_order_acquire) & capability) != capability) {
+        return false;
+    }
+    const uint64_t artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
+    for (uint64_t bit = 1; bit != 0 && bit <= capability; bit <<= 1) {
+        if ((capability & bit) == 0) continue;
+        const size_t index = CapabilityIndex(bit);
+        if (index >= state.proof_records.size()) return false;
+        const auto& record = state.proof_records[index];
+        if (record.capability != bit || record.state != dartplant::vm_abi::ProofState::kVerified ||
+            record.artifact_generation != artifact_generation ||
+            record.isolate_generation != state.identity.generation) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool HasFailedCapability(const State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
     return (state.failed_capabilities.load(std::memory_order_acquire) & capability) != 0;
 }
 
+size_t CapabilityIndex(uint64_t capability) {
+    size_t index = 0;
+    while (capability > 1) {
+        capability >>= 1;
+        ++index;
+    }
+    return index;
+}
+
+dartplant::vm_abi::CapabilityProofRecord& ProofRecord(State& state, uint64_t capability) {
+    return state.proof_records[CapabilityIndex(capability)];
+}
+
+dartplant::vm_abi::ProofState CurrentProofState(const State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
+    const size_t index = CapabilityIndex(capability);
+    return index >= state.proof_records.size() ? dartplant::vm_abi::ProofState::kUnavailable
+                                               : state.proof_records[index].state;
+}
+
 void MarkCapabilityVerified(State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
     state.failed_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
     state.verified_capabilities.fetch_or(capability, std::memory_order_acq_rel);
+    const uint64_t artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
+    for (uint64_t bit = 1; bit != 0 && bit <= capability; bit <<= 1) {
+        if ((capability & bit) == 0) continue;
+        auto& record = ProofRecord(state, bit);
+        record.capability = bit;
+        record.state = dartplant::vm_abi::ProofState::kVerified;
+        record.artifact_generation = artifact_generation;
+        record.isolate_generation = state.identity.generation;
+    }
 }
 
 void MarkCapabilityFailed(State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
     state.verified_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
     state.failed_capabilities.fetch_or(capability, std::memory_order_acq_rel);
+    const uint64_t artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
+    for (uint64_t bit = 1; bit != 0 && bit <= capability; bit <<= 1) {
+        if ((capability & bit) == 0) continue;
+        auto& record = ProofRecord(state, bit);
+        record.capability = bit;
+        record.state = dartplant::vm_abi::ProofState::kFailedForIncarnation;
+        record.artifact_generation = artifact_generation;
+        record.isolate_generation = state.identity.generation;
+    }
+}
+
+void MarkCapabilityAmbiguous(State& state, uint64_t capability) {
+    MarkCapabilityFailed(state, capability);
+    std::lock_guard proof_lock(state.artifact_mutex);
+    for (uint64_t bit = 1; bit != 0 && bit <= capability; bit <<= 1) {
+        if ((capability & bit) == 0) continue;
+        ProofRecord(state, bit).state = dartplant::vm_abi::ProofState::kAmbiguous;
+    }
 }
 
 void ResetCapabilityProof(State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
     state.verified_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
     state.failed_capabilities.fetch_and(~capability, std::memory_order_acq_rel);
+    for (uint64_t bit = 1; bit != 0 && bit <= capability; bit <<= 1) {
+        if ((capability & bit) == 0 || CapabilityIndex(bit) >= state.proof_records.size()) continue;
+        auto& record = ProofRecord(state, bit);
+        record = {};
+        record.capability = bit;
+        record.state = HasCapability(state, bit) ? dartplant::vm_abi::ProofState::kUnverified
+                                                 : dartplant::vm_abi::ProofState::kUnavailable;
+    }
+}
+
+bool CapabilityDependenciesVerified(const State& state, uint64_t capability) {
+    const auto verified = [&](uint64_t bit) { return HasVerifiedCapability(state, bit); };
+    if (capability == dartplant::vm_abi::kCapabilityAotEntryLayout) {
+        return verified(dartplant::vm_abi::kCapabilityFunctionCodeLayout);
+    }
+    if (capability == dartplant::vm_abi::kCapabilityClosureCallLayout) {
+        return verified(dartplant::vm_abi::kCapabilityInvocationCallAbi) &&
+               verified(dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout) &&
+               verified(dartplant::vm_abi::kCapabilityFunctionTypeLayout);
+    }
+    return true;
+}
+
+bool ProofDomainsMatch(const State& state, uint64_t capability,
+                       const dartplant::RuntimeProfileRecord& profile) {
+    std::lock_guard proof_lock(state.artifact_mutex);
+    const auto& record = state.proof_records[CapabilityIndex(capability)];
+    const auto domains = dartplant::vm_abi::CapabilityDomains(capability);
+    return record.abi_domains == domains &&
+           record.abi_domain_key == dartplant::vm_abi::BuildCapabilityAbiKey(profile, capability);
+}
+
+bool CallObjectDependencyDomainsMatch(const State& state,
+                                      const dartplant::RuntimeProfileRecord& profile) {
+    return ProofDomainsMatch(state, dartplant::vm_abi::kCapabilityInvocationCallAbi, profile) &&
+           ProofDomainsMatch(state, dartplant::vm_abi::kCapabilityFunctionTypeLayout, profile);
+}
+
+bool ClosureDependencyDomainsMatch(const State& state,
+                                   const dartplant::RuntimeProfileRecord& profile) {
+    if (!CallObjectDependencyDomainsMatch(state, profile)) return false;
+    return ProofDomainsMatch(state, dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout,
+                             profile);
+}
+
+bool CandidatePassedRootProof(const State& state, size_t index) {
+    return index < state.root_compatible_candidates.size() &&
+           state.root_compatible_candidates[index];
+}
+
+std::string SelectedRowsJson(const dartplant::vm_abi::DomainSetSelection* selection) {
+    std::string rows = "[";
+    if (selection != nullptr) {
+        for (size_t index = 0; index < selection->selected_rows.size(); ++index) {
+            if (index != 0) rows.push_back(',');
+            rows.push_back('"');
+            const auto* profile = selection->selected_rows[index];
+            const char* name = profile == nullptr || profile->live_vm.name == nullptr
+                                   ? "unknown"
+                                   : profile->live_vm.name;
+            for (const char* cursor = name; *cursor != '\0'; ++cursor) {
+                if (*cursor == '"' || *cursor == '\\') rows.push_back('\\');
+                rows.push_back(*cursor);
+            }
+            rows.push_back('"');
+        }
+    }
+    rows.push_back(']');
+    return rows;
+}
+
+void LogCapabilityDiagnostic(State& state, uint64_t capability, const char* diagnostic_state,
+                             const dartplant::vm_abi::DomainSetSelection* selection = nullptr) {
+    const auto* descriptor = dartplant::vm_abi::FindCapabilityDescriptor(capability);
+    const char* capability_name = descriptor == nullptr || descriptor->diagnostic_name == nullptr
+                                      ? "Unknown"
+                                      : descriptor->diagnostic_name;
+    const size_t source_rows = state.source_candidate_count;
+    const size_t root_compatible = state.root_compatible_count;
+    const size_t relational_passed = selection == nullptr ? 0 : selection->compatible_rows;
+    const size_t distinct_keys = selection == nullptr ? 0 : selection->distinct_domain_sets;
+    const std::string selected_rows = SelectedRowsJson(selection);
+    const uint64_t artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
+    const uint64_t isolate_generation = state.identity.generation;
+    const uint64_t verified = state.verified_capabilities.load(std::memory_order_acquire);
+    const uint64_t failed = state.failed_capabilities.load(std::memory_order_acquire);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "capability diagnostic capability=%s source_rows=%zu root_compatible=%zu "
+        "relational_passed=%zu distinct_keys=%zu selected_rows=%s artifact_generation=%llu "
+        "isolate_generation=%llu state=%s",
+        capability_name, source_rows, root_compatible, relational_passed, distinct_keys,
+        selected_rows.c_str(), static_cast<unsigned long long>(artifact_generation),
+        static_cast<unsigned long long>(isolate_generation), diagnostic_state);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "DARTPLANT_CI {\"event\":\"capability\",\"schema_version\":2,"
+        "\"capability\":\"%s\",\"capability_bit\":\"0x%llx\",\"state\":\"%s\","
+        "\"source_rows\":%zu,\"root_compatible\":%zu,\"relational_passed\":%zu,"
+        "\"distinct_keys\":%zu,\"selected_rows\":%s,\"artifact_generation\":%llu,"
+        "\"isolate_generation\":%llu,\"verified\":\"0x%llx\",\"failed\":\"0x%llx\"}",
+        capability_name, static_cast<unsigned long long>(capability), diagnostic_state, source_rows,
+        root_compatible, relational_passed, distinct_keys, selected_rows.c_str(),
+        static_cast<unsigned long long>(artifact_generation),
+        static_cast<unsigned long long>(isolate_generation),
+        static_cast<unsigned long long>(verified), static_cast<unsigned long long>(failed));
+}
+
+uint64_t CapabilityForEvidenceKind(DartPlantVmCapabilityEvidenceKind kind) {
+    switch (kind) {
+    case DARTPLANT_VM_EVIDENCE_FUNCTION_CODE:
+        return dartplant::vm_abi::kCapabilityFunctionCodeLayout;
+    case DARTPLANT_VM_EVIDENCE_AOT_ENTRY:
+        return dartplant::vm_abi::kCapabilityAotEntryLayout;
+    case DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR:
+        return dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout;
+    case DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE:
+        return dartplant::vm_abi::kCapabilityFunctionTypeLayout;
+    case DARTPLANT_VM_EVIDENCE_CLOSURE_CALL:
+        return dartplant::vm_abi::kCapabilityClosureCallLayout;
+    case DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI:
+        return dartplant::vm_abi::kCapabilityInvocationCallAbi;
+    case DARTPLANT_VM_EVIDENCE_EXCEPTION_BRIDGE:
+        return dartplant::vm_abi::kCapabilityExceptionBridgeLayout;
+    }
+    return dartplant::vm_abi::kCapabilityNone;
+}
+
+template <typename Predicate>
+const dartplant::RuntimeProfileRecord* ResolveCapabilityProfile(
+    State& state, uint64_t capability, Predicate&& predicate,
+    dartplant::vm_abi::DomainSetSelection* out_selection = nullptr) {
+    std::vector<bool> compatible;
+    compatible.reserve(state.abi_candidates.profiles.size());
+    for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+        const auto* candidate = state.abi_candidates.profiles[index];
+        compatible.push_back(CandidatePassedRootProof(state, index) && candidate != nullptr &&
+                             predicate(*candidate));
+    }
+    const auto selection =
+        dartplant::vm_abi::SelectCapabilityAbiSet(state.abi_candidates, capability, compatible);
+    if (out_selection != nullptr) *out_selection = selection;
+    if (!selection.passed()) {
+        if (selection.ambiguous()) {
+            MarkCapabilityAmbiguous(state, capability);
+            LogCapabilityDiagnostic(state, capability, "ambiguous", &selection);
+        } else {
+            MarkCapabilityFailed(state, capability);
+            LogCapabilityDiagnostic(state, capability, "predicate_failed", &selection);
+        }
+        return nullptr;
+    }
+    {
+        std::lock_guard proof_lock(state.artifact_mutex);
+        auto& record = ProofRecord(state, capability);
+        record.abi_domain_key = selection.abi_domain_key;
+        record.abi_domains = dartplant::vm_abi::CapabilityDomains(capability);
+    }
+    return selection.representative;
+}
+
+bool CapabilityRecordCurrent(const State& state, uint64_t capability) {
+    std::lock_guard proof_lock(state.artifact_mutex);
+    const size_t index = CapabilityIndex(capability);
+    if (index >= state.proof_records.size()) return false;
+    const auto& record = state.proof_records[index];
+    return record.capability == capability &&
+           record.artifact_generation ==
+               state.artifact_generation.load(std::memory_order_acquire) &&
+           record.isolate_generation == state.identity.generation;
+}
+
+void SetProofRecordDomains(State& state, uint64_t capability,
+                           const dartplant::RuntimeProfileRecord& profile,
+                           std::string_view domain_key = {}) {
+    std::lock_guard proof_lock(state.artifact_mutex);
+    auto& record = ProofRecord(state, capability);
+    record.abi_domains = dartplant::vm_abi::CapabilityDomains(capability);
+    record.abi_domain_key = domain_key.empty()
+                                ? dartplant::vm_abi::BuildCapabilityAbiKey(profile, capability)
+                                : std::string(domain_key);
+}
+
+bool EstablishEagerCapabilityProofs(State& state,
+                                    const std::vector<bool>* compatible_rows = nullptr) {
+    const std::vector<bool> all_compatible(state.abi_candidates.profiles.size(), true);
+    const auto& compatible = compatible_rows == nullptr ? all_compatible : *compatible_rows;
+    if (compatible.size() != state.abi_candidates.profiles.size()) return false;
+    state.root_compatible_candidates = compatible;
+    for (uint64_t bit = 1; bit != 0 && bit <= kEagerRuntimeProofMask; bit <<= 1) {
+        if ((state.capabilities & kEagerRuntimeProofMask & bit) == 0) continue;
+        const auto selection =
+            dartplant::vm_abi::SelectCapabilityAbiSet(state.abi_candidates, bit, compatible);
+        if (!selection.passed()) {
+            if (selection.ambiguous()) {
+                MarkCapabilityAmbiguous(state, bit);
+            } else {
+                MarkCapabilityFailed(state, bit);
+            }
+            return false;
+        }
+        SetProofRecordDomains(state, bit, *selection.representative, selection.abi_domain_key);
+    }
+    return true;
+}
+
+bool ReproveCoreBinding(State& state) {
+    const auto modules = dartplant::EnumerateModules();
+    state.root_compatible_candidates.assign(state.abi_candidates.profiles.size(), false);
+    std::vector<dartplant::vm_abi::CandidateProbe> probes(state.abi_candidates.profiles.size());
+    std::vector<bool> compatible;
+    compatible.reserve(state.abi_candidates.profiles.size());
+    for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+        const auto* candidate = state.abi_candidates.profiles[index];
+        if (candidate == nullptr) {
+            compatible.push_back(false);
+            continue;
+        }
+        dartplant::vm_abi::CandidateProbeInput input{};
+        input.roots.profile = candidate;
+        input.roots.thread = state.thread;
+        input.roots.current_isolate = state.identity.isolate;
+        input.roots.canonical_null = state.null_raw;
+        input.roots.require_current_isolate = true;
+        input.roots.require_canonical_null = true;
+        input.roots.require_dart_core = true;
+        input.modules = &modules;
+        probes[index] = dartplant::vm_abi::ProbeCandidate(input);
+        compatible.push_back(probes[index].passed);
+    }
+    const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+        state.abi_candidates, dartplant::vm_abi::kCapabilityRuntimeRoots, compatible);
+    if (!selection.passed()) return false;
+    const auto selected = std::find(state.abi_candidates.profiles.begin(),
+                                    state.abi_candidates.profiles.end(), selection.representative);
+    if (selected == state.abi_candidates.profiles.end()) return false;
+    const size_t selected_index =
+        static_cast<size_t>(std::distance(state.abi_candidates.profiles.begin(), selected));
+    if (!probes[selected_index].passed || probes[selected_index].enter_entry == 0 ||
+        probes[selected_index].exit_entry == 0) {
+        return false;
+    }
+    state.abi_candidates.representative = selection.representative;
+    state.root_compatible_candidates = compatible;
+    state.root_compatible_count =
+        static_cast<size_t>(std::count(compatible.begin(), compatible.end(), true));
+    state.profile = selection.representative;
+    state.enter_safepoint = probes[selected_index].enter_entry;
+    state.exit_safepoint = probes[selected_index].exit_entry;
+    state.safepoint_bindings.clear();
+    for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+        if (!compatible[index]) continue;
+        state.safepoint_bindings.push_back({
+            .profile = state.abi_candidates.profiles[index],
+            .enter = probes[index].enter_entry,
+            .exit = probes[index].exit_entry,
+        });
+    }
+    return EstablishEagerCapabilityProofs(state, &compatible);
+}
+
+bool ReadCompressedObject(const dartplant::RuntimeProfileRecord& profile, uint64_t heap_base,
+                          uint64_t owner, uint32_t offset, uint64_t* out_raw) {
+    if (out_raw == nullptr || profile.raw_object.compressed_word_size != sizeof(uint32_t) ||
+        !TaggedInHeapWindow(profile, heap_base, owner)) {
+        return false;
+    }
+    uint32_t compressed = 0;
+    const uintptr_t address =
+        static_cast<uintptr_t>(owner - profile.raw_object.heap_object_tag) + offset;
+    if (!ReadSelf(address, &compressed) ||
+        (compressed & profile.raw_object.smi_tag_mask) != profile.raw_object.heap_object_tag ||
+        heap_base > UINT64_MAX - compressed) {
+        return false;
+    }
+    *out_raw = heap_base + compressed;
+    return TaggedInHeapWindow(profile, heap_base, *out_raw);
+}
+
+bool ResolveEvidenceCode(const State& state, const dartplant::RuntimeProfileRecord& profile,
+                         const DartPlantVmCapabilityEvidence& evidence, uint64_t* out_code) {
+    if (out_code == nullptr) return false;
+    if (evidence.code != 0) {
+        *out_code = evidence.code;
+        return true;
+    }
+    const uint64_t heap_base =
+        ThreadWord(const_cast<State&>(state), profile.live_vm.thread_heap_base_offset);
+    return ReadCompressedObject(profile, heap_base, evidence.function,
+                                profile.live_vm.function_code_offset, out_code);
+}
+
+bool ProveFunctionTypeForProfile(const State& state, const dartplant::RuntimeProfileRecord& profile,
+                                 uint64_t function) {
+    const uint64_t heap_base =
+        ThreadWord(const_cast<State&>(state), profile.live_vm.thread_heap_base_offset);
+    return dartplant::vm_abi::ProveFunctionTypeLayout(profile, heap_base, function).passed;
+}
+
+bool ProveAotEntryForProfile(const State& state, const dartplant::RuntimeProfileRecord& profile,
+                             uint64_t code, uint64_t expected_entry) {
+    const uint64_t heap_base =
+        ThreadWord(const_cast<State&>(state), profile.live_vm.thread_heap_base_offset);
+    if (!TaggedInHeapWindow(profile, heap_base, code)) return false;
+    const uintptr_t code_object = static_cast<uintptr_t>(code - profile.raw_object.heap_object_tag);
+    uint64_t normal = 0;
+    uint64_t monomorphic = 0;
+    uint32_t length = 0;
+    if (!ReadNativePointer(code_object + profile.live_vm.code_entry_point_offset, &normal) ||
+        !ReadNativePointer(code_object + profile.live_vm.code_monomorphic_entry_point_offset,
+                           &monomorphic) ||
+        !ReadSelf(code_object + profile.live_vm.code_instructions_length_offset, &length)) {
+        return false;
+    }
+    dartplant::AotCodePayloadRange range{};
+    if (!dartplant::ComputeAotCodePayloadRange(profile.live_vm.profile_version, normal, monomorphic,
+                                               length, &range) ||
+        expected_entry < range.start || expected_entry >= range.end ||
+        state.artifacts.app.load_bias == 0) {
+        return false;
+    }
+    const uintptr_t end = static_cast<uintptr_t>(range.end);
+    for (const auto& executable : state.artifacts.app.executable_ranges) {
+        if (range.start >= executable.start && end <= executable.end) return true;
+    }
+    return false;
+}
+
+template <typename Predicate>
+const dartplant::RuntimeProfileRecord* SelectCapabilityProfile(
+    State& state, uint64_t capability, Predicate&& predicate,
+    dartplant::vm_abi::DomainSetSelection* out_selection = nullptr) {
+    std::vector<bool> compatible;
+    compatible.reserve(state.abi_candidates.profiles.size());
+    for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+        const auto* candidate = state.abi_candidates.profiles[index];
+        compatible.push_back(CandidatePassedRootProof(state, index) && candidate != nullptr &&
+                             predicate(*candidate));
+    }
+    const auto selection =
+        dartplant::vm_abi::SelectCapabilityAbiSet(state.abi_candidates, capability, compatible);
+    if (out_selection != nullptr) *out_selection = selection;
+    if (!selection.passed()) {
+        if (selection.ambiguous()) {
+            MarkCapabilityAmbiguous(state, capability);
+            LogCapabilityDiagnostic(state, capability, "ambiguous", &selection);
+        } else {
+            MarkCapabilityFailed(state, capability);
+            LogCapabilityDiagnostic(state, capability, "predicate_failed", &selection);
+        }
+        return nullptr;
+    }
+    SetProofRecordDomains(state, capability, *selection.representative, selection.abi_domain_key);
+    return selection.representative;
+}
+
+DartPlantStatus ProveCapability(void* user_data, const DartPlantIsolateIdentity* identity,
+                                const DartPlantVmCapabilityEvidence* evidence,
+                                DartPlantVmCapabilityProof* out_proof) {
+    auto* state = static_cast<State*>(user_data);
+    if (state == nullptr || identity == nullptr || evidence == nullptr || out_proof == nullptr ||
+        evidence->struct_size < sizeof(DartPlantVmCapabilityEvidence)) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const uint64_t requested_capability = CapabilityForEvidenceKind(evidence->kind);
+    if (requested_capability == dartplant::vm_abi::kCapabilityNone ||
+        identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (identity->generation != state->identity.generation) {
+        LogCapabilityDiagnostic(*state, requested_capability, "generation_stale");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::unique_lock<std::recursive_mutex> artifact_lock(state->artifact_mutex, std::try_to_lock);
+    if (!artifact_lock.owns_lock() || state->artifact_quiescing.load(std::memory_order_acquire)) {
+        LogCapabilityDiagnostic(*state, requested_capability, "unavailable");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!state->artifact_valid.load(std::memory_order_acquire)) {
+        LogCapabilityDiagnostic(*state, requested_capability, "generation_stale");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    out_proof->struct_size = sizeof(DartPlantVmCapabilityProof);
+    out_proof->capability = dartplant::vm_abi::kCapabilityNone;
+    out_proof->resolved_target = 0;
+    out_proof->profile_version = 0;
+    out_proof->artifact_generation = state->artifact_generation.load(std::memory_order_acquire);
+    out_proof->isolate_generation = state->identity.generation;
+    if (ValidateCurrentOwner(*state) != DARTPLANT_OK) {
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+
+    const auto function_code = dartplant::vm_abi::kCapabilityFunctionCodeLayout;
+    const auto aot_entry = dartplant::vm_abi::kCapabilityAotEntryLayout;
+    const auto call_abi = dartplant::vm_abi::kCapabilityInvocationCallAbi;
+    const auto descriptor = dartplant::vm_abi::kCapabilityArgumentsDescriptorLayout;
+    const auto function_type = dartplant::vm_abi::kCapabilityFunctionTypeLayout;
+    const auto closure_call = dartplant::vm_abi::kCapabilityClosureCallLayout;
+    const auto exception_bridge = dartplant::vm_abi::kCapabilityExceptionBridgeLayout;
+    const dartplant::RuntimeProfileRecord* selected = nullptr;
+    dartplant::vm_abi::DomainSetSelection proof_selection{};
+    if (evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ||
+        evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY ||
+        evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI) {
+        const bool allow_shared =
+            (evidence->flags & DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER) != 0;
+        const uint64_t selected_capability =
+            evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ? function_code
+            : evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY   ? aot_entry
+                                                                  : call_abi;
+        if (!CapabilityDependenciesVerified(*state, selected_capability)) {
+            MarkCapabilityFailed(*state, selected_capability);
+            LogCapabilityDiagnostic(*state, selected_capability, "dependency_mismatch");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        std::vector<bool> compatible;
+        compatible.reserve(state->abi_candidates.profiles.size());
+        for (size_t index = 0; index < state->abi_candidates.profiles.size(); ++index) {
+            const auto* candidate = state->abi_candidates.profiles[index];
+            uint64_t candidate_code = 0;
+            if (!CandidatePassedRootProof(*state, index) || candidate == nullptr ||
+                !ResolveEvidenceCode(*state, *candidate, *evidence, &candidate_code)) {
+                compatible.push_back(false);
+                continue;
+            }
+            const uint64_t heap_base =
+                ThreadWord(*state, candidate->live_vm.thread_heap_base_offset);
+            const auto proof = dartplant::vm_abi::ProveFunctionCodeEntry(
+                *candidate, heap_base, evidence->function, candidate_code, evidence->expected_entry,
+                allow_shared, evidence->entry_kind);
+            compatible.push_back(proof.passed &&
+                                 (evidence->kind != DARTPLANT_VM_EVIDENCE_AOT_ENTRY ||
+                                  ProveAotEntryForProfile(*state, *candidate, candidate_code,
+                                                          evidence->expected_entry)));
+        }
+        proof_selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+            state->abi_candidates, selected_capability, compatible);
+        const auto& selection = proof_selection;
+        if (!selection.passed()) {
+            if (selection.ambiguous()) {
+                MarkCapabilityAmbiguous(*state, selected_capability);
+                LogCapabilityDiagnostic(*state, selected_capability, "ambiguous", &selection);
+            } else {
+                MarkCapabilityFailed(*state, selected_capability);
+                LogCapabilityDiagnostic(*state, selected_capability, "predicate_failed",
+                                        &selection);
+            }
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        selected = selection.representative;
+        if (selected_capability == aot_entry &&
+            !ProofDomainsMatch(*state, function_code, *selected)) {
+            MarkCapabilityFailed(*state, selected_capability);
+            LogCapabilityDiagnostic(*state, selected_capability, "dependency_mismatch", &selection);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        SetProofRecordDomains(*state, selected_capability, *selected, selection.abi_domain_key);
+        MarkCapabilityVerified(*state, selected_capability);
+    } else if (evidence->kind == DARTPLANT_VM_EVIDENCE_EXCEPTION_BRIDGE) {
+        if (!HasCapability(*state, exception_bridge) ||
+            HasFailedCapability(*state, exception_bridge) || state->artifacts.engines.empty()) {
+            MarkCapabilityFailed(*state, exception_bridge);
+            LogCapabilityDiagnostic(*state, exception_bridge, "unavailable");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        std::vector<bool> compatible;
+        compatible.reserve(state->abi_candidates.profiles.size());
+        std::vector<uint64_t> targets(state->abi_candidates.profiles.size(), 0);
+        for (size_t index = 0; index < state->abi_candidates.profiles.size(); ++index) {
+            const auto* candidate = state->abi_candidates.profiles[index];
+            uintptr_t target = 0;
+            bool valid =
+                CandidatePassedRootProof(*state, index) && candidate != nullptr &&
+                candidate->thread_jump_to_frame_entry_point_offset != 0 &&
+                ReadSelf(state->thread + candidate->thread_jump_to_frame_entry_point_offset,
+                         &target) &&
+                target != 0;
+            if (valid) {
+                size_t owners = 0;
+                const auto owns_target = [target](const auto& artifact) {
+                    return std::any_of(
+                        artifact.executable_ranges.begin(), artifact.executable_ranges.end(),
+                        [target](const auto& range) {
+                            return range.end >= range.start + sizeof(uint32_t) &&
+                                   target >= range.start && target <= range.end - sizeof(uint32_t);
+                        });
+                };
+                if (owns_target(state->artifacts.app)) ++owners;
+                for (const auto& engine : state->artifacts.engines) {
+                    if (owns_target(engine)) ++owners;
+                }
+                valid = owners == 1;
+                __android_log_print(
+                    ANDROID_LOG_INFO, kTag,
+                    "exception bridge candidate[%zu] profile=%s target=0x%llx owners=%zu valid=%u",
+                    index, candidate->live_vm.name, static_cast<unsigned long long>(target), owners,
+                    static_cast<unsigned>(valid));
+            }
+            targets[index] = target;
+            compatible.push_back(valid);
+        }
+        proof_selection = dartplant::vm_abi::SelectCapabilityAbiSet(state->abi_candidates,
+                                                                    exception_bridge, compatible);
+        const auto& selection = proof_selection;
+        if (!selection.passed()) {
+            if (selection.ambiguous()) {
+                MarkCapabilityAmbiguous(*state, exception_bridge);
+                LogCapabilityDiagnostic(*state, exception_bridge, "ambiguous", &selection);
+            } else {
+                MarkCapabilityFailed(*state, exception_bridge);
+                LogCapabilityDiagnostic(*state, exception_bridge, "predicate_failed", &selection);
+            }
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const auto selected_row =
+            std::find(state->abi_candidates.profiles.begin(), state->abi_candidates.profiles.end(),
+                      selection.representative);
+        if (selected_row == state->abi_candidates.profiles.end()) {
+            MarkCapabilityFailed(*state, exception_bridge);
+            LogCapabilityDiagnostic(*state, exception_bridge, "predicate_failed", &selection);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const size_t selected_index = static_cast<size_t>(
+            std::distance(state->abi_candidates.profiles.begin(), selected_row));
+        selected = selection.representative;
+        state->exception_profile = selected;
+        SetProofRecordDomains(*state, exception_bridge, *selected, selection.abi_domain_key);
+        out_proof->resolved_target = targets[selected_index];
+        MarkCapabilityVerified(*state, exception_bridge);
+    } else if (evidence->kind == DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR) {
+        if (!CapabilityDependenciesVerified(*state, descriptor)) {
+            MarkCapabilityFailed(*state, descriptor);
+            LogCapabilityDiagnostic(*state, descriptor, "dependency_mismatch");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        std::vector<bool> compatible;
+        compatible.reserve(state->abi_candidates.profiles.size());
+        for (size_t index = 0; index < state->abi_candidates.profiles.size(); ++index) {
+            const auto* candidate = state->abi_candidates.profiles[index];
+            if (!CandidatePassedRootProof(*state, index) || candidate == nullptr) {
+                compatible.push_back(false);
+                continue;
+            }
+            const uint64_t heap_base =
+                ThreadWord(*state, candidate->live_vm.thread_heap_base_offset);
+            compatible.push_back(dartplant::vm_abi::ProveArgumentsDescriptorLayout(
+                                     *candidate, heap_base, evidence->descriptor)
+                                     .passed);
+        }
+        proof_selection = dartplant::vm_abi::SelectCapabilityAbiSet(state->abi_candidates,
+                                                                    descriptor, compatible);
+        const auto& selection = proof_selection;
+        if (!selection.passed()) {
+            if (selection.ambiguous()) {
+                MarkCapabilityAmbiguous(*state, descriptor);
+                LogCapabilityDiagnostic(*state, descriptor, "ambiguous", &selection);
+            } else {
+                MarkCapabilityFailed(*state, descriptor);
+                LogCapabilityDiagnostic(*state, descriptor, "predicate_failed", &selection);
+            }
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        selected = selection.representative;
+        SetProofRecordDomains(*state, descriptor, *selected, selection.abi_domain_key);
+        state->call_profile = selected;
+        MarkCapabilityVerified(*state, descriptor);
+    } else if (evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE) {
+        selected = SelectCapabilityProfile(
+            *state, function_type,
+            [&state, evidence](const auto& candidate) {
+                return ProveFunctionTypeForProfile(*state, candidate, evidence->function);
+            },
+            &proof_selection);
+        if (selected == nullptr) return DARTPLANT_PROFILE_MISMATCH;
+        state->object_profile = selected;
+        SetProofRecordDomains(*state, function_type, *selected);
+        MarkCapabilityVerified(*state, function_type);
+    } else if (evidence->kind == DARTPLANT_VM_EVIDENCE_CLOSURE_CALL) {
+        if (!CapabilityDependenciesVerified(*state, closure_call)) {
+            MarkCapabilityFailed(*state, closure_call);
+            LogCapabilityDiagnostic(*state, closure_call, "dependency_mismatch");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        std::vector<bool> compatible;
+        compatible.reserve(state->abi_candidates.profiles.size());
+        for (size_t index = 0; index < state->abi_candidates.profiles.size(); ++index) {
+            const auto* candidate = state->abi_candidates.profiles[index];
+            if (!CandidatePassedRootProof(*state, index) || candidate == nullptr) {
+                compatible.push_back(false);
+                continue;
+            }
+            const uint64_t heap_base =
+                ThreadWord(*state, candidate->live_vm.thread_heap_base_offset);
+            uint64_t candidate_code = 0;
+            compatible.push_back(
+                ResolveEvidenceCode(*state, *candidate, *evidence, &candidate_code) &&
+                dartplant::vm_abi::ProveFunctionCodeEntry(
+                    *candidate, heap_base, evidence->function, candidate_code,
+                    evidence->expected_entry,
+                    (evidence->flags & DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER) != 0,
+                    evidence->entry_kind)
+                    .passed &&
+                ProveFunctionTypeForProfile(*state, *candidate, evidence->function) &&
+                dartplant::vm_abi::ProveClosureCallRelation(
+                    *candidate, heap_base, evidence->function, evidence->descriptor,
+                    evidence->type_arguments));
+        }
+        proof_selection = dartplant::vm_abi::SelectCapabilityAbiSet(state->abi_candidates,
+                                                                    closure_call, compatible);
+        const auto& selection = proof_selection;
+        if (!selection.passed()) {
+            if (selection.ambiguous()) {
+                MarkCapabilityAmbiguous(*state, closure_call);
+                LogCapabilityDiagnostic(*state, closure_call, "ambiguous", &selection);
+            } else {
+                MarkCapabilityFailed(*state, closure_call);
+                LogCapabilityDiagnostic(*state, closure_call, "predicate_failed", &selection);
+            }
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        selected = selection.representative;
+        if (!ClosureDependencyDomainsMatch(*state, *selected)) {
+            MarkCapabilityFailed(*state, closure_call);
+            LogCapabilityDiagnostic(*state, closure_call, "dependency_mismatch", &selection);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        SetProofRecordDomains(*state, closure_call, *selected, selection.abi_domain_key);
+        MarkCapabilityVerified(*state, closure_call);
+    } else {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    out_proof->capability =
+        evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE          ? function_code
+        : evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY            ? aot_entry
+        : evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI  ? call_abi
+        : evidence->kind == DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR ? descriptor
+        : evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE        ? function_type
+        : evidence->kind == DARTPLANT_VM_EVIDENCE_CLOSURE_CALL         ? closure_call
+                                                                       : exception_bridge;
+    out_proof->profile_version = selected == nullptr ? 0 : selected->live_vm.profile_version;
+    LogCapabilityDiagnostic(*state, out_proof->capability, "verified", &proof_selection);
+    return DARTPLANT_OK;
 }
 
 void LogCapabilityTransition(State& state, uint64_t capability, const char* name,
@@ -251,24 +991,48 @@ void LogCapabilityTransition(State& state, uint64_t capability, const char* name
         name, result, static_cast<unsigned long long>(capability),
         static_cast<unsigned long long>(verified), static_cast<unsigned long long>(failed),
         static_cast<unsigned long long>(artifact_generation));
-    __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "DARTPLANT_CI {\"event\":\"capability\",\"name\":\"%s\",\"state\":\"%s\","
-                        "\"capability\":\"0x%llx\",\"verified\":\"0x%llx\",\"failed\":\"0x%llx\","
-                        "\"artifact_generation\":%llu,\"isolate_generation\":%llu}",
-                        name, result, static_cast<unsigned long long>(capability),
-                        static_cast<unsigned long long>(verified),
-                        static_cast<unsigned long long>(failed),
-                        static_cast<unsigned long long>(artifact_generation),
-                        static_cast<unsigned long long>(state.identity.generation));
 }
 
 bool ProveTransitionCapability(State& state) {
     constexpr uint64_t capability = dartplant::vm_abi::kCapabilityGeneratedTransitionLayout;
-    if (!HasCapability(state, capability) || state.profile == nullptr) return false;
-    const auto proof =
-        dartplant::vm_abi::ProveGeneratedTransitionState(*state.profile, state.thread);
+    if (!HasCapability(state, capability) || state.profile == nullptr ||
+        state.abi_candidates.empty()) {
+        return false;
+    }
+    dartplant::vm_abi::DomainSetSelection selection{};
+    const auto* profile = ResolveCapabilityProfile(
+        state, capability,
+        [&state](const dartplant::RuntimeProfileRecord& candidate) {
+            return dartplant::vm_abi::ProveGeneratedTransitionState(candidate, state.thread).passed;
+        },
+        &selection);
+    if (profile == nullptr) {
+        LogCapabilityTransition(
+            state, capability, "generated-transition",
+            CurrentProofState(state, capability) == dartplant::vm_abi::ProofState::kAmbiguous
+                ? "ambiguous"
+                : "failed");
+        return false;
+    }
+    const auto safepoint = std::find_if(
+        state.safepoint_bindings.begin(), state.safepoint_bindings.end(),
+        [profile](const SafepointBinding& binding) {
+            return binding.profile == profile && binding.enter != 0 && binding.exit != 0;
+        });
+    if (safepoint == state.safepoint_bindings.end()) {
+        MarkCapabilityFailed(state, capability);
+        LogCapabilityDiagnostic(state, capability, "dependency_mismatch", &selection);
+        LogCapabilityTransition(state, capability, "generated-transition", "missing-stub-binding");
+        return false;
+    }
+    state.transition_profile = profile;
+    state.enter_safepoint = safepoint->enter;
+    state.exit_safepoint = safepoint->exit;
+    const dartplant::vm_abi::GeneratedTransitionProof proof =
+        dartplant::vm_abi::ProveGeneratedTransitionState(*profile, state.thread);
     if (!proof.passed) {
         MarkCapabilityFailed(state, capability);
+        LogCapabilityDiagnostic(state, capability, "predicate_failed", &selection);
         __android_log_print(
             ANDROID_LOG_WARN, kTag,
             "transition state proof rejected execution=%llu top_exit=0x%llx vm_tag=0x%llx "
@@ -283,6 +1047,7 @@ bool ProveTransitionCapability(State& state) {
     const bool first = !HasVerifiedCapability(state, capability);
     MarkCapabilityVerified(state, capability);
     if (first) {
+        LogCapabilityDiagnostic(state, capability, "verified", &selection);
         __android_log_print(
             ANDROID_LOG_INFO, kTag,
             "transition state proof passed execution=%llu top_exit=0x%llx vm_tag=0x%llx "
@@ -315,18 +1080,19 @@ bool ValidateHotArtifactBinding(const State& state) {
 
 uint64_t InvalidateArtifactBindingLocked(State& state) {
     state.artifact_valid.store(false, std::memory_order_release);
-    ResetCapabilityProof(state, kIncarnationScopedProofMask);
+    ResetCapabilityProof(state, state.capabilities);
     return state.artifact_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
-bool ValidActiveObjectRaw(const State& state, uint64_t raw, bool allow_smi, bool allow_null) {
+bool ValidActiveObjectRaw(const State& state, const dartplant::RuntimeProfileRecord& profile,
+                          uint64_t raw, bool allow_smi, bool allow_null) {
     if (raw == state.null_raw) return allow_null;
-    const auto& object = state.profile->raw_object;
+    const auto& object = profile.raw_object;
     const uint64_t tag = raw & object.smi_tag_mask;
     if (tag != object.heap_object_tag) return tag == object.smi_tag && allow_smi;
     uint64_t heap_base = 0;
-    if (!ReadSelf(state.thread + state.profile->live_vm.thread_heap_base_offset, &heap_base) ||
-        !TaggedInHeapWindow(*state.profile, heap_base, raw)) {
+    if (!ReadSelf(state.thread + profile.live_vm.thread_heap_base_offset, &heap_base) ||
+        !TaggedInHeapWindow(profile, heap_base, raw)) {
         return false;
     }
     uint64_t tags = 0;
@@ -342,24 +1108,53 @@ DartPlantStatus ReadAndProveActiveExceptionState(State& state, uint64_t* out_exc
     }
     const DartPlantStatus owner = ValidateCurrentOwner(state);
     if (owner != DARTPLANT_OK) return owner;
+    std::vector<bool> compatible;
+    compatible.reserve(state.abi_candidates.profiles.size());
+    for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+        const auto* candidate = state.abi_candidates.profiles[index];
+        uint64_t exception = 0;
+        uint64_t stacktrace = 0;
+        const bool valid =
+            CandidatePassedRootProof(state, index) && candidate != nullptr &&
+            ReadSelf(state.thread + candidate->thread_bridge.active_exception_offset, &exception) &&
+            ReadSelf(state.thread + candidate->thread_bridge.active_stacktrace_offset,
+                     &stacktrace) &&
+            ValidActiveObjectRaw(state, *candidate, exception, true, false) &&
+            ValidActiveObjectRaw(state, *candidate, stacktrace, false, true);
+        compatible.push_back(valid);
+    }
+    const auto selection =
+        dartplant::vm_abi::SelectCapabilityAbiSet(state.abi_candidates, capability, compatible);
+    if (!selection.passed()) {
+        const bool first_failure = !HasFailedCapability(state, capability);
+        if (selection.ambiguous()) {
+            MarkCapabilityAmbiguous(state, capability);
+            LogCapabilityDiagnostic(state, capability, "ambiguous", &selection);
+        } else {
+            MarkCapabilityFailed(state, capability);
+            LogCapabilityDiagnostic(state, capability, "predicate_failed", &selection);
+        }
+        if (first_failure) {
+            LogCapabilityTransition(state, capability, "active-exception",
+                                    selection.ambiguous() ? "ambiguous" : "failed");
+        }
+        return selection.ambiguous() ? DARTPLANT_PROFILE_MISMATCH : DARTPLANT_OBJECT_HANDLE_INVALID;
+    }
+    state.exception_profile = selection.representative;
+    SetProofRecordDomains(state, capability, *selection.representative, selection.abi_domain_key);
+    const auto& bridge = *state.exception_profile;
     uint64_t exception = 0;
     uint64_t stacktrace = 0;
-    if (!ReadSelf(state.thread + state.profile->thread_bridge.active_exception_offset,
-                  &exception) ||
-        !ReadSelf(state.thread + state.profile->thread_bridge.active_stacktrace_offset,
-                  &stacktrace) ||
-        !ValidActiveObjectRaw(state, exception, true, false) ||
-        !ValidActiveObjectRaw(state, stacktrace, false, true)) {
-        const bool first_failure = !HasFailedCapability(state, capability);
+    if (!ReadSelf(state.thread + bridge.thread_bridge.active_exception_offset, &exception) ||
+        !ReadSelf(state.thread + bridge.thread_bridge.active_stacktrace_offset, &stacktrace)) {
         MarkCapabilityFailed(state, capability);
-        if (first_failure) {
-            LogCapabilityTransition(state, capability, "active-exception", "failed");
-        }
+        LogCapabilityDiagnostic(state, capability, "predicate_failed", &selection);
         return DARTPLANT_OBJECT_HANDLE_INVALID;
     }
     const bool first_verification = !HasVerifiedCapability(state, capability);
     MarkCapabilityVerified(state, capability);
     if (first_verification) {
+        LogCapabilityDiagnostic(state, capability, "verified", &selection);
         LogCapabilityTransition(state, capability, "active-exception", "verified");
     }
     *out_exception = exception;
@@ -631,7 +1426,10 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
                                        const DartPlantGeneratedTransitionFrame* frame, void*) {
     auto* state = static_cast<State*>(user_data);
     if (state == nullptr || identity == nullptr || frame == nullptr || state->profile == nullptr ||
-        frame->thread != state->thread || identity->isolate != state->identity.isolate ||
+        state->transition_profile == nullptr || frame->thread != state->thread ||
+        identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group ||
+        identity->generation != state->identity.generation ||
         (frame->flags & DARTPLANT_GENERATED_TRANSITION_SYNTHETIC_EXIT_FRAME) == 0) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
@@ -660,8 +1458,8 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         !ProveTransitionCapability(*state)) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    const auto& bridge = state->profile->thread_bridge;
-    const auto& transition = state->profile->transition;
+    const auto& bridge = state->transition_profile->thread_bridge;
+    const auto& transition = state->transition_profile->transition;
     const uint64_t execution_state = ThreadWord(*state, bridge.execution_state_offset);
     const uint64_t top_exit_frame = ThreadWord(*state, bridge.top_exit_frame_offset);
     uint64_t& exit_through_ffi = ThreadWord(*state, bridge.exit_through_ffi_offset);
@@ -670,6 +1468,8 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
     if (execution_state != transition.execution_generated ||
         top_exit_frame != transition.exit_none || vm_tag != transition.vm_tag_dart) {
         MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "predicate_failed");
         LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
                                 "generated-transition", "failed-state");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -688,6 +1488,8 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         exit_through_ffi = transition.exit_none;
     } else if (exit_through_ffi != transition.exit_none) {
         MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "predicate_failed");
         LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
                                 "generated-transition", "failed-exit-marker");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -709,6 +1511,8 @@ DartPlantStatus EnterGeneratedToNative(void* user_data, const DartPlantIsolateId
         ThreadWord(*state, bridge.exit_through_ffi_offset) = previous_exit_marker;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "predicate_failed");
         LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
                                 "generated-transition", "failed-post-enter");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -720,7 +1524,10 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
                                        const DartPlantGeneratedTransitionFrame* frame, void*) {
     auto* state = static_cast<State*>(user_data);
     if (state == nullptr || identity == nullptr || frame == nullptr || state->profile == nullptr ||
-        frame->thread != state->thread) {
+        state->transition_profile == nullptr || frame->thread != state->thread ||
+        identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group ||
+        identity->generation != state->identity.generation) {
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     std::lock_guard artifact_lock(state->artifact_mutex);
@@ -740,12 +1547,14 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
                             "native return rejected: VM artifact incarnation changed");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    const auto& bridge = state->profile->thread_bridge;
-    const auto& transition = state->profile->transition;
+    const auto& bridge = state->transition_profile->thread_bridge;
+    const auto& transition = state->transition_profile->transition;
     if (ThreadWord(*state, bridge.execution_state_offset) != transition.execution_native ||
         ThreadWord(*state, bridge.top_exit_frame_offset) != frame->exit_frame ||
         ThreadWord(*state, bridge.exit_through_ffi_offset) != transition.exit_through_ffi) {
         MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "predicate_failed");
         LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
                                 "generated-transition", "failed-native-state");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -770,6 +1579,8 @@ DartPlantStatus LeaveNativeToGenerated(void* user_data, const DartPlantIsolateId
         ThreadWord(*state, bridge.exit_through_ffi_offset) = previous_exit_marker;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         MarkCapabilityFailed(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+                                "predicate_failed");
         LogCapabilityTransition(*state, dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
                                 "generated-transition", "failed-post-leave");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
@@ -782,8 +1593,12 @@ DartPlantStatus ReadActiveException(void* user_data, const DartPlantIsolateIdent
     auto* state = static_cast<State*>(user_data);
     if (state == nullptr || identity == nullptr || out_raw == nullptr ||
         identity->isolate != state->identity.isolate ||
-        identity->isolate_group != state->identity.isolate_group ||
-        identity->generation != state->identity.generation || state->profile == nullptr) {
+        identity->isolate_group != state->identity.isolate_group || state->profile == nullptr) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (identity->generation != state->identity.generation) {
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityExceptionLayout,
+                                "generation_stale");
         return DARTPLANT_INVALID_ARGUMENT;
     }
     uint64_t exception = 0;
@@ -800,8 +1615,12 @@ DartPlantStatus ReadActiveStacktrace(void* user_data, const DartPlantIsolateIden
     auto* state = static_cast<State*>(user_data);
     if (state == nullptr || identity == nullptr || out_raw == nullptr ||
         identity->isolate != state->identity.isolate ||
-        identity->isolate_group != state->identity.isolate_group ||
-        identity->generation != state->identity.generation || state->profile == nullptr) {
+        identity->isolate_group != state->identity.isolate_group || state->profile == nullptr) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (identity->generation != state->identity.generation) {
+        LogCapabilityDiagnostic(*state, dartplant::vm_abi::kCapabilityExceptionLayout,
+                                "generation_stale");
         return DARTPLANT_INVALID_ARGUMENT;
     }
     uint64_t exception = 0;
@@ -817,86 +1636,107 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
                                          uint64_t type_arguments_raw, uint32_t index,
                                          uint64_t* out_raw) {
     auto* state = static_cast<State*>(user_data);
-    const auto* type_arguments =
-        state == nullptr || state->profile == nullptr ? nullptr : &state->profile->type_arguments;
-    const auto* raw =
-        state == nullptr || state->profile == nullptr ? nullptr : &state->profile->raw_object;
     if (state == nullptr || identity == nullptr || out_raw == nullptr ||
-        type_arguments == nullptr || raw == nullptr ||
-        identity->isolate != state->identity.isolate ||
-        identity->isolate_group != state->identity.isolate_group ||
-        identity->generation != state->identity.generation ||
-        (type_arguments_raw & raw->smi_tag_mask) != raw->heap_object_tag) {
+        state->profile == nullptr || identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group) {
         return DARTPLANT_INVALID_ARGUMENT;
     }
     constexpr uint64_t capability = dartplant::vm_abi::kCapabilityTypeArgumentsLayout;
+    if (identity->generation != state->identity.generation) {
+        LogCapabilityDiagnostic(*state, capability, "generation_stale");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
     if (!HasCapability(*state, capability) || HasFailedCapability(*state, capability)) {
+        LogCapabilityDiagnostic(*state, capability, "unavailable");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
+    dartplant::vm_abi::DomainSetSelection selection{};
     const auto fail_proof = [&](DartPlantStatus status) {
         const bool first_failure = !HasFailedCapability(*state, capability);
         MarkCapabilityFailed(*state, capability);
+        LogCapabilityDiagnostic(*state, capability, "predicate_failed", &selection);
         if (first_failure) {
             LogCapabilityTransition(*state, capability, "type-arguments-element", "failed");
         }
         return status;
     };
-    // This callback is invoked by dartplant_core before Generated->Native and
-    // before any Dart API scope/safepoint. The mutator therefore cannot move
-    // this object while these raw compressed fields are inspected. Every
-    // returned element is immediately copied into the generated-root lease;
-    // user callbacks never retain or dereference this object address.
-    const uint64_t heap_base = ThreadWord(*state, state->profile->live_vm.thread_heap_base_offset);
-    const uintptr_t tagged_object = static_cast<uintptr_t>(type_arguments_raw);
-    // Generated Dart registers/stack slots contain a full tagged ObjectPtr even
-    // in compressed-pointer builds. Only fields inside heap objects are stored
-    // as 32-bit compressed pointers. Constrain the full pointer to this heap's
-    // 4-GiB compression window before reading its header.
-    if (!TaggedInHeapWindow(*state->profile, heap_base, tagged_object)) {
+    std::vector<bool> compatible;
+    compatible.reserve(state->abi_candidates.profiles.size());
+    for (size_t index = 0; index < state->abi_candidates.profiles.size(); ++index) {
+        const auto* candidate = state->abi_candidates.profiles[index];
+        bool valid = false;
+        if (CandidatePassedRootProof(*state, index) && candidate != nullptr &&
+            candidate->raw_object.compressed_word_size == sizeof(uint32_t)) {
+            const uint64_t heap_base =
+                ThreadWord(*state, candidate->live_vm.thread_heap_base_offset);
+            const uintptr_t tagged_object = static_cast<uintptr_t>(type_arguments_raw);
+            valid = TaggedInHeapWindow(*candidate, heap_base, tagged_object);
+            const uintptr_t object =
+                valid ? tagged_object - candidate->raw_object.heap_object_tag : 0;
+            uint64_t tags = 0;
+            if (valid && ReadSelf(object, &tags) && candidate->raw_object.class_id_tag_bits > 0 &&
+                candidate->raw_object.class_id_tag_bits < 64) {
+                const uint64_t class_id_mask =
+                    (uint64_t{1} << candidate->raw_object.class_id_tag_bits) - 1;
+                const uint32_t cid = static_cast<uint32_t>(
+                    (tags >> candidate->raw_object.class_id_tag_shift) & class_id_mask);
+                uint32_t length_raw = 0;
+                uint32_t compressed_element = 0;
+                if (index > (std::numeric_limits<uintptr_t>::max() -
+                             candidate->type_arguments.types_offset) /
+                                sizeof(uint32_t) ||
+                    object > std::numeric_limits<uintptr_t>::max() -
+                                 candidate->type_arguments.types_offset -
+                                 static_cast<uintptr_t>(index) * sizeof(uint32_t)) {
+                    compatible.push_back(false);
+                    continue;
+                }
+                const uintptr_t element_address = object + candidate->type_arguments.types_offset +
+                                                  static_cast<uintptr_t>(index) * sizeof(uint32_t);
+                valid = cid == candidate->type_arguments.cid &&
+                        ReadSelf(object + candidate->type_arguments.length_offset, &length_raw) &&
+                        dartplant::vm_abi::DecodePositiveCompressedSmi(
+                            length_raw, candidate->raw_object, &length_raw) &&
+                        length_raw > index && ReadSelf(element_address, &compressed_element) &&
+                        (compressed_element & candidate->raw_object.smi_tag_mask) ==
+                            candidate->raw_object.heap_object_tag &&
+                        heap_base <= std::numeric_limits<uintptr_t>::max() - compressed_element;
+            }
+        }
+        compatible.push_back(valid);
+    }
+    selection =
+        dartplant::vm_abi::SelectCapabilityAbiSet(state->abi_candidates, capability, compatible);
+    if (!selection.passed()) {
+        if (selection.ambiguous()) {
+            MarkCapabilityAmbiguous(*state, capability);
+            LogCapabilityDiagnostic(*state, capability, "ambiguous", &selection);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
         return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
     }
-    const uintptr_t object = tagged_object - raw->heap_object_tag;
-
-    uint64_t tags = 0;
-    if (!ReadSelf(object, &tags)) return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    if (raw->class_id_tag_bits == 0 || raw->class_id_tag_bits >= 64) {
-        return fail_proof(DARTPLANT_PROFILE_MISMATCH);
-    }
-    const uint64_t class_id_mask = (uint64_t{1} << raw->class_id_tag_bits) - 1;
-    const uint32_t cid = static_cast<uint32_t>((tags >> raw->class_id_tag_shift) & class_id_mask);
-    if (cid != type_arguments->cid) return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-
-    uint32_t length_raw = 0;
-    if (!ReadSelf(object + type_arguments->length_offset, &length_raw)) {
-        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    }
-    if ((length_raw & raw->smi_tag_mask) != raw->smi_tag) {
-        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    }
-    if ((length_raw >> raw->smi_tag_shift) <= index) {
-        return DARTPLANT_INVALID_ARGUMENT;
-    }
-    if (raw->compressed_word_size != sizeof(uint32_t) ||
-        index > (std::numeric_limits<uintptr_t>::max() - type_arguments->types_offset) /
-                    sizeof(uint32_t)) {
+    state->object_profile = selection.representative;
+    SetProofRecordDomains(*state, capability, *selection.representative, selection.abi_domain_key);
+    const auto& profile = *state->object_profile;
+    const uint64_t heap_base = ThreadWord(*state, profile.live_vm.thread_heap_base_offset);
+    const uintptr_t object =
+        static_cast<uintptr_t>(type_arguments_raw) - profile.raw_object.heap_object_tag;
+    if (index > (std::numeric_limits<uintptr_t>::max() - profile.type_arguments.types_offset) /
+                    sizeof(uint32_t) ||
+        object > std::numeric_limits<uintptr_t>::max() - profile.type_arguments.types_offset -
+                     static_cast<uintptr_t>(index) * sizeof(uint32_t)) {
         return fail_proof(DARTPLANT_PROFILE_MISMATCH);
     }
     uint32_t compressed_element = 0;
-    const uintptr_t element_address =
-        object + type_arguments->types_offset + static_cast<uintptr_t>(index) * sizeof(uint32_t);
-    if (!ReadSelf(element_address, &compressed_element)) {
+    const uintptr_t element_address = object + profile.type_arguments.types_offset +
+                                      static_cast<uintptr_t>(index) * sizeof(uint32_t);
+    if (!ReadSelf(element_address, &compressed_element))
         return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    }
-    if ((compressed_element & raw->smi_tag_mask) != raw->heap_object_tag) {
-        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    }
-    if (heap_base > std::numeric_limits<uintptr_t>::max() - compressed_element) {
-        return fail_proof(DARTPLANT_OBJECT_HANDLE_INVALID);
-    }
     *out_raw = heap_base + compressed_element;
     const bool first_verification = !HasVerifiedCapability(*state, capability);
     MarkCapabilityVerified(*state, capability);
     if (first_verification) {
+        LogCapabilityDiagnostic(*state, capability, "verified", &selection);
         LogCapabilityTransition(*state, capability, "type-arguments-element", "verified");
     }
     return DARTPLANT_OK;
@@ -904,7 +1744,7 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
 
 const DartPlantVmAdapterCallbacks kCallbacks = {
     .struct_size = sizeof(DartPlantVmAdapterCallbacks),
-    .adapter_version = 3,
+    .adapter_version = 4,
     .enter_isolate = EnterIsolate,
     .leave_isolate = LeaveIsolate,
     .enter_scope = EnterScope,
@@ -923,6 +1763,7 @@ const DartPlantVmAdapterCallbacks kCallbacks = {
     .read_active_exception = ReadActiveException,
     .read_active_stacktrace = ReadActiveStacktrace,
     .read_type_arguments_element = ReadTypeArgumentsElement,
+    .prove_capability = ProveCapability,
 };
 
 }  // namespace
@@ -1000,7 +1841,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         dartplant::vm_abi::ResolveVerifiedBinding(resolver_input);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "ABI resolver snapshot=%s features=%s source_candidates=%zu build_id_gate=disabled",
+        "ABI resolver snapshot=%s features=%s source_candidates=%zu snapshot_identity_is_hint=1",
         snapshot_hash, options->snapshot_features == nullptr ? "" : options->snapshot_features,
         resolution.candidates.size());
     for (size_t index = 0; index < resolution.candidates.size(); ++index) {
@@ -1067,7 +1908,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "verified VM binding abi=%s profile=%s app_path=%s app_build_id=%s "
                         "capabilities=0x%llx engines=%zu engine_anchor=0x%llx "
-                        "engine_build_ids_are_diagnostic_only=1",
+                        "engine_build_ids_are_incarnation_identity=1",
                         profile->abi_id, profile->live_vm.name,
                         resolution.binding.artifacts.app.path.c_str(),
                         resolution.binding.artifacts.app.build_id.c_str(),
@@ -1083,6 +1924,36 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     }
     State& state = instance->state;
     state.profile = profile;
+    state.abi_candidates = resolution.binding.core.candidates;
+    state.source_candidate_count = resolution.candidates.size();
+    state.root_compatible_count = resolution.passed_rows;
+    if (state.abi_candidates.empty()) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "resolver returned no retained core candidate rows");
+        delete instance;
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    // Resolver core candidates have already passed the startup root proof.
+    // Keep that proof provenance available to every later capability proof;
+    // artifact revalidation replaces this mask with the current incarnation's
+    // root-compatible rows.
+    state.root_compatible_candidates.assign(state.abi_candidates.profiles.size(), true);
+    for (const auto& diagnostic : resolution.candidates) {
+        if (!diagnostic.probe.passed || diagnostic.profile == nullptr ||
+            std::find(state.abi_candidates.profiles.begin(), state.abi_candidates.profiles.end(),
+                      diagnostic.profile) == state.abi_candidates.profiles.end()) {
+            continue;
+        }
+        state.safepoint_bindings.push_back({
+            .profile = diagnostic.profile,
+            .enter = diagnostic.probe.enter_entry,
+            .exit = diagnostic.probe.exit_entry,
+        });
+    }
+    state.transition_profile = profile;
+    state.exception_profile = nullptr;
+    state.call_profile = nullptr;
+    state.object_profile = nullptr;
     state.artifacts = resolution.binding.artifacts;
     state.capabilities = resolution.binding.capabilities;
     state.verified_capabilities.store(state.capabilities & kEagerRuntimeProofMask,
@@ -1098,7 +1969,6 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         delete instance;
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle);
     Dart_Handle null_handle = Dart_Null_DL();
     for (auto& root : state.roots) {
         root.handle = Dart_NewPersistentHandle_DL(null_handle);
@@ -1137,6 +2007,22 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         .generation = options->isolate_generation,
     };
     state.identity = identity;
+    for (uint64_t bit = 1; bit != 0 && bit <= state.capabilities; bit <<= 1) {
+        if ((state.capabilities & bit) == 0) continue;
+        auto& record = ProofRecord(state, bit);
+        record.capability = bit;
+        record.state = dartplant::vm_abi::ProofState::kUnverified;
+        record.artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
+        record.isolate_generation = state.identity.generation;
+    }
+    if (!EstablishEagerCapabilityProofs(state)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag, "eager VM capability domains are ambiguous");
+        DeleteRoots(state);
+        delete instance;
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    MarkCapabilityVerified(state, state.capabilities & kEagerRuntimeProofMask);
+    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle);
     DartPlantStatus status = dartplant_vm_adapter_create(&kCallbacks, &state, &state.adapter);
     __android_log_print(ANDROID_LOG_INFO, kTag, "core adapter create status=%d", status);
     if (status != DARTPLANT_OK) {
@@ -1155,7 +2041,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     *out_instance = reinterpret_cast<DartPlantFlutterVmAdapter*>(instance);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "source-verified Dart %s V3 adapter initialized abi=%s snapshot=%s thread=0x%llx",
+        "source-verified Dart %s V4 adapter initialized abi=%s snapshot=%s thread=0x%llx",
         profile->live_vm.dart_version, profile->abi_id, snapshot_hash,
         static_cast<unsigned long long>(thread));
     __android_log_print(ANDROID_LOG_INFO, kTag,
@@ -1208,9 +2094,13 @@ uint64_t dartplant_flutter_vm_adapter_capabilities(const DartPlantFlutterVmAdapt
 
 uint64_t dartplant_flutter_vm_adapter_verified_capabilities(
     const DartPlantFlutterVmAdapter* instance) {
-    return instance == nullptr ? 0
-                               : reinterpret_cast<const FlutterVmAdapterImpl*>(instance)
-                                     ->state.verified_capabilities.load(std::memory_order_acquire);
+    if (instance == nullptr) return 0;
+    const State& state = reinterpret_cast<const FlutterVmAdapterImpl*>(instance)->state;
+    uint64_t verified = 0;
+    for (uint64_t bit = 1; bit != 0 && bit <= state.capabilities; bit <<= 1) {
+        if ((state.capabilities & bit) != 0 && HasVerifiedCapability(state, bit)) verified |= bit;
+    }
+    return verified;
 }
 
 uint64_t dartplant_flutter_vm_adapter_failed_capabilities(
@@ -1229,6 +2119,12 @@ DartPlantFlutterVmProofState dartplant_flutter_vm_adapter_capability_state(
     }
     const State& state = reinterpret_cast<const FlutterVmAdapterImpl*>(instance)->state;
     if (!HasCapability(state, mask)) return DARTPLANT_FLUTTER_VM_PROOF_UNSUPPORTED;
+    if (CurrentProofState(state, mask) == dartplant::vm_abi::ProofState::kAmbiguous) {
+        return DARTPLANT_FLUTTER_VM_PROOF_AMBIGUOUS;
+    }
+    if (!CapabilityRecordCurrent(state, mask)) {
+        return DARTPLANT_FLUTTER_VM_PROOF_UNVERIFIED;
+    }
     if (HasFailedCapability(state, mask)) {
         return DARTPLANT_FLUTTER_VM_PROOF_FAILED_FOR_INCARNATION;
     }
@@ -1247,9 +2143,13 @@ void dartplant_flutter_vm_adapter_invalidate_artifacts(DartPlantFlutterVmAdapter
     if (instance == nullptr) return;
     State& state = reinterpret_cast<FlutterVmAdapterImpl*>(instance)->state;
     dartplant::VmAdapterCloseAdmission(state.adapter);
-    std::lock_guard artifact_lock(state.artifact_mutex);
-    state.artifact_quiescing.store(true, std::memory_order_release);
-    const uint64_t artifact_generation = InvalidateArtifactBindingLocked(state);
+    uint64_t artifact_generation = 0;
+    {
+        std::lock_guard artifact_lock(state.artifact_mutex);
+        state.artifact_quiescing.store(true, std::memory_order_release);
+        artifact_generation = InvalidateArtifactBindingLocked(state);
+    }
+    dartplant::VmAdapterInvalidateAbiBinding(state.adapter);
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "artifact binding invalidated abi=%s isolate_generation=%llu "
                         "artifact_generation=%llu",
@@ -1278,9 +2178,13 @@ DartPlantStatus dartplant_flutter_vm_adapter_retire_artifacts(DartPlantFlutterVm
     const DartPlantStatus quiesce = dartplant_flutter_vm_adapter_quiesce_artifacts(instance);
     if (quiesce != DARTPLANT_OK) return quiesce;
 
-    std::lock_guard artifact_lock(state.artifact_mutex);
-    if (!state.artifact_valid.load(std::memory_order_acquire)) return DARTPLANT_OK;
-    const uint64_t artifact_generation = InvalidateArtifactBindingLocked(state);
+    uint64_t artifact_generation = 0;
+    {
+        std::lock_guard artifact_lock(state.artifact_mutex);
+        if (!state.artifact_valid.load(std::memory_order_acquire)) return DARTPLANT_OK;
+        artifact_generation = InvalidateArtifactBindingLocked(state);
+    }
+    dartplant::VmAdapterInvalidateAbiBinding(state.adapter);
     __android_log_print(ANDROID_LOG_INFO, kTag,
                         "artifact binding retired abi=%s isolate_generation=%llu "
                         "artifact_generation=%llu",
@@ -1314,8 +2218,12 @@ DartPlantStatus dartplant_flutter_vm_adapter_revalidate_artifacts(
                                 state.artifact_generation.load(std::memory_order_acquire)));
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle |
-                                      dartplant::vm_abi::kCapabilitySafepointStubs);
+    if (!ReproveCoreBinding(state)) {
+        state.artifact_valid.store(false, std::memory_order_release);
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    MarkCapabilityVerified(state, state.capabilities & kEagerRuntimeProofMask);
+    MarkCapabilityVerified(state, dartplant::vm_abi::kCapabilityArtifactLifecycle);
     state.artifact_quiescing.store(false, std::memory_order_release);
     dartplant::VmAdapterOpenAdmission(state.adapter);
     __android_log_print(
@@ -1337,15 +2245,14 @@ const DartPlantFlutterVmDescriptor* DescriptorAt(uint32_t index) {
             result[cursor] = {
                 .struct_size = sizeof(DartPlantFlutterVmDescriptor),
                 .descriptor_version = 1,
-                .vm_adapter_version = 3,
+                .vm_adapter_version = 4,
                 .descriptor_id = metadata.descriptor_id,
                 .dart_version = profile->live_vm.dart_version,
                 .flutter_version = metadata.flutter_version,
                 .snapshot_hash = profile->live_vm.snapshot_hash,
                 .flutter_module_name = "libflutter.so",
-                // Deprecated compatibility field. Engine Build IDs are
-                // observed as artifact-incarnation diagnostics and never
-                // select a private VM ABI.
+                // Deprecated compatibility field. Build IDs are discovered
+                // from mapped ELF artifacts and bind only their incarnation.
                 .flutter_build_id = "",
                 .pointer_size = profile->machine.pointer_size,
                 .compressed_pointers =

@@ -26,6 +26,7 @@
 
 #include "core/internal.h"
 #include "host/signal_lease.h"
+#include "vm/live_vm_internal.h"
 
 namespace dartplant {
 namespace {
@@ -205,12 +206,8 @@ extern "C" DartPlantStatus dartplant_live_vm_bootstrap_process(
     dartplant::SetLastError("live VM cold bootstrap currently requires Linux/Android ARM64");
     return DARTPLANT_UNSUPPORTED_ABI;
 #else
-    DartPlantLiveVmProfile selected_profile{};
-    selected_profile.struct_size = sizeof(selected_profile);
-    DartPlantStatus status = dartplant_live_vm_select_profile(snapshot, &selected_profile);
-    if (status != DARTPLANT_OK) return status;
-
     const DartPlantLiveVmBootstrapOptions effective = dartplant::NormalizeOptions(options);
+    DartPlantStatus status = DARTPLANT_OK;
     DartPlantLiveVmBootstrapInfo info{};
     info.struct_size = sizeof(info);
 
@@ -282,8 +279,9 @@ extern "C" DartPlantStatus dartplant_live_vm_bootstrap_process(
 
                 DartPlantLiveVmContext candidate{};
                 candidate.struct_size = sizeof(candidate);
-                status = dartplant_live_vm_context_from_arm64_registers(snapshot, &registers,
-                                                                        &candidate);
+                dartplant::LiveVmCandidateResolution resolution{};
+                status = dartplant::ResolveLiveVmCandidateForRegisters(*snapshot, registers,
+                                                                       &resolution, &candidate);
                 if (status != DARTPLANT_OK) {
                     if (registers.thr != 0) {
                         std::snprintf(info.last_validation_error,

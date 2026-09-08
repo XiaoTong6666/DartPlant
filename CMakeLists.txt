@@ -70,6 +70,7 @@ add_library(
     src/runtime/default_runtime.cpp
     src/vm/profiles.cpp
     src/vm/runtime_profiles.cpp
+    src/vm/abi/candidate_set.cpp
     src/vm/abi/proof.cpp
     src/vm/abi/probe.cpp
     src/vm/abi/resolver.cpp

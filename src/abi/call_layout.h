@@ -12,6 +12,10 @@
 #include <vector>
 
 #include "abi/representation.h"
+namespace dartplant {
+struct RuntimeProfileRecord;
+}
+
 namespace dartplant::abi {
 
 enum class DartCallLayoutStatus : uint8_t {
@@ -73,6 +77,14 @@ struct DartClosureSignatureLayout {
 };
 
 struct DartCallLayout {
+    // Bound at hook admission from the VM adapter's generation-scoped call ABI
+    // proof. Exact offline artifacts may carry their immutable index profile.
+    // Typed invocation must not rediscover private offsets from a version or
+    // snapshot string while decoding descriptor/object relations.
+    const RuntimeProfileRecord *vm_call_profile = nullptr;
+    const RuntimeProfileRecord *vm_object_profile = nullptr;
+    uint64_t vm_artifact_generation = 0;
+    uint64_t vm_isolate_generation = 0;
     std::vector<DartParameterLayout> parameters;
     DartParameterLayout result{};
     uint32_t stack_words = 0;

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/internal.h"
+#include "vm/abi/resolver.h"
 
 #if defined(__aarch64__) && !defined(MAP_FIXED_NOREPLACE)
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -323,12 +324,46 @@ bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context
         hook->method_storage->function->source == DartFunctionSource::kSynthetic) {
         return true;
     }
-    const uint32_t offset = hook->method_storage->function->thread_jump_to_frame_entry_point_offset;
     const uintptr_t thread = static_cast<uintptr_t>(context.x[26]);
-    uintptr_t target = 0;
-    if (offset == 0 || thread == 0 || !ReadSelfWord(thread + offset, &target) || target == 0 ||
+    const auto& binding = hook->exception_bridge_binding;
+    const bool adapter_bound_live =
+        hook->method_storage->function->source == DartFunctionSource::kLiveVm &&
+        hook->vm_adapter != nullptr;
+    if (thread == 0 || !binding.verified ||
+        ((adapter_bound_live && (binding.target == 0 || hook->runtime_generation == nullptr ||
+                                 hook->runtime_generation->load(std::memory_order_acquire) !=
+                                     hook->expected_runtime_generation)) ||
+         (!adapter_bound_live && binding.target == 0 && binding.thread_offset == 0))) {
+        SetLastError("Dart JumpToFrame capability binding is unavailable or stale");
+        return false;
+    }
+    if (hook->vm_adapter != nullptr) {
+        DartPlantVmCapabilityProof proof{};
+        proof.struct_size = sizeof(proof);
+        const RuntimeProfileRecord* profile = nullptr;
+        if (VmAdapterGetCapabilityBinding(hook->vm_adapter,
+                                          DARTPLANT_VM_CAP_EXCEPTION_BRIDGE_LAYOUT, &proof,
+                                          &profile) != DARTPLANT_OK ||
+            profile == nullptr || proof.resolved_target != binding.target ||
+            proof.artifact_generation != binding.artifact_generation ||
+            proof.isolate_generation != binding.isolate_generation ||
+            dartplant::vm_abi::BuildCapabilityAbiKey(
+                *profile, dartplant::vm_abi::kCapabilityExceptionBridgeLayout) !=
+                binding.abi_domain_key) {
+            SetLastError("Dart JumpToFrame capability binding changed after hook admission");
+            return false;
+        }
+    }
+    uintptr_t target = binding.target;
+    if (binding.target == 0) {
+        if (binding.thread_offset == 0 || !ReadSelfWord(thread + binding.thread_offset, &target)) {
+            SetLastError("failed to resolve offline Dart JumpToFrame target");
+            return false;
+        }
+    }
+    if (hook->method_storage->function->source == DartFunctionSource::kLiveVm &&
         !IsKnownExecutableAddress(target)) {
-        SetLastError("failed to resolve Dart JumpToFrame for exception-safe callbacks");
+        SetLastError("verified Dart JumpToFrame target is no longer executable");
         return false;
     }
 
@@ -342,15 +377,15 @@ bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context
         }
         return state.backup != nullptr && state.published_hook != nullptr;
     }
-    const HostApiBinding* binding = hook->host_binding;
-    if (!HostBindingSupportsPublishedHooks(binding)) {
+    const HostApiBinding* host_binding = hook->host_binding;
+    if (!HostBindingSupportsPublishedHooks(host_binding)) {
         SetLastError("exception bridge host cannot safely publish Dart control flow");
         return false;
     }
 
     auto published = std::make_unique<PublishedHostHook>();
     DartPlantStatus status = PreparePublishedHostHook(
-        published.get(), binding, target,
+        published.get(), host_binding, target,
         reinterpret_cast<void*>(&dartplant_arm64_jump_to_frame_hook), false);
     if (status != DARTPLANT_OK) return false;
 

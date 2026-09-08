@@ -10,6 +10,9 @@
 #include "abi/calling_convention.h"
 #include "abi/evidence_solver.h"
 #include "runtime/runtime_internal.h"
+#include "vm/abi/proof.h"
+#include "vm/abi/resolver.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
@@ -209,10 +212,15 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         return reject(DARTPLANT_ALREADY_HOOKED, DARTPLANT_REJECT_HOOK_FAILED,
                       "compiler ABI evidence must be registered before installing the hook");
     }
+    const bool defer_live_profile_binding =
+        method->function->source == dartplant::DartFunctionSource::kLiveVm;
     const dartplant::RuntimeProfileRecord* vm_profile =
-        dartplant::FindRuntimeProfileByVersion(method->function->runtime_profile_version);
+        defer_live_profile_binding
+            ? nullptr
+            : dartplant::FindRuntimeProfileByVersion(method->function->runtime_profile_version);
     if (method->function->closure_call_entry_only) {
-        if (vm_profile == nullptr || method->record.entry_kind != DARTPLANT_ENTRY_DEFAULT) {
+        if ((!defer_live_profile_binding && vm_profile == nullptr) ||
+            method->record.entry_kind != DARTPLANT_ENTRY_DEFAULT) {
             return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ENTRY_KIND_UNSUPPORTED,
                           "closure ABI evidence has no exact PRODUCT ARM64 runtime profile");
         }
@@ -254,7 +262,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     // all user formals/type parameters; the closure-only receiver is synthesized
     // below and artifact fingerprint/entry evidence remains authoritative for
     // the physical closure target.
-    if (method->function->source == dartplant::DartFunctionSource::kLiveVm) {
+    if (method->function->source == dartplant::DartFunctionSource::kLiveVm &&
+        method->function->closure_call_entry_only) {
         function_type_object = method->function->function_object;
     } else if (method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
                method->function->closure_call_entry_only &&
@@ -280,13 +289,37 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
                           "live FunctionType is unavailable for ABI evidence validation");
         }
-        DartPlantFlutterSnapshotInfo snapshot_info{};
-        snapshot_info.struct_size = sizeof(snapshot_info);
-        dartplant::FillSnapshotInfo(*runtime->snapshot, &snapshot_info);
+        dartplant::VmRuntimeFacts facts{};
+        facts.snapshot_hash = runtime->snapshot->snapshot_hash;
+        facts.snapshot_features = runtime->snapshot->snapshot_features;
+        facts.compressed_pointers = runtime->snapshot->compressed_pointers;
+        dartplant::vm_abi::AbiCandidateSet candidates{};
+        candidates.profiles = dartplant::ResolveRuntimeProfileCandidates(facts);
+        std::vector<bool> compatible;
+        compatible.reserve(candidates.profiles.size());
+        for (const auto* candidate : candidates.profiles) {
+            compatible.push_back(
+                candidate != nullptr &&
+                std::find(runtime->live_vm_core_candidates.begin(),
+                          runtime->live_vm_core_candidates.end(),
+                          candidate) != runtime->live_vm_core_candidates.end() &&
+                dartplant::vm_abi::ProveFunctionTypeLayout(
+                    *candidate, runtime->live_vm_context->heap_base, function_type_object)
+                    .passed);
+        }
+        const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+            candidates, dartplant::vm_abi::kCapabilityFunctionTypeLayout, compatible);
+        if (!selection.passed()) {
+            return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_INCOMPLETE,
+                          selection.ambiguous()
+                              ? "live FunctionType capability proof is ambiguous"
+                              : "live FunctionType capability proof rejected every candidate");
+        }
+        vm_profile = selection.representative;
         DartPlantDartFunctionSignatureInfo signature{};
         signature.struct_size = sizeof(signature);
-        const DartPlantStatus signature_status = dartplant_live_vm_read_function_signature(
-            &*runtime->live_vm_context, &snapshot_info, function_type_object, &signature);
+        const DartPlantStatus signature_status = dartplant::ReadLiveVmFunctionSignatureForProfile(
+            *runtime->live_vm_context, *vm_profile, function_type_object, &signature);
         if (signature_status != DARTPLANT_OK) {
             return reject(signature_status, DARTPLANT_REJECT_ABI_INCOMPLETE,
                           "live FunctionType could not validate compiler ABI evidence");
@@ -329,7 +362,8 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
                evidence->has_optional_parameters != 0) {
         return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
                       "optional closure ABI requires a retained live FunctionType");
-    } else if (method->function->source != dartplant::DartFunctionSource::kOfflineSnapshotIndex) {
+    } else if (method->function->source != dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+               !defer_live_profile_binding) {
         return reject(
             DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_ABI_INCOMPLETE,
             "compiler ABI evidence requires a live Function or exact artifact-index method");
@@ -411,18 +445,16 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         closure_signature.has_named_optional_parameters =
             live_signature->has_named_optional_parameters != 0;
 
-        DartPlantFlutterSnapshotInfo snapshot_info{};
-        snapshot_info.struct_size = sizeof(snapshot_info);
-        dartplant::FillSnapshotInfo(*runtime->snapshot, &snapshot_info);
         const uint32_t first_user_parameter =
             synthesize_implicit_closure_receiver ? 0 : live_signature->implicit_parameter_count;
         for (uint32_t index = first_user_parameter; index < live_signature->parameter_count;
              ++index) {
             DartPlantDartParameterInfo parameter{};
             parameter.struct_size = sizeof(parameter);
-            const DartPlantStatus parameter_status = dartplant_live_vm_read_function_parameter(
-                &*runtime->live_vm_context, &snapshot_info, function_type_object, index,
-                &parameter);
+            const DartPlantStatus parameter_status =
+                dartplant::ReadLiveVmFunctionParameterForProfile(*runtime->live_vm_context,
+                                                                 *vm_profile, function_type_object,
+                                                                 index, &parameter);
             if (parameter_status != DARTPLANT_OK) {
                 existing->layout_status = dartplant::abi::DartCallLayoutStatus::kIncompleteEvidence;
                 break;
@@ -450,10 +482,19 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             .register_index = 0,
         };
         layout->has_arguments_descriptor = true;
-        layout->arguments_descriptor_location = dartplant::abi::DartAbiLocation{
-            .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
-            .register_index = vm_profile->arguments_descriptor_register,
-        };
+        if (!defer_live_profile_binding) {
+            layout->arguments_descriptor_location = dartplant::abi::DartAbiLocation{
+                .kind = dartplant::abi::DartAbiLocationKind::kGpRegister,
+                .register_index = vm_profile->arguments_descriptor_register,
+            };
+        }
+    }
+    if (existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk) {
+        // Live call fields bind at hook admission. The object pointer records
+        // the capability-proven parser provenance and is replaced by the
+        // adapter's generation-scoped FunctionType binding at admission.
+        layout->vm_call_profile = defer_live_profile_binding ? nullptr : vm_profile;
+        layout->vm_object_profile = vm_profile;
     }
     existing->call_layout = existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
                                     method->function->code_target->HasProvenUniqueIdentity()

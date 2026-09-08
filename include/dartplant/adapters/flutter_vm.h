@@ -18,16 +18,27 @@ extern "C" {
 typedef struct DartPlantFlutterVmAdapter DartPlantFlutterVmAdapter;
 
 typedef enum DartPlantFlutterVmCapability {
-    DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN = 1u << 0,
-    DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN = 1u << 1,
-    DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN = 1u << 2,
-    DARTPLANT_FLUTTER_VM_CAP_REGISTER_SEMANTICS_PROVEN = 1u << 3,
-    DARTPLANT_FLUTTER_VM_CAP_DART_CORE_PROVEN = 1u << 4,
-    DARTPLANT_FLUTTER_VM_CAP_SAFEPOINT_STUBS_PROVEN = 1u << 5,
-    DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED = 1u << 6,
-    DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_SOURCE_VERIFIED = 1u << 7,
-    DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED = 1u << 8,
-    DARTPLANT_FLUTTER_VM_CAP_ARTIFACT_LIFECYCLE_BOUND = 1u << 9,
+    DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN = DARTPLANT_VM_CAP_RUNTIME_ROOTS,
+    DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN = DARTPLANT_VM_CAP_OWNER_IDENTITY,
+    DARTPLANT_FLUTTER_VM_CAP_CANONICAL_NULL_PROVEN = DARTPLANT_VM_CAP_CANONICAL_NULL,
+    DARTPLANT_FLUTTER_VM_CAP_REGISTER_SEMANTICS_PROVEN = DARTPLANT_VM_CAP_REGISTER_SEMANTICS,
+    DARTPLANT_FLUTTER_VM_CAP_DART_CORE_PROVEN = DARTPLANT_VM_CAP_DART_CORE,
+    DARTPLANT_FLUTTER_VM_CAP_SAFEPOINT_STUBS_PROVEN = DARTPLANT_VM_CAP_SAFEPOINT_STUBS,
+    DARTPLANT_FLUTTER_VM_CAP_GENERATED_TRANSITION_SOURCE_VERIFIED =
+        DARTPLANT_VM_CAP_GENERATED_TRANSITION_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_SOURCE_VERIFIED = DARTPLANT_VM_CAP_EXCEPTION_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED =
+        DARTPLANT_VM_CAP_TYPE_ARGUMENTS_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_ARTIFACT_LIFECYCLE_BOUND = DARTPLANT_VM_CAP_ARTIFACT_LIFECYCLE,
+    DARTPLANT_FLUTTER_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT_VERIFIED =
+        DARTPLANT_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_INVOCATION_CALL_ABI_VERIFIED = DARTPLANT_VM_CAP_INVOCATION_CALL_ABI,
+    DARTPLANT_FLUTTER_VM_CAP_FUNCTION_CODE_LAYOUT_VERIFIED = DARTPLANT_VM_CAP_FUNCTION_CODE_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_AOT_ENTRY_LAYOUT_VERIFIED = DARTPLANT_VM_CAP_AOT_ENTRY_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_FUNCTION_TYPE_LAYOUT_VERIFIED = DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_CLOSURE_CALL_LAYOUT_VERIFIED = DARTPLANT_VM_CAP_CLOSURE_CALL_LAYOUT,
+    DARTPLANT_FLUTTER_VM_CAP_EXCEPTION_BRIDGE_LAYOUT_VERIFIED =
+        DARTPLANT_VM_CAP_EXCEPTION_BRIDGE_LAYOUT,
 } DartPlantFlutterVmCapability;
 
 typedef enum DartPlantFlutterVmProofState {
@@ -35,6 +46,7 @@ typedef enum DartPlantFlutterVmProofState {
     DARTPLANT_FLUTTER_VM_PROOF_UNVERIFIED = 1,
     DARTPLANT_FLUTTER_VM_PROOF_VERIFIED = 2,
     DARTPLANT_FLUTTER_VM_PROOF_FAILED_FOR_INCARNATION = 3,
+    DARTPLANT_FLUTTER_VM_PROOF_AMBIGUOUS = 4,
 } DartPlantFlutterVmProofState;
 
 typedef struct DartPlantFlutterVmAdapterOptions {
@@ -56,9 +68,8 @@ typedef struct DartPlantFlutterVmDescriptor {
     const char* flutter_version;
     const char* snapshot_hash;
     const char* flutter_module_name;
-    // Deprecated compatibility field. Build IDs no longer select the Dart VM
-    // private ABI. The adapter observes the currently mapped engine/app Build
-    // IDs only as artifact-incarnation diagnostics after structural proof.
+    // Deprecated compatibility field. Build IDs are discovered dynamically
+    // from mapped ELF artifacts and bind only the artifact incarnation.
     const char* flutter_build_id;
     uint32_t pointer_size;
     uint8_t compressed_pointers;
@@ -117,11 +128,11 @@ dartplant_flutter_vm_adapter_revalidate_artifacts(DartPlantFlutterVmAdapter* ins
 DARTPLANT_EXPORT DartPlantStatus
 dartplant_flutter_vm_adapter_destroy(DartPlantFlutterVmAdapter* instance);
 // Source-verified ABI descriptors compiled into this adapter. Snapshot identity
-// is only a ranking hint; every compatible finite source candidate is eligible
-// for read-only structural proof. Artifact Build IDs never determine ABI
-// compatibility. The implementation remains process-global because dart_api_dl
-// itself is process-global; create returns VM_ADAPTER_BUSY while another
-// instance is attached.
+// ranks a finite candidate set; read-only structural and relational proofs
+// select ABI domains. Artifact Build IDs never select private VM layouts. The
+// implementation remains process-global because dart_api_dl itself is
+// process-global; create returns VM_ADAPTER_BUSY while another instance is
+// attached.
 DARTPLANT_EXPORT uint32_t dartplant_flutter_vm_descriptor_count(void);
 DARTPLANT_EXPORT const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_descriptor_at(
     uint32_t index);

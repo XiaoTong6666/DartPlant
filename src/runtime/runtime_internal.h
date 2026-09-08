@@ -21,6 +21,7 @@
 #include "runtime/flutter_snapshot_internal.h"
 #include "runtime/snapshot_index.h"
 #include "vm/object_bridge.h"
+#include "vm/runtime_profiles.h"
 
 namespace dartplant {
 
@@ -117,6 +118,7 @@ struct DartPlantRuntime {
     uint64_t bound_artifact_snapshot_generation = 0;
     DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
     std::optional<DartPlantLiveVmContext> live_vm_context;
+    std::vector<const dartplant::RuntimeProfileRecord*> live_vm_core_candidates;
     // Canonical semantic roots are captured only from an exact, validated live
     // VM profile and are scoped to this runtime generation.
     uint64_t live_vm_null_value = 0;

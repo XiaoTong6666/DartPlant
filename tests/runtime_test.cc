@@ -573,6 +573,23 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     function.entry_alias_count = 1;
     function.live = true;
     index.functions.push_back(std::move(function));
+    DartPlantLiveVmFunctionInfo live_info{};
+    live_info.struct_size = sizeof(live_info);
+    live_info.entry_alias_count = 1;
+    live_info.function = 0x1001;
+    live_info.code = 0x2001;
+    live_info.function_entry_point = reinterpret_cast<uintptr_t>(target);
+    live_info.code_entry_point = reinterpret_cast<uintptr_t>(target);
+    live_info.entry_va = 0x1000;
+    live_info.code_section_va = 0x1000;
+    live_info.code_size = 1;
+    live_info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
+    live_info.entry_kind_mask = 0x01;
+    std::snprintf(live_info.library_uri, sizeof(live_info.library_uri), "%s",
+                  "package:fixture/main.dart");
+    std::snprintf(live_info.class_name, sizeof(live_info.class_name), "%s", "Fixture");
+    std::snprintf(live_info.function_name, sizeof(live_info.function_name), "%s", "add");
+    index.live_function_infos.push_back(live_info);
     runtime->live_snapshot_index = std::move(index);
     runtime->live_function_index_info.struct_size = sizeof(DartPlantLiveVmFunctionIndexInfo);
     runtime->live_function_index_info.function_count = 1;
@@ -2516,6 +2533,20 @@ TEST_CASE(RuntimeLiveIndexResolvesExactEntryKindsWithoutSplittingLogicalFunction
     append_entry(DARTPLANT_ENTRY_UNCHECKED, base);
     append_entry(DARTPLANT_ENTRY_MONOMORPHIC, base + 4);
     append_entry(DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED, base + 8);
+    auto& cached_info = index.live_function_infos[0];
+    cached_info.code_size = 16;
+    cached_info.function_entry_point = base;
+    cached_info.code_entry_point = base;
+    cached_info.function_unchecked_entry_point = base;
+    cached_info.code_unchecked_entry_point = base;
+    cached_info.code_monomorphic_entry_point = base + 4;
+    cached_info.code_monomorphic_unchecked_entry_point = base + 8;
+    cached_info.entry_va = 0x1000;
+    cached_info.unchecked_entry_va = 0x1000;
+    cached_info.monomorphic_entry_va = 0x1004;
+    cached_info.monomorphic_unchecked_entry_va = 0x1008;
+    cached_info.entry_kind_mask = 0x0f;
+    for (auto& aliases : cached_info.entry_alias_counts) aliases = 1;
 
     const auto resolve = [&](DartPlantEntryKind kind, uintptr_t expected) {
         const DartPlantMethodQuery query = {
@@ -2562,6 +2593,14 @@ TEST_CASE(RuntimeLiveIndexResolvesExactEntryKindsWithoutSplittingLogicalFunction
     EXPECT_EQ(base, legacy_info.code_entry_point);
     EXPECT_EQ(16U, legacy_info.code_size);
     EXPECT_EQ(0xfeedbeefU, legacy_info.entry_alias_counts[0]);
+
+    index.live_function_infos.clear();
+    DartPlantLiveVmFunctionInfo inconsistent_info{};
+    inconsistent_info.struct_size = sizeof(inconsistent_info);
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant_runtime_get_function_info(runtime, 0, &inconsistent_info));
+    EXPECT_TRUE(std::string(dartplant_last_error()).find("cached live Function index") !=
+                std::string::npos);
 
     dartplant_release_method(normal);
     dartplant_release_method(unchecked);

@@ -164,12 +164,7 @@ std::optional<uintptr_t> ModuleImage::Resolve(DartPlantAddressKind kind, uint64_
         }
         return std::nullopt;
     case DARTPLANT_ADDRESS_SNAPSHOT_OFFSET:
-        if (section_va == 0) {
-            if (executable_ranges.empty()) {
-                return std::nullopt;
-            }
-            section_va = executable_ranges.front().virtual_address;
-        }
+        if (section_va == 0) return std::nullopt;
         if (section_va > UINTPTR_MAX - load_bias) {
             return std::nullopt;
         }

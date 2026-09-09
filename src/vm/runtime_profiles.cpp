@@ -23,23 +23,30 @@ bool HasSnapshotFeature(std::string_view features, std::string_view expected) {
 }
 
 bool MachineFactsMatch(const RuntimeProfileRecord& profile, const VmRuntimeFacts& facts) {
+    bool expected_product = facts.product;
+    bool expected_compressed = facts.compressed_pointers;
+    if (!facts.snapshot_features.empty()) {
+        const bool product = HasSnapshotFeature(facts.snapshot_features, "product");
+        const bool release = HasSnapshotFeature(facts.snapshot_features, "release");
+        if (product == release) return false;
+        expected_product = product;
+        const bool compressed = HasSnapshotFeature(facts.snapshot_features, "compressed-pointers");
+        const bool uncompressed =
+            HasSnapshotFeature(facts.snapshot_features, "no-compressed-pointers");
+        if (compressed == uncompressed) return false;
+        expected_compressed = compressed;
+    }
     if (profile.machine.architecture != facts.architecture ||
         profile.machine.pointer_size != facts.pointer_size ||
-        profile.machine.product != facts.product ||
-        profile.machine.compressed_pointers != facts.compressed_pointers) {
+        profile.machine.product != expected_product ||
+        profile.machine.compressed_pointers != expected_compressed) {
         return false;
     }
     // snapshot_features is independent runtime evidence when available. Do
     // not require it merely to enumerate a candidate: callers may only know
     // machine facts during early discovery.
     if (!facts.snapshot_features.empty()) {
-        if (profile.machine.product && !HasSnapshotFeature(facts.snapshot_features, "product")) {
-            return false;
-        }
-        if (profile.machine.compressed_pointers &&
-            !HasSnapshotFeature(facts.snapshot_features, "compressed-pointers")) {
-            return false;
-        }
+        if (!HasSnapshotFeature(facts.snapshot_features, "arm64")) return false;
     }
     return true;
 }
@@ -64,15 +71,21 @@ const RuntimeProfileRecord* FindRuntimeProfileBySnapshot(std::string_view snapsh
                                                          std::string_view snapshot_profile) {
     const auto* begin = std::begin(kGeneratedRuntimeProfiles);
     const auto* end = std::end(kGeneratedRuntimeProfiles);
-    const auto* found = std::find_if(begin, end, [&](const RuntimeProfileRecord& item) {
+    const RuntimeProfileRecord* found = nullptr;
+    for (const auto* current = begin; current != end; ++current) {
+        const RuntimeProfileRecord& item = *current;
         const std::string_view hash =
             item.live_vm.snapshot_hash == nullptr ? std::string_view{} : item.live_vm.snapshot_hash;
         const std::string_view profile = item.live_vm.snapshot_profile == nullptr
                                              ? std::string_view{}
                                              : item.live_vm.snapshot_profile;
-        return hash == snapshot_hash && (snapshot_profile.empty() || profile == snapshot_profile);
-    });
-    return found == end ? nullptr : found;
+        if (hash != snapshot_hash || (!snapshot_profile.empty() && profile != snapshot_profile)) {
+            continue;
+        }
+        if (found != nullptr) return nullptr;
+        found = current;
+    }
+    return found;
 }
 
 std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
@@ -97,8 +110,10 @@ std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
     return compatible;
 }
 
-uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash) {
-    const RuntimeProfileRecord* profile = FindRuntimeProfileBySnapshot(snapshot_hash);
+uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash,
+                                            std::string_view snapshot_profile) {
+    const RuntimeProfileRecord* profile =
+        FindRuntimeProfileBySnapshot(snapshot_hash, snapshot_profile);
     return profile == nullptr ? 0 : profile->thread_jump_to_frame_entry_point_offset;
 }
 

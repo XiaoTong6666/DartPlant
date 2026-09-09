@@ -26,10 +26,13 @@ def main() -> int:
     parser.add_argument("--expected-flutter", required=True)
     parser.add_argument("--expected-dart", required=True)
     parser.add_argument("--family", required=True)
+    parser.add_argument("--mode", choices=["release", "profile"], default="release")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
-    toolchain = flutter_cold_bootstrap.build_flutter_fixture(flutter=args.flutter)
+    toolchain = flutter_cold_bootstrap.build_flutter_fixture(
+        flutter=args.flutter, build_mode=args.mode
+    )
     if toolchain.flutter_version != args.expected_flutter:
         raise RuntimeError(
             f"Flutter version mismatch: expected {args.expected_flutter}, "
@@ -40,17 +43,18 @@ def main() -> int:
             f"Dart version mismatch: expected {args.expected_dart}, got {toolchain.dart_version}"
         )
 
-    apk = flutter_cold_bootstrap.APK_PATH
+    apk = flutter_cold_bootstrap.flutter_fixture_apk_path(args.mode)
     provenance = inspect_arm64_apk(apk)
     output_dir = args.out.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_apk = output_dir / "app-release.apk"
+    output_apk = output_dir / f"app-{args.mode}.apk"
     shutil.copy2(apk, output_apk)
     provenance["apk"] = output_apk.name
     manifest = {
         "family": args.family,
         "flutter": toolchain.flutter_version,
         "dart": toolchain.dart_version,
+        "mode": args.mode,
         **provenance,
     }
     (output_dir / "manifest.json").write_text(

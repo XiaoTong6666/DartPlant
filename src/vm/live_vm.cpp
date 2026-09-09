@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #include "runtime/runtime_internal.h"
 #include "vm/abi/probe.h"
@@ -36,6 +41,27 @@ constexpr uint64_t kMaxClassFunctions = 1ULL << 20;
 constexpr size_t kLiveVmProfileV1Size =
     offsetof(DartPlantLiveVmProfile, code_unchecked_entry_point_offset);
 constexpr size_t kLiveVmProbeInfoV1Size = offsetof(DartPlantLiveVmProbeInfo, requested_entry_kind);
+
+void LogLiveIndex(const char* format, ...) {
+#if defined(__ANDROID__)
+    va_list args;
+    va_start(args, format);
+    __android_log_vprint(ANDROID_LOG_INFO, "DartPlantLiveIndex", format, args);
+    va_end(args);
+#else
+    (void) format;
+#endif
+}
+
+bool FailClassCollection(const char** out_stage, const char* stage) {
+    if (out_stage != nullptr) *out_stage = stage;
+    return false;
+}
+
+bool FailFunctionCollection(const char** out_stage, const char* stage) {
+    if (out_stage != nullptr) *out_stage = stage;
+    return false;
+}
 
 template <typename T>
 void CopyOutputPrefix(const T& source, T* destination) {
@@ -761,10 +787,11 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
                          uint64_t tagged_class, uint64_t library, bool is_top_level,
                          const char* library_uri, const char* class_name,
                          const DartPlantFlutterSnapshotInfo& snapshot,
-                         std::vector<CollectedLiveFunction>* functions) {
+                         std::vector<CollectedLiveFunction>* functions, const char** out_stage) {
+    if (out_stage != nullptr) *out_stage = "function-cid";
     if (functions == nullptr || library_uri == nullptr || class_name == nullptr ||
         !RequireCid(reader, profile, tagged_function, profile.cid_function)) {
-        return false;
+        return FailFunctionCollection(out_stage, "function-cid");
     }
 
     const uintptr_t function_address = Untag(profile, tagged_function);
@@ -795,7 +822,7 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
         !ReadCompressedObject(reader, function_address, profile, profile.function_code_offset,
                               heap_base, &collected.info.code) ||
         !RequireCid(reader, profile, collected.info.code, profile.cid_code)) {
-        return false;
+        return FailFunctionCollection(out_stage, "function-fields");
     }
 
     const bool closure_call_entry_only = IsClosureFunctionKind(profile.profile_version, kind);
@@ -816,7 +843,7 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
                      &collected.info.code_size) ||
         collected.info.function_entry_point == 0 || collected.info.code_entry_point == 0 ||
         collected.info.code_size == 0) {
-        return false;
+        return FailFunctionCollection(out_stage, "code-fields");
     }
     // AOT closure invocation loads Closure.entry_point and calls only the
     // Function normal entry. The remaining Function/Code caches are not part
@@ -829,51 +856,51 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
                                       collected.info.code_monomorphic_unchecked_entry_point == 0 ||
                                       collected.info.function_unchecked_entry_point !=
                                           collected.info.code_unchecked_entry_point))) {
-        return false;
+        return FailFunctionCollection(out_stage, "entry-match");
     }
     collected.info.code_owner_matches_function = code_owner == tagged_function ? 1 : 0;
     if (!collected.info.code_owner_matches_function &&
         (!RequireCid(reader, profile, code_owner, profile.cid_function) ||
          !HasSnapshotFeature(snapshot.snapshot_features, "dedup_instructions"))) {
-        return false;
+        return FailFunctionCollection(out_stage, "code-owner");
     }
 
     AotCodePayloadRange payload_range{};
     if (!ComputeAotCodePayloadRange(profile.profile_version, collected.info.code_entry_point,
                                     collected.info.code_monomorphic_entry_point,
                                     collected.info.code_size, &payload_range)) {
-        return false;
+        return FailFunctionCollection(out_stage, "payload-range");
     }
     const uint64_t payload_start = payload_range.start;
     const uint64_t payload_end = payload_range.end;
     if (collected.info.code_unchecked_entry_point != 0 &&
         (collected.info.code_unchecked_entry_point < payload_start ||
          collected.info.code_unchecked_entry_point >= payload_end)) {
-        return false;
+        return FailFunctionCollection(out_stage, "unchecked-range");
     }
     if (collected.info.code_monomorphic_unchecked_entry_point != 0 &&
         (collected.info.code_monomorphic_unchecked_entry_point < payload_start ||
          collected.info.code_monomorphic_unchecked_entry_point >= payload_end)) {
-        return false;
+        return FailFunctionCollection(out_stage, "mono-unchecked-range");
     }
     if (collected.info.code_unchecked_entry_point != 0 &&
         collected.info.code_monomorphic_unchecked_entry_point != 0) {
         if (collected.info.code_unchecked_entry_point < collected.info.code_entry_point ||
             collected.info.code_monomorphic_unchecked_entry_point <
                 collected.info.code_monomorphic_entry_point) {
-            return false;
+            return FailFunctionCollection(out_stage, "unchecked-order");
         }
         const uint64_t unchecked_delta =
             collected.info.code_unchecked_entry_point - collected.info.code_entry_point;
         if (collected.info.code_monomorphic_unchecked_entry_point -
                 collected.info.code_monomorphic_entry_point !=
             unchecked_delta) {
-            return false;
+            return FailFunctionCollection(out_stage, "unchecked-delta");
         }
     }
     if (!RuntimeInstructionEntryToVa(snapshot, collected.info.function_entry_point,
                                      &collected.info.entry_va)) {
-        return false;
+        return FailFunctionCollection(out_stage, "entry-va");
     }
     if (!closure_call_entry_only &&
         (!RuntimeInstructionEntryToVa(snapshot, collected.info.function_unchecked_entry_point,
@@ -883,25 +910,26 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
          !RuntimeInstructionEntryToVa(snapshot,
                                       collected.info.code_monomorphic_unchecked_entry_point,
                                       &collected.info.monomorphic_unchecked_entry_va))) {
-        return false;
+        return FailFunctionCollection(out_stage, "alternate-entry-va");
     }
     collected.info.closure_call_entry_only = closure_call_entry_only ? 1 : 0;
     collected.info.entry_kind_mask = closure_call_entry_only ? 0x1u : 0x0fu;
     collected.info.code_section_va = snapshot.isolate_instructions_va;
     functions->push_back(collected);
+    if (out_stage != nullptr) *out_stage = "complete";
     return true;
 }
 
-bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
-                             const DartPlantLiveVmProfile& profile, uint64_t heap_base,
-                             uint64_t tagged_class, bool is_top_level,
-                             const DartPlantFlutterSnapshotInfo& snapshot,
-                             std::unordered_set<uint64_t>* seen_functions,
-                             std::vector<CollectedLiveFunction>* functions,
-                             uint32_t* skipped_function_count) {
+bool CollectFunctionsInClass(
+    const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+    uint64_t tagged_class, bool is_top_level, const DartPlantFlutterSnapshotInfo& snapshot,
+    std::unordered_set<uint64_t>* seen_functions, std::vector<CollectedLiveFunction>* functions,
+    uint32_t* skipped_function_count, uint32_t* function_rejection_logs, const char** out_stage) {
+    if (out_stage != nullptr) *out_stage = "class-cid";
     if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr ||
+        function_rejection_logs == nullptr ||
         !RequireCid(reader, profile, tagged_class, profile.cid_class)) {
-        return false;
+        return FailClassCollection(out_stage, "class-cid");
     }
 
     uint64_t library = 0;
@@ -909,13 +937,13 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
     if (!ReadClassLibrary(reader, profile, heap_base, tagged_class, &library) ||
         !ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
                               profile.class_functions_offset, heap_base, &class_functions)) {
-        return false;
+        return FailClassCollection(out_stage, "class-roots");
     }
 
     char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
     char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
     if (!ReadLibraryUri(reader, profile, heap_base, library, library_uri, sizeof(library_uri))) {
-        return false;
+        return FailClassCollection(out_stage, "library-uri");
     }
     if (is_top_level) {
         std::snprintf(class_name, sizeof(class_name), "%s", "Global");
@@ -924,21 +952,21 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
         if (!ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
                                   profile.class_name_offset, heap_base, &class_name_object) ||
             !ReadDartString(reader, profile, class_name_object, class_name, sizeof(class_name))) {
-            return false;
+            return FailClassCollection(out_stage, "class-name");
         }
     }
 
     uint32_t functions_cid = 0;
     if (!ReadCid(reader, profile, class_functions, &functions_cid) ||
         (functions_cid != profile.cid_array && functions_cid != profile.cid_immutable_array)) {
-        return false;
+        return FailClassCollection(out_stage, "functions-cid");
     }
     uint64_t length = 0;
     if (!ReadPositiveCompressedSmi(reader,
                                    Untag(profile, class_functions) + profile.array_length_offset,
                                    profile, &length) ||
         length > kMaxClassFunctions) {
-        return false;
+        return FailClassCollection(out_stage, "functions-length");
     }
 
     for (uint64_t index = 0; index < length; ++index) {
@@ -961,11 +989,23 @@ bool CollectFunctionsInClass(const ProcessMemoryReader& reader,
             ++*skipped_function_count;
             continue;
         }
+        const char* function_stage = "unknown";
         if (!CollectLiveFunction(reader, profile, heap_base, function, kind, tagged_class, library,
-                                 is_top_level, library_uri, class_name, snapshot, functions)) {
+                                 is_top_level, library_uri, class_name, snapshot, functions,
+                                 &function_stage)) {
             ++*skipped_function_count;
+            if (*function_rejection_logs < 20) {
+                ++*function_rejection_logs;
+                LogLiveIndex(
+                    "function rejected class=0x%llx function=0x%llx kind=%u stage=%s "
+                    "function_kind_off=0x%x code_size_off=0x%x",
+                    static_cast<unsigned long long>(tagged_class),
+                    static_cast<unsigned long long>(function), kind, function_stage,
+                    profile.function_kind_tag_offset, profile.code_instructions_length_offset);
+            }
         }
     }
+    if (out_stage != nullptr) *out_stage = "complete";
     return true;
 }
 
@@ -987,8 +1027,33 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
             static_cast<uintptr_t>(context.class_table) + profile.class_table_num_cids_offset,
             &num_cids) ||
         num_cids == 0 || num_cids > max_cids) {
+        LogLiveIndex(
+            "start rejected profile=%s class_table=0x%llx cached=0x%llx object_store=0x%llx "
+            "num_cids=0x%llx max=0x%llx num_cids_off=0x%x",
+            profile.name == nullptr ? "" : profile.name,
+            static_cast<unsigned long long>(context.class_table),
+            static_cast<unsigned long long>(context.cached_class_table_table),
+            static_cast<unsigned long long>(context.object_store),
+            static_cast<unsigned long long>(num_cids), static_cast<unsigned long long>(max_cids),
+            profile.class_table_num_cids_offset);
         return false;
     }
+    LogLiveIndex(
+        "start profile=%s heap=0x%llx class_table=0x%llx cached=0x%llx object_store=0x%llx "
+        "num_cids=%llu class_offsets=name:0x%x/functions:0x%x/library:0x%x",
+        profile.name == nullptr ? "" : profile.name,
+        static_cast<unsigned long long>(context.heap_base),
+        static_cast<unsigned long long>(context.class_table),
+        static_cast<unsigned long long>(context.cached_class_table_table),
+        static_cast<unsigned long long>(context.object_store),
+        static_cast<unsigned long long>(num_cids), profile.class_name_offset,
+        profile.class_functions_offset, profile.class_library_offset);
+
+    uint32_t nonzero_class_slots = 0;
+    uint32_t accepted_classes = 0;
+    uint32_t rejected_classes = 0;
+    uint32_t rejection_logs = 0;
+    uint32_t function_rejection_logs = 0;
     for (uint64_t cid = 1; cid < num_cids; ++cid) {
         uint64_t tagged_class = 0;
         if (!reader.Read(
@@ -997,8 +1062,29 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
             tagged_class == 0) {
             continue;
         }
-        (void) CollectFunctionsInClass(reader, profile, context.heap_base, tagged_class, false,
-                                       snapshot, &seen_functions, functions, &skipped);
+        ++nonzero_class_slots;
+        const size_t before = functions->size();
+        const char* stage = "unknown";
+        if (CollectFunctionsInClass(reader, profile, context.heap_base, tagged_class, false,
+                                    snapshot, &seen_functions, functions, &skipped,
+                                    &function_rejection_logs, &stage)) {
+            ++accepted_classes;
+            if (accepted_classes <= 6) {
+                LogLiveIndex("class accepted cid=%llu tagged=0x%llx added=%llu total=%llu",
+                             static_cast<unsigned long long>(cid),
+                             static_cast<unsigned long long>(tagged_class),
+                             static_cast<unsigned long long>(functions->size() - before),
+                             static_cast<unsigned long long>(functions->size()));
+            }
+        } else {
+            ++rejected_classes;
+            if (rejection_logs < 12) {
+                ++rejection_logs;
+                LogLiveIndex("class rejected cid=%llu tagged=0x%llx stage=%s",
+                             static_cast<unsigned long long>(cid),
+                             static_cast<unsigned long long>(tagged_class), stage);
+            }
+        }
     }
 
     uint64_t libraries = 0;
@@ -1006,6 +1092,9 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
             static_cast<uintptr_t>(context.object_store) + profile.object_store_libraries_offset,
             &libraries) ||
         !RequireCid(reader, profile, libraries, profile.cid_growable_object_array)) {
+        LogLiveIndex("libraries root rejected raw=0x%llx offset=0x%x expected_cid=%u",
+                     static_cast<unsigned long long>(libraries),
+                     profile.object_store_libraries_offset, profile.cid_growable_object_array);
         return false;
     }
     const uintptr_t growable = Untag(profile, libraries);
@@ -1016,8 +1105,14 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
         library_count > kMaxClassFunctions ||
         !ReadCompressedObject(reader, growable, profile, profile.growable_object_array_data_offset,
                               context.heap_base, &data)) {
+        LogLiveIndex("libraries container rejected raw=0x%llx count=%llu data=0x%llx",
+                     static_cast<unsigned long long>(libraries),
+                     static_cast<unsigned long long>(library_count),
+                     static_cast<unsigned long long>(data));
         return false;
     }
+    uint32_t accepted_top_levels = 0;
+    uint32_t rejected_top_levels = 0;
     for (uint64_t index = 0; index < library_count; ++index) {
         uint64_t library = 0;
         if (!ReadArrayElement(reader, profile, context.heap_base, data, index, &library) ||
@@ -1030,8 +1125,30 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
                                   &top_level_class)) {
             continue;
         }
-        (void) CollectFunctionsInClass(reader, profile, context.heap_base, top_level_class, true,
-                                       snapshot, &seen_functions, functions, &skipped);
+        const size_t before = functions->size();
+        const char* stage = "unknown";
+        if (CollectFunctionsInClass(reader, profile, context.heap_base, top_level_class, true,
+                                    snapshot, &seen_functions, functions, &skipped,
+                                    &function_rejection_logs, &stage)) {
+            ++accepted_top_levels;
+            if (accepted_top_levels <= 6) {
+                LogLiveIndex(
+                    "top-level accepted index=%llu library=0x%llx class=0x%llx added=%llu total=%llu",
+                    static_cast<unsigned long long>(index),
+                    static_cast<unsigned long long>(library),
+                    static_cast<unsigned long long>(top_level_class),
+                    static_cast<unsigned long long>(functions->size() - before),
+                    static_cast<unsigned long long>(functions->size()));
+            }
+        } else {
+            ++rejected_top_levels;
+            if (rejected_top_levels <= 12) {
+                LogLiveIndex("top-level rejected index=%llu library=0x%llx class=0x%llx stage=%s",
+                             static_cast<unsigned long long>(index),
+                             static_cast<unsigned long long>(library),
+                             static_cast<unsigned long long>(top_level_class), stage);
+            }
+        }
     }
 
     std::array<std::unordered_map<uint64_t, uint32_t>, 4> aliases_by_kind;
@@ -1068,6 +1185,13 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
     out_info->code_target_count = static_cast<uint32_t>(default_aliases.size());
     out_info->shared_code_target_count = shared_targets;
     out_info->skipped_function_count = skipped;
+    LogLiveIndex(
+        "summary profile=%s class_slots=%u classes_ok=%u classes_rejected=%u libraries=%llu "
+        "top_levels_ok=%u top_levels_rejected=%u functions=%u code_targets=%u shared=%u skipped=%u",
+        profile.name == nullptr ? "" : profile.name, nonzero_class_slots, accepted_classes,
+        rejected_classes, static_cast<unsigned long long>(library_count), accepted_top_levels,
+        rejected_top_levels, out_info->function_count, out_info->code_target_count,
+        out_info->shared_code_target_count, out_info->skipped_function_count);
     return true;
 }
 

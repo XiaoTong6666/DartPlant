@@ -47,6 +47,7 @@ def cmd_test(args: argparse.Namespace) -> None:
             rounds=args.rounds,
             timeout_seconds=args.timeout,
             build=not args.no_flutter_build,
+            build_mode=args.flutter_mode,
             dobby_root=Path(args.dobby_root) if args.dobby_root else None,
         )
         return
@@ -103,6 +104,9 @@ def main() -> None:
     test_parser.add_argument("--ndk")
     test_parser.add_argument("--dobby-root")
     test_parser.add_argument("--flutter")
+    test_parser.add_argument(
+        "--flutter-mode", choices=["release", "profile"], default="release"
+    )
     test_parser.add_argument("--rounds", type=int, default=10)
     test_parser.add_argument("--timeout", type=float, default=5.0)
     test_parser.add_argument("--no-flutter-build", action="store_true")

@@ -145,3 +145,40 @@ TEST_CASE(ElfProgramHeaderCorpusRejectsOverflowAndImpossibleFileSize) {
     };
     EXPECT_FALSE(dartplant::BuildModuleImageFromProgramHeaders("bad-size.so", 0, bad_size, &image));
 }
+
+TEST_CASE(SnapshotOffsetRequiresExplicitIsolateInstructionsBase) {
+    const std::array headers = {
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R | PF_X,
+            .offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+            .memory_size = 0x1000,
+        },
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R | PF_X,
+            .offset = 0x3000,
+            .virtual_address = 0x3000,
+            .file_size = 0x1000,
+            .memory_size = 0x1000,
+        },
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R | PF_X,
+            .offset = 0x7000,
+            .virtual_address = 0x7000,
+            .file_size = 0x2000,
+            .memory_size = 0x2000,
+        },
+    };
+    dartplant::ModuleImage image;
+    EXPECT_TRUE(
+        dartplant::BuildModuleImageFromProgramHeaders("libapp.so", 0x100000, headers, &image));
+    EXPECT_FALSE(image.Resolve(DARTPLANT_ADDRESS_SNAPSHOT_OFFSET, 0x100).has_value());
+    const auto resolved = image.Resolve(DARTPLANT_ADDRESS_SNAPSHOT_OFFSET, 0x100, 0x7000);
+    EXPECT_TRUE(resolved.has_value());
+    EXPECT_EQ(0x107100U, *resolved);
+    EXPECT_FALSE(*resolved == 0x101100U);  // Never relative to the first RX PT_LOAD.
+}

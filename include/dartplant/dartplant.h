@@ -84,6 +84,11 @@ typedef struct DartPlantAddressQuery {
     uint32_t code_size;
     const char* expected_build_id;
     const char* expected_fingerprint;
+    // V2 append-only field. DARTPLANT_ADDRESS_SNAPSHOT_OFFSET is meaningful
+    // only relative to a proven _kDartIsolateSnapshotInstructions ELF VA; it
+    // is never inferred from PT_LOAD ordering. Older V1 callers may omit this
+    // field for the other address kinds.
+    uint64_t section_va;
 } DartPlantAddressQuery;
 
 enum { DARTPLANT_INIT_API_VERSION = 1 };

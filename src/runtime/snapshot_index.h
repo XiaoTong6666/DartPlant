@@ -55,6 +55,11 @@ struct SnapshotIndex {
     std::string profile_version;
     uint32_t vm_profile_version = 0;
     std::vector<SnapshotFunction> functions;
+    // Live VM enumeration already produces one complete entry-family record
+    // per Dart Function. Preserve that canonical record so indexed public
+    // queries do not need to reconstruct it by rescanning the flattened
+    // SnapshotFunction list for every position.
+    std::vector<DartPlantLiveVmFunctionInfo> live_function_infos;
 
     const SnapshotFunction* FindSnapshotFunction(std::string_view library_uri,
                                                  std::string_view class_name,

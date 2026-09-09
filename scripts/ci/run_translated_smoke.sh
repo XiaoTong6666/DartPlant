@@ -18,29 +18,31 @@ for manifest in "${manifests[@]}"; do
   family="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["family"])' "$manifest")"
   flutter="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["flutter"])' "$manifest")"
   dart="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dart"])' "$manifest")"
-  apk="$(dirname "$manifest")/app-release.apk"
+  mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$manifest")"
+  key="$family-$mode"
+  apk="$(dirname "$manifest")/app-$mode.apk"
 
   if ! python3 scripts/ci/run_flutter_device.py \
     --apk "$apk" \
     --test normal \
     --runtime-tier translated-smoke \
-    --log "$output_dir/logcat/$family.log" \
-    --metadata "$output_dir/runner/$family.json" \
+    --log "$output_dir/logcat/$key.log" \
+    --metadata "$output_dir/runner/$key.json" \
     --timeout 120; then
     status=1
     continue
   fi
 
   if ! python3 scripts/ci/analyze_logcat.py \
-    --log "$output_dir/logcat/$family.log" \
-    --metadata "$output_dir/runner/$family.json" \
+    --log "$output_dir/logcat/$key.log" \
+    --metadata "$output_dir/runner/$key.json" \
     --flutter "$flutter" \
     --dart "$dart" \
     --test normal \
     --runtime-tier translated-smoke \
-    --report-json "$output_dir/reports/$family.json" \
-    --summary-md "$output_dir/reports/$family.md" \
-    --junit "$output_dir/reports/$family.xml"; then
+    --report-json "$output_dir/reports/$key.json" \
+    --summary-md "$output_dir/reports/$key.md" \
+    --junit "$output_dir/reports/$key.xml"; then
     status=1
   fi
 done

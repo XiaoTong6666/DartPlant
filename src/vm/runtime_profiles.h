@@ -172,7 +172,8 @@ const RuntimeProfileRecord* FindRuntimeProfileBySnapshot(std::string_view snapsh
                                                          std::string_view snapshot_profile = {});
 std::vector<const RuntimeProfileRecord*> ResolveRuntimeProfileCandidates(
     const VmRuntimeFacts& facts);
-uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash);
+uint32_t ThreadJumpToFrameOffsetForSnapshot(std::string_view snapshot_hash,
+                                            std::string_view snapshot_profile = {});
 bool IsClosureFunctionKind(uint32_t profile_version, uint32_t function_kind);
 bool ComputeAotCodePayloadStart(uint32_t profile_version, uint64_t normal_entry,
                                 uint64_t monomorphic_entry, uint64_t* out_start,

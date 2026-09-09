@@ -189,7 +189,8 @@ DartPlantStatus dartplant_find_method(const DartPlantMethodQuery* query,
         dartplant::SetLastError("Dart method query is ambiguous");
         return DARTPLANT_AMBIGUOUS_METHOD;
     }
-    const auto target = module->Resolve(matches[0]->address_kind, matches[0]->address);
+    const auto target =
+        module->Resolve(matches[0]->address_kind, matches[0]->address, matches[0]->section_va);
     if (!target.has_value()) {
         dartplant::SetLastError("method address kind cannot be resolved");
         return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;
@@ -236,7 +237,8 @@ DartPlantStatus dartplant_hook_method_raw(const DartPlantMethod* method, void* r
 
 DartPlantStatus dartplant_hook_address(const DartPlantAddressQuery* query, void* replacement,
                                        void** backup, DartPlantHook** out_hook) {
-    if (query == nullptr || query->struct_size < sizeof(DartPlantAddressQuery) ||
+    constexpr size_t kAddressQueryV1Size = offsetof(DartPlantAddressQuery, section_va);
+    if (query == nullptr || query->struct_size < kAddressQueryV1Size ||
         query->module_name == nullptr) {
         dartplant::SetLastError("address query is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -254,7 +256,14 @@ DartPlantStatus dartplant_hook_address(const DartPlantAddressQuery* query, void*
         dartplant::SetLastError("address query module is not loaded");
         return DARTPLANT_MODULE_NOT_FOUND;
     }
-    const auto target = refreshed->Resolve(query->address_kind, query->address);
+    const uint64_t section_va =
+        query->struct_size >= sizeof(DartPlantAddressQuery) ? query->section_va : 0;
+    if (query->address_kind == DARTPLANT_ADDRESS_SNAPSHOT_OFFSET && section_va == 0) {
+        dartplant::SetLastError(
+            "snapshot offsets require an explicit isolate snapshot instructions VA");
+        return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;
+    }
+    const auto target = refreshed->Resolve(query->address_kind, query->address, section_va);
     if (!target.has_value()) {
         dartplant::SetLastError("address kind cannot be resolved");
         return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;

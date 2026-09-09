@@ -98,7 +98,7 @@ jobs:
           set -uo pipefail
           mkdir -p build/ci/logcat build/ci/reports build/ci/runner
           serial="$(cat build/ci/emulator/serial)"
-          expected_count="$(python3 -c 'import json; print(len(json.load(open("scripts/ci/flutter_families.json"))))')"
+          expected_count="$(python3 -c 'import json; print(2 * len(json.load(open("scripts/ci/flutter_families.json"))))')"
           mapfile -t manifests < <(find build/ci/downloads -name manifest.json -type f | sort)
           actual_count="${#manifests[@]}"
           if [[ "$actual_count" -ne "$expected_count" ]]; then
@@ -115,30 +115,32 @@ jobs:
             family="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["family"])' "$manifest")"
             flutter="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["flutter"])' "$manifest")"
             dart="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dart"])' "$manifest")"
-            apk="$(dirname "$manifest")/app-release.apk"
+            mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$manifest")"
+            key="$family-$mode"
+            apk="$(dirname "$manifest")/app-$mode.apk"
 
-            echo "=== $family ==="
+            echo "=== $key ==="
             if ! python3 scripts/ci/run_flutter_device.py \
               --serial "$serial" \
               --apk "$apk" \
               --test all \
               --runtime-tier native \
-              --log "build/ci/logcat/$family.log" \
-              --metadata "build/ci/runner/$family.json" \
+              --log "build/ci/logcat/$key.log" \
+              --metadata "build/ci/runner/$key.json" \
               --timeout 600; then
               status=1
             fi
 
             if ! python3 scripts/ci/analyze_logcat.py \
-              --log "build/ci/logcat/$family.log" \
-              --metadata "build/ci/runner/$family.json" \
+              --log "build/ci/logcat/$key.log" \
+              --metadata "build/ci/runner/$key.json" \
               --flutter "$flutter" \
               --dart "$dart" \
               --test all \
               --runtime-tier native \
-              --report-json "build/ci/reports/$family.json" \
-              --summary-md "build/ci/reports/$family.md" \
-              --junit "build/ci/reports/$family.xml"; then
+              --report-json "build/ci/reports/$key.json" \
+              --summary-md "build/ci/reports/$key.md" \
+              --junit "build/ci/reports/$key.xml"; then
               status=1
             fi
           done

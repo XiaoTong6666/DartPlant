@@ -20,6 +20,7 @@
 #include "dartplant/dartplant.h"
 #include "dartplant/host_api.h"
 #include "dartplant/invocation.h"
+#include "elf/elf_types.h"
 #include "vm/object_bridge.h"
 
 namespace dartplant {
@@ -42,15 +43,6 @@ struct ModuleImage {
     bool ContainsExecutable(uintptr_t address, size_t size) const;
     std::optional<uintptr_t> Resolve(DartPlantAddressKind kind, uint64_t address,
                                      uint64_t section_va = 0) const;
-};
-
-struct ElfProgramHeaderView {
-    uint32_t type = 0;
-    uint32_t flags = 0;
-    uint64_t offset = 0;
-    uint64_t virtual_address = 0;
-    uint64_t file_size = 0;
-    uint64_t memory_size = 0;
 };
 
 // Pure program-header parser shared by dl_iterate_phdr production discovery

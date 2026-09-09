@@ -337,13 +337,14 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     function->identity = MethodIdentityFromRecord(method_record);
     function->source = DartFunctionSource::kOfflineSnapshotIndex;
     function->function_kind = record->function_kind;
-    if (const RuntimeProfileRecord* profile = FindRuntimeProfileBySnapshot(index.snapshot_hash);
+    if (const RuntimeProfileRecord* profile =
+            FindRuntimeProfileBySnapshot(index.snapshot_hash, snapshot.profile_name);
         profile != nullptr) {
         function->runtime_profile_version = profile->live_vm.profile_version;
     }
     function->closure_call_entry_only = record->closure_call_entry_only;
     function->thread_jump_to_frame_entry_point_offset =
-        ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash);
+        ThreadJumpToFrameOffsetForSnapshot(index.snapshot_hash, snapshot.profile_name);
     function->code_target = code_target;
     code_target->AddAlias(function->identity);
 
@@ -354,6 +355,52 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     method->runtime_generation = runtime_generation;
     method->expected_runtime_generation = expected_runtime_generation;
     *out_method = method;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus MergeValidatedArtifactIdentityIntoLiveMethod(const SnapshotIndex& artifact_index,
+                                                             const DartPlantMethodQuery& query,
+                                                             DartPlantMethod* live_method) {
+    if (live_method == nullptr || live_method->function == nullptr ||
+        live_method->function->code_target == nullptr ||
+        live_method->function->source != DartFunctionSource::kLiveVm) {
+        SetLastError("live method is unavailable for artifact identity convergence");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+
+    bool ambiguous = false;
+    const SnapshotFunction* artifact = artifact_index.FindSnapshotFunction(
+        query.library_uri, query.class_name == nullptr ? "" : query.class_name, query.function_name,
+        query.signature == nullptr ? "" : query.signature, query.entry_kind, &ambiguous);
+    if (ambiguous) {
+        SetLastError("artifact identity is ambiguous for the resolved live method");
+        return DARTPLANT_AMBIGUOUS_METHOD;
+    }
+    // Most live Functions do not have a compiler sidecar. Their VM identity
+    // remains usable, but no artifact Code-identity claim is synthesized.
+    if (artifact == nullptr) return DARTPLANT_OK;
+
+    const uintptr_t live_entry = MethodTarget(live_method);
+    const uint32_t live_code_size = MethodCodeSize(live_method);
+    if (artifact->runtime_entry == 0 || artifact->code_size == 0 ||
+        artifact->runtime_entry != live_entry || artifact->code_size != live_code_size) {
+        SetLastError("artifact and live Function indices disagree on the physical Code entry");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+
+    const auto& target = live_method->function->code_target;
+    const uint32_t artifact_alias_count = std::max<uint32_t>(1, artifact->entry_alias_count);
+    if (artifact->code_identity_proof == DARTPLANT_CODE_IDENTITY_UNIQUE &&
+        (artifact_alias_count != 1 || target->AliasCount() > 1)) {
+        SetLastError("artifact UNIQUE Code identity conflicts with live alias evidence");
+        return DARTPLANT_METADATA_INVALID;
+    }
+    if (!target->MergeEvidence(live_code_size, 0, artifact_alias_count,
+                               artifact->code_identity_proof)) {
+        SetLastError("artifact Code identity conflicts with the resolved live target");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
     ClearLastError();
     return DARTPLANT_OK;
 }
@@ -370,7 +417,8 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
         return DARTPLANT_PROFILE_MISMATCH;
     }
 
-    const RuntimeProfileRecord* vm_profile = FindRuntimeProfileBySnapshot(index->snapshot_hash);
+    const RuntimeProfileRecord* vm_profile =
+        FindRuntimeProfileBySnapshot(index->snapshot_hash, snapshot.profile_name);
 
     std::unordered_map<uintptr_t, DartPlantCodeIdentityProof> identity_proofs;
     std::unordered_map<uintptr_t, uint32_t> physical_alias_counts;
@@ -1380,97 +1428,15 @@ DartPlantStatus dartplant_runtime_get_function_info(const DartPlantRuntime* runt
         dartplant::SetLastError("runtime Function index position is out of range");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    const dartplant::SnapshotFunction* source = nullptr;
-    uint32_t default_index = 0;
-    for (const auto& candidate : runtime->live_snapshot_index->functions) {
-        if (candidate.entry_kind != DARTPLANT_ENTRY_DEFAULT) continue;
-        if (default_index++ == index) {
-            source = &candidate;
-            break;
-        }
-    }
-    if (source == nullptr) {
-        dartplant::SetLastError("runtime Function index default-entry record is missing");
+    const auto& cached_infos = runtime->live_snapshot_index->live_function_infos;
+    if (cached_infos.size() != runtime->live_function_index_info.function_count) {
+        dartplant::SetLastError("runtime cached live Function index is inconsistent");
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    DartPlantLiveVmFunctionInfo info{};
-    info.struct_size = sizeof(info);
-    info.function = source->function_object;
-    info.code = source->code_object;
-    info.code_object_pool = source->code_object_pool;
-    info.code_section_va = source->code_section_va;
-    info.code_size = source->code_instructions_length;
-    info.function_kind = source->function_kind;
-    info.owner_class = source->owner_class;
-    info.library = source->library;
-    info.owner_is_toplevel_class = source->owner_is_toplevel_class ? 1 : 0;
-    info.code_owner_matches_function = source->code_owner_matches_function ? 1 : 0;
-    const uint64_t payload_start = source->code_payload_start;
-    if (payload_start == 0 || info.code_size == 0 || payload_start > UINT64_MAX - info.code_size) {
-        dartplant::SetLastError("runtime Function index has no exact Code payload range");
-        return DARTPLANT_RUNTIME_NOT_READY;
-    }
-    const uint64_t payload_end = payload_start + info.code_size;
-    for (const auto& candidate : runtime->live_snapshot_index->functions) {
-        if (candidate.function_object != source->function_object ||
-            candidate.library_uri != source->library_uri ||
-            candidate.class_name != source->class_name ||
-            candidate.function_name != source->function_name ||
-            candidate.signature != source->signature) {
-            continue;
-        }
-        const uint32_t raw_kind = static_cast<uint32_t>(candidate.entry_kind);
-        if (raw_kind >= 4 || candidate.runtime_entry == 0 || candidate.entry_va == 0) continue;
-        if (candidate.code_payload_start != payload_start ||
-            candidate.code_instructions_length != info.code_size ||
-            candidate.runtime_entry < payload_start || candidate.runtime_entry >= payload_end ||
-            candidate.code_size != payload_end - candidate.runtime_entry) {
-            dartplant::SetLastError(
-                "runtime Function index contains inconsistent Code payload ranges");
-            return DARTPLANT_RUNTIME_NOT_READY;
-        }
-        info.entry_kind_mask |= static_cast<uint8_t>(1u << raw_kind);
-        info.entry_alias_counts[raw_kind] = candidate.entry_alias_count;
-        switch (candidate.entry_kind) {
-        case DARTPLANT_ENTRY_DEFAULT:
-            info.function_entry_point = candidate.runtime_entry;
-            info.code_entry_point = candidate.runtime_entry;
-            info.entry_va = candidate.entry_va;
-            break;
-        case DARTPLANT_ENTRY_UNCHECKED:
-            info.function_unchecked_entry_point = candidate.runtime_entry;
-            info.code_unchecked_entry_point = candidate.runtime_entry;
-            info.unchecked_entry_va = candidate.entry_va;
-            break;
-        case DARTPLANT_ENTRY_MONOMORPHIC:
-            info.code_monomorphic_entry_point = candidate.runtime_entry;
-            info.monomorphic_entry_va = candidate.entry_va;
-            break;
-        case DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED:
-            info.code_monomorphic_unchecked_entry_point = candidate.runtime_entry;
-            info.monomorphic_unchecked_entry_va = candidate.entry_va;
-            break;
-        }
-    }
-    if (payload_end <= payload_start) {
-        dartplant::SetLastError("runtime Function index entry family is incomplete");
-        return DARTPLANT_RUNTIME_NOT_READY;
-    }
-    info.entry_alias_count = info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
-    info.entry_is_shared = info.entry_alias_count > 1 ? 1 : 0;
-    info.closure_call_entry_only =
-        runtime->live_vm_context.has_value() &&
-                dartplant::IsClosureFunctionKind(runtime->live_vm_context->profile_version,
-                                                 source->function_kind)
-            ? 1
-            : 0;
-    std::snprintf(info.library_uri, sizeof(info.library_uri), "%s", source->library_uri.c_str());
-    std::snprintf(info.class_name, sizeof(info.class_name), "%s", source->class_name.c_str());
-    std::snprintf(info.function_name, sizeof(info.function_name), "%s",
-                  source->function_name.c_str());
+    const DartPlantLiveVmFunctionInfo& source = cached_infos[index];
     const size_t caller_size = out_info->struct_size;
-    const size_t written_size = std::min(caller_size, sizeof(info));
-    std::memcpy(out_info, &info, written_size);
+    const size_t written_size = std::min(caller_size, sizeof(source));
+    std::memcpy(out_info, &source, written_size);
     out_info->struct_size = static_cast<uint32_t>(written_size);
     dartplant::ClearLastError();
     return DARTPLANT_OK;
@@ -1656,6 +1622,16 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
             *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->entry_targets,
             *query, runtime->generation, runtime->generation->load(std::memory_order_acquire),
             out_method);
+        if (status == DARTPLANT_OK && runtime->artifact_snapshot_index.has_value()) {
+            const DartPlantStatus merge_status =
+                dartplant::MergeValidatedArtifactIdentityIntoLiveMethod(
+                    *runtime->artifact_snapshot_index, *query, *out_method);
+            if (merge_status != DARTPLANT_OK) {
+                dartplant_release_method(*out_method);
+                *out_method = nullptr;
+                status = merge_status;
+            }
+        }
     }
     if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->artifact_snapshot_index.has_value()) {
         status = dartplant::ResolveArtifactIndexedRuntimeMethod(

@@ -74,7 +74,7 @@ jobs:
     uses: ./.github/workflows/_native.yml
 
   flutter-aot:
-    name: Flutter release AOT / ${{ matrix.id }}
+    name: Flutter release/profile AOT / ${{ matrix.id }}
     needs: configure
     strategy:
       fail-fast: false

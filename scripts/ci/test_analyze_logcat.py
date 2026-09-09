@@ -109,6 +109,16 @@ def _passing_lines() -> list[str]:
     )
     for markers in analyze_logcat.LEGACY_PROOFS.values():
         lines.extend(markers)
+    lines.extend(
+        [
+            "producer code-identity policy verified mode=dedup-shared "
+            "instrumented_aliases=2 add_int_aliases=2",
+            "instrumentedAdd probe mode=dedup-shared enter=5 leave=5 "
+            "second_listener_enter=5 live_ok=5 live_failed=0 lookup_ok=1 model_ok=1 "
+            "policy_ok=1 ambiguous_identity=1 second_listener_identity=1 "
+            "result=115 expected=115",
+        ]
+    )
     return lines
 
 
@@ -252,6 +262,76 @@ class AnalyzeLogcatTest(unittest.TestCase):
         lines.append("F/libc: Fatal signal 11 (SIGSEGV), code 1, pid 999 (com.example.other)")
         analysis = self._analyze(lines)
         self.assertTrue(analysis.passed, analysis.crash_hits)
+
+    def test_interleaved_system_crash_is_not_attributed_to_fixture(self) -> None:
+        lines = _passing_lines()
+        lines.extend(
+            [
+                "09-09 08:28:20.850  4242  4242 I DartPlantFixture: fixture still alive",
+                "09-09 08:28:20.862  2219  2250 F libc    : Fatal signal 6 (SIGABRT), "
+                "code -1 (SI_QUEUE) in tid 2250 (alarm_default_c), pid 2219 (droid.bluetooth)",
+                "09-09 08:28:20.870  4242  4242 I flutter : fixture continues",
+            ]
+        )
+        analysis = self._analyze(lines)
+        self.assertTrue(analysis.passed, analysis.crash_hits)
+        self.assertEqual(analysis.crash_hits, ())
+
+    def test_process_scoped_threadtime_crash_fails(self) -> None:
+        lines = _passing_lines()
+        lines.append(
+            "09-09 08:28:20.862  4242  4250 F libc    : Fatal signal 11 (SIGSEGV), "
+            "code 1, pid 4242 (dartplant_fixture)"
+        )
+        analysis = self._analyze(lines)
+        self.assertFalse(analysis.passed)
+        self.assertTrue(analysis.crash_hits)
+
+    def test_profile_no_dedup_code_identity_semantics_pass(self) -> None:
+        lines = _passing_lines()
+        lines = [
+            line
+            for line in lines
+            if "producer code-identity policy verified mode=" not in line
+            and "instrumentedAdd probe mode=" not in line
+        ]
+        lines.extend(
+            [
+                "producer code-identity policy verified mode=no-dedup-unique "
+                "instrumented_aliases=1 add_int_aliases=1",
+                "instrumentedAdd probe mode=no-dedup-unique enter=5 leave=5 "
+                "second_listener_enter=0 live_ok=5 live_failed=0 lookup_ok=1 model_ok=1 "
+                "policy_ok=1 ambiguous_identity=0 second_listener_identity=0 "
+                "result=115 expected=115",
+            ]
+        )
+        analysis = self._analyze(lines)
+        self.assertTrue(analysis.passed, [check for check in analysis.checks if not check.passed])
+
+    def test_profile_no_dedup_wrong_alias_semantics_fail(self) -> None:
+        lines = _passing_lines()
+        lines = [
+            line
+            for line in lines
+            if "producer code-identity policy verified mode=" not in line
+            and "instrumentedAdd probe mode=" not in line
+        ]
+        lines.extend(
+            [
+                "producer code-identity policy verified mode=no-dedup-unique "
+                "instrumented_aliases=2 add_int_aliases=2",
+                "instrumentedAdd probe mode=no-dedup-unique enter=5 leave=5 "
+                "second_listener_enter=0 live_ok=5 live_failed=0 lookup_ok=1 model_ok=1 "
+                "policy_ok=1 ambiguous_identity=0 second_listener_identity=0 "
+                "result=115 expected=115",
+            ]
+        )
+        analysis = self._analyze(lines)
+        self.assertFalse(analysis.passed)
+        failure = next(
+            check for check in analysis.checks if check.name == "Code identity semantics"
+        )
+        self.assertIn("instrumented_aliases=1", failure.detail)
 
     def test_prelaunch_runner_error_without_pid_fails_without_crashing(self) -> None:
         metadata = copy.deepcopy(_metadata())

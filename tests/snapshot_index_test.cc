@@ -184,6 +184,10 @@ TEST_CASE(LiveSnapshotAdapterAcceptsDefaultOnlyClosureEntryFamily) {
     dartplant::SnapshotIndex index;
     EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
     EXPECT_EQ(1U, index.functions.size());
+    EXPECT_EQ(1U, index.live_function_infos.size());
+    EXPECT_EQ(function.function, index.live_function_infos[0].function);
+    EXPECT_EQ(function.code, index.live_function_infos[0].code);
+    EXPECT_EQ(function.entry_kind_mask, index.live_function_infos[0].entry_kind_mask);
     EXPECT_EQ(DARTPLANT_ENTRY_DEFAULT, index.functions[0].entry_kind);
     EXPECT_EQ(0x7200001000ULL, index.functions[0].runtime_entry);
     EXPECT_EQ(0x40ULL, index.functions[0].code_size);
@@ -207,6 +211,7 @@ TEST_CASE(LiveSnapshotAdapterRejectsIncompleteFamilyWithoutPartialPublish) {
     dartplant::SnapshotIndex index;
     EXPECT_TRUE(!dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
     EXPECT_TRUE(index.functions.empty());
+    EXPECT_TRUE(index.live_function_infos.empty());
 }
 
 TEST_CASE(LiveSnapshotAdapterUsesDartPayloadStartForMonomorphicCode) {
@@ -238,6 +243,8 @@ TEST_CASE(LiveSnapshotAdapterUsesDartPayloadStartForMonomorphicCode) {
     dartplant::SnapshotIndex index;
     EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(function, 1, &index));
     EXPECT_EQ(4U, index.functions.size());
+    EXPECT_EQ(1U, index.live_function_infos.size());
+    EXPECT_EQ(0x0fU, static_cast<uint32_t>(index.live_function_infos[0].entry_kind_mask));
     EXPECT_EQ(kPayload, index.functions[0].code_payload_start);
     EXPECT_EQ(kLength, index.functions[0].code_instructions_length);
     EXPECT_EQ(kLength - 24U, index.functions[0].code_size);

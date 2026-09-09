@@ -467,6 +467,7 @@ TEST_CASE(GenericHostApiRetainsBackendInstanceForInstalledHook) {
         .code_size = 1,
         .expected_build_id = nullptr,
         .expected_fingerprint = nullptr,
+        .section_va = 0,
     };
     void* backup = nullptr;
     DartPlantHook* hook = nullptr;
@@ -598,6 +599,7 @@ TEST_CASE(SimpleInitValidatesReconfigurationAndShutdownClearsOnlyCurrentHost) {
         .code_size = 1,
         .expected_build_id = nullptr,
         .expected_fingerprint = nullptr,
+        .section_va = 0,
     };
     void* backup = nullptr;
     DartPlantHook* hook = nullptr;
@@ -709,6 +711,7 @@ TEST_CASE(AddressHookUsesHostApiAndUnhooks) {
         .code_size = 1,
         .expected_build_id = nullptr,
         .expected_fingerprint = nullptr,
+        .section_va = 0,
     };
     void* backup = nullptr;
     DartPlantHook* hook = nullptr;
@@ -771,6 +774,7 @@ TEST_CASE(AddressHookRejectsNonExecutableRange) {
         .code_size = sizeof(stack_value),
         .expected_build_id = nullptr,
         .expected_fingerprint = nullptr,
+        .section_va = 0,
     };
     void* backup = nullptr;
     DartPlantHook* hook = nullptr;

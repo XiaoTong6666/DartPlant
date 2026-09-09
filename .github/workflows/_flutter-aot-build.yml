@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build:
-    name: ${{ inputs.family }} release AOT
+    name: ${{ inputs.family }} release/profile AOT
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -106,16 +106,20 @@ jobs:
           flutter --version
           dart --version
 
-      - name: Build release ARM64 fixture
+      - name: Build release/profile ARM64 fixtures
         run: |
-          python3 scripts/ci/build_flutter_fixture.py \
-            --flutter "$(command -v flutter)" \
-            --expected-flutter "${{ inputs.flutter_version }}" \
-            --expected-dart "${{ inputs.dart_version }}" \
-            --family "${{ inputs.family }}" \
-            --out "build/ci/flutter/${{ inputs.family }}"
+          set -euo pipefail
+          for mode in release profile; do
+            python3 scripts/ci/build_flutter_fixture.py \
+              --flutter "$(command -v flutter)" \
+              --expected-flutter "${{ inputs.flutter_version }}" \
+              --expected-dart "${{ inputs.dart_version }}" \
+              --family "${{ inputs.family }}" \
+              --mode "$mode" \
+              --out "build/ci/flutter/${{ inputs.family }}/$mode"
+          done
 
-      - name: Upload release AOT fixture
+      - name: Upload release/profile AOT fixtures
         uses: actions/upload-artifact@v4
         with:
           name: dartplant-${{ inputs.family }}

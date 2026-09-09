@@ -57,6 +57,7 @@ add_library(
     STATIC
     src/core/dartplant.cpp
     src/core/hook_registry.cpp
+    src/elf/dynamic_view.cpp
     src/elf/module_image.cpp
     src/host/loader_contract.cpp
     src/host/publication_gate.cpp
@@ -386,6 +387,7 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
     add_executable(
         dartplant_tests
         tests/test_main.cc
+        tests/elf_dynamic_view_test.cc
         tests/elf_resolver_test.cc
         tests/loader_contract_test.cc
         tests/signal_lease_test.cc

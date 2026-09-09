@@ -721,6 +721,7 @@ int main() {
         .code_size = 4,
         .expected_build_id = nullptr,
         .expected_fingerprint = nullptr,
+        .section_va = 0,
     };
     DartPlantHook* hook = nullptr;
     void* backup = nullptr;

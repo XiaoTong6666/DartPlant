@@ -46,13 +46,6 @@ LEGACY_PROOFS = {
         "exception bridge lifetime probe enter=1 leave=0 unhook=1 idle=1 inactive=1 "
         "failures=0 shutdown=1 passed=1",
     ),
-    "Shared-code semantics": (
-        "explicit_opt_in=1",
-        "ambiguous_identity=1",
-        "second_listener_identity=1",
-        "aliases=2",
-        "known_aliases=2",
-    ),
     "Live VM model": ("runtime live-vm lookup addInt ok", "model_ok=1"),
 }
 
@@ -399,6 +392,80 @@ def _check_legacy_proofs(log_text: str, expected_test: str) -> list[Check]:
     return checks
 
 
+def _check_code_identity_semantics(log_text: str) -> Check:
+    producer_lines = [
+        line
+        for line in log_text.splitlines()
+        if "producer code-identity policy verified mode=" in line
+    ]
+    probe_lines = [
+        line for line in log_text.splitlines() if "instrumentedAdd probe mode=" in line
+    ]
+    if not producer_lines or not probe_lines:
+        return Check(
+            "Code identity semantics",
+            False,
+            "missing producer code-identity policy or instrumentedAdd probe evidence",
+        )
+
+    producer = producer_lines[-1]
+    probe = probe_lines[-1]
+    common_probe = (
+        "enter=5",
+        "leave=5",
+        "live_ok=5",
+        "live_failed=0",
+        "lookup_ok=1",
+        "model_ok=1",
+        "policy_ok=1",
+        "result=115",
+        "expected=115",
+    )
+    if "mode=no-dedup-unique" in producer:
+        producer_markers = (
+            "instrumented_aliases=1",
+            "add_int_aliases=1",
+        )
+        probe_markers = common_probe + (
+            "mode=no-dedup-unique",
+            "second_listener_enter=0",
+            "ambiguous_identity=0",
+            "second_listener_identity=0",
+        )
+        mode = "no-dedup-unique"
+    elif "mode=dedup-shared" in producer:
+        producer_markers = (
+            "instrumented_aliases=2",
+            "add_int_aliases=2",
+        )
+        probe_markers = common_probe + (
+            "mode=dedup-shared",
+            "second_listener_enter=5",
+            "ambiguous_identity=1",
+            "second_listener_identity=1",
+        )
+        mode = "dedup-shared"
+    else:
+        return Check(
+            "Code identity semantics",
+            False,
+            f"unknown producer mode: {producer.strip()}",
+        )
+
+    missing_producer = [marker for marker in producer_markers if marker not in producer]
+    missing_probe = [marker for marker in probe_markers if marker not in probe]
+    passed = not missing_producer and not missing_probe
+    detail = f"mode={mode} producer/probe evidence verified"
+    if not passed:
+        detail = f"mode={mode} producer_missing={missing_producer} probe_missing={missing_probe}"
+    return Check("Code identity semantics", passed, detail)
+
+
+_THREADTIME_PID_RE = re.compile(
+    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+(\d+)\s+[VDIWEFAS]\s+"
+)
+
+
 def _crash_hits(log_text: str, metadata: dict[str, object]) -> list[str]:
     lines = log_text.splitlines()
     package = str(metadata.get("package", ""))
@@ -419,12 +486,26 @@ def _crash_hits(log_text: str, metadata: dict[str, object]) -> list[str]:
         "use-after-free",
     )
     hits: list[str] = []
-    for index, line in enumerate(lines):
+    pid_re = re.compile(rf"\b{re.escape(pid)}\b") if pid else None
+    for line in lines:
         if not any(marker in line for marker in markers):
             continue
-        window = "\n".join(lines[max(0, index - 3) : min(len(lines), index + 9)])
-        pid_re = re.compile(rf"\b{re.escape(pid)}\b") if pid else None
-        if (package and package in window) or (pid_re is not None and pid_re.search(window)):
+
+        # Logcat is a system-wide stream. Do not associate an unrelated fatal
+        # record with the fixture merely because fixture output happened to be
+        # interleaved a few lines away. Prefer the emitting PID from threadtime
+        # format; for crash/tombstone records without that provenance, require
+        # the fixture package or PID on the fatal line itself.
+        source_match = _THREADTIME_PID_RE.match(line)
+        source_pid = source_match.group(1) if source_match else ""
+        if source_pid:
+            if pid and source_pid == pid:
+                hits.append(line.strip())
+            elif package and package in line:
+                hits.append(line.strip())
+            continue
+
+        if (package and package in line) or (pid_re is not None and pid_re.search(line)):
             hits.append(line.strip())
     return hits
 
@@ -475,6 +556,7 @@ def analyze(
     if expected_test in {"all", "generic_gc"}:
         checks.append(_check_generic_gc(events))
     checks.extend(_check_legacy_proofs(log_text, expected_test))
+    checks.append(_check_code_identity_semantics(log_text))
     crash_hits = _crash_hits(log_text, metadata)
     checks.append(
         Check(

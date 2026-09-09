@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -32,6 +33,43 @@ EXPECTED_FIXED_REGISTERS = {
     "args_desc": 4,
 }
 
+ARTIFACT_ONLY_ABI_FIELD_NAMES = {
+    "entry_va",
+    "runtime_entry",
+    "code_payload_va",
+    "code_size",
+    "code_fingerprint",
+    "fingerprint",
+    "build_id",
+    "load_bias",
+    "snapshot_symbol_va",
+    "snapshot_symbol_file_offset",
+    "snapshot_symbol_runtime",
+    "snapshot_symbol_size",
+    "artifact_generation",
+    "isolate_generation",
+}
+
+PROVENANCE_ONLY_PROFILE_FIELDS = {
+    "snapshot_hash",
+    "dart_version",
+    "name",
+    "snapshot_profile",
+    "profile_version",
+    "abi_identity",
+    "abi_id",
+}
+
+EXPECTED_SNAPSHOT_SYMBOLS = {
+    "kSnapshotBuildIdAsmSymbol": "_kDartSnapshotBuildId",
+    "kVmSnapshotDataAsmSymbol": "_kDartVmSnapshotData",
+    "kVmSnapshotInstructionsAsmSymbol": "_kDartVmSnapshotInstructions",
+    "kVmSnapshotBssAsmSymbol": "_kDartVmSnapshotBss",
+    "kIsolateSnapshotDataAsmSymbol": "_kDartIsolateSnapshotData",
+    "kIsolateSnapshotInstructionsAsmSymbol": "_kDartIsolateSnapshotInstructions",
+    "kIsolateSnapshotBssAsmSymbol": "_kDartIsolateSnapshotBss",
+}
+
 SDK_REGISTER_PATTERNS = {
     "thr": r"const Register THR = R26;",
     "pp": r"const Register PP = R27;",
@@ -44,6 +82,11 @@ SDK_REGISTER_PATTERNS = {
 
 AOT_BLOCK_PATTERN = re.compile(
     r"#if defined\(PRODUCT\) && defined\(TARGET_ARCH_ARM64\) &&\s*\\\n"
+    r"\s*defined\(DART_COMPRESSED_POINTERS\)"
+)
+
+NONPRODUCT_AOT_BLOCK_PATTERN = re.compile(
+    r"#if !defined\(PRODUCT\) && defined\(TARGET_ARCH_ARM64\) &&\s*\\\n"
     r"\s*defined\(DART_COMPRESSED_POINTERS\)"
 )
 
@@ -135,7 +178,16 @@ def _u(value: int) -> str:
 
 
 def _product_arm64_compressed_aot_block(text: str) -> str:
-    matches = list(AOT_BLOCK_PATTERN.finditer(text))
+    return _arm64_compressed_aot_block(text, product=True)
+
+
+def _nonproduct_arm64_compressed_aot_block(text: str) -> str:
+    return _arm64_compressed_aot_block(text, product=False)
+
+
+def _arm64_compressed_aot_block(text: str, *, product: bool) -> str:
+    pattern = AOT_BLOCK_PATTERN if product else NONPRODUCT_AOT_BLOCK_PATTERN
+    matches = list(pattern.finditer(text))
     for match in matches:
         end = text.find("#endif", match.start())
         if end < 0:
@@ -143,7 +195,8 @@ def _product_arm64_compressed_aot_block(text: str) -> str:
         block = text[match.start() : end]
         if "AOT_Function_code_offset" in block:
             return block
-    raise ValueError("PRODUCT ARM64 compressed AOT offset block was not found")
+    mode = "PRODUCT" if product else "!PRODUCT"
+    raise ValueError(f"{mode} ARM64 compressed AOT offset block was not found")
 
 
 def _parse_aot_offset(block: str, name: str) -> int:
@@ -187,7 +240,9 @@ def _parse_aot_offset_at(block: str, name: str, index: int) -> int:
 def _verify_profile_against_aot_offsets(
     profile: dict[str, object], runtime_offsets: str
 ) -> None:
-    block = _product_arm64_compressed_aot_block(runtime_offsets)
+    block = _arm64_compressed_aot_block(
+        runtime_offsets, product=bool(profile["machine"]["product"])
+    )
     name = str(profile["name"])
     for (section, field), sdk_name in AOT_OFFSET_BINDINGS.items():
         if (section, field) in AOT_ARRAY_OFFSET_BINDINGS:
@@ -208,6 +263,202 @@ def _verify_profile_against_aot_offsets(
                 f"with {sdk_name}[{index}]=0x{actual:x}"
             )
 
+
+def _verify_class_table_num_cids_contract(
+    profile: dict[str, object],
+    runtime_offsets: str,
+    class_table_header: str,
+    *,
+    source_name: str,
+) -> None:
+    """Verify the private ClassTable::NumCids() backing-field offset.
+
+    runtime_offsets_extracted.h exposes ClassTable's !PRODUCT allocation-
+    tracing pointer but not the nested CidIndexedTable::num_cids_ member.
+    PRODUCT and !PRODUCT therefore need an explicit source-proven derivation
+    instead of sharing the same manifest value.
+    """
+
+    pointer_size = int(profile["machine"]["pointer_size"])
+    if pointer_size != 8:
+        raise ValueError(
+            f"{source_name}: unsupported ClassTable pointer size: {pointer_size}"
+        )
+
+    normalized = " ".join(class_table_header.split())
+    for evidence in (
+        "ClassTableAllocator* allocator_; intptr_t num_cids_ = 0; intptr_t capacity_ = 0;",
+        "static_assert(sizeof(cached_allocation_tracing_state_table_) == kWordSize); return OFFSET_OF(ClassTable, cached_allocation_tracing_state_table_);",
+        "NOT_IN_PRODUCT(AcqRelAtomic<uint8_t*> cached_allocation_tracing_state_table_ = {nullptr});",
+    ):
+        if evidence not in normalized:
+            raise ValueError(
+                f"{source_name}: ClassTable private layout contract changed: {evidence}"
+            )
+
+    allocator_positions = [
+        match.start()
+        for match in re.finditer(r"ClassTableAllocator\* allocator_;", normalized)
+    ]
+    tracing_position = normalized.find(
+        "NOT_IN_PRODUCT(AcqRelAtomic<uint8_t*> cached_allocation_tracing_state_table_"
+    )
+    if len(allocator_positions) < 2 or tracing_position <= allocator_positions[-1]:
+        raise ValueError(
+            f"{source_name}: ClassTable allocator/tracing-field order changed"
+        )
+
+    product = bool(profile["machine"]["product"])
+    if product:
+        # ClassTable::allocator_ followed by CidIndexedTable::allocator_, then
+        # CidIndexedTable::num_cids_.
+        expected = pointer_size * 2
+    else:
+        block = _arm64_compressed_aot_block(runtime_offsets, product=False)
+        tracing_offset = _parse_aot_offset(
+            block, "AOT_ClassTable_allocation_tracing_state_table_offset"
+        )
+        if tracing_offset != pointer_size:
+            raise ValueError(
+                f"{source_name}: !PRODUCT ClassTable allocation-tracing field moved: "
+                f"0x{tracing_offset:x} != 0x{pointer_size:x}"
+            )
+        # The tracing pointer occupies one machine word at tracing_offset;
+        # classes_ follows it, and nested CidIndexedTable starts with an
+        # allocator pointer before num_cids_.
+        expected = tracing_offset + pointer_size * 2
+
+    actual = int(profile["class_table"]["num_cids"])
+    if actual != expected:
+        raise ValueError(
+            f"{profile['name']}: manifest class_table.num_cids=0x{actual:x} "
+            f"disagrees with source-proven {source_name} layout=0x{expected:x}"
+        )
+
+
+
+def _verify_class_raw_layout_contract(
+    profile: dict[str, object], raw_object: str, *, source_name: str
+) -> None:
+    """Verify the precompiled UntaggedClass fields consumed by live indexing."""
+
+    compressed_word_size = int(profile["raw_object"]["compressed_word_size"])
+    if compressed_word_size != 4:
+        raise ValueError(
+            f"{source_name}: unsupported compressed UntaggedClass word size: "
+            f"{compressed_word_size}"
+        )
+
+    normalized = " ".join(raw_object.split())
+    ordered_fields = (
+        "COMPRESSED_POINTER_FIELD(StringPtr, name)",
+        "NOT_IN_PRODUCT(COMPRESSED_POINTER_FIELD(StringPtr, user_name))",
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, functions)",
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, functions_hash_table)",
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, fields)",
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, offset_in_words_to_field)",
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, interfaces)",
+        "COMPRESSED_POINTER_FIELD(ScriptPtr, script)",
+        "COMPRESSED_POINTER_FIELD(LibraryPtr, library)",
+    )
+    cursor = normalized.find("class UntaggedClass : public UntaggedObject")
+    if cursor < 0:
+        raise ValueError(f"{source_name}: UntaggedClass declaration is missing")
+    for field in ordered_fields:
+        position = normalized.find(field, cursor)
+        if position < 0:
+            raise ValueError(
+                f"{source_name}: UntaggedClass live-index field order changed at {field}"
+            )
+        cursor = position + len(field)
+
+    expected_name = compressed_word_size * 2
+    expected_functions = expected_name + compressed_word_size
+    if not bool(profile["machine"]["product"]):
+        expected_functions += compressed_word_size
+    expected_library = expected_functions + compressed_word_size * 6
+
+    expected = {
+        "name": expected_name,
+        "functions": expected_functions,
+        "library": expected_library,
+    }
+    actual = profile["class"]
+    for field, value in expected.items():
+        manifest_value = int(actual[field])
+        if manifest_value != value:
+            raise ValueError(
+                f"{profile['name']}: manifest class.{field}=0x{manifest_value:x} "
+                f"disagrees with source-proven {source_name} layout=0x{value:x}"
+            )
+
+
+def _verify_code_instructions_length_contract(
+    profile: dict[str, object], raw_object: str, *, source_name: str
+) -> None:
+    """Verify UntaggedCode::instructions_length_ for PRODUCT and !PRODUCT AOT.
+
+    The generated runtime-offset table exposes the early Code entry/object
+    fields but not the trailing instructions_length_ field. In a precompiled
+    !PRODUCT runtime, three diagnostic object pointers plus an aligned 64-bit
+    compile timestamp are retained before state_bits_, shifting
+    instructions_length_ by 0x20 relative to PRODUCT.
+    """
+
+    pointer_size = int(profile["machine"]["pointer_size"])
+    if pointer_size != 8:
+        raise ValueError(
+            f"{source_name}: unsupported UntaggedCode pointer size: {pointer_size}"
+        )
+
+    normalized = " ".join(raw_object.split())
+    start = normalized.find("class UntaggedCode : public UntaggedObject")
+    if start < 0:
+        raise ValueError(f"{source_name}: UntaggedCode declaration is missing")
+    end = normalized.find("class UntaggedObjectPool", start)
+    if end < 0:
+        raise ValueError(f"{source_name}: UntaggedCode declaration is unterminated")
+    code = normalized[start:end]
+
+    ordered_fields = (
+        "POINTER_FIELD(ObjectPtr, owner)",
+        "POINTER_FIELD(ExceptionHandlersPtr, exception_handlers)",
+        "POINTER_FIELD(PcDescriptorsPtr, pc_descriptors)",
+        "POINTER_FIELD(ObjectPtr, catch_entry)",
+        "POINTER_FIELD(CompressedStackMapsPtr, compressed_stackmaps)",
+        "POINTER_FIELD(ArrayPtr, inlined_id_to_function)",
+        "POINTER_FIELD(CodeSourceMapPtr, code_source_map)",
+        "NOT_IN_PRODUCT(POINTER_FIELD(ObjectPtr, return_address_metadata))",
+        "NOT_IN_PRODUCT(POINTER_FIELD(LocalVarDescriptorsPtr, var_descriptors))",
+        "NOT_IN_PRODUCT(POINTER_FIELD(ArrayPtr, comments))",
+        "NOT_IN_PRODUCT(alignas(8) int64_t compile_timestamp_);",
+        "int32_t state_bits_;",
+        "ONLY_IN_PRECOMPILED(uint32_t instructions_length_);",
+    )
+    cursor = 0
+    for field in ordered_fields:
+        position = code.find(field, cursor)
+        if position < 0:
+            raise ValueError(
+                f"{source_name}: UntaggedCode AOT layout changed at {field}"
+            )
+        cursor = position + len(field)
+
+    owner_offset = int(profile["code"]["owner"])
+    # owner_ is followed by six always-present pointer fields through
+    # code_source_map_. PRODUCT then stores state_bits_ and the 32-bit AOT
+    # instructions length. !PRODUCT retains three more pointers and an aligned
+    # 64-bit timestamp before those two scalar fields.
+    expected = owner_offset + pointer_size * 7 + 4
+    if not bool(profile["machine"]["product"]):
+        expected += pointer_size * 4
+
+    actual = int(profile["code"]["instructions_length"])
+    if actual != expected:
+        raise ValueError(
+            f"{profile['name']}: manifest code.instructions_length=0x{actual:x} "
+            f"disagrees with source-proven {source_name} layout=0x{expected:x}"
+        )
 
 
 def _verify_aot_payload_contract(
@@ -670,6 +921,37 @@ def _verify_capability_fingerprint_coverage(profile: dict[str, object]) -> None:
             )
 
 
+def _verify_abi_layer_separation(
+    profile: dict[str, object],
+    *,
+    domain_fields: dict[str, tuple[str, ...]] | None = None,
+    capability_fields: dict[str, tuple[tuple[str, str], ...]] | None = None,
+) -> None:
+    domains = ABI_DOMAIN_FIELDS if domain_fields is None else domain_fields
+    capabilities = CAPABILITY_FINGERPRINT_FIELDS if capability_fields is None else capability_fields
+
+    for section in ABI_PROFILE_SECTIONS:
+        for field in profile[section]:
+            if field in ARTIFACT_ONLY_ABI_FIELD_NAMES:
+                raise ValueError(
+                    f"{section}.{field}: artifact/runtime fact must not enter RuntimeProfileRecord ABI"
+                )
+
+    def reject_path(owner: str, path: str) -> None:
+        if path in PROVENANCE_ONLY_PROFILE_FIELDS:
+            raise ValueError(f"{owner}: provenance-only field must not enter ABI identity: {path}")
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf in ARTIFACT_ONLY_ABI_FIELD_NAMES:
+            raise ValueError(f"{owner}: artifact/runtime field must not enter ABI identity: {path}")
+
+    for domain, fields in domains.items():
+        for path in fields:
+            reject_path(f"ABI domain {domain}", path)
+    for capability, fields in capabilities.items():
+        for path, _ in fields:
+            reject_path(f"capability {capability}", path)
+
+
 def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
     actual = _class_id_map(class_id_text)
     cids = profile["cids"]
@@ -1044,6 +1326,180 @@ def _verify_closure_call_descriptor_contract(
             )
 
 
+def _verify_snapshot_header_contract(
+    snapshot_header: str, source_name: str, expected_full_aot_kind: int | None = 3
+) -> None:
+    normalized = " ".join(snapshot_header.split())
+    required = (
+        "static constexpr int32_t kMagicValue = 0xdcdcf5f5;",
+        "static constexpr intptr_t kMagicOffset = 0;",
+        "static constexpr intptr_t kMagicSize = sizeof(int32_t);",
+        "static constexpr intptr_t kLengthOffset = kMagicOffset + kMagicSize;",
+        "static constexpr intptr_t kLengthSize = sizeof(int64_t);",
+        "static constexpr intptr_t kKindOffset = kLengthOffset + kLengthSize;",
+        "static constexpr intptr_t kKindSize = sizeof(int64_t);",
+        "static constexpr intptr_t kHeaderSize = kKindOffset + kKindSize;",
+        "return Read<int64_t>(kLengthOffset) + kMagicSize;",
+        "return Write<int64_t>(kLengthOffset, value - kMagicSize);",
+    )
+    for evidence in required:
+        if evidence not in normalized:
+            raise ValueError(f"{source_name}: Dart snapshot header contract changed: {evidence}")
+
+    enum_match = re.search(r"enum\s+Kind\s*\{(?P<body>.*?)\};", snapshot_header, re.DOTALL)
+    if enum_match is None:
+        raise ValueError(f"{source_name}: Dart Snapshot::Kind enum is missing")
+    values: dict[str, int] = {}
+    current = -1
+    for raw in enum_match.group("body").split(","):
+        token = re.sub(r"//.*", "", raw).strip()
+        if not token:
+            continue
+        if "=" in token:
+            name, value = [part.strip() for part in token.split("=", 1)]
+            current = int(value, 0)
+        else:
+            name = token
+            current += 1
+        values[name] = current
+    if "kFullAOT" not in values:
+        raise ValueError(f"{source_name}: Snapshot::kFullAOT is missing")
+    if expected_full_aot_kind is not None and values.get("kFullAOT") != expected_full_aot_kind:
+        raise ValueError(
+            f"{source_name}: Snapshot::kFullAOT changed: {values.get('kFullAOT')!r}"
+        )
+
+
+def _verify_snapshot_symbol_contract(
+    dart_api: str,
+    source_name: str,
+    expected_symbols: dict[str, str] | None = EXPECTED_SNAPSHOT_SYMBOLS,
+) -> None:
+    normalized = " ".join(dart_api.replace("\\\n", " ").split())
+    if expected_symbols is None:
+        current_macros = (
+            "kSnapshotBuildIdAsmSymbol",
+            "kSnapshotDataAsmSymbol",
+            "kSnapshotTextAsmSymbol",
+            "kSnapshotBssAsmSymbol",
+        )
+        for macro in current_macros:
+            if re.search(rf"#define\s+{re.escape(macro)}\s+\"[^\"]+\"", normalized) is None:
+                raise ValueError(f"{source_name}: current Dart AOT snapshot symbol is missing: {macro}")
+        return
+    for macro, value in expected_symbols.items():
+        pattern = rf'#define\s+{re.escape(macro)}\s+"{re.escape(value)}"'
+        if re.search(pattern, normalized) is None:
+            raise ValueError(f"{source_name}: Dart AOT snapshot symbol changed: {macro}")
+
+
+def _verify_snapshot_feature_contract(dart_source: str, source_name: str) -> None:
+    normalized = " ".join(dart_source.split())
+    for evidence in (
+        '#if defined(DEBUG) buffer.AddString("debug"); #elif defined(PRODUCT) buffer.AddString("product"); #else buffer.AddString("release"); #endif',
+        '#elif defined(TARGET_ARCH_ARM64) buffer.AddString(" arm64");',
+        '#if defined(DART_TARGET_OS_ANDROID) buffer.AddString(" android");',
+        '#if defined(DART_COMPRESSED_POINTERS) buffer.AddString(" compressed-pointers"); #else buffer.AddString(" no-compressed-pointers"); #endif',
+    ):
+        if evidence not in normalized:
+            raise ValueError(f"{source_name}: Dart snapshot feature contract changed: {evidence}")
+
+
+def _verify_parameter_flags_contract(runtime_api: str, platform_globals: str, source_name: str) -> None:
+    api = " ".join(runtime_api.split())
+    globals_text = " ".join(platform_globals.split())
+    enum_match = re.search(r"enum ParameterFlags \{ (?P<body>.*?) \};", api)
+    if enum_match is None:
+        raise ValueError(f"{source_name}: ParameterFlags enum is missing")
+    names = [part.strip() for part in enum_match.group("body").split(",") if part.strip()]
+    if names[:2] != ["kRequiredNamedParameterFlag", "kNumParameterFlags"]:
+        raise ValueError(f"{source_name}: named-parameter flag numbering changed: {names[:2]}")
+    for evidence in (
+        "kNumParameterFlagsPerElementLog2 = kBitsPerWordLog2 - 1 - kNumParameterFlags;",
+        "kNumParameterFlagsPerElement = 1 << kNumParameterFlagsPerElementLog2;",
+    ):
+        if evidence not in api:
+            raise ValueError(f"{source_name}: named-parameter flag packing changed: {evidence}")
+    for evidence in (
+        "constexpr intptr_t kInt64SizeLog2 = 3;",
+        "constexpr intptr_t kBitsPerByteLog2 = 3;",
+        "constexpr intptr_t kWordSizeLog2 = kInt64SizeLog2;",
+        "constexpr intptr_t kBitsPerWordLog2 = kWordSizeLog2 + kBitsPerByteLog2;",
+    ):
+        if evidence not in globals_text:
+            raise ValueError(f"{source_name}: 64-bit word geometry changed: {evidence}")
+    # ARM64 is a 64-bit target: 1 << (6 - 1 - 1) == 16.
+    if 1 << ((3 + 3) - 1 - 1) != 16:
+        raise AssertionError("internal named-parameter packing derivation is invalid")
+
+
+def _verify_dart_aot_elf_contract(elf_source: str, source_name: str) -> None:
+    normalized = " ".join(elf_source.split())
+    for evidence in (
+        "DynamicEntryType::DT_HASH",
+        'section_table_->Add(hash, ".hash");',
+        "GenerateBuildId();",
+        "write_section(section_table_);",
+    ):
+        if evidence not in normalized:
+            raise ValueError(f"{source_name}: Dart AOT ELF producer contract changed: {evidence}")
+
+
+def _snapshot_hash_inputs(make_version_source: str, source_name: str) -> list[str]:
+    match = re.search(
+        r"VM_SNAPSHOT_FILES\s*=\s*(\[[\s\S]*?\])\s*\n\s*\n",
+        make_version_source,
+    )
+    if match is None:
+        raise ValueError(f"{source_name}: tools/make_version.py snapshot input list is missing")
+    try:
+        values = ast.literal_eval(match.group(1))
+    except (SyntaxError, ValueError) as error:
+        raise ValueError(f"{source_name}: invalid VM_SNAPSHOT_FILES list") from error
+    if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+        raise ValueError(f"{source_name}: invalid VM_SNAPSHOT_FILES entries")
+    normalized = " ".join(make_version_source.split())
+    for evidence in ("vmhash = hashlib.md5()", "return vmhash.hexdigest()"):
+        if evidence not in normalized:
+            raise ValueError(f"{source_name}: snapshot source hash algorithm changed: {evidence}")
+    return values
+
+
+def _git_show_bytes(sdk_root: Path, revision: str, path: str) -> bytes:
+    result = sp.run(
+        ["git", "-C", str(sdk_root), "show", f"{revision}:{path}"],
+        check=False,
+        stdout=sp.PIPE,
+        stderr=sp.PIPE,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            f"Dart SDK revision {revision} cannot provide {path}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    return result.stdout
+
+
+def _verify_snapshot_source_hash(
+    sdk_root: Path,
+    revision: str,
+    make_version_source: str,
+    expected_hash: str,
+    source_name: str,
+) -> None:
+    inputs = _snapshot_hash_inputs(make_version_source, source_name)
+    digest = hashlib.md5()
+    for filename in inputs:
+        digest.update(_git_show_bytes(sdk_root, revision, f"runtime/vm/{filename}"))
+    actual = digest.hexdigest()
+    if len(actual) != 32 or any(character not in "0123456789abcdef" for character in actual):
+        raise ValueError(f"{source_name}: generated snapshot source hash is not 32 lowercase hex")
+    if actual != expected_hash:
+        raise ValueError(
+            f"{source_name}: manifest snapshot hash {expected_hash} != source hash {actual}"
+        )
+
+
 def _git_show(sdk_root: Path, revision: str, path: str) -> str:
     result = sp.run(
         ["git", "-C", str(sdk_root), "show", f"{revision}:{path}"],
@@ -1071,6 +1527,7 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         object_header = _git_show(sdk_root, version, "runtime/vm/object.h")
         app_snapshot = _git_show(sdk_root, version, "runtime/vm/app_snapshot.cc")
         raw_object = _git_show(sdk_root, version, "runtime/vm/raw_object.h")
+        class_table_header = _git_show(sdk_root, version, "runtime/vm/class_table.h")
         class_id = _git_show(sdk_root, version, "runtime/vm/class_id.h")
         tags = _git_show(sdk_root, version, "runtime/vm/tags.h")
         thread = _git_show(sdk_root, version, "runtime/vm/thread.h")
@@ -1096,7 +1553,24 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         stack_frame_arm64 = _git_show(sdk_root, version, "runtime/vm/stack_frame_arm64.h")
         stack_frame = _git_show(sdk_root, version, "runtime/vm/stack_frame.cc")
         dart_api_impl = _git_show(sdk_root, version, "runtime/vm/dart_api_impl.cc")
+        snapshot_header = _git_show(sdk_root, version, "runtime/vm/snapshot.h")
+        dart_api = _git_show(sdk_root, version, "runtime/include/dart_api.h")
+        dart_source = _git_show(sdk_root, version, "runtime/vm/dart.cc")
+        elf_source = _git_show(sdk_root, version, "runtime/vm/elf.cc")
+        make_version = _git_show(sdk_root, version, "tools/make_version.py")
         _verify_profile_against_aot_offsets(profile, runtime_offsets)
+        _verify_class_table_num_cids_contract(
+            profile,
+            runtime_offsets,
+            class_table_header,
+            source_name=f"Dart SDK {version}",
+        )
+        _verify_class_raw_layout_contract(
+            profile, raw_object, source_name=f"Dart SDK {version}"
+        )
+        _verify_code_instructions_length_contract(
+            profile, raw_object, source_name=f"Dart SDK {version}"
+        )
         _verify_aot_payload_contract(
             object_header, app_snapshot, source_name=f"Dart SDK {version}"
         )
@@ -1128,6 +1602,20 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         _verify_closure_call_descriptor_contract(
             il_header, kernel_flowgraph, source_name=f"Dart SDK {version}"
         )
+        _verify_snapshot_header_contract(snapshot_header, source_name=f"Dart SDK {version}")
+        _verify_snapshot_symbol_contract(dart_api, source_name=f"Dart SDK {version}")
+        _verify_snapshot_feature_contract(dart_source, source_name=f"Dart SDK {version}")
+        _verify_parameter_flags_contract(
+            runtime_api, platform_globals, source_name=f"Dart SDK {version}"
+        )
+        _verify_dart_aot_elf_contract(elf_source, source_name=f"Dart SDK {version}")
+        _verify_snapshot_source_hash(
+            sdk_root,
+            version,
+            make_version,
+            str(profile["snapshot_hash"]),
+            source_name=f"Dart SDK {version}",
+        )
         print(f"Dart SDK AOT profile verified: {profile['name']} @ {version}")
 
 
@@ -1140,17 +1628,19 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
         raise ValueError("dart VM profile manifest must contain profiles")
 
     versions: set[int] = set()
-    hashes: set[str] = set()
+    source_identities: set[tuple[str, str]] = set()
     names: set[str] = set()
     for profile in profiles:
         version = int(profile["profile_version"])
         name = str(profile["name"])
         snapshot_hash = str(profile["snapshot_hash"])
-        if version in versions or name in names or snapshot_hash in hashes:
+        snapshot_profile = str(profile["snapshot_profile"])
+        source_identity = (snapshot_hash, snapshot_profile)
+        if version in versions or name in names or source_identity in source_identities:
             raise ValueError("dart VM profile identities must be unique")
         versions.add(version)
         names.add(name)
-        hashes.add(snapshot_hash)
+        source_identities.add(source_identity)
         if len(snapshot_hash) != 32 or any(c not in "0123456789abcdef" for c in snapshot_hash):
             raise ValueError(f"invalid snapshot hash for {name}: {snapshot_hash}")
 
@@ -1158,12 +1648,13 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
         if (
             machine.get("architecture") != "arm64"
             or int(machine.get("pointer_size", 0)) != 8
-            or machine.get("product") is not True
+            or not isinstance(machine.get("product"), bool)
             or machine.get("compressed_pointers") is not True
         ):
             raise ValueError(f"{name}: unsupported VM machine ABI")
         _verify_abi_domain_coverage(profile)
         _verify_capability_fingerprint_coverage(profile)
+        _verify_abi_layer_separation(profile)
         expected_identities = {
             domain: _canonical_abi_id(profile, domain)
             for domain in ("full", *ABI_DOMAIN_FIELDS)
@@ -1291,6 +1782,11 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         / "frontend"
         / "kernel_binary_flowgraph.cc"
     )
+    snapshot_header = sdk_root / "runtime" / "vm" / "snapshot.h"
+    dart_api = sdk_root / "runtime" / "include" / "dart_api.h"
+    dart_source = sdk_root / "runtime" / "vm" / "dart.cc"
+    elf_source = sdk_root / "runtime" / "vm" / "elf.cc"
+    make_version = sdk_root / "tools" / "make_version.py"
     for path in (
         constants,
         calling,
@@ -1312,6 +1808,11 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         il_arm64,
         il_header,
         kernel_flowgraph,
+        snapshot_header,
+        dart_api,
+        dart_source,
+        elf_source,
+        make_version,
     ):
         if not path.is_file():
             raise ValueError(f"Dart SDK source contract file is missing: {path}")
@@ -1436,6 +1937,16 @@ def verify_sdk_contract(sdk_root: Path) -> None:
     thread_text = thread.read_text()
     if "jump_to_frame_entry_point_" not in thread_text or "StubCode::JumpToFrame().EntryPoint()" not in thread_text:
         raise ValueError("Dart Thread no longer exposes the JumpToFrame cached entry point")
+    _verify_snapshot_header_contract(
+        snapshot_header.read_text(), "current Dart SDK", expected_full_aot_kind=None
+    )
+    _verify_snapshot_symbol_contract(
+        dart_api.read_text(), "current Dart SDK", expected_symbols=None
+    )
+    _verify_snapshot_feature_contract(dart_source.read_text(), "current Dart SDK")
+    _verify_parameter_flags_contract(runtime_api.read_text(), platform_globals.read_text(), "current Dart SDK")
+    _verify_dart_aot_elf_contract(elf_source.read_text(), "current Dart SDK")
+    _snapshot_hash_inputs(make_version.read_text(), "current Dart SDK")
     print(f"Dart SDK ARM64 source contract verified: {sdk_root}")
 
 

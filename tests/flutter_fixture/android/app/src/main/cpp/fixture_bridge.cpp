@@ -69,6 +69,7 @@ std::atomic<uint64_t> g_live_vm_probe_failed = 0;
 std::atomic_bool g_runtime_live_vm_ready{false};
 std::atomic_bool g_shared_policy_ok{false};
 std::atomic_bool g_shared_identity_ambiguous_seen{false};
+std::atomic_bool g_expect_deduplicated_shared_code{false};
 std::atomic<uint64_t> g_add_int_listener_enter = 0;
 std::atomic_bool g_add_int_listener_identity_ok{false};
 std::atomic<uint64_t> g_null_passthrough_count = 0;
@@ -107,6 +108,26 @@ void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
 }
 
+bool SnapshotHasExactFeature(const char* features, const char* expected) {
+    if (features == nullptr || expected == nullptr || expected[0] == '\0') return false;
+    const size_t expected_length = std::strlen(expected);
+    const char* cursor = features;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r') ++cursor;
+        if (*cursor == '\0') break;
+        const char* end = cursor;
+        while (*end != '\0' && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') {
+            ++end;
+        }
+        if (static_cast<size_t>(end - cursor) == expected_length &&
+            std::memcmp(cursor, expected, expected_length) == 0) {
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
 bool ResolveRetainedClosureFunction(Dart_Handle closure_handle, uintptr_t expected_entry,
                                     uint64_t* out_closure_raw, uint64_t* out_function_raw,
                                     uint32_t* out_field_offset) {
@@ -116,7 +137,10 @@ bool ResolveRetainedClosureFunction(Dart_Handle closure_handle, uintptr_t expect
         g_snapshot_info.snapshot_hash[0] == '\0') {
         return false;
     }
-    const auto* profile = dartplant::FindRuntimeProfileBySnapshot(g_snapshot_info.snapshot_hash);
+    const auto* profile = dartplant::FindRuntimeProfileBySnapshot(
+        g_snapshot_info.snapshot_hash, g_snapshot_info.profile_name == nullptr
+                                           ? std::string_view{}
+                                           : std::string_view{g_snapshot_info.profile_name});
     if (profile == nullptr || profile->raw_object.compressed_word_size != sizeof(uint32_t)) {
         return false;
     }
@@ -218,6 +242,13 @@ void OnInstrumentedAddEnter(DartPlantInvocation* invocation, void*) {
     }
     DartPlantLiveVmProbeInfo live{};
     live.struct_size = sizeof(live);
+    // TODO(runtime): This is intentionally still the full diagnostic probe. On
+    // a real Flutter UI thread it currently costs about 60 ms per invocation
+    // because it refreshes /proc/self/maps and rescans the ClassTable plus
+    // top-level libraries/functions to recover the same Function identity.
+    // Replace this hot-path use with a generation-bound fast invocation proof
+    // that reuses the already verified live index, while keeping the full probe
+    // for bootstrap/admission diagnostics and explicit regression coverage.
     const DartPlantStatus live_status =
         dartplant_live_vm_probe_invocation(invocation, &g_snapshot_info, &live);
     const uintptr_t expected_entry =
@@ -1005,11 +1036,12 @@ DartPlantStatus InstallAdvancedOrdinaryAotHooks() {
         !FindLiveTopLevelMethod("verifiedAbiDouble", &g_verified_abi_double)) {
         return DARTPLANT_METHOD_NOT_FOUND;
     }
-    const bool ordinary_aot_resolved = g_verified_abi_double != nullptr &&
-                                       g_verified_abi_double->function != nullptr &&
-                                       g_verified_abi_double->function->source ==
-                                           dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
-                                       dartplant_method_runtime_address(g_verified_abi_double) != 0;
+    const bool ordinary_aot_resolved =
+        g_verified_abi_double != nullptr && g_verified_abi_double->function != nullptr &&
+        (g_verified_abi_double->function->source == dartplant::DartFunctionSource::kLiveVm ||
+         g_verified_abi_double->function->source ==
+             dartplant::DartFunctionSource::kOfflineSnapshotIndex) &&
+        dartplant_method_runtime_address(g_verified_abi_double) != 0;
     const DartPlantStatus ordinary_index_status =
         ordinary_aot_resolved ? DARTPLANT_OK : DARTPLANT_METHOD_NOT_FOUND;
     DartPlantStatus ordinary_evidence_status = DARTPLANT_NOT_INITIALIZED;
@@ -1061,12 +1093,22 @@ DartPlantStatus InstallAdvancedOrdinaryAotHooks() {
         ordinary_observer_hook_status == DARTPLANT_OK;
     __android_log_print(
         ordinary_aot_discovery ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "DartPlant ordinary AOT discovery: %u index_status=%d evidence_status=%d abi_info_status=%d abi_state=%u verified_layout=%u hook_status=%d observer_hook_status=%d source_offline=%u entry=0x%llx function=0x%llx code=0x%llx error=%s",
+        "DartPlant ordinary AOT discovery: %u index_status=%d evidence_status=%d abi_info_status=%d abi_state=%u verified_layout=%u hook_status=%d observer_hook_status=%d source=%s source_live=%u source_offline=%u entry=0x%llx function=0x%llx code=0x%llx error=%s",
         static_cast<unsigned>(ordinary_aot_discovery), ordinary_index_status,
         ordinary_evidence_status, ordinary_abi_info_status,
         static_cast<unsigned>(ordinary_abi_info.state),
         static_cast<unsigned>(ordinary_abi_info.has_verified_call_layout), ordinary_hook_status,
         ordinary_observer_hook_status,
+        g_verified_abi_double == nullptr || g_verified_abi_double->function == nullptr ? "none"
+        : g_verified_abi_double->function->source == dartplant::DartFunctionSource::kLiveVm
+            ? "live-vm+artifact-evidence"
+        : g_verified_abi_double->function->source ==
+                dartplant::DartFunctionSource::kOfflineSnapshotIndex
+            ? "artifact-index"
+            : "other",
+        static_cast<unsigned>(
+            g_verified_abi_double != nullptr && g_verified_abi_double->function != nullptr &&
+            g_verified_abi_double->function->source == dartplant::DartFunctionSource::kLiveVm),
         static_cast<unsigned>(g_verified_abi_double != nullptr &&
                               g_verified_abi_double->function != nullptr &&
                               g_verified_abi_double->function->source ==
@@ -1161,10 +1203,32 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         g_cold_bootstrap_status.store(DARTPLANT_RUNTIME_NOT_READY, std::memory_order_release);
         return;
     }
+    const bool dedup_instructions =
+        SnapshotHasExactFeature(g_snapshot_info.snapshot_features, "dedup_instructions");
+    const bool no_dedup_instructions =
+        SnapshotHasExactFeature(g_snapshot_info.snapshot_features, "no-dedup_instructions");
+    if (dedup_instructions == no_dedup_instructions) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "live Function index producer mode is ambiguous dedup=%u no_dedup=%u features=%s",
+            static_cast<unsigned>(dedup_instructions), static_cast<unsigned>(no_dedup_instructions),
+            g_snapshot_info.snapshot_features == nullptr ? "" : g_snapshot_info.snapshot_features);
+        g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
+        return;
+    }
+    g_expect_deduplicated_shared_code.store(dedup_instructions, std::memory_order_release);
+    const uint32_t expected_instrumented_aliases = dedup_instructions ? 2U : 1U;
     bool indexed_instrumented_add = false;
+    bool indexed_add_int = false;
     bool indexed_echo_object = false;
     bool indexed_closure_entry_proof = false;
     uint64_t indexed_entry_va = 0;
+    uint64_t instrumented_function_object = 0;
+    uint64_t instrumented_code_object = 0;
+    uint64_t instrumented_runtime_entry = 0;
+    uint64_t add_int_function_object = 0;
+    uint64_t add_int_code_object = 0;
+    uint64_t add_int_runtime_entry = 0;
     for (uint32_t position = 0; position < function_index.function_count; ++position) {
         DartPlantLiveVmFunctionInfo function{};
         function.struct_size = sizeof(function);
@@ -1178,10 +1242,11 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
             std::strcmp(function.function_name, "instrumentedAdd") == 0) {
             __android_log_print(
                 ANDROID_LOG_INFO, kTag,
-                "entry-family instrumentedAdd mask=0x%x aliases=%u/%u/%u/%u fn=0x%llx fn_u=0x%llx code=0x%llx code_u=0x%llx mono=0x%llx mono_u=0x%llx",
+                "entry-family instrumentedAdd mask=0x%x aliases=%u/%u/%u/%u aggregate=%u expected=%u dedup=%u fn=0x%llx fn_u=0x%llx code=0x%llx code_u=0x%llx mono=0x%llx mono_u=0x%llx",
                 function.entry_kind_mask, function.entry_alias_counts[0],
                 function.entry_alias_counts[1], function.entry_alias_counts[2],
-                function.entry_alias_counts[3],
+                function.entry_alias_counts[3], function.entry_alias_count,
+                expected_instrumented_aliases, static_cast<unsigned>(dedup_instructions),
                 static_cast<unsigned long long>(function.function_entry_point),
                 static_cast<unsigned long long>(function.function_unchecked_entry_point),
                 static_cast<unsigned long long>(function.code_entry_point),
@@ -1190,7 +1255,7 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
                 static_cast<unsigned long long>(function.code_monomorphic_unchecked_entry_point));
             indexed_instrumented_add =
                 function.function != 0 && function.code != 0 && function.code_size != 0 &&
-                function.entry_alias_count == 2 &&
+                function.entry_alias_count == expected_instrumented_aliases &&
                 function.entry_va + g_snapshot_info.load_bias == function.function_entry_point &&
                 function.entry_kind_mask == 0x0f &&
                 function.function_entry_point == function.code_entry_point &&
@@ -1198,6 +1263,28 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
                 function.code_monomorphic_entry_point != 0 &&
                 function.code_monomorphic_unchecked_entry_point != 0;
             indexed_entry_va = function.entry_va;
+            instrumented_function_object = function.function;
+            instrumented_code_object = function.code;
+            instrumented_runtime_entry = function.function_entry_point;
+        }
+        if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
+            std::strcmp(function.class_name, "DartPlantFixture") == 0 &&
+            std::strcmp(function.function_name, "addInt") == 0) {
+            indexed_add_int = function.function != 0 && function.code != 0 &&
+                              function.code_size != 0 &&
+                              function.entry_alias_count == expected_instrumented_aliases &&
+                              function.function_entry_point == function.code_entry_point;
+            add_int_function_object = function.function;
+            add_int_code_object = function.code;
+            add_int_runtime_entry = function.function_entry_point;
+            __android_log_print(
+                ANDROID_LOG_INFO, kTag,
+                "entry-family addInt aliases=%u expected=%u dedup=%u function=0x%llx code=0x%llx entry=0x%llx",
+                function.entry_alias_count, expected_instrumented_aliases,
+                static_cast<unsigned>(dedup_instructions),
+                static_cast<unsigned long long>(function.function),
+                static_cast<unsigned long long>(function.code),
+                static_cast<unsigned long long>(function.function_entry_point));
         }
         if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
             std::strcmp(function.class_name, "Global") == 0 &&
@@ -1253,18 +1340,37 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         }
         ++decoded_pool_entries;
     }
-    if (!indexed_instrumented_add || !indexed_echo_object) {
+    const bool producer_identity_ok =
+        indexed_add_int && instrumented_function_object != add_int_function_object &&
+        (dedup_instructions ? (instrumented_code_object == add_int_code_object &&
+                               instrumented_runtime_entry == add_int_runtime_entry)
+                            : (instrumented_code_object != add_int_code_object &&
+                               instrumented_runtime_entry != add_int_runtime_entry));
+    if (!indexed_instrumented_add || !indexed_echo_object || !producer_identity_ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "live FunctionInfo producer verification instrumented=%u add_int=%u echo=%u identity=%u dedup=%u instrumented_fn=0x%llx add_int_fn=0x%llx instrumented_code=0x%llx add_int_code=0x%llx instrumented_entry=0x%llx add_int_entry=0x%llx",
+            static_cast<unsigned>(indexed_instrumented_add), static_cast<unsigned>(indexed_add_int),
+            static_cast<unsigned>(indexed_echo_object), static_cast<unsigned>(producer_identity_ok),
+            static_cast<unsigned>(dedup_instructions),
+            static_cast<unsigned long long>(instrumented_function_object),
+            static_cast<unsigned long long>(add_int_function_object),
+            static_cast<unsigned long long>(instrumented_code_object),
+            static_cast<unsigned long long>(add_int_code_object),
+            static_cast<unsigned long long>(instrumented_runtime_entry),
+            static_cast<unsigned long long>(add_int_runtime_entry));
         LogFailure("live FunctionInfo entry verification");
         g_cold_bootstrap_status.store(DARTPLANT_METHOD_NOT_FOUND, std::memory_order_release);
         return;
     }
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "live-index functions=%u entry_targets=%u shared_payloads=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u",
+        "live-index functions=%u entry_targets=%u shared_payloads=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u dedup=%u producer_identity=%u",
         function_index.function_count, function_index.code_target_count,
         function_index.shared_code_target_count, function_index.skipped_function_count,
         static_cast<unsigned long long>(indexed_entry_va), decoded_pool_entries,
-        static_cast<unsigned>(indexed_closure_entry_proof));
+        static_cast<unsigned>(indexed_closure_entry_proof),
+        static_cast<unsigned>(dedup_instructions), static_cast<unsigned>(producer_identity_ok));
 
     if (!FindLiveTopLevelMethod("instrumentedAdd", &g_instrumented_add)) {
         LogFailure("live VM method resolution");
@@ -1281,26 +1387,53 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     instrumented_add_profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
     instrumented_add_profile.argument_locations[1] = {DARTPLANT_ABI_GP_REGISTER, 2, {0, 0}};
     instrumented_add_profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
-    DartPlantHook* rejected_hook = nullptr;
-    const DartPlantStatus fail_closed_status =
-        InstallMethodHook(g_instrumented_add, instrumented_add_profile, OnInstrumentedAddLeave,
-                          &rejected_hook, OnInstrumentedAddEnter);
-    if (fail_closed_status != DARTPLANT_SHARED_CODE_ENTRY || rejected_hook != nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kTag,
-                            "shared-code fail-closed check failed status=%d hook=%p error=%s",
-                            fail_closed_status, rejected_hook, dartplant_last_error());
-        g_cold_bootstrap_status.store(DARTPLANT_HOOK_FAILED, std::memory_order_release);
-        return;
-    }
-    g_shared_policy_ok.store(true, std::memory_order_release);
-
-    const DartPlantStatus hook_status = InstallMethodHook(
-        g_instrumented_add, instrumented_add_profile, OnInstrumentedAddLeave,
-        &g_instrumented_add_hook, OnInstrumentedAddEnter, DARTPLANT_HOOK_ALLOW_SHARED_CODE);
-    if (hook_status != DARTPLANT_OK) {
-        LogFailure("shared-code hook installation");
-        g_cold_bootstrap_status.store(hook_status, std::memory_order_release);
-        return;
+    if (dedup_instructions) {
+        DartPlantHook* rejected_hook = nullptr;
+        const DartPlantStatus fail_closed_status =
+            InstallMethodHook(g_instrumented_add, instrumented_add_profile, OnInstrumentedAddLeave,
+                              &rejected_hook, OnInstrumentedAddEnter);
+        if (fail_closed_status != DARTPLANT_SHARED_CODE_ENTRY || rejected_hook != nullptr) {
+            __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                "shared-code fail-closed check failed status=%d hook=%p error=%s",
+                                fail_closed_status, rejected_hook, dartplant_last_error());
+            g_cold_bootstrap_status.store(DARTPLANT_HOOK_FAILED, std::memory_order_release);
+            return;
+        }
+        const DartPlantStatus hook_status = InstallMethodHook(
+            g_instrumented_add, instrumented_add_profile, OnInstrumentedAddLeave,
+            &g_instrumented_add_hook, OnInstrumentedAddEnter, DARTPLANT_HOOK_ALLOW_SHARED_CODE);
+        if (hook_status != DARTPLANT_OK) {
+            LogFailure("shared-code hook installation");
+            g_cold_bootstrap_status.store(hook_status, std::memory_order_release);
+            return;
+        }
+    } else {
+        const DartPlantStatus hook_status =
+            InstallMethodHook(g_instrumented_add, instrumented_add_profile, OnInstrumentedAddLeave,
+                              &g_instrumented_add_hook, OnInstrumentedAddEnter);
+        if (hook_status != DARTPLANT_OK || g_instrumented_add_hook == nullptr ||
+            g_instrumented_add->function == nullptr ||
+            g_instrumented_add->function->code_target == nullptr ||
+            g_instrumented_add->function->code_target->IsShared() ||
+            g_instrumented_add->function->code_target->AliasCount() != 1) {
+            __android_log_print(
+                ANDROID_LOG_ERROR, kTag,
+                "no-dedup unique hook check failed status=%d hook=%p shared=%u aliases=%u error=%s",
+                hook_status, g_instrumented_add_hook,
+                static_cast<unsigned>(g_instrumented_add != nullptr &&
+                                      g_instrumented_add->function != nullptr &&
+                                      g_instrumented_add->function->code_target != nullptr &&
+                                      g_instrumented_add->function->code_target->IsShared()),
+                g_instrumented_add == nullptr || g_instrumented_add->function == nullptr ||
+                        g_instrumented_add->function->code_target == nullptr
+                    ? 0U
+                    : g_instrumented_add->function->code_target->AliasCount(),
+                dartplant_last_error());
+            g_cold_bootstrap_status.store(
+                hook_status != DARTPLANT_OK ? hook_status : DARTPLANT_HOOK_FAILED,
+                std::memory_order_release);
+            return;
+        }
     }
 
     const DartPlantMethodQuery add_int_query = {
@@ -1311,28 +1444,78 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         .signature = "",
         .entry_kind = DARTPLANT_ENTRY_DEFAULT,
     };
-    if (dartplant_runtime_find_method(g_runtime, &add_int_query, &g_add_int) != DARTPLANT_OK ||
-        g_add_int == nullptr || g_add_int->function == nullptr ||
-        g_add_int->function->code_target != g_instrumented_add->function->code_target) {
-        LogFailure("shared addInt live resolution");
+    const DartPlantStatus add_int_status =
+        dartplant_runtime_find_method(g_runtime, &add_int_query, &g_add_int);
+    const bool add_int_model_ok =
+        add_int_status == DARTPLANT_OK && g_add_int != nullptr && g_add_int->function != nullptr &&
+        g_add_int->function->code_target != nullptr && g_instrumented_add->function != nullptr &&
+        g_instrumented_add->function->code_target != nullptr &&
+        g_add_int->function->function_object != g_instrumented_add->function->function_object &&
+        (dedup_instructions
+             ? (g_add_int->function->code_object == g_instrumented_add->function->code_object &&
+                g_add_int->function->code_target == g_instrumented_add->function->code_target &&
+                g_add_int->function->code_target->IsShared())
+             : (g_add_int->function->code_object != g_instrumented_add->function->code_object &&
+                g_add_int->function->code_target != g_instrumented_add->function->code_target &&
+                !g_add_int->function->code_target->IsShared() &&
+                !g_instrumented_add->function->code_target->IsShared()));
+    if (!add_int_model_ok) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "addInt producer identity failed status=%d dedup=%u instrumented_fn=0x%llx add_int_fn=0x%llx instrumented_code=0x%llx add_int_code=0x%llx instrumented_target=%p add_int_target=%p error=%s",
+            add_int_status, static_cast<unsigned>(dedup_instructions),
+            static_cast<unsigned long long>(g_instrumented_add == nullptr ||
+                                                    g_instrumented_add->function == nullptr
+                                                ? 0
+                                                : g_instrumented_add->function->function_object),
+            static_cast<unsigned long long>(g_add_int == nullptr || g_add_int->function == nullptr
+                                                ? 0
+                                                : g_add_int->function->function_object),
+            static_cast<unsigned long long>(g_instrumented_add == nullptr ||
+                                                    g_instrumented_add->function == nullptr
+                                                ? 0
+                                                : g_instrumented_add->function->code_object),
+            static_cast<unsigned long long>(g_add_int == nullptr || g_add_int->function == nullptr
+                                                ? 0
+                                                : g_add_int->function->code_object),
+            g_instrumented_add == nullptr || g_instrumented_add->function == nullptr
+                ? nullptr
+                : static_cast<void*>(g_instrumented_add->function->code_target.get()),
+            g_add_int == nullptr || g_add_int->function == nullptr
+                ? nullptr
+                : static_cast<void*>(g_add_int->function->code_target.get()),
+            dartplant_last_error());
+        LogFailure(dedup_instructions ? "shared addInt live resolution"
+                                      : "no-dedup addInt live resolution");
         g_cold_bootstrap_status.store(DARTPLANT_METHOD_NOT_FOUND, std::memory_order_release);
         return;
     }
-    DartPlantHookOptions add_int_listener_options = {
-        .struct_size = sizeof(DartPlantHookOptions),
-        .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
-        .on_enter = OnSharedAddIntListenerEnter,
-        .on_leave = nullptr,
-        .user_data = nullptr,
-        .vm_adapter = nullptr,
-    };
-    const DartPlantStatus listener_status = dartplant_runtime_add_listener(
-        g_runtime, g_add_int, &add_int_listener_options, -100, &g_add_int_listener);
-    if (listener_status != DARTPLANT_OK) {
-        LogFailure("shared addInt listener");
-        g_cold_bootstrap_status.store(listener_status, std::memory_order_release);
-        return;
+    if (dedup_instructions) {
+        DartPlantHookOptions add_int_listener_options = {
+            .struct_size = sizeof(DartPlantHookOptions),
+            .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
+            .on_enter = OnSharedAddIntListenerEnter,
+            .on_leave = nullptr,
+            .user_data = nullptr,
+            .vm_adapter = nullptr,
+        };
+        const DartPlantStatus listener_status = dartplant_runtime_add_listener(
+            g_runtime, g_add_int, &add_int_listener_options, -100, &g_add_int_listener);
+        if (listener_status != DARTPLANT_OK) {
+            LogFailure("shared addInt listener");
+            g_cold_bootstrap_status.store(listener_status, std::memory_order_release);
+            return;
+        }
     }
+    g_shared_policy_ok.store(true, std::memory_order_release);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "producer code-identity policy verified mode=%s instrumented_target=%p add_int_target=%p instrumented_aliases=%u add_int_aliases=%u",
+        dedup_instructions ? "dedup-shared" : "no-dedup-unique",
+        static_cast<void*>(g_instrumented_add->function->code_target.get()),
+        static_cast<void*>(g_add_int->function->code_target.get()),
+        g_instrumented_add->function->code_target->AliasCount(),
+        g_add_int->function->code_target->AliasCount());
 
     if (!FindLiveTopLevelMethod("nullableEchoObject", &g_echo_object)) {
         LogFailure("nullable object live resolution");
@@ -1375,12 +1558,14 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         dartplant_runtime_get_method_parameter(g_runtime, g_negate_bool, 0, &bool_parameter);
     const DartPlantStatus profile_status =
         dartplant_live_vm_select_profile(&g_snapshot_info, &live_profile);
-    const uint32_t expected_bool_cid = live_profile.profile_version == 3 ? 63U : 62U;
+    const auto* live_record = dartplant::FindRuntimeProfileByVersion(live_profile.profile_version);
+    const uint32_t expected_bool_cid = live_record == nullptr ? 0 : live_record->canonical_bool.cid;
     const bool signature_ok =
         signature_status == DARTPLANT_OK && parameter_status == DARTPLANT_OK &&
-        profile_status == DARTPLANT_OK && bool_signature.parameter_count == 1 &&
-        bool_signature.implicit_parameter_count == 0 && bool_signature.fixed_parameter_count == 1 &&
-        bool_signature.optional_parameter_count == 0 && bool_signature.type_parameter_count == 0 &&
+        profile_status == DARTPLANT_OK && live_record != nullptr && expected_bool_cid != 0 &&
+        bool_signature.parameter_count == 1 && bool_signature.implicit_parameter_count == 0 &&
+        bool_signature.fixed_parameter_count == 1 && bool_signature.optional_parameter_count == 0 &&
+        bool_signature.type_parameter_count == 0 &&
         bool_signature.parent_type_argument_count == 0 &&
         !bool_signature.has_named_optional_parameters &&
         bool_signature.result_type.kind == DARTPLANT_DART_TYPE_INTERFACE &&
@@ -1739,29 +1924,44 @@ dartplant_fixture_instrumented_add_probe() {
         bootstrap_function == nullptr ? nullptr : bootstrap_function->code_target;
     const auto add_int_target =
         add_int_function == nullptr ? nullptr : add_int_function->code_target;
-    const bool model_ok =
+    const bool expect_dedup = g_expect_deduplicated_shared_code.load(std::memory_order_acquire);
+    const bool common_model_ok =
         lookup_ok && bootstrap_function != nullptr && add_int_function != nullptr &&
         bootstrap_target != nullptr && add_int_target != nullptr &&
         bootstrap_function->function_object != 0 && add_int_function->function_object != 0 &&
         bootstrap_function->function_object != add_int_function->function_object &&
-        bootstrap_function->code_object != 0 &&
-        bootstrap_function->code_object == add_int_function->code_object &&
-        bootstrap_target == add_int_target && bootstrap_target->IsShared() &&
-        bootstrap_target->AliasCount() == 2 && bootstrap_target->KnownAliasCount() == 2 &&
-        shared_policy_ok && ambiguous_seen && add_int_listener_enter == enter &&
-        add_int_listener_identity_ok && g_instrumented_add_hook != nullptr &&
+        bootstrap_function->code_object != 0 && add_int_function->code_object != 0 &&
+        shared_policy_ok && g_instrumented_add_hook != nullptr &&
         g_instrumented_add_hook->code_target == bootstrap_target &&
         bootstrap_target->HookRecord() == g_instrumented_add_hook;
+    const bool model_ok =
+        common_model_ok &&
+        (expect_dedup
+             ? (bootstrap_function->code_object == add_int_function->code_object &&
+                bootstrap_target == add_int_target && bootstrap_target->IsShared() &&
+                bootstrap_target->AliasCount() == 2 && bootstrap_target->KnownAliasCount() == 2 &&
+                ambiguous_seen && add_int_listener_enter == enter && add_int_listener_identity_ok)
+             : (bootstrap_function->code_object != add_int_function->code_object &&
+                bootstrap_target != add_int_target && !bootstrap_target->IsShared() &&
+                !add_int_target->IsShared() && bootstrap_target->AliasCount() == 1 &&
+                add_int_target->AliasCount() == 1 && bootstrap_target->KnownAliasCount() == 1 &&
+                add_int_target->KnownAliasCount() == 1 && !ambiguous_seen &&
+                add_int_listener_enter == 0 && !add_int_listener_identity_ok));
     if (lookup_ok) {
         __android_log_print(
             ANDROID_LOG_INFO, kTag,
-            "runtime live-vm lookup addInt ok entry=0x%llx model_ok=%u function=0x%llx bootstrap_function=0x%llx code=0x%llx target=%p aliases=%u shared=%u hook_target_same=%u",
+            "runtime live-vm lookup addInt ok mode=%s entry=0x%llx model_ok=%u function=0x%llx bootstrap_function=0x%llx code=0x%llx bootstrap_code=0x%llx target=%p bootstrap_target=%p aliases=%u/%u known=%u/%u shared=%u/%u hook_target_same=%u",
+            expect_dedup ? "dedup-shared" : "no-dedup-unique",
             static_cast<unsigned long long>(add_int_entry), static_cast<unsigned>(model_ok),
             static_cast<unsigned long long>(add_int_function->function_object),
             static_cast<unsigned long long>(bootstrap_function->function_object),
             static_cast<unsigned long long>(add_int_function->code_object),
-            static_cast<void*>(add_int_target.get()), add_int_target->AliasCount(),
+            static_cast<unsigned long long>(bootstrap_function->code_object),
+            static_cast<void*>(add_int_target.get()), static_cast<void*>(bootstrap_target.get()),
+            add_int_target->AliasCount(), bootstrap_target->AliasCount(),
+            add_int_target->KnownAliasCount(), bootstrap_target->KnownAliasCount(),
             static_cast<unsigned>(add_int_target->IsShared()),
+            static_cast<unsigned>(bootstrap_target->IsShared()),
             static_cast<unsigned>(g_instrumented_add_hook != nullptr &&
                                   g_instrumented_add_hook->code_target == add_int_target &&
                                   add_int_target->HookRecord() == g_instrumented_add_hook));
@@ -1774,8 +1974,9 @@ dartplant_fixture_instrumented_add_probe() {
 
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "instrumentedAdd probe enter=%llu leave=%llu second_listener_enter=%llu live_ok=%llu live_failed=%llu lookup_ok=%u model_ok=%u shared=1 explicit_opt_in=%u ambiguous_identity=%u second_listener_identity=%u aliases=2 known_aliases=2 result=%llu expected=115",
-        static_cast<unsigned long long>(enter), static_cast<unsigned long long>(leave),
+        "instrumentedAdd probe mode=%s enter=%llu leave=%llu second_listener_enter=%llu live_ok=%llu live_failed=%llu lookup_ok=%u model_ok=%u policy_ok=%u ambiguous_identity=%u second_listener_identity=%u result=%llu expected=115",
+        expect_dedup ? "dedup-shared" : "no-dedup-unique", static_cast<unsigned long long>(enter),
+        static_cast<unsigned long long>(leave),
         static_cast<unsigned long long>(add_int_listener_enter),
         static_cast<unsigned long long>(live_ok), static_cast<unsigned long long>(live_failed),
         static_cast<unsigned>(lookup_ok), static_cast<unsigned>(model_ok),
@@ -2153,6 +2354,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_runtime_live_vm_ready.store(false, std::memory_order_release);
     g_shared_policy_ok.store(false, std::memory_order_release);
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
+    g_expect_deduplicated_shared_code.store(false, std::memory_order_release);
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
@@ -2281,6 +2483,7 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_runtime_live_vm_ready.store(false, std::memory_order_release);
     g_shared_policy_ok.store(false, std::memory_order_release);
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
+    g_expect_deduplicated_shared_code.store(false, std::memory_order_release);
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);

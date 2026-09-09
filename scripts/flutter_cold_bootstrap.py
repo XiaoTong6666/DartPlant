@@ -17,7 +17,6 @@ from util import ROOT_DIR, adb_cmd, find_arm64_device, run
 
 
 FIXTURE_DIR = ROOT_DIR / "tests" / "flutter_fixture"
-APK_PATH = FIXTURE_DIR / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk"
 GENERATED_DIR = FIXTURE_DIR / ".dart_tool" / "dartplant" / "generated"
 SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
@@ -75,6 +74,39 @@ class FlutterToolchain:
     dart_version: str
 
 
+def _normalize_flutter_mode(mode: str) -> str:
+    if mode not in {"release", "profile"}:
+        raise ValueError(f"unsupported Flutter AOT mode: {mode}")
+    return mode
+
+
+def flutter_fixture_apk_path(mode: str) -> Path:
+    mode = _normalize_flutter_mode(mode)
+    return (
+        FIXTURE_DIR
+        / "build"
+        / "app"
+        / "outputs"
+        / "flutter-apk"
+        / f"app-{mode}.apk"
+    )
+
+
+def flutter_gen_snapshot_path(flutter: str, mode: str) -> Path:
+    mode = _normalize_flutter_mode(mode)
+    flutter_root = Path(flutter).resolve().parent.parent
+    return (
+        flutter_root
+        / "bin"
+        / "cache"
+        / "artifacts"
+        / "engine"
+        / f"android-arm64-{mode}"
+        / "linux-x64"
+        / "gen_snapshot"
+    )
+
+
 def _capture(cmd: list[str], *, timeout: float | None = None) -> str:
     result = sp.run(
         cmd,
@@ -122,10 +154,25 @@ def _detect_flutter_toolchain(flutter: str) -> FlutterToolchain:
 
 
 def _build_fixture(
-    flutter: str, *, dobby_root: Path | None = None
+    flutter: str, *, dobby_root: Path | None = None, build_mode: str = "release"
 ) -> FlutterToolchain:
+    build_mode = _normalize_flutter_mode(build_mode)
     toolchain = _detect_flutter_toolchain(flutter)
     build_env = os.environ.copy()
+    # The fixture is deliberately cleaned and rebuilt with several Flutter
+    # toolchains in one checkout. Gradle's file-system watcher can retain
+    # stale snapshots across those destructive clean/rebuild boundaries and
+    # has produced disappearing R8/mergeJavaResource incremental inputs on the
+    # development host. Disable VFS watching and the persistent Gradle daemon
+    # for this deterministic compiler-oracle build; neither setting changes
+    # Dart AOT or APK contents.
+    gradle_opts = build_env.get("GRADLE_OPTS", "").strip()
+    deterministic_gradle_opts = (
+        "-Dorg.gradle.vfs.watch=false -Dorg.gradle.daemon=false"
+    )
+    build_env["GRADLE_OPTS"] = " ".join(
+        part for part in (gradle_opts, deterministic_gradle_opts) if part
+    )
     resolved_dobby_root = (
         dobby_root.expanduser().resolve()
         if dobby_root is not None
@@ -177,7 +224,7 @@ def _build_fixture(
         flutter,
         "build",
         "apk",
-        "--release",
+        f"--{build_mode}",
         "--target-platform",
         "android-arm64",
         f"--dart-define=DARTPLANT_CI_FLUTTER_VERSION={toolchain.flutter_version}",
@@ -185,8 +232,9 @@ def _build_fixture(
         "--dart-define=DARTPLANT_CI_TARGET_ABI=arm64-v8a",
     ]
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
-    if not APK_PATH.is_file():
-        raise FileNotFoundError(f"Flutter release APK was not produced: {APK_PATH}")
+    apk_path = flutter_fixture_apk_path(build_mode)
+    if not apk_path.is_file():
+        raise FileNotFoundError(f"Flutter {build_mode} APK was not produced: {apk_path}")
 
     dill_candidates = sorted(
         (FIXTURE_DIR / ".dart_tool" / "flutter_build").glob("*/app.dill"),
@@ -194,26 +242,21 @@ def _build_fixture(
         reverse=True,
     )
     if not dill_candidates:
-        raise FileNotFoundError("Flutter release build did not leave an app.dill for the oracle")
+        raise FileNotFoundError(
+            f"Flutter {build_mode} build did not leave an app.dill for the oracle"
+        )
     dill = GENERATED_DIR / "oracle_app.dill"
     shutil.copy2(dill_candidates[0], dill)
     libapp = GENERATED_DIR / "libapp.so"
-    with zipfile.ZipFile(APK_PATH) as archive:
+    with zipfile.ZipFile(apk_path) as archive:
         libapp.write_bytes(archive.read("lib/arm64-v8a/libapp.so"))
 
     flutter_root = Path(flutter).resolve().parent.parent
-    gen_snapshot = (
-        flutter_root
-        / "bin"
-        / "cache"
-        / "artifacts"
-        / "engine"
-        / "android-arm64-release"
-        / "linux-x64"
-        / "gen_snapshot"
-    )
+    gen_snapshot = flutter_gen_snapshot_path(flutter, build_mode)
     if not gen_snapshot.is_file():
-        raise FileNotFoundError(f"Flutter ARM64 gen_snapshot not found: {gen_snapshot}")
+        raise FileNotFoundError(
+            f"Flutter ARM64 {build_mode} gen_snapshot not found: {gen_snapshot}"
+        )
     dart = flutter_root / "bin" / "cache" / "dart-sdk" / "bin" / "dart"
     if not dart.is_file():
         raise FileNotFoundError(f"Flutter Dart executable not found: {dart}")
@@ -372,7 +415,7 @@ def _build_fixture(
     shutil.rmtree(FIXTURE_DIR / "android" / "app" / ".cxx", ignore_errors=True)
     shutil.rmtree(FIXTURE_DIR / "build" / "app" / "intermediates" / "cxx", ignore_errors=True)
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
-    with zipfile.ZipFile(APK_PATH) as archive:
+    with zipfile.ZipFile(apk_path) as archive:
         rebuilt_libapp = archive.read("lib/arm64-v8a/libapp.so")
     if rebuilt_libapp != libapp.read_bytes():
         raise RuntimeError(
@@ -382,14 +425,15 @@ def _build_fixture(
 
 
 def build_flutter_fixture(
-    *, flutter: str | None, dobby_root: Path | None = None
+    *, flutter: str | None, dobby_root: Path | None = None, build_mode: str = "release"
 ) -> FlutterToolchain:
     flutter_bin = _resolve_flutter(flutter)
+    build_mode = _normalize_flutter_mode(build_mode)
     lock_path = FIXTURE_DIR / "pubspec.lock"
     lock_existed = lock_path.is_file()
     lock_contents = lock_path.read_bytes() if lock_existed else None
     try:
-        return _build_fixture(flutter_bin, dobby_root=dobby_root)
+        return _build_fixture(flutter_bin, dobby_root=dobby_root, build_mode=build_mode)
     finally:
         # Compatibility builds intentionally resolve the dependency graph with
         # the active Flutter/Dart SDK. Do not leave those SDK-specific pins in
@@ -400,8 +444,8 @@ def build_flutter_fixture(
             lock_path.unlink(missing_ok=True)
 
 
-def _assert_no_packaged_runtime_metadata() -> None:
-    with zipfile.ZipFile(APK_PATH) as archive:
+def _assert_no_packaged_runtime_metadata(apk_path: Path) -> None:
+    with zipfile.ZipFile(apk_path) as archive:
         entries = archive.namelist()
     forbidden = [
         entry
@@ -758,22 +802,24 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT Function discovery failed\n{logs}"
         )
+    ordinary_lines = [
+        line for line in logs.splitlines() if "DartPlant ordinary AOT discovery:" in line
+    ]
+    ordinary_line = ordinary_lines[-1] if ordinary_lines else ""
     required_ordinary_markers = (
+        "DartPlant ordinary AOT discovery: 1",
         "evidence_status=0",
         "abi_info_status=0",
         "abi_state=2",
         "verified_layout=1",
         "hook_status=0",
         "observer_hook_status=0",
-        "source_offline=1",
+        "source=live-vm+artifact-evidence",
+        "source_live=1",
     )
-    if any(marker not in logs for marker in required_ordinary_markers):
+    if any(marker not in ordinary_line for marker in required_ordinary_markers):
         raise RuntimeError(
             f"cold start {round_index}: ordinary AOT compiler ABI binding failed\n{logs}"
-        )
-    if "source_offline=1" not in logs:
-        raise RuntimeError(
-            f"cold start {round_index}: ordinary AOT lookup did not use the artifact index\n{logs}"
         )
     if "DartPlant ordinary AOT typed probe: 1 values=16.125/6.25" not in logs:
         raise RuntimeError(
@@ -796,16 +842,47 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         )
     if "runtime live-vm lookup addInt ok" not in logs or "model_ok=1" not in logs:
         raise RuntimeError(f"cold start {round_index}: live model regression failed\n{logs}")
-    required_shared_markers = (
-        "explicit_opt_in=1",
-        "ambiguous_identity=1",
-        "second_listener_identity=1",
-        "aliases=2",
-        "known_aliases=2",
-    )
-    if any(marker not in logs for marker in required_shared_markers):
+    producer_lines = [
+        line for line in logs.splitlines() if "producer code-identity policy verified mode=" in line
+    ]
+    probe_lines = [
+        line for line in logs.splitlines() if "instrumentedAdd probe mode=" in line
+    ]
+    producer_line = producer_lines[-1] if producer_lines else ""
+    probe_line = probe_lines[-1] if probe_lines else ""
+    if "mode=no-dedup-unique" in producer_line:
+        required_identity_markers = (
+            "instrumented_aliases=1",
+            "add_int_aliases=1",
+        )
+        required_probe_markers = (
+            "mode=no-dedup-unique",
+            "policy_ok=1",
+            "ambiguous_identity=0",
+            "second_listener_identity=0",
+            "model_ok=1",
+        )
+    elif "mode=dedup-shared" in producer_line:
+        required_identity_markers = (
+            "instrumented_aliases=2",
+            "add_int_aliases=2",
+        )
+        required_probe_markers = (
+            "mode=dedup-shared",
+            "policy_ok=1",
+            "ambiguous_identity=1",
+            "second_listener_identity=1",
+            "model_ok=1",
+        )
+    else:
         raise RuntimeError(
-            f"cold start {round_index}: shared-code callback semantics failed\n{logs}"
+            f"cold start {round_index}: producer code-identity mode was not proven\n{logs}"
+        )
+    if any(marker not in producer_line for marker in required_identity_markers) or any(
+        marker not in probe_line for marker in required_probe_markers
+    ):
+        raise RuntimeError(
+            f"cold start {round_index}: code-identity callback semantics failed\n{logs}"
         )
     if "Fatal signal" in logs or "FATAL EXCEPTION" in logs:
         raise RuntimeError(f"cold start {round_index}: process reported a fatal failure\n{logs}")
@@ -832,21 +909,26 @@ def run_flutter_cold_bootstrap_test(
     rounds: int,
     timeout_seconds: float,
     build: bool,
+    build_mode: str = "release",
     dobby_root: Path | None = None,
 ) -> None:
     if rounds <= 0:
         raise ValueError("rounds must be greater than zero")
     if timeout_seconds <= 0:
         raise ValueError("timeout must be greater than zero")
+    build_mode = _normalize_flutter_mode(build_mode)
 
     if build:
-        build_flutter_fixture(flutter=flutter, dobby_root=dobby_root)
-    if not APK_PATH.is_file():
-        raise FileNotFoundError(f"missing Flutter fixture APK: {APK_PATH}")
-    _assert_no_packaged_runtime_metadata()
+        build_flutter_fixture(
+            flutter=flutter, dobby_root=dobby_root, build_mode=build_mode
+        )
+    apk_path = flutter_fixture_apk_path(build_mode)
+    if not apk_path.is_file():
+        raise FileNotFoundError(f"missing Flutter {build_mode} fixture APK: {apk_path}")
+    _assert_no_packaged_runtime_metadata(apk_path)
 
     serial = find_arm64_device(device)
-    run(adb_cmd(["install", "-r", str(APK_PATH)], device=serial))
+    run(adb_cmd(["install", "-r", str(apk_path)], device=serial))
 
     results = [
         _validate_round(serial, index, timeout_seconds) for index in range(1, rounds + 1)

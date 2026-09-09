@@ -2,6 +2,7 @@
 #define DARTPLANT_RUNTIME_FLUTTER_SNAPSHOT_INTERNAL_H_
 
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -9,6 +10,13 @@
 #include "dartplant/advanced/flutter_snapshot.h"
 
 namespace dartplant {
+
+struct DartSnapshotHeader {
+    uint64_t declared_length = 0;
+    uint64_t kind = 0;
+    std::string snapshot_hash;
+    std::string features;
+};
 
 struct FlutterSnapshotSource {
     std::string module_name;
@@ -25,9 +33,13 @@ struct FlutterSnapshotSource {
     bool Matches(const ModuleImage& module) const;
     std::optional<uintptr_t> ResolveInstructionVa(const ModuleImage& module,
                                                   uint64_t instruction_va) const;
+    std::optional<uintptr_t> ResolveInstructionOffset(const ModuleImage& module,
+                                                      uint64_t instruction_offset) const;
 };
 
 std::optional<std::string> SelectFlutterSnapshotProfile(std::string_view features);
+
+std::optional<DartSnapshotHeader> ParseDartSnapshotHeader(std::span<const uint8_t> bytes);
 
 std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& module,
                                                              std::string* error);

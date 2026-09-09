@@ -106,6 +106,7 @@ bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& functio
             .live = true,
         });
     }
+    index->live_function_infos.push_back(function);
     return true;
 }
 

@@ -603,6 +603,609 @@
         "exception": "dart-vm-arm64-product-compressed/abi-exception-36b6aa25e8ddf9ce95925268"
       },
       "abi_id": "dart-vm-arm64-product-compressed/abi-c62ee85628f83b613230f9e9"
+    },
+    {
+      "profile_version": 4,
+      "name": "dart-3.4.4-arm64-nonproduct-compressed",
+      "dart_version": "3.4.4",
+      "snapshot_hash": "d20a1be77c3d3c41b2a5accaee1ce549",
+      "snapshot_profile": "flutter-arm64-profile-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 72,
+        "object_null": 112,
+        "global_object_pool": 1880,
+        "isolate": 1776,
+        "isolate_group": 1784,
+        "jump_to_frame_entry_point": 616,
+        "enter_safepoint_stub": 464,
+        "exit_safepoint_stub": 472,
+        "top_exit_frame": 1808,
+        "vm_tag": 1840,
+        "active_exception": 1864,
+        "active_stacktrace": 1872,
+        "execution_state": 1904,
+        "exit_through_ffi": 1920
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 24
+      },
+      "object_store": {
+        "libraries": 936
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 148
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 52,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 16,
+        "library": 40
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 22,
+        "array": 89,
+        "immutable_array": 90,
+        "growable_object_array": 91,
+        "one_byte_string": 93,
+        "two_byte_string": 94
+      },
+      "canonical_bool": {
+        "thread_true": 120,
+        "thread_false": 128,
+        "value": 8,
+        "cid": 62
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 48,
+        "cid_function_type": 49,
+        "cid_record_type": 50,
+        "cid_type_parameter": 51,
+        "cid_null": 170,
+        "cid_dynamic": 171,
+        "cid_void": 172,
+        "cid_never": 173,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 2,
+        "type_class_id_shift": 4,
+        "type_parameter_function_bit": 4
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": false,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 46,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_identity": {
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-ebd23f1270ec4efb6d42ae65",
+        "core": "dart-vm-arm64-nonproduct-compressed/abi-core-af5698e84c0b7b6ed25708fc",
+        "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-d33d204969c0855db9521564",
+        "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
+        "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-8dfdfa0cfa1b4e788769f837"
+      },
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-ebd23f1270ec4efb6d42ae65"
+    },
+    {
+      "profile_version": 5,
+      "name": "dart-3.5.0-arm64-nonproduct-compressed",
+      "dart_version": "3.5.0",
+      "snapshot_hash": "80a49c7111088100a233b2ae788e1f48",
+      "snapshot_profile": "flutter-arm64-profile-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 72,
+        "object_null": 120,
+        "global_object_pool": 1912,
+        "isolate": 1800,
+        "isolate_group": 1808,
+        "jump_to_frame_entry_point": 624,
+        "enter_safepoint_stub": 472,
+        "exit_safepoint_stub": 480,
+        "top_exit_frame": 1832,
+        "vm_tag": 1872,
+        "active_exception": 1896,
+        "active_stacktrace": 1904,
+        "execution_state": 1936,
+        "exit_through_ffi": 1952
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 24
+      },
+      "object_store": {
+        "libraries": 896
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 148
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 52,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 16,
+        "library": 40
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 22,
+        "array": 89,
+        "immutable_array": 90,
+        "growable_object_array": 91,
+        "one_byte_string": 93,
+        "two_byte_string": 94
+      },
+      "canonical_bool": {
+        "thread_true": 128,
+        "thread_false": 136,
+        "value": 8,
+        "cid": 62
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 48,
+        "cid_function_type": 49,
+        "cid_record_type": 50,
+        "cid_type_parameter": 51,
+        "cid_null": 170,
+        "cid_dynamic": 171,
+        "cid_void": 172,
+        "cid_never": 173,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 1,
+        "type_class_id_shift": 3,
+        "type_parameter_function_bit": 3
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": false,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 46,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_identity": {
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-6edd859d736de3002db808ef",
+        "core": "dart-vm-arm64-nonproduct-compressed/abi-core-c356442a97cc0e2a1ff4e928",
+        "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-72d1859c927336e07e234119",
+        "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-16277c21148bf7ba2a41fca9",
+        "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-f458cbc09509db7e9046a128"
+      },
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-6edd859d736de3002db808ef"
+    },
+    {
+      "profile_version": 6,
+      "name": "dart-3.12.1-arm64-nonproduct-compressed",
+      "dart_version": "3.12.1",
+      "snapshot_hash": "ace654289f5abc240509fc941453ebc5",
+      "snapshot_profile": "flutter-arm64-profile-compressed",
+      "registers": {
+        "thr": 26,
+        "pp": 27,
+        "code": 24,
+        "heap_bits": 28,
+        "null": 22,
+        "spreg": 15,
+        "args_desc": 4,
+        "dart_gp_args": [
+          1,
+          2,
+          3,
+          5,
+          6,
+          7
+        ],
+        "dart_fpu_args": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "thread": {
+        "heap_base": 88,
+        "object_null": 136,
+        "global_object_pool": 1760,
+        "isolate": 1664,
+        "isolate_group": 1672,
+        "jump_to_frame_entry_point": 632,
+        "enter_safepoint_stub": 488,
+        "exit_safepoint_stub": 496,
+        "top_exit_frame": 1696,
+        "vm_tag": 1736,
+        "active_exception": 1744,
+        "active_stacktrace": 1752,
+        "execution_state": 1784,
+        "exit_through_ffi": 1800
+      },
+      "isolate_group": {
+        "class_table": 16,
+        "cached_class_table_table": 24,
+        "object_store": 32
+      },
+      "class_table": {
+        "num_cids": 24
+      },
+      "object_store": {
+        "libraries": 992
+      },
+      "instructions": {
+        "monomorphic_entry_offset_aot": 8,
+        "polymorphic_entry_offset_aot": 24
+      },
+      "code": {
+        "entry_point": 8,
+        "unchecked_entry_point": 24,
+        "monomorphic_entry_point": 16,
+        "monomorphic_unchecked_entry_point": 32,
+        "object_pool": 40,
+        "owner": 56,
+        "instructions_length": 148
+      },
+      "function": {
+        "entry_point": 8,
+        "unchecked_entry_point": 16,
+        "name": 24,
+        "owner": 28,
+        "code": 44,
+        "kind_tag": 52,
+        "signature": 32
+      },
+      "class": {
+        "name": 8,
+        "functions": 16,
+        "library": 40
+      },
+      "library": {
+        "url": 12,
+        "toplevel_class": 28
+      },
+      "array": {
+        "length": 12,
+        "elements": 16
+      },
+      "growable_object_array": {
+        "length": 12,
+        "data": 16
+      },
+      "string": {
+        "length": 8,
+        "data": 16
+      },
+      "object_pool": {
+        "length": 8,
+        "elements": 16
+      },
+      "cids": {
+        "class": 5,
+        "function": 7,
+        "library": 13,
+        "code": 18,
+        "object_pool": 23,
+        "array": 90,
+        "immutable_array": 91,
+        "growable_object_array": 92,
+        "one_byte_string": 94,
+        "two_byte_string": 95
+      },
+      "canonical_bool": {
+        "thread_true": 152,
+        "thread_false": 160,
+        "value": 8,
+        "cid": 63
+      },
+      "function_type": {
+        "abstract_type_flags": 16,
+        "type_parameters": 32,
+        "result_type": 36,
+        "parameter_types": 40,
+        "named_parameter_names": 44,
+        "packed_parameter_counts": 48,
+        "packed_type_parameter_counts": 52,
+        "cid_type": 49,
+        "cid_function_type": 50,
+        "cid_record_type": 51,
+        "cid_type_parameter": 52,
+        "cid_null": 171,
+        "cid_dynamic": 172,
+        "cid_void": 173,
+        "cid_never": 174,
+        "type_parameter_base": 36,
+        "type_parameter_index": 38,
+        "nullability_bits": 1,
+        "type_class_id_shift": 3,
+        "type_parameter_function_bit": 3
+      },
+      "raw_object": {
+        "heap_object_tag": 1,
+        "smi_tag": 0,
+        "smi_tag_mask": 1,
+        "smi_tag_shift": 1,
+        "class_id_tag_shift": 12,
+        "class_id_tag_bits": 20,
+        "compressed_word_size": 4
+      },
+      "arguments_descriptor": {
+        "type_args_len": 16,
+        "count": 20,
+        "size": 24,
+        "positional_count": 28,
+        "first_named_entry": 32,
+        "named_entry_size": 8,
+        "name": 0,
+        "position": 4
+      },
+      "function_kind": {
+        "regular": 0,
+        "closure": 1,
+        "implicit_closure": 2,
+        "tag_shift": 0,
+        "tag_bits": 5
+      },
+      "machine": {
+        "architecture": "arm64",
+        "pointer_size": 8,
+        "product": false,
+        "compressed_pointers": true
+      },
+      "type_arguments": {
+        "cid": 47,
+        "length": 12,
+        "types": 24
+      },
+      "transition": {
+        "vm_tag_dart": 8,
+        "execution_vm": 0,
+        "execution_generated": 1,
+        "execution_native": 2,
+        "exit_none": 0,
+        "exit_through_ffi": 1,
+        "exit_through_runtime_call": 2
+      },
+      "abi_identity": {
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-6d832f294748dab684a44640",
+        "core": "dart-vm-arm64-nonproduct-compressed/abi-core-4e59defe0a25aaf5c21a6feb",
+        "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-83270ceaeb08cbb569ceab3b",
+        "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
+        "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-36b6aa25e8ddf9ce95925268"
+      },
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-6d832f294748dab684a44640"
     }
   ]
 }

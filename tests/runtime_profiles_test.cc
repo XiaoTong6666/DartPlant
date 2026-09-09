@@ -17,7 +17,7 @@ TEST_CASE(RuntimeProfilesMatchDartArm64CallingConvention) {
     constexpr std::array<uint8_t, 6> kExpectedGp = {1, 2, 3, 5, 6, 7};
     constexpr std::array<uint8_t, 6> kExpectedFpu = {0, 1, 2, 3, 4, 5};
 
-    EXPECT_EQ(3U, dartplant::RuntimeProfileCount());
+    EXPECT_EQ(6U, dartplant::RuntimeProfileCount());
     for (size_t index = 0; index < dartplant::RuntimeProfileCount(); ++index) {
         const auto& profile = dartplant::RuntimeProfiles()[index];
         EXPECT_EQ(15U, profile.dart_sp_register);
@@ -43,7 +43,7 @@ TEST_CASE(RuntimeProfilesMatchDartArm64CallingConvention) {
         EXPECT_TRUE(profile.abi_identity.exception != nullptr &&
                     profile.abi_identity.exception[0] != '\0');
         EXPECT_EQ(8U, profile.machine.pointer_size);
-        EXPECT_TRUE(profile.machine.product);
+        EXPECT_EQ(index < 3, profile.machine.product);
         EXPECT_TRUE(profile.machine.compressed_pointers);
         EXPECT_TRUE(profile.thread_bridge.enter_safepoint_stub_offset != 0);
         EXPECT_TRUE(profile.thread_bridge.exit_safepoint_stub_offset != 0);
@@ -67,23 +67,58 @@ TEST_CASE(RuntimeProfilesMatchDartArm64CallingConvention) {
 TEST_CASE(RuntimeProfileCandidatesUseSnapshotAsHintNotArtifactGate) {
     dartplant::VmRuntimeFacts facts{};
     facts.snapshot_hash = "d20a1be77c3d3c41b2a5accaee1ce549";
-    facts.snapshot_features = "arm64 product compressed-pointers";
+    facts.snapshot_features = "product arm64 android compressed-pointers";
     auto candidates = dartplant::ResolveRuntimeProfileCandidates(facts);
-    EXPECT_EQ(dartplant::RuntimeProfileCount(), candidates.size());
+    EXPECT_EQ(3U, candidates.size());
     EXPECT_EQ(1U, candidates[0]->live_vm.profile_version);
 
     facts.snapshot_hash = "ffffffffffffffffffffffffffffffff";
     candidates = dartplant::ResolveRuntimeProfileCandidates(facts);
-    EXPECT_EQ(dartplant::RuntimeProfileCount(), candidates.size());
+    EXPECT_EQ(3U, candidates.size());
 
     facts.snapshot_hash = {};
     candidates = dartplant::ResolveRuntimeProfileCandidates(facts);
-    EXPECT_EQ(dartplant::RuntimeProfileCount(), candidates.size());
+    EXPECT_EQ(3U, candidates.size());
 
     facts.snapshot_hash = "d20a1be77c3d3c41b2a5accaee1ce549";
-    facts.snapshot_features = "arm64 product";
+    facts.snapshot_features = "product arm64 android";
     candidates = dartplant::ResolveRuntimeProfileCandidates(facts);
     EXPECT_EQ(0U, candidates.size());
+}
+
+TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapshotHash) {
+    constexpr std::string_view kHash = "d20a1be77c3d3c41b2a5accaee1ce549";
+    const auto* ambiguous = dartplant::FindRuntimeProfileBySnapshot(kHash);
+    EXPECT_TRUE(ambiguous == nullptr);
+    const auto* product =
+        dartplant::FindRuntimeProfileBySnapshot(kHash, "flutter-arm64-product-compressed");
+    const auto* profile =
+        dartplant::FindRuntimeProfileBySnapshot(kHash, "flutter-arm64-profile-compressed");
+    EXPECT_TRUE(product != nullptr);
+    EXPECT_TRUE(profile != nullptr);
+    EXPECT_EQ(1U, product->live_vm.profile_version);
+    EXPECT_EQ(4U, profile->live_vm.profile_version);
+    EXPECT_TRUE(product->machine.product);
+    EXPECT_FALSE(profile->machine.product);
+    EXPECT_EQ(0x30U, product->live_vm.function_kind_tag_offset);
+    EXPECT_EQ(0x34U, profile->live_vm.function_kind_tag_offset);
+    EXPECT_EQ(product->thread_jump_to_frame_entry_point_offset,
+              profile->thread_jump_to_frame_entry_point_offset);
+    EXPECT_EQ(0U, dartplant::ThreadJumpToFrameOffsetForSnapshot(kHash));
+    EXPECT_EQ(
+        product->thread_jump_to_frame_entry_point_offset,
+        dartplant::ThreadJumpToFrameOffsetForSnapshot(kHash, "flutter-arm64-product-compressed"));
+    EXPECT_EQ(
+        profile->thread_jump_to_frame_entry_point_offset,
+        dartplant::ThreadJumpToFrameOffsetForSnapshot(kHash, "flutter-arm64-profile-compressed"));
+
+    dartplant::VmRuntimeFacts facts{};
+    facts.snapshot_hash = kHash;
+    facts.snapshot_features = "release arm64 android compressed-pointers";
+    const auto candidates = dartplant::ResolveRuntimeProfileCandidates(facts);
+    EXPECT_EQ(3U, candidates.size());
+    EXPECT_EQ(4U, candidates[0]->live_vm.profile_version);
+    EXPECT_FALSE(candidates[0]->machine.product);
 }
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {

@@ -19,7 +19,6 @@ namespace dartplant {
 
 enum class ElfDynamicViewStatus : uint8_t {
     kAvailable = 0,
-    kUnavailable,
     kMalformed,
 };
 
@@ -30,10 +29,22 @@ enum class ElfDynamicLookupStatus : uint8_t {
     kMalformed,
 };
 
+enum class ElfProgramHeaderLookupStatus : uint8_t {
+    kFound = 0,
+    kMissing,
+    kAmbiguous,
+};
+
+struct ElfProgramHeaderLookupResult {
+    ElfProgramHeaderLookupStatus status = ElfProgramHeaderLookupStatus::kMissing;
+    ElfProgramHeaderView header{};
+};
+
 struct ElfDynamicSymbol {
     uint64_t value = 0;
     uint64_t size = 0;
     uint8_t info = 0;
+    uint8_t other = 0;
     uint16_t section_index = SHN_UNDEF;
 };
 
@@ -55,7 +66,7 @@ struct ElfDynamicView {
 };
 
 struct ElfDynamicViewResult {
-    ElfDynamicViewStatus status = ElfDynamicViewStatus::kUnavailable;
+    ElfDynamicViewStatus status = ElfDynamicViewStatus::kMalformed;
     ElfDynamicView view{};
 };
 
@@ -73,6 +84,23 @@ public:
 class LoadedElfReader final : public ElfVaReader {
 public:
     LoadedElfReader(uintptr_t load_bias, std::span<const ElfProgramHeaderView> headers)
+        : load_bias_(load_bias), headers_(headers) {}
+
+    bool Read(uint64_t va, void* output, size_t size) const override;
+    std::optional<uint64_t> ReadableBytes(uint64_t va) const override;
+
+private:
+    uintptr_t load_bias_ = 0;
+    std::span<const ElfProgramHeaderView> headers_;
+};
+
+// Requires `headers` to have passed ValidateElfLoadLayout(). Reads a loaded
+// image while admitting only bytes canonically backed by a
+// readable PT_LOAD's p_filesz range. Use this for artifact metadata; unlike
+// LoadedElfReader, it never treats zero-filled p_memsz tails as ELF evidence.
+class FileBackedLoadedElfReader final : public ElfVaReader {
+public:
+    FileBackedLoadedElfReader(uintptr_t load_bias, std::span<const ElfProgramHeaderView> headers)
         : load_bias_(load_bias), headers_(headers) {}
 
     bool Read(uint64_t va, void* output, size_t size) const override;
@@ -102,31 +130,56 @@ private:
 std::optional<uint64_t> ElfVaToFileOffset(std::span<const ElfProgramHeaderView> headers,
                                           uint64_t va, size_t size = 1);
 
+// Proves that one non-empty program-header range has a unique PT_LOAD VA to
+// file mapping equal to p_offset and carries the requested file-backed flags.
+bool ElfProgramHeaderHasCanonicalFileBacking(std::span<const ElfProgramHeaderView> headers,
+                                             const ElfProgramHeaderView& header,
+                                             uint32_t required_flags);
+
 // Parses the ELF64/AArch64 program table without requiring section headers.
 bool ParseElf64ProgramHeaders(std::span<const uint8_t> bytes,
                               std::vector<ElfProgramHeaderView>* out_headers);
 
-// Returns a unique program header of the requested type. Multiple matching
-// entries are deliberately ambiguous and return nullopt.
-std::optional<ElfProgramHeaderView> FindElfProgramHeader(
-    std::span<const ElfProgramHeaderView> headers, uint32_t type);
+// Validates PT_LOAD layout facts that do not require file backing. PT_LOAD
+// entries must be ordered by p_vaddr and have disjoint p_memsz ranges, so a
+// valid view cannot make one ELF VA map to multiple file locations.
+bool ValidateElfLoadLayout(std::span<const ElfProgramHeaderView> headers);
+
+// Validates that every PT_LOAD file-backed range is contained in the supplied
+// ELF file.
+bool ValidateElfLoadFileBounds(std::span<const uint8_t> bytes,
+                               std::span<const ElfProgramHeaderView> headers);
+
+// Applies both layout and file-bound validation to a file-backed ELF view.
+bool ValidateElfLoadSegments(std::span<const uint8_t> bytes,
+                             std::span<const ElfProgramHeaderView> headers);
+
+// Finds a unique program header of the requested type while preserving the
+// distinction between a genuinely absent header and a malformed/ambiguous ELF
+// containing multiple headers of an intrinsically singular type such as
+// PT_DYNAMIC. Callers must not collapse kAmbiguous into compatibility
+// fallback.
+ElfProgramHeaderLookupResult FindElfProgramHeader(std::span<const ElfProgramHeaderView> headers,
+                                                  uint32_t type);
 
 // Validates that one VA range is contained in a single PT_LOAD carrying all
 // required flags. loaded_image selects p_memsz rather than p_filesz.
 bool ElfVaRangeHasFlags(std::span<const ElfProgramHeaderView> headers, uint64_t va, uint64_t size,
                         uint32_t required_flags, bool loaded_image);
 
-// Parses at most dynamic_size bytes and requires DT_NULL within that bound.
-// DT_* pointer values are not relocated here. A usable dynamic symbol-table
-// view requires SYMTAB/STRTAB/STRSZ/SYMENT; SysV/GNU hash tables are optional
-// indexing capabilities. Every advertised table anchor must be readable
-// through the supplied backing.
+// Parses the unique PT_DYNAMIC selected by the caller and requires DT_NULL
+// within dynamic_size. DT_* pointer values are not relocated here. A usable
+// dynamic symbol-table view requires SYMTAB/STRTAB/STRSZ/SYMENT. Every
+// advertised table anchor must be readable through the supplied backing.
+// Since PT_DYNAMIC is already authoritative, every invalid or incomplete view
+// is malformed.
 ElfDynamicViewResult ReadElfDynamicView(const ElfVaReader& reader, uint64_t dynamic_va,
                                         uint64_t dynamic_size);
 
-// Exact dynamic-symbol lookup. GNU hash is preferred when both hash styles are
-// present, matching Android bionic. GNU hash lookup uses bloom/bucket/chain
-// semantics directly and does not invent a SysV-style dynsym count.
+// Exact dynamic-symbol lookup. At least one SysV/GNU hash index is required;
+// GNU hash is preferred when both styles are present, matching Android bionic.
+// GNU hash lookup uses bloom/bucket/chain semantics directly and does not
+// invent a SysV-style dynsym count.
 ElfDynamicLookupResult FindElfDynamicSymbol(const ElfVaReader& reader, const ElfDynamicView& view,
                                             std::string_view name);
 

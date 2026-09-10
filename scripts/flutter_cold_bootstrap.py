@@ -521,7 +521,24 @@ def _structured_events(logs: str, event_name: str) -> list[dict[str, object]]:
     return events
 
 
-def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> ColdStartResult:
+def _required_ordinary_source_markers(build_mode: str) -> tuple[str, ...]:
+    build_mode = _normalize_flutter_mode(build_mode)
+    if build_mode == "profile":
+        return (
+            "source=live-vm+artifact-evidence",
+            "source_live=1",
+            "source_offline=0",
+        )
+    return (
+        "source=artifact-index",
+        "source_live=0",
+        "source_offline=1",
+    )
+
+
+def _validate_round(
+    serial: str, round_index: int, timeout_seconds: float, build_mode: str
+) -> ColdStartResult:
     run(adb_cmd(["logcat", "-c"], device=serial))
     run(adb_cmd(["shell", "am", "force-stop", PACKAGE], device=serial))
     run(
@@ -814,8 +831,7 @@ def _validate_round(serial: str, round_index: int, timeout_seconds: float) -> Co
         "verified_layout=1",
         "hook_status=0",
         "observer_hook_status=0",
-        "source=live-vm+artifact-evidence",
-        "source_live=1",
+        *_required_ordinary_source_markers(build_mode),
     )
     if any(marker not in ordinary_line for marker in required_ordinary_markers):
         raise RuntimeError(
@@ -931,7 +947,8 @@ def run_flutter_cold_bootstrap_test(
     run(adb_cmd(["install", "-r", str(apk_path)], device=serial))
 
     results = [
-        _validate_round(serial, index, timeout_seconds) for index in range(1, rounds + 1)
+        _validate_round(serial, index, timeout_seconds, build_mode)
+        for index in range(1, rounds + 1)
     ]
     sampled = [result.sampled for result in results]
     no_dart_pc = sum(result.dart_pc == 0 for result in results)

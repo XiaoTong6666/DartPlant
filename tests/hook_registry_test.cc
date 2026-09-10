@@ -763,6 +763,71 @@ TEST_CASE(MethodQueryResolvesFixtureAddress) {
     dlclose(fixture);
 }
 
+TEST_CASE(LegacySnapshotOffsetRequiresProvenFlutterSnapshotSource) {
+    ResetFakeHost();
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto modules = dartplant::EnumerateModules();
+    const auto module = dartplant::FindModule(modules, "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    const uint64_t section_va = reinterpret_cast<uintptr_t>(target) - module->load_bias;
+    const std::string metadata =
+        "{\"format\":1,\"module\":{\"soname\":\"libdartplant_fixture.so\"},"
+        "\"methods\":[{\"library_uri\":\"package:fixture/main.dart\","
+        "\"class\":\"Fixture\",\"name\":\"add\",\"entry_kind\":0,"
+        "\"address_kind\":3,\"code_section_va\":" +
+        std::to_string(section_va) + ",\"code_offset\":0,\"code_size\":1}]}";
+    EXPECT_EQ(DARTPLANT_OK, dartplant_initialize_from_json(metadata.c_str()));
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "(int, int) -> int",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ADDRESS_KIND, dartplant_find_method(&query, &method));
+    EXPECT_TRUE(method == nullptr);
+    dartplant_reset();
+    dlclose(fixture);
+}
+
+TEST_CASE(RawSnapshotOffsetRequiresProvenFlutterSnapshotSource) {
+    ResetFakeHost();
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto modules = dartplant::EnumerateModules();
+    const auto module = dartplant::FindModule(modules, "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantAddressQuery query = {
+        .struct_size = sizeof(query),
+        .module_name = "libdartplant_fixture.so",
+        .address = 0,
+        .address_kind = DARTPLANT_ADDRESS_SNAPSHOT_OFFSET,
+        .code_size = 1,
+        .expected_build_id = nullptr,
+        .expected_fingerprint = nullptr,
+        .section_va = reinterpret_cast<uintptr_t>(target) - module->load_bias,
+    };
+    void* backup = nullptr;
+    DartPlantHook* hook = nullptr;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ADDRESS_KIND,
+              dartplant_hook_address(&query, reinterpret_cast<void*>(Replacement), &backup, &hook));
+    EXPECT_EQ(0, g_hook_calls);
+    dartplant_reset();
+    dlclose(fixture);
+}
+
 TEST_CASE(AddressHookRejectsNonExecutableRange) {
     ResetFakeHost();
     int stack_value = 0;

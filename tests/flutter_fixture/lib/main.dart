@@ -658,6 +658,12 @@ Future<void> main() async {
     if (wants('artifact_revalidate')) {
       _ciScenario('artifact_revalidate', artifactRevalidatePassed);
     }
+    final snapshotOffsetPassed = DartPlantNative.snapshotOffsetProof() == 31;
+    if (wants('normal')) {
+      _ciScenario('snapshot_offset', snapshotOffsetPassed, <String, Object?>{
+        'proof': DartPlantNative.snapshotOffsetProof(),
+      });
+    }
 
     final selectedNativeProofPassed = requestedTest == 'all'
         ? _ciRuntimeTests.every((name) => _ciScenarioResults[name] == true)

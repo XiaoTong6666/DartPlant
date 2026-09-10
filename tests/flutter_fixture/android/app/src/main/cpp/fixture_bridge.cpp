@@ -101,11 +101,86 @@ std::atomic_bool g_type_arguments_parameter_relocated{false};
 std::atomic_bool g_type_arguments_callback_passed{false};
 std::atomic_bool g_type_arguments_require_relocation{true};
 std::atomic_bool g_artifact_lifecycle_passed{false};
+std::atomic<uint64_t> g_snapshot_offset_proof{0};
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
+}
+
+uint64_t VerifySnapshotOffsetPublicAndLegacy() {
+    constexpr uint64_t kRawSectionMismatch = 1U << 0;
+    constexpr uint64_t kRawRangeMismatch = 1U << 1;
+    constexpr uint64_t kRawResolved = 1U << 2;
+    constexpr uint64_t kLegacyHashMismatch = 1U << 3;
+    constexpr uint64_t kLegacyResolved = 1U << 4;
+    if (g_snapshot_info.snapshot_hash == nullptr || g_snapshot_info.snapshot_hash[0] == '\0' ||
+        g_snapshot_info.isolate_instructions_size < 4 ||
+        g_snapshot_info.isolate_instructions_va == UINT64_MAX) {
+        return 0;
+    }
+
+    DartPlantAddressQuery raw = {
+        .struct_size = sizeof(DartPlantAddressQuery),
+        .module_name = "libapp.so",
+        .address = 0,
+        .address_kind = DARTPLANT_ADDRESS_SNAPSHOT_OFFSET,
+        .code_size = 4,
+        .expected_build_id = nullptr,
+        .expected_fingerprint = nullptr,
+        .section_va = g_snapshot_info.isolate_instructions_va + 1,
+    };
+    void* backup = nullptr;
+    DartPlantHook* hook = nullptr;
+    uint64_t result =
+        dartplant_hook_address(&raw, nullptr, &backup, &hook) == DARTPLANT_UNSUPPORTED_ADDRESS_KIND
+            ? kRawSectionMismatch
+            : 0;
+
+    raw.section_va = g_snapshot_info.isolate_instructions_va;
+    raw.address = g_snapshot_info.isolate_instructions_size - 2;
+    result |=
+        dartplant_hook_address(&raw, nullptr, &backup, &hook) == DARTPLANT_UNSUPPORTED_ADDRESS_KIND
+            ? kRawRangeMismatch
+            : 0;
+
+    raw.address = 0;
+    result |= dartplant_hook_address(&raw, nullptr, &backup, &hook) == DARTPLANT_INVALID_ARGUMENT
+                  ? kRawResolved
+                  : 0;
+
+    const auto metadata_for = [](const char* hash) {
+        return std::string("{\"format\":1,\"snapshot_hash\":\"") + hash +
+               "\",\"module\":{\"soname\":\"libapp.so\"},\"methods\":[{"
+               "\"library_uri\":\"package:fixture/snapshot.dart\",\"name\":\"probe\","
+               "\"entry_kind\":0,\"address_kind\":3,\"code_section_va\":" +
+               std::to_string(g_snapshot_info.isolate_instructions_va) +
+               ",\"code_offset\":0,\"code_size\":4}]}";
+    };
+    const DartPlantMethodQuery legacy_query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:fixture/snapshot.dart",
+        .class_name = nullptr,
+        .function_name = "probe",
+        .signature = nullptr,
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    if (dartplant_initialize_from_json(metadata_for("00000000000000000000000000000000").c_str()) ==
+        DARTPLANT_OK) {
+        result |=
+            dartplant_find_method(&legacy_query, &method) == DARTPLANT_UNSUPPORTED_ADDRESS_KIND
+                ? kLegacyHashMismatch
+                : 0;
+    }
+    if (dartplant_initialize_from_json(metadata_for(g_snapshot_info.snapshot_hash).c_str()) ==
+            DARTPLANT_OK &&
+        dartplant_find_method(&legacy_query, &method) == DARTPLANT_OK) {
+        result |= kLegacyResolved;
+        dartplant_release_method(method);
+    }
+    return result;
 }
 
 bool SnapshotHasExactFeature(const char* features, const char* expected) {
@@ -2137,6 +2212,11 @@ dartplant_fixture_artifact_lifecycle_proof() {
     return g_artifact_lifecycle_passed.load(std::memory_order_acquire) ? 1 : 0;
 }
 
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_snapshot_offset_proof() {
+    return g_snapshot_offset_proof.load(std::memory_order_acquire);
+}
+
 extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
@@ -2183,6 +2263,16 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_snapshot_info = snapshot_info;
     __android_log_print(ANDROID_LOG_INFO, kTag, "snapshot for VM adapter hash=%s features=%s",
                         snapshot_info.snapshot_hash, snapshot_info.snapshot_features);
+    constexpr uint64_t kSnapshotOffsetProofAll = (1U << 5) - 1;
+    const uint64_t snapshot_offset_proof = VerifySnapshotOffsetPublicAndLegacy();
+    g_snapshot_offset_proof.store(snapshot_offset_proof, std::memory_order_release);
+    if (snapshot_offset_proof != kSnapshotOffsetProofAll) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "snapshot offset public/legacy proof failed: 0x%llx",
+                            static_cast<unsigned long long>(snapshot_offset_proof));
+        g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
     const uint32_t descriptor_count = dartplant_flutter_vm_descriptor_count();
     const DartPlantFlutterVmDescriptor* matched_descriptor = nullptr;
     for (uint32_t index = 0; index < descriptor_count; ++index) {

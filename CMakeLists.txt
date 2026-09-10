@@ -300,6 +300,7 @@ if(ANDROID)
         add_executable(
             dartplant_device_tests
             tests/android/device_test_main.cc
+            tests/android/device_flutter_snapshot_test.cc
             tests/android/device_bridge_probe.S
         )
         target_compile_features(dartplant_device_tests PRIVATE cxx_std_20)

@@ -19,6 +19,8 @@
 #include "dartplant/runtime_profile.h"
 #include "runtime/runtime_internal.h"
 
+int RunDeviceFlutterSnapshotDiscoveryTests();
+
 namespace {
 
 using Add = int (*)(int, int);
@@ -686,6 +688,7 @@ int main() {
         .hook_with_publication = nullptr,
     };
     dartplant::InstallHostApi(&legacy_dobby_host, dartplant::HostPublicationPolicy::kLocalGate);
+    if (RunDeviceFlutterSnapshotDiscoveryTests() != 0) return 1;
     if (ExerciseLegacyDobbyLocalPublicationGate() != 0) return 1;
     if (ExerciseLegacyDobbyConcurrentPublicationGate() != 0) return 1;
     if (ExerciseGeneratedPublicationGateEntrantDrain() != 0) return 1;

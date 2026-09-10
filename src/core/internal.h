@@ -41,8 +41,7 @@ struct ModuleImage {
     std::vector<ExecutableRange> executable_ranges;
 
     bool ContainsExecutable(uintptr_t address, size_t size) const;
-    std::optional<uintptr_t> Resolve(DartPlantAddressKind kind, uint64_t address,
-                                     uint64_t section_va = 0) const;
+    std::optional<uintptr_t> Resolve(DartPlantAddressKind kind, uint64_t address) const;
 };
 
 // Pure program-header parser shared by dl_iterate_phdr production discovery

@@ -28,6 +28,24 @@ class FlutterColdBootstrapModeTest(unittest.TestCase):
         self.assertEqual("gen_snapshot", release.name)
         self.assertEqual("gen_snapshot", profile.name)
 
+    def test_ordinary_source_contract_is_mode_specific(self) -> None:
+        self.assertEqual(
+            (
+                "source=live-vm+artifact-evidence",
+                "source_live=1",
+                "source_offline=0",
+            ),
+            flutter_cold_bootstrap._required_ordinary_source_markers("profile"),
+        )
+        self.assertEqual(
+            (
+                "source=artifact-index",
+                "source_live=0",
+                "source_offline=1",
+            ),
+            flutter_cold_bootstrap._required_ordinary_source_markers("release"),
+        )
+
     def test_unknown_flutter_mode_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported Flutter AOT mode"):
             flutter_cold_bootstrap.flutter_fixture_apk_path("debug")

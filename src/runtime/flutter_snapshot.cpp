@@ -15,12 +15,6 @@
 namespace dartplant {
 namespace {
 
-struct ElfSymbol {
-    uint64_t value = 0;
-    uint64_t size = 0;
-    uint64_t file_offset = 0;
-};
-
 struct LoadedSnapshotSymbols {
     uintptr_t isolate_data = 0;
     uint64_t isolate_data_size = 0;
@@ -35,13 +29,6 @@ struct LoadedSnapshotLookup {
     ElfDynamicLookupStatus status = ElfDynamicLookupStatus::kUnavailable;
     bool matched_module = false;
 };
-
-bool SnapshotDynamicSymbolIsValid(const ElfDynamicSymbol& symbol,
-                                  std::span<const ElfProgramHeaderView> headers,
-                                  uint32_t required_flags, bool loaded_image) {
-    return symbol.value != 0 && symbol.size != 0 && ELF64_ST_TYPE(symbol.info) == STT_OBJECT &&
-           ElfVaRangeHasFlags(headers, symbol.value, symbol.size, required_flags, loaded_image);
-}
 
 int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
     auto* lookup = static_cast<LoadedSnapshotLookup*>(opaque);
@@ -61,19 +48,29 @@ int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
             .virtual_address = phdr.p_vaddr,
             .file_size = phdr.p_filesz,
             .memory_size = phdr.p_memsz,
+            .alignment = phdr.p_align,
         });
     }
+    if (!ValidateElfLoadLayout(headers)) {
+        lookup->status = ElfDynamicLookupStatus::kMalformed;
+        return 1;
+    }
     const auto dynamic = FindElfProgramHeader(headers, PT_DYNAMIC);
-    if (!dynamic.has_value()) {
+    if (dynamic.status == ElfProgramHeaderLookupStatus::kMissing) {
         lookup->status = ElfDynamicLookupStatus::kUnavailable;
         return 1;
     }
-    LoadedElfReader reader(info->dlpi_addr, headers);
-    const auto view = ReadElfDynamicView(reader, dynamic->virtual_address, dynamic->memory_size);
-    if (view.status == ElfDynamicViewStatus::kUnavailable) {
-        lookup->status = ElfDynamicLookupStatus::kUnavailable;
+    if (dynamic.status == ElfProgramHeaderLookupStatus::kAmbiguous) {
+        lookup->status = ElfDynamicLookupStatus::kMalformed;
         return 1;
     }
+    if (!ElfProgramHeaderHasCanonicalFileBacking(headers, dynamic.header, PF_R)) {
+        lookup->status = ElfDynamicLookupStatus::kMalformed;
+        return 1;
+    }
+    FileBackedLoadedElfReader reader(info->dlpi_addr, headers);
+    const auto view =
+        ReadElfDynamicView(reader, dynamic.header.virtual_address, dynamic.header.file_size);
     if (view.status == ElfDynamicViewStatus::kMalformed) {
         lookup->status = ElfDynamicLookupStatus::kMalformed;
         return 1;
@@ -89,8 +86,8 @@ int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
         lookup->status = instructions.status;
         return 1;
     }
-    if (!SnapshotDynamicSymbolIsValid(data.symbol, headers, PF_R, true) ||
-        !SnapshotDynamicSymbolIsValid(instructions.symbol, headers, PF_R | PF_X, true) ||
+    if (!SnapshotSymbolMatchesContract(data.symbol, headers, PF_R, false) ||
+        !SnapshotSymbolMatchesContract(instructions.symbol, headers, PF_R | PF_X, false) ||
         data.symbol.value > UINTPTR_MAX - info->dlpi_addr ||
         instructions.symbol.value > UINTPTR_MAX - info->dlpi_addr) {
         lookup->status = ElfDynamicLookupStatus::kMalformed;
@@ -114,8 +111,8 @@ std::optional<std::vector<uint8_t>> ReadFile(const std::string& path) {
 
 struct FileSnapshotLookup {
     ElfDynamicLookupStatus status = ElfDynamicLookupStatus::kUnavailable;
-    ElfSymbol isolate_data{};
-    ElfSymbol isolate_instructions{};
+    ElfSectionSymbol isolate_data{};
+    ElfSectionSymbol isolate_instructions{};
 };
 
 FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& bytes) {
@@ -124,12 +121,18 @@ FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& by
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     const auto dynamic = FindElfProgramHeader(headers, PT_DYNAMIC);
-    if (!dynamic.has_value()) return {.status = ElfDynamicLookupStatus::kUnavailable};
-    FileElfReader reader(bytes, headers);
-    const auto view = ReadElfDynamicView(reader, dynamic->virtual_address, dynamic->file_size);
-    if (view.status == ElfDynamicViewStatus::kUnavailable) {
+    if (dynamic.status == ElfProgramHeaderLookupStatus::kMissing) {
         return {.status = ElfDynamicLookupStatus::kUnavailable};
     }
+    if (dynamic.status == ElfProgramHeaderLookupStatus::kAmbiguous) {
+        return {.status = ElfDynamicLookupStatus::kMalformed};
+    }
+    if (!ElfProgramHeaderHasCanonicalFileBacking(headers, dynamic.header, PF_R)) {
+        return {.status = ElfDynamicLookupStatus::kMalformed};
+    }
+    FileElfReader reader(bytes, headers);
+    const auto view =
+        ReadElfDynamicView(reader, dynamic.header.virtual_address, dynamic.header.file_size);
     if (view.status == ElfDynamicViewStatus::kMalformed) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
@@ -140,8 +143,8 @@ FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& by
     if (instructions.status != ElfDynamicLookupStatus::kFound) {
         return {.status = instructions.status};
     }
-    if (!SnapshotDynamicSymbolIsValid(data.symbol, headers, PF_R, false) ||
-        !SnapshotDynamicSymbolIsValid(instructions.symbol, headers, PF_R | PF_X, false)) {
+    if (!SnapshotSymbolMatchesContract(data.symbol, headers, PF_R, false) ||
+        !SnapshotSymbolMatchesContract(instructions.symbol, headers, PF_R | PF_X, false)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     const auto data_offset =
@@ -153,60 +156,29 @@ FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& by
     }
     return {
         .status = ElfDynamicLookupStatus::kFound,
-        .isolate_data = {data.symbol.value, data.symbol.size, *data_offset},
-        .isolate_instructions = {instructions.symbol.value, instructions.symbol.size,
-                                 *instruction_offset},
+        .isolate_data =
+            {
+                .value = data.symbol.value,
+                .size = data.symbol.size,
+                .file_offset = *data_offset,
+                .info = data.symbol.info,
+                .other = data.symbol.other,
+                .section_index = data.symbol.section_index,
+            },
+        .isolate_instructions =
+            {
+                .value = instructions.symbol.value,
+                .size = instructions.symbol.size,
+                .file_offset = *instruction_offset,
+                .info = instructions.symbol.info,
+                .other = instructions.symbol.other,
+                .section_index = instructions.symbol.section_index,
+            },
     };
 }
 
-std::optional<ElfSymbol> FindSymbol(const std::vector<uint8_t>& bytes, std::string_view wanted) {
-    if (bytes.size() < sizeof(Elf64_Ehdr)) return std::nullopt;
-    const auto* header = reinterpret_cast<const Elf64_Ehdr*>(bytes.data());
-    if (memcmp(header->e_ident, ELFMAG, SELFMAG) != 0 || header->e_ident[EI_CLASS] != ELFCLASS64 ||
-        header->e_shentsize != sizeof(Elf64_Shdr)) {
-        return std::nullopt;
-    }
-    const size_t section_bytes = static_cast<size_t>(header->e_shnum) * header->e_shentsize;
-    if (header->e_shoff > bytes.size() || section_bytes > bytes.size() - header->e_shoff) {
-        return std::nullopt;
-    }
-    const auto* sections = reinterpret_cast<const Elf64_Shdr*>(bytes.data() + header->e_shoff);
-    for (size_t section_index = 0; section_index < header->e_shnum; ++section_index) {
-        const Elf64_Shdr& section = sections[section_index];
-        if (section.sh_type != SHT_DYNSYM && section.sh_type != SHT_SYMTAB) continue;
-        if (section.sh_link >= header->e_shnum) continue;
-        const Elf64_Shdr& strings = sections[section.sh_link];
-        if (section.sh_entsize != sizeof(Elf64_Sym) || section.sh_offset > bytes.size() ||
-            section.sh_size > bytes.size() - section.sh_offset ||
-            strings.sh_offset > bytes.size() ||
-            strings.sh_size > bytes.size() - strings.sh_offset) {
-            continue;
-        }
-        const auto* symbols = reinterpret_cast<const Elf64_Sym*>(bytes.data() + section.sh_offset);
-        const auto* names = reinterpret_cast<const char*>(bytes.data() + strings.sh_offset);
-        const size_t count = section.sh_size / section.sh_entsize;
-        for (size_t index = 0; index < count; ++index) {
-            const Elf64_Sym& symbol = symbols[index];
-            if (symbol.st_name >= strings.sh_size || symbol.st_value == 0 ||
-                wanted != names + symbol.st_name) {
-                continue;
-            }
-            for (size_t data_section = 0; data_section < header->e_shnum; ++data_section) {
-                const Elf64_Shdr& owner = sections[data_section];
-                if (owner.sh_addr <= symbol.st_value &&
-                    symbol.st_value - owner.sh_addr <= owner.sh_size &&
-                    symbol.st_value - owner.sh_addr <= UINT64_MAX - owner.sh_offset) {
-                    return ElfSymbol{symbol.st_value, symbol.st_size,
-                                     owner.sh_offset + (symbol.st_value - owner.sh_addr)};
-                }
-            }
-        }
-    }
-    return std::nullopt;
-}
-
 std::optional<DartSnapshotHeader> ReadSnapshotHeader(const std::vector<uint8_t>& bytes,
-                                                     const ElfSymbol& symbol) {
+                                                     const ElfSectionSymbol& symbol) {
     if (symbol.file_offset > bytes.size() || symbol.size > bytes.size() - symbol.file_offset) {
         return std::nullopt;
     }
@@ -232,6 +204,197 @@ bool HasFeature(std::string_view features, std::string_view feature) {
 }
 
 }  // namespace
+
+namespace {
+
+bool SnapshotSymbolMatchesContract(uint64_t value, uint64_t size, uint8_t info,
+                                   uint16_t section_index,
+                                   std::span<const ElfProgramHeaderView> headers,
+                                   uint32_t required_flags, bool loaded_image) {
+    return value != 0 && size != 0 && section_index != SHN_UNDEF && section_index < SHN_LORESERVE &&
+           ELF64_ST_BIND(info) == STB_GLOBAL && ELF64_ST_TYPE(info) == STT_OBJECT &&
+           ElfVaRangeHasFlags(headers, value, size, required_flags, loaded_image);
+}
+
+}  // namespace
+
+bool SnapshotSymbolMatchesContract(const ElfDynamicSymbol& symbol,
+                                   std::span<const ElfProgramHeaderView> headers,
+                                   uint32_t required_flags, bool loaded_image) {
+    return SnapshotSymbolMatchesContract(symbol.value, symbol.size, symbol.info,
+                                         symbol.section_index, headers, required_flags,
+                                         loaded_image);
+}
+
+bool SnapshotSymbolMatchesContract(const ElfSectionSymbol& symbol,
+                                   std::span<const ElfProgramHeaderView> headers,
+                                   uint32_t required_flags, bool loaded_image) {
+    return SnapshotSymbolMatchesContract(symbol.value, symbol.size, symbol.info,
+                                         symbol.section_index, headers, required_flags,
+                                         loaded_image);
+}
+
+ElfSectionLookupResult FindElfSectionSymbol(std::span<const uint8_t> bytes,
+                                            std::span<const ElfProgramHeaderView> headers,
+                                            std::string_view wanted) {
+    if (wanted.empty() || bytes.size() < sizeof(Elf64_Ehdr)) {
+        return {.status = ElfSectionLookupStatus::kMalformed};
+    }
+
+    Elf64_Ehdr header{};
+    memcpy(&header, bytes.data(), sizeof(header));
+    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64 ||
+        header.e_shentsize != sizeof(Elf64_Shdr)) {
+        return {.status = ElfSectionLookupStatus::kMalformed};
+    }
+    if (header.e_shnum == 0) return {.status = ElfSectionLookupStatus::kNotFound};
+    if (header.e_shoff > bytes.size() ||
+        static_cast<uint64_t>(header.e_shnum) >
+            (bytes.size() - static_cast<size_t>(header.e_shoff)) / sizeof(Elf64_Shdr)) {
+        return {.status = ElfSectionLookupStatus::kMalformed};
+    }
+
+    const auto read_section = [&](size_t index, Elf64_Shdr* out) {
+        if (out == nullptr || index >= header.e_shnum) return false;
+        const uint64_t offset = header.e_shoff + uint64_t{index} * sizeof(Elf64_Shdr);
+        if (offset > bytes.size() || sizeof(Elf64_Shdr) > bytes.size() - offset) return false;
+        memcpy(out, bytes.data() + static_cast<size_t>(offset), sizeof(*out));
+        return true;
+    };
+
+    size_t dynsym_count = 0;
+    size_t symtab_count = 0;
+    for (size_t section_index = 0; section_index < header.e_shnum; ++section_index) {
+        Elf64_Shdr section{};
+        if (!read_section(section_index, &section)) {
+            return {.status = ElfSectionLookupStatus::kMalformed};
+        }
+        dynsym_count += section.sh_type == SHT_DYNSYM ? 1 : 0;
+        symtab_count += section.sh_type == SHT_SYMTAB ? 1 : 0;
+    }
+    if (dynsym_count > 1 || (dynsym_count == 0 && symtab_count > 1)) {
+        return {.status = ElfSectionLookupStatus::kMalformed};
+    }
+    if (dynsym_count == 0 && symtab_count == 0) {
+        return {.status = ElfSectionLookupStatus::kNotFound};
+    }
+    const uint32_t authoritative_type = dynsym_count == 1 ? SHT_DYNSYM : SHT_SYMTAB;
+    struct ResolvedSymbol {
+        uint64_t value;
+        uint64_t size;
+        uint8_t info;
+        uint8_t other;
+        uint16_t section_index;
+        uint64_t file_offset;
+    };
+    std::optional<ResolvedSymbol> resolved_symbol;
+
+    for (size_t section_index = 0; section_index < header.e_shnum; ++section_index) {
+        Elf64_Shdr section{};
+        if (!read_section(section_index, &section)) {
+            return {.status = ElfSectionLookupStatus::kMalformed};
+        }
+        if (section.sh_type != authoritative_type) continue;
+        if (section.sh_link >= header.e_shnum || section.sh_entsize != sizeof(Elf64_Sym) ||
+            (section.sh_size % section.sh_entsize) != 0 || section.sh_offset > bytes.size() ||
+            section.sh_size > bytes.size() - section.sh_offset) {
+            return {.status = ElfSectionLookupStatus::kMalformed};
+        }
+
+        Elf64_Shdr strings{};
+        if (!read_section(section.sh_link, &strings) || strings.sh_type != SHT_STRTAB ||
+            strings.sh_offset > bytes.size() ||
+            strings.sh_size > bytes.size() - strings.sh_offset) {
+            return {.status = ElfSectionLookupStatus::kMalformed};
+        }
+
+        const size_t count = static_cast<size_t>(section.sh_size / section.sh_entsize);
+        for (size_t index = 0; index < count; ++index) {
+            Elf64_Sym symbol{};
+            const uint64_t symbol_offset = section.sh_offset + uint64_t{index} * sizeof(Elf64_Sym);
+            if (symbol_offset > bytes.size() || sizeof(symbol) > bytes.size() - symbol_offset) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            memcpy(&symbol, bytes.data() + static_cast<size_t>(symbol_offset), sizeof(symbol));
+            if (symbol.st_name >= strings.sh_size) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            const size_t name_offset = static_cast<size_t>(strings.sh_offset + symbol.st_name);
+            const size_t name_limit = static_cast<size_t>(strings.sh_size - symbol.st_name);
+            const void* terminator = memchr(bytes.data() + name_offset, '\0', name_limit);
+            if (terminator == nullptr) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            const auto* end = static_cast<const uint8_t*>(terminator);
+            const size_t name_size = end - (bytes.data() + name_offset);
+            if (name_size != wanted.size() ||
+                memcmp(bytes.data() + name_offset, wanted.data(), wanted.size()) != 0) {
+                continue;
+            }
+
+            if (symbol.st_value == 0) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            if (symbol.st_shndx == SHN_UNDEF || symbol.st_shndx >= header.e_shnum ||
+                symbol.st_size == 0 || symbol.st_size > SIZE_MAX ||
+                ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL ||
+                ELF64_ST_TYPE(symbol.st_info) != STT_OBJECT) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            Elf64_Shdr owner{};
+            if (!read_section(symbol.st_shndx, &owner) || (owner.sh_flags & SHF_ALLOC) == 0 ||
+                owner.sh_type == SHT_NOBITS || owner.sh_addr > symbol.st_value ||
+                owner.sh_offset > bytes.size() || owner.sh_size > bytes.size() - owner.sh_offset) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            const uint64_t section_delta = symbol.st_value - owner.sh_addr;
+            if (section_delta >= owner.sh_size || symbol.st_size > owner.sh_size - section_delta ||
+                owner.sh_offset > UINT64_MAX - section_delta) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            const uint64_t section_file_offset = owner.sh_offset + section_delta;
+            const auto file_offset =
+                ElfVaToFileOffset(headers, symbol.st_value, static_cast<size_t>(symbol.st_size));
+            if (!file_offset.has_value() || *file_offset != section_file_offset ||
+                *file_offset > bytes.size() || symbol.st_size > bytes.size() - *file_offset) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            const ResolvedSymbol candidate = {
+                .value = symbol.st_value,
+                .size = symbol.st_size,
+                .info = symbol.st_info,
+                .other = symbol.st_other,
+                .section_index = symbol.st_shndx,
+                .file_offset = *file_offset,
+            };
+            if (resolved_symbol.has_value() &&
+                (resolved_symbol->value != candidate.value ||
+                 resolved_symbol->size != candidate.size ||
+                 resolved_symbol->info != candidate.info ||
+                 resolved_symbol->other != candidate.other ||
+                 resolved_symbol->section_index != candidate.section_index ||
+                 resolved_symbol->file_offset != candidate.file_offset)) {
+                return {.status = ElfSectionLookupStatus::kMalformed};
+            }
+            resolved_symbol = candidate;
+        }
+    }
+    if (resolved_symbol.has_value()) {
+        return {
+            .status = ElfSectionLookupStatus::kFound,
+            .symbol =
+                {
+                    .value = resolved_symbol->value,
+                    .size = resolved_symbol->size,
+                    .file_offset = resolved_symbol->file_offset,
+                    .info = resolved_symbol->info,
+                    .other = resolved_symbol->other,
+                    .section_index = resolved_symbol->section_index,
+                },
+        };
+    }
+    return {.status = ElfSectionLookupStatus::kNotFound};
+}
 
 std::optional<DartSnapshotHeader> ParseDartSnapshotHeader(std::span<const uint8_t> bytes) {
     constexpr int32_t kMagicValue = static_cast<int32_t>(0xdcdcf5f5U);
@@ -319,19 +482,28 @@ std::optional<uintptr_t> FlutterSnapshotSource::ResolveInstructionVa(
         instruction_va - isolate_instructions_va >= isolate_instructions_size) {
         return std::nullopt;
     }
-    const uintptr_t target = isolate_instructions_runtime +
-                             static_cast<uintptr_t>(instruction_va - isolate_instructions_va);
-    return module.ContainsExecutable(target, 4) ? std::optional<uintptr_t>(target) : std::nullopt;
+    return ResolveInstructionRange(module, instruction_va - isolate_instructions_va, 4);
+}
+
+std::optional<uintptr_t> FlutterSnapshotSource::ResolveInstructionRange(
+    const ModuleImage& module, uint64_t instruction_offset, uint64_t instruction_size) const {
+    if (!Matches(module) || instruction_size == 0 ||
+        instruction_offset >= isolate_instructions_size ||
+        instruction_size > isolate_instructions_size - instruction_offset ||
+        instruction_size > SIZE_MAX ||
+        instruction_offset > UINTPTR_MAX - isolate_instructions_runtime) {
+        return std::nullopt;
+    }
+    const uintptr_t target =
+        isolate_instructions_runtime + static_cast<uintptr_t>(instruction_offset);
+    return module.ContainsExecutable(target, static_cast<size_t>(instruction_size))
+               ? std::optional<uintptr_t>(target)
+               : std::nullopt;
 }
 
 std::optional<uintptr_t> FlutterSnapshotSource::ResolveInstructionOffset(
     const ModuleImage& module, uint64_t instruction_offset) const {
-    if (!Matches(module) || instruction_offset >= isolate_instructions_size ||
-        instruction_offset > UINTPTR_MAX - isolate_instructions_runtime) {
-        return std::nullopt;
-    }
-    const uintptr_t target = isolate_instructions_runtime + instruction_offset;
-    return module.ContainsExecutable(target, 4) ? std::optional<uintptr_t>(target) : std::nullopt;
+    return ResolveInstructionRange(module, instruction_offset, 4);
 }
 
 std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& module,
@@ -425,23 +597,42 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
     // A section-table lookup is supplementary compatibility for images whose
     // dynamic symbol view is structurally unavailable. It never masks a
     // malformed or authoritative PT_DYNAMIC not-found result.
-    const auto isolate_data = FindSymbol(*bytes, "_kDartIsolateSnapshotData");
-    const auto isolate_instr = FindSymbol(*bytes, "_kDartIsolateSnapshotInstructions");
-    if (!isolate_data.has_value() || !isolate_instr.has_value() || isolate_instr->size == 0) {
+    std::vector<ElfProgramHeaderView> headers;
+    if (!ParseElf64ProgramHeaders(*bytes, &headers)) {
+        if (error != nullptr) *error = "Flutter app ELF program headers are malformed";
+        return std::nullopt;
+    }
+    const auto isolate_data = FindElfSectionSymbol(*bytes, headers, "_kDartIsolateSnapshotData");
+    const auto isolate_instr =
+        FindElfSectionSymbol(*bytes, headers, "_kDartIsolateSnapshotInstructions");
+    if (isolate_data.status == ElfSectionLookupStatus::kMalformed ||
+        isolate_instr.status == ElfSectionLookupStatus::kMalformed) {
+        if (error != nullptr) *error = "Flutter app section-table snapshot symbols are malformed";
+        return std::nullopt;
+    }
+    if (isolate_data.status != ElfSectionLookupStatus::kFound ||
+        isolate_instr.status != ElfSectionLookupStatus::kFound || isolate_instr.symbol.size == 0) {
         if (error != nullptr) *error = "loaded app module has no Dart isolate snapshot symbols";
         return std::nullopt;
     }
-    const auto header = ReadSnapshotHeader(*bytes, *isolate_data);
+    if (!SnapshotSymbolMatchesContract(isolate_data.symbol, headers, PF_R, false) ||
+        !SnapshotSymbolMatchesContract(isolate_instr.symbol, headers, PF_R | PF_X, false)) {
+        if (error != nullptr) {
+            *error = "Flutter app section-table snapshot symbols lack required PT_LOAD flags";
+        }
+        return std::nullopt;
+    }
+    const auto header = ReadSnapshotHeader(*bytes, isolate_data.symbol);
     if (!header.has_value()) {
         if (error != nullptr) *error = "Dart isolate snapshot header is not recognized";
         return std::nullopt;
     }
-    if (isolate_instr->value > UINTPTR_MAX - module.load_bias) {
+    if (isolate_instr.symbol.value > UINTPTR_MAX - module.load_bias) {
         if (error != nullptr) *error = "Dart isolate snapshot instructions VA overflows runtime";
         return std::nullopt;
     }
-    return build_source(*header, isolate_instr->value, isolate_instr->size,
-                        module.load_bias + isolate_instr->value);
+    return build_source(*header, isolate_instr.symbol.value, isolate_instr.symbol.size,
+                        module.load_bias + isolate_instr.symbol.value);
 }
 
 }  // namespace dartplant

@@ -18,6 +18,7 @@ struct ElfProgramHeaderView {
     uint64_t virtual_address = 0;
     uint64_t file_size = 0;
     uint64_t memory_size = 0;
+    uint64_t alignment = 0;
 };
 
 }  // namespace dartplant

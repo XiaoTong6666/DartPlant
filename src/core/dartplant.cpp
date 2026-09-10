@@ -12,6 +12,7 @@
 
 #include "core/internal.h"
 #include "runtime/default_runtime.h"
+#include "runtime/flutter_snapshot_internal.h"
 
 namespace dartplant {
 namespace {
@@ -75,6 +76,40 @@ DartPlantStatus ValidateTarget(const ModuleImage& module, uintptr_t target, uint
         return DARTPLANT_FINGERPRINT_MISMATCH;
     }
     return DARTPLANT_OK;
+}
+
+std::optional<uintptr_t> ResolveProvenSnapshotOffset(const ModuleImage& module, uint64_t section_va,
+                                                     uint64_t offset, uint32_t code_size,
+                                                     const char* expected_snapshot_hash,
+                                                     std::string* error) {
+    std::string discovery_error;
+    const auto snapshot = DiscoverFlutterSnapshot(module, &discovery_error);
+    if (!snapshot.has_value()) {
+        if (error != nullptr) {
+            *error = discovery_error.empty() ? "Flutter snapshot source is unavailable"
+                                             : discovery_error;
+        }
+        return std::nullopt;
+    }
+    if (section_va != snapshot->isolate_instructions_va) {
+        if (error != nullptr) {
+            *error = "snapshot offset section VA does not match isolate snapshot instructions";
+        }
+        return std::nullopt;
+    }
+    if (expected_snapshot_hash != nullptr &&
+        (expected_snapshot_hash[0] == '\0' ||
+         !EqualsIgnoreCase(snapshot->snapshot_hash, expected_snapshot_hash))) {
+        if (error != nullptr) {
+            *error = "metadata snapshot hash does not match discovered Flutter snapshot";
+        }
+        return std::nullopt;
+    }
+    const auto target = snapshot->ResolveInstructionRange(module, offset, code_size);
+    if (!target.has_value() && error != nullptr) {
+        *error = "snapshot offset range is outside executable isolate snapshot instructions";
+    }
+    return target;
 }
 
 }  // namespace
@@ -189,10 +224,16 @@ DartPlantStatus dartplant_find_method(const DartPlantMethodQuery* query,
         dartplant::SetLastError("Dart method query is ambiguous");
         return DARTPLANT_AMBIGUOUS_METHOD;
     }
+    std::string resolution_error;
     const auto target =
-        module->Resolve(matches[0]->address_kind, matches[0]->address, matches[0]->section_va);
+        matches[0]->address_kind == DARTPLANT_ADDRESS_SNAPSHOT_OFFSET
+            ? dartplant::ResolveProvenSnapshotOffset(
+                  *module, matches[0]->section_va, matches[0]->address, matches[0]->code_size,
+                  state.metadata->snapshot_hash.c_str(), &resolution_error)
+            : module->Resolve(matches[0]->address_kind, matches[0]->address);
     if (!target.has_value()) {
-        dartplant::SetLastError("method address kind cannot be resolved");
+        dartplant::SetLastError(resolution_error.empty() ? "method address kind cannot be resolved"
+                                                         : std::move(resolution_error));
         return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;
     }
     const DartPlantStatus validation = dartplant::ValidateTarget(
@@ -263,9 +304,15 @@ DartPlantStatus dartplant_hook_address(const DartPlantAddressQuery* query, void*
             "snapshot offsets require an explicit isolate snapshot instructions VA");
         return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;
     }
-    const auto target = refreshed->Resolve(query->address_kind, query->address, section_va);
+    std::string resolution_error;
+    const auto target =
+        query->address_kind == DARTPLANT_ADDRESS_SNAPSHOT_OFFSET
+            ? dartplant::ResolveProvenSnapshotOffset(*refreshed, section_va, query->address,
+                                                     query->code_size, nullptr, &resolution_error)
+            : refreshed->Resolve(query->address_kind, query->address);
     if (!target.has_value()) {
-        dartplant::SetLastError("address kind cannot be resolved");
+        dartplant::SetLastError(resolution_error.empty() ? "address kind cannot be resolved"
+                                                         : std::move(resolution_error));
         return DARTPLANT_UNSUPPORTED_ADDRESS_KIND;
     }
     const DartPlantStatus validation =

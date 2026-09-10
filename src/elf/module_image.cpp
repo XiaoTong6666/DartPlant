@@ -1,24 +1,30 @@
 // Copyright (C) 2026 XiaoTong6666
 // SPDX-License-Identifier: Apache-2.0
 
+#include "elf/module_image.h"
+
 #include <elf.h>
 #include <link.h>
 #include <string.h>
 
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 
 #include "core/internal.h"
+#include "elf/dynamic_view.h"
 
 namespace dartplant {
 namespace {
 
 constexpr uint32_t kGnuBuildIdType = 3;
 
-uintptr_t AlignUp(uintptr_t value, uintptr_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
+bool AlignUp4(uint64_t value, uint64_t* output) {
+    if (output == nullptr || value > std::numeric_limits<uint64_t>::max() - 3) return false;
+    *output = (value + 3) & ~uint64_t{3};
+    return true;
 }
 
 std::string BaseName(std::string_view path) {
@@ -35,31 +41,28 @@ std::string BytesToHex(const uint8_t* bytes, size_t size) {
     return stream.str();
 }
 
-std::string ReadBuildId(const dl_phdr_info* info) {
-    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr) & header = info->dlpi_phdr[i];
-        if (header.p_type != PT_NOTE) {
-            continue;
-        }
-        const auto* cursor = reinterpret_cast<const uint8_t*>(info->dlpi_addr + header.p_vaddr);
-        const auto* end = cursor + header.p_memsz;
-        while (cursor + sizeof(ElfW(Nhdr)) <= end) {
-            const auto* note = reinterpret_cast<const ElfW(Nhdr)*>(cursor);
-            cursor += sizeof(ElfW(Nhdr));
-            if (cursor + AlignUp(note->n_namesz, 4) + AlignUp(note->n_descsz, 4) > end) {
-                break;
-            }
-            const char* name = reinterpret_cast<const char*>(cursor);
-            cursor += AlignUp(note->n_namesz, 4);
-            const uint8_t* descriptor = cursor;
-            cursor += AlignUp(note->n_descsz, 4);
-            if (note->n_type == kGnuBuildIdType && note->n_namesz >= 3 &&
-                memcmp(name, "GNU", 3) == 0) {
-                return BytesToHex(descriptor, note->n_descsz);
-            }
-        }
+ElfBuildIdResult ReadLoadedGnuBuildIdNotesInternal(uintptr_t load_bias,
+                                                   std::span<const ElfProgramHeaderView> headers) {
+    if (!ValidateElfLoadLayout(headers)) {
+        return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
     }
-    return {};
+    ElfBuildIdResult aggregate = {.status = ElfBuildIdStatus::kNotFound, .build_id = {}};
+    for (const auto& header : headers) {
+        if (header.type != PT_NOTE) continue;
+        if (!ElfProgramHeaderHasCanonicalFileBacking(headers, header, PF_R) ||
+            header.virtual_address > UINTPTR_MAX - load_bias) {
+            return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+        }
+        const uintptr_t start = load_bias + static_cast<uintptr_t>(header.virtual_address);
+        if (header.file_size > UINTPTR_MAX - start) {
+            return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+        }
+        const auto result = ParseGnuBuildIdNotes(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(start), static_cast<size_t>(header.file_size)));
+        aggregate = MergeElfBuildIdResults(aggregate, result);
+        if (aggregate.status == ElfBuildIdStatus::kMalformed) return aggregate;
+    }
+    return aggregate;
 }
 
 int CollectModule(dl_phdr_info* info, size_t, void* data) {
@@ -79,18 +82,96 @@ int CollectModule(dl_phdr_info* info, size_t, void* data) {
             .virtual_address = header.p_vaddr,
             .file_size = header.p_filesz,
             .memory_size = header.p_memsz,
+            .alignment = header.p_align,
         });
     }
+    if (!ValidateElfLoadLayout(headers)) return 0;
     ModuleImage image;
     if (!BuildModuleImageFromProgramHeaders(info->dlpi_name, info->dlpi_addr, headers, &image)) {
         return 0;
     }
-    image.build_id = ReadBuildId(info);
+    const auto build_id = ReadLoadedGnuBuildIdNotes(info->dlpi_addr, headers);
+    if (build_id.status == ElfBuildIdStatus::kMalformed ||
+        build_id.status == ElfBuildIdStatus::kAmbiguous) {
+        return 0;
+    }
+    image.build_id = build_id.build_id;
     modules->push_back(std::move(image));
     return 0;
 }
 
 }  // namespace
+
+ElfBuildIdResult ReadLoadedGnuBuildIdNotes(uintptr_t load_bias,
+                                           std::span<const ElfProgramHeaderView> headers) {
+    return ReadLoadedGnuBuildIdNotesInternal(load_bias, headers);
+}
+
+ElfBuildIdResult ParseGnuBuildIdNotes(std::span<const uint8_t> notes) {
+    uint64_t cursor = 0;
+    std::optional<std::string> build_id;
+    while (cursor < notes.size()) {
+        const uint64_t remaining = notes.size() - cursor;
+        if (remaining < sizeof(ElfW(Nhdr))) {
+            const auto tail = notes.subspan(static_cast<size_t>(cursor));
+            if (std::all_of(tail.begin(), tail.end(), [](uint8_t value) { return value == 0; })) {
+                break;
+            }
+            return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+        }
+
+        ElfW(Nhdr) note{};
+        memcpy(&note, notes.data() + static_cast<size_t>(cursor), sizeof(note));
+        cursor += sizeof(note);
+
+        uint64_t padded_name = 0;
+        uint64_t padded_desc = 0;
+        if (!AlignUp4(note.n_namesz, &padded_name) || !AlignUp4(note.n_descsz, &padded_desc) ||
+            padded_name > notes.size() - cursor) {
+            return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+        }
+        const uint64_t name_offset = cursor;
+        cursor += padded_name;
+        if (padded_desc > notes.size() - cursor) {
+            return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+        }
+        const uint64_t descriptor_offset = cursor;
+        cursor += padded_desc;
+
+        if (note.n_type == kGnuBuildIdType && note.n_namesz == 4 && note.n_descsz != 0 &&
+            memcmp(notes.data() + static_cast<size_t>(name_offset), "GNU\0", 4) == 0) {
+            const std::string candidate =
+                BytesToHex(notes.data() + static_cast<size_t>(descriptor_offset),
+                           static_cast<size_t>(note.n_descsz));
+            if (build_id.has_value() && *build_id != candidate) {
+                return {.status = ElfBuildIdStatus::kAmbiguous, .build_id = {}};
+            }
+            build_id = candidate;
+        }
+    }
+    if (build_id.has_value()) {
+        return {.status = ElfBuildIdStatus::kFound, .build_id = std::move(*build_id)};
+    }
+    return {.status = ElfBuildIdStatus::kNotFound, .build_id = {}};
+}
+
+ElfBuildIdResult MergeElfBuildIdResults(const ElfBuildIdResult& current,
+                                        const ElfBuildIdResult& next) {
+    if (current.status == ElfBuildIdStatus::kMalformed ||
+        next.status == ElfBuildIdStatus::kMalformed) {
+        return {.status = ElfBuildIdStatus::kMalformed, .build_id = {}};
+    }
+    if (current.status == ElfBuildIdStatus::kAmbiguous ||
+        next.status == ElfBuildIdStatus::kAmbiguous) {
+        return {.status = ElfBuildIdStatus::kAmbiguous, .build_id = {}};
+    }
+    if (current.status == ElfBuildIdStatus::kFound && next.status == ElfBuildIdStatus::kFound) {
+        return current.build_id == next.build_id
+                   ? current
+                   : ElfBuildIdResult{.status = ElfBuildIdStatus::kAmbiguous, .build_id = {}};
+    }
+    return current.status == ElfBuildIdStatus::kFound ? current : next;
+}
 
 bool BuildModuleImageFromProgramHeaders(std::string_view path, uintptr_t load_bias,
                                         std::span<const ElfProgramHeaderView> headers,
@@ -139,8 +220,7 @@ bool ModuleImage::ContainsExecutable(uintptr_t address, size_t size) const {
                        });
 }
 
-std::optional<uintptr_t> ModuleImage::Resolve(DartPlantAddressKind kind, uint64_t address,
-                                              uint64_t section_va) const {
+std::optional<uintptr_t> ModuleImage::Resolve(DartPlantAddressKind kind, uint64_t address) const {
     switch (kind) {
     case DARTPLANT_ADDRESS_RUNTIME:
         return static_cast<uintptr_t>(address);
@@ -149,30 +229,24 @@ std::optional<uintptr_t> ModuleImage::Resolve(DartPlantAddressKind kind, uint64_
             return std::nullopt;
         }
         return load_bias + static_cast<uintptr_t>(address);
-    case DARTPLANT_ADDRESS_FILE_OFFSET:
+    case DARTPLANT_ADDRESS_FILE_OFFSET: {
+        std::optional<uintptr_t> result;
         for (const ExecutableRange& range : executable_ranges) {
             if (range.file_offset > UINT64_MAX - range.file_size) continue;
             const uint64_t file_end = range.file_offset + range.file_size;
-            if (address >= range.file_offset && address < file_end) {
-                const uint64_t delta = address - range.file_offset;
-                if (range.virtual_address > UINTPTR_MAX - load_bias ||
-                    delta > UINTPTR_MAX - (load_bias + range.virtual_address)) {
-                    return std::nullopt;
-                }
-                return load_bias + range.virtual_address + delta;
-            }
+            if (address < range.file_offset || address >= file_end) continue;
+            const uint64_t delta = address - range.file_offset;
+            if (range.virtual_address > UINTPTR_MAX - load_bias) return std::nullopt;
+            const uintptr_t base = load_bias + static_cast<uintptr_t>(range.virtual_address);
+            if (delta > UINTPTR_MAX - base) return std::nullopt;
+            const uintptr_t candidate = base + static_cast<uintptr_t>(delta);
+            if (result.has_value() && *result != candidate) return std::nullopt;
+            result = candidate;
         }
-        return std::nullopt;
+        return result;
+    }
     case DARTPLANT_ADDRESS_SNAPSHOT_OFFSET:
-        if (section_va == 0) return std::nullopt;
-        if (section_va > UINTPTR_MAX - load_bias) {
-            return std::nullopt;
-        }
-        const uintptr_t base = load_bias + static_cast<uintptr_t>(section_va);
-        if (address > UINTPTR_MAX - base) {
-            return std::nullopt;
-        }
-        return base + static_cast<uintptr_t>(address);
+        return std::nullopt;
     }
     return std::nullopt;
 }

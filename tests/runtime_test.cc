@@ -542,9 +542,23 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     snapshot.snapshot_features = "arm64 product compressed-pointers";
     snapshot.profile_name = "synthetic-live-index";
     snapshot.isolate_instructions_va = 0x1000;
-    snapshot.isolate_instructions_size = 0x100;
     snapshot.isolate_instructions_runtime = reinterpret_cast<uintptr_t>(target);
-    runtime->snapshot = std::move(snapshot);
+    snapshot.isolate_instructions_size = 1;
+    for (const auto& range : module.executable_ranges) {
+        if (snapshot.isolate_instructions_runtime < range.start ||
+            snapshot.isolate_instructions_runtime >= range.end) {
+            continue;
+        }
+        snapshot.isolate_instructions_size =
+            std::min<uint64_t>(0x100, range.end - snapshot.isolate_instructions_runtime);
+        break;
+    }
+    runtime->snapshot = snapshot;
+    std::string image_error;
+    EXPECT_TRUE(runtime->image_set.SetRoot(
+        module, snapshot, runtime->generation->load(std::memory_order_acquire), &image_error));
+    const auto* root_image = runtime->image_set.Root();
+    EXPECT_TRUE(root_image != nullptr);
 
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
@@ -558,6 +572,8 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     index.dart_version = "test";
     index.profile_version = "synthetic-live-index";
     dartplant::SnapshotFunction function;
+    function.runtime_image_id = root_image->id;
+    function.loading_unit_id = 1;
     function.library_uri = "package:fixture/main.dart";
     function.class_name = "Fixture";
     function.function_name = "add";
@@ -583,6 +599,8 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     live_info.entry_va = 0x1000;
     live_info.code_section_va = 0x1000;
     live_info.code_size = 1;
+    live_info.runtime_image_id = root_image->id;
+    live_info.loading_unit_id = 1;
     live_info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
     live_info.entry_kind_mask = 0x01;
     std::snprintf(live_info.library_uri, sizeof(live_info.library_uri), "%s",
@@ -590,6 +608,8 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     std::snprintf(live_info.class_name, sizeof(live_info.class_name), "%s", "Fixture");
     std::snprintf(live_info.function_name, sizeof(live_info.function_name), "%s", "add");
     index.live_function_infos.push_back(live_info);
+    const std::array<dartplant::RuntimeImageId, 1> live_bindings = {root_image->id};
+    EXPECT_TRUE(runtime->image_set.BindLiveEntries(live_bindings));
     runtime->live_snapshot_index = std::move(index);
     runtime->live_function_index_info.struct_size = sizeof(DartPlantLiveVmFunctionIndexInfo);
     runtime->live_function_index_info.function_count = 1;
@@ -613,9 +633,21 @@ void SeedSyntheticArtifactImage(DartPlantRuntime* runtime, const dartplant::Modu
     snapshot.snapshot_features = "arm64 product compressed-pointers";
     snapshot.profile_name = "synthetic-artifact-index";
     snapshot.isolate_instructions_va = 0x1000;
-    snapshot.isolate_instructions_size = 0x100;
     snapshot.isolate_instructions_runtime = reinterpret_cast<uintptr_t>(target);
-    runtime->snapshot = std::move(snapshot);
+    snapshot.isolate_instructions_size = 1;
+    for (const auto& range : module.executable_ranges) {
+        if (snapshot.isolate_instructions_runtime < range.start ||
+            snapshot.isolate_instructions_runtime >= range.end) {
+            continue;
+        }
+        snapshot.isolate_instructions_size =
+            std::min<uint64_t>(0x100, range.end - snapshot.isolate_instructions_runtime);
+        break;
+    }
+    runtime->snapshot = snapshot;
+    std::string image_error;
+    EXPECT_TRUE(runtime->image_set.SetRoot(
+        module, snapshot, runtime->generation->load(std::memory_order_acquire), &image_error));
     runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
 }
 
@@ -672,6 +704,27 @@ TEST_CASE(FunctionHandlesShareEntryTargetByEntry) {
     EXPECT_TRUE(first_target->HookRecord() == &hook);
     first_target->UnbindHookRecord(&hook);
     EXPECT_TRUE(first_target->HookRecord() == nullptr);
+}
+
+TEST_CASE(EntryTargetRegistrySeparatesIdenticalAddressesAcrossRuntimeImages) {
+    dartplant::DartEntryTargetRegistry registry;
+    auto root = registry.GetOrCreate(0x123456, 64, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                     0x123400, 0x96, 1);
+    auto deferred = registry.GetOrCreate(0x123456, 64, 0x2001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                         0x123400, 0x96, 2);
+    auto root_again = registry.GetOrCreate(0x123456, 64, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                           0x123400, 0x96, 1);
+    EXPECT_TRUE(root != nullptr);
+    EXPECT_TRUE(deferred != nullptr);
+    EXPECT_TRUE(root != deferred);
+    EXPECT_TRUE(root == root_again);
+    EXPECT_EQ(1U, root->image_id);
+    EXPECT_EQ(2U, deferred->image_id);
+    EXPECT_TRUE(root->payload != nullptr);
+    EXPECT_TRUE(deferred->payload != nullptr);
+    EXPECT_TRUE(root->payload != deferred->payload);
+    EXPECT_EQ(1U, root->payload->image_id);
+    EXPECT_EQ(2U, deferred->payload->image_id);
 }
 
 TEST_CASE(SharedCodeCallbacksFailClosedAndExposeRequestedIdentity) {
@@ -1976,6 +2029,75 @@ TEST_CASE(RuntimeRequiresMatchingAotModules) {
     dartplant_runtime_destroy(runtime);
 }
 
+TEST_CASE(RuntimeEngineAnchorDisambiguatesSameNameFlutterMappings) {
+    auto make_module = [](const char* name, const char* path, uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = "same-build";
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+
+    const auto app = make_module("libapp.so", "/app/libapp.so", 0x100000);
+    const auto engine_a = make_module("libflutter.so", "/engine/a/libflutter.so", 0x200000);
+    const auto engine_b = make_module("libflutter.so", "/engine/b/libflutter.so", 0x300000);
+    const std::vector<dartplant::ModuleImage> modules = {app, engine_a, engine_b};
+
+    auto seed_runtime = [&](DartPlantRuntime* runtime) {
+        DartPlantRuntimeProfile profile{};
+        dartplant_runtime_profile_init_arm64_aot(&profile);
+        profile.app_module_name = "libapp.so";
+        profile.runtime_module_name = "libflutter.so";
+        runtime->profile.Assign(profile);
+        runtime->selected_app_module = app;
+        dartplant::FlutterSnapshotSource snapshot;
+        snapshot.module_name = app.name;
+        snapshot.module_path = app.path;
+        snapshot.module_build_id = app.build_id;
+        snapshot.snapshot_hash = "synthetic-engine-anchor";
+        snapshot.snapshot_features = "arm64 android product compressed-pointers";
+        snapshot.profile_name = "flutter-arm64-product-compressed";
+        snapshot.isolate_instructions_va = 0x1000;
+        snapshot.isolate_instructions_size = 0x1000;
+        snapshot.isolate_instructions_runtime = 0x100000;
+        snapshot.compressed_pointers = true;
+        runtime->snapshot = snapshot;
+        std::string error;
+        EXPECT_TRUE(runtime->image_set.SetRoot(app, snapshot, 1, &error));
+    };
+
+    DartPlantRuntime ambiguous;
+    seed_runtime(&ambiguous);
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, dartplant::RefreshRuntimeModules(&ambiguous, modules));
+    EXPECT_TRUE(!ambiguous.selected_runtime_module.has_value());
+
+    DartPlantRuntime anchored;
+    seed_runtime(&anchored);
+    anchored.engine_anchor = 0x300100;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&anchored, modules));
+    EXPECT_TRUE(anchored.selected_runtime_module.has_value());
+    EXPECT_EQ(engine_b.path, anchored.selected_runtime_module->path);
+    EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, anchored.state);
+
+    const uint64_t engine_b_generation = anchored.generation->load(std::memory_order_acquire);
+    anchored.live_snapshot_index.emplace();
+    anchored.engine_anchor = 0x200100;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&anchored, modules));
+    EXPECT_TRUE(anchored.selected_runtime_module.has_value());
+    EXPECT_EQ(engine_a.path, anchored.selected_runtime_module->path);
+    EXPECT_EQ(engine_b_generation + 1, anchored.generation->load(std::memory_order_acquire));
+    EXPECT_TRUE(!anchored.live_snapshot_index.has_value());
+    EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, anchored.state);
+}
+
 TEST_CASE(RuntimeDiagnosticsReportStructuredModuleRejection) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
@@ -2081,6 +2203,15 @@ TEST_CASE(RuntimeHookMethodHandleKeepsOuterOperationPinnedAcrossHelpers) {
     DartPlantRuntime* runtime = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
     SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+
+    uint32_t image_count = 0;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_count(runtime, &image_count));
+    EXPECT_EQ(1U, image_count);
+    DartPlantRuntimeImageInfo image_info{};
+    image_info.struct_size = sizeof(image_info);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_info(runtime, 0, &image_info));
+    EXPECT_EQ(1U, image_info.live_entry_count);
+    EXPECT_EQ(1U, static_cast<uint32_t>(image_info.live_semantic_bound));
 
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -2286,6 +2417,9 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     DartPlantRuntime* runtime = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
     SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+    uint32_t image_count = 0;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_count(runtime, &image_count));
+    EXPECT_EQ(1U, image_count);
 
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -2312,6 +2446,9 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     EXPECT_TRUE(!runtime->live_vm_context.has_value());
     EXPECT_TRUE(!runtime->live_snapshot_index.has_value());
     EXPECT_TRUE(!runtime->artifact_snapshot_index.has_value());
+    image_count = 123;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_count(runtime, &image_count));
+    EXPECT_EQ(0U, image_count);
     EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
     EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
     EXPECT_EQ(1, g_fake_unhook_calls);

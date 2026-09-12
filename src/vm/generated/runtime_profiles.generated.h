@@ -5,10 +5,10 @@ namespace dartplant {
 
 inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-54c9f8f6445a5fbffa415e8c",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-c43e7867dd748a37d2ceb96b",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-54c9f8f6445a5fbffa415e8c",
-            .core = "dart-vm-arm64-product-compressed/abi-core-2f32075ce84808b0ab60c406",
+            .full = "dart-vm-arm64-product-compressed/abi-c43e7867dd748a37d2ceb96b",
+            .core = "dart-vm-arm64-product-compressed/abi-core-e1061561f58d7c038f469012",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-d33d204969c0855db9521564",
             .transition = "dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
@@ -79,6 +79,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x3d0u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,
@@ -168,10 +169,10 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-97249511cf5d71730aded562",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-07236cefd64b03dd1bf66a40",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-97249511cf5d71730aded562",
-            .core = "dart-vm-arm64-product-compressed/abi-core-67fe74003c2ab7329e3e6429",
+            .full = "dart-vm-arm64-product-compressed/abi-07236cefd64b03dd1bf66a40",
+            .core = "dart-vm-arm64-product-compressed/abi-core-74cbbf9ab54b6ae8aa33a065",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-72d1859c927336e07e234119",
             .transition = "dart-vm-arm64-product-compressed/abi-transition-16277c21148bf7ba2a41fca9",
@@ -242,6 +243,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x3a8u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,
@@ -331,10 +333,10 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-c62ee85628f83b613230f9e9",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-aec816312dff5ff988273208",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-c62ee85628f83b613230f9e9",
-            .core = "dart-vm-arm64-product-compressed/abi-core-8ce3336409530be1f2925730",
+            .full = "dart-vm-arm64-product-compressed/abi-aec816312dff5ff988273208",
+            .core = "dart-vm-arm64-product-compressed/abi-core-bc6b59e7b5831ae761fbdc1b",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-83270ceaeb08cbb569ceab3b",
             .transition = "dart-vm-arm64-product-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
@@ -405,6 +407,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x408u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,
@@ -494,10 +497,10 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-ebd23f1270ec4efb6d42ae65",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-20557461da7f1215390b7bcd",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-ebd23f1270ec4efb6d42ae65",
-            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-af5698e84c0b7b6ed25708fc",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-20557461da7f1215390b7bcd",
+            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-db1d640d9b121f8cfe7d67e4",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-d33d204969c0855db9521564",
             .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
@@ -568,6 +571,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x3d0u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,
@@ -657,10 +661,10 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-6edd859d736de3002db808ef",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-e898adb37cb97aa11c0c7572",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-6edd859d736de3002db808ef",
-            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-c356442a97cc0e2a1ff4e928",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-e898adb37cb97aa11c0c7572",
+            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-3948b87f17c744121b9a9d24",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-72d1859c927336e07e234119",
             .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-16277c21148bf7ba2a41fca9",
@@ -731,6 +735,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x3a8u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,
@@ -820,10 +825,10 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-6d832f294748dab684a44640",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-7121b5c56151e1596b328b8d",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-6d832f294748dab684a44640",
-            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-4e59defe0a25aaf5c21a6feb",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-7121b5c56151e1596b328b8d",
+            .core = "dart-vm-arm64-nonproduct-compressed/abi-core-8a4f6459376d7e69bed0a194",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-83270ceaeb08cbb569ceab3b",
             .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
@@ -894,6 +899,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .code_monomorphic_entry_point_offset = 0x10u,
             .code_monomorphic_unchecked_entry_point_offset = 0x20u,
             .function_unchecked_entry_point_offset = 0x10u,
+            .object_store_loading_units_offset = 0x408u,
         },
         .dart_sp_register = 15u,
         .arguments_descriptor_register = 4u,

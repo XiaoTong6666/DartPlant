@@ -123,12 +123,12 @@ TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapsho
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     const auto* profiles = dartplant::RuntimeProfiles();
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-54c9f8f6445a5fbffa415e8c",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-c43e7867dd748a37d2ceb96b",
               std::string_view(profiles[0].abi_identity.full));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[1].abi_id));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[2].abi_id));
     EXPECT_TRUE(std::string_view(profiles[1].abi_id) != std::string_view(profiles[2].abi_id));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-core-2f32075ce84808b0ab60c406",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-core-e1061561f58d7c038f469012",
               std::string_view(profiles[0].abi_identity.core));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
               std::string_view(profiles[0].abi_identity.call));

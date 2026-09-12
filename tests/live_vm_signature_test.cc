@@ -9,6 +9,7 @@
 #include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
 #include "vm/abi/proof.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace {
@@ -283,13 +284,33 @@ TEST_CASE(LiveVmParsesOptionalPositionalParameters) {
     }
 }
 
-TEST_CASE(LiveVmFunctionTypeRejectsMissingNamedParameterFlagSlots) {
+TEST_CASE(LiveVmFunctionTypeAcceptsTrimmedZeroNamedParameterFlagSlots) {
     for (const auto& item : kSignatureProfiles) {
         auto fixture = BuildSignatureFixture(item);
-        // Six named parameters require six name slots plus one ARM64 Smi flag
-        // slot. Truncating the array to the names alone must fail closed rather
-        // than silently treating every named parameter as optional.
+        // FunctionType::FinalizeNameArray trims trailing all-zero required flag
+        // slots, so an array containing only names means every name is optional.
         fixture.heap.SetArray(0x380, fixture.profile.cid_array, 6);
+
+        DartPlantDartFunctionSignatureInfo signature{};
+        signature.struct_size = sizeof(signature);
+        EXPECT_EQ(DARTPLANT_OK,
+                  dartplant_live_vm_read_function_signature(&fixture.context, &fixture.snapshot,
+                                                            fixture.function, &signature));
+        for (uint32_t index = 2; index < 8; ++index) {
+            DartPlantDartParameterInfo parameter{};
+            parameter.struct_size = sizeof(parameter);
+            EXPECT_EQ(DARTPLANT_OK, dartplant_live_vm_read_function_parameter(
+                                        &fixture.context, &fixture.snapshot, fixture.function,
+                                        index, &parameter));
+            EXPECT_EQ(0U, parameter.is_required);
+        }
+    }
+}
+
+TEST_CASE(LiveVmFunctionTypeRejectsMissingNamedParameterNames) {
+    for (const auto& item : kSignatureProfiles) {
+        auto fixture = BuildSignatureFixture(item);
+        fixture.heap.SetArray(0x380, fixture.profile.cid_array, 5);
 
         DartPlantDartFunctionSignatureInfo signature{};
         signature.struct_size = sizeof(signature);
@@ -310,6 +331,49 @@ TEST_CASE(LiveVmFunctionTypeFailsClosedWhenAotDroppedSignature) {
         EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
                   dartplant_live_vm_read_function_signature(&fixture.context, &fixture.snapshot,
                                                             fixture.function, &signature));
+    }
+}
+
+TEST_CASE(LiveVmDeferredProgramHashReadsSourceVerifiedObjectStoreRoot) {
+    constexpr uint32_t kProgramHash = 0x12345678;
+    for (const auto& item : kSignatureProfiles) {
+        SyntheticDartHeap heap;
+        DartPlantFlutterSnapshotInfo snapshot{};
+        snapshot.struct_size = sizeof(snapshot);
+        snapshot.snapshot_hash = item.snapshot_hash;
+        snapshot.profile_name = kSnapshotProfile;
+        snapshot.compressed_pointers = 1;
+
+        DartPlantLiveVmProfile profile{};
+        profile.struct_size = sizeof(profile);
+        EXPECT_EQ(DARTPLANT_OK, dartplant_live_vm_select_profile(&snapshot, &profile));
+        EXPECT_EQ(item.profile_version, profile.profile_version);
+        const auto* record = dartplant::FindRuntimeProfileByVersion(profile.profile_version);
+        EXPECT_TRUE(record != nullptr);
+        EXPECT_TRUE(profile.object_store_loading_units_offset != 0);
+
+        constexpr size_t kObjectStore = 0x100;
+        constexpr size_t kLoadingUnits = 0x800;
+        heap.SetArray(kLoadingUnits, profile.cid_array, 3);
+        heap.SetArraySmi(kLoadingUnits, 0, kProgramHash);
+        heap.Store<uint64_t>(kObjectStore + profile.object_store_loading_units_offset,
+                             heap.Tagged(kLoadingUnits));
+
+        DartPlantLiveVmContext context{};
+        context.struct_size = sizeof(context);
+        context.profile_version = profile.profile_version;
+        context.heap_base = heap.base();
+        context.object_store = heap.base() + kObjectStore;
+
+        uint32_t actual = 0;
+        EXPECT_EQ(DARTPLANT_OK,
+                  dartplant::ReadLiveVmRootProgramHashForProfile(context, *record, &actual));
+        EXPECT_EQ(kProgramHash, actual);
+
+        heap.SetArraySmi(kLoadingUnits, 0, kProgramHash + 1);
+        EXPECT_EQ(DARTPLANT_OK,
+                  dartplant::ReadLiveVmRootProgramHashForProfile(context, *record, &actual));
+        EXPECT_EQ(kProgramHash + 1, actual);
     }
 }
 

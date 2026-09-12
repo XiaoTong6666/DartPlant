@@ -66,6 +66,7 @@ struct DartCodePayload {
 
     mutable std::mutex mutex;
     Id id = 0;
+    uint64_t image_id = 0;
     uintptr_t start = 0;
     uint32_t instructions_length = 0;
     uint64_t code_object = 0;
@@ -112,6 +113,7 @@ struct DartEntryTarget {
 
     mutable std::mutex mutex;
     Id id = 0;
+    uint64_t image_id = 0;
     uintptr_t entry = 0;
     uint32_t code_size = 0;
     uint64_t code_object = 0;
@@ -248,6 +250,7 @@ private:
 
 struct DartFunctionHandle {
     DartMethodIdentity identity;
+    uint64_t image_id = 0;
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     DartFunctionSource source = DartFunctionSource::kLegacyMetadata;
@@ -268,7 +271,7 @@ public:
         uintptr_t entry, uint32_t code_size, uint64_t code_object = 0,
         uint32_t reported_alias_count = 1,
         DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN,
-        uintptr_t payload_start = 0, uint32_t instructions_length = 0) {
+        uintptr_t payload_start = 0, uint32_t instructions_length = 0, uint64_t image_id = 0) {
         if (entry == 0) return nullptr;
         const bool explicit_payload_identity = payload_start != 0 || instructions_length != 0;
         if (payload_start == 0) payload_start = entry;
@@ -287,7 +290,8 @@ public:
             return nullptr;
         }
         std::lock_guard lock(mutex_);
-        auto target_found = targets_.find(entry);
+        const ImageAddressKey target_key{.image_id = image_id, .address = entry};
+        auto target_found = targets_.find(target_key);
         if (target_found != targets_.end()) {
             if (auto existing = target_found->second.lock(); existing != nullptr) {
                 auto existing_payload = existing->Payload();
@@ -303,8 +307,8 @@ public:
                     if (existing_payload->HasExactIdentity() || existing->HookRecord() != nullptr) {
                         return nullptr;
                     }
-                    auto replacement = FindOrCreatePayloadLocked(payload_start, instructions_length,
-                                                                 code_object, true);
+                    auto replacement = FindOrCreatePayloadLocked(
+                        image_id, payload_start, instructions_length, code_object, true);
                     if (replacement == nullptr ||
                         !existing->MergeEvidenceAndUpgradePayload(
                             code_size, code_object, reported_alias_count, identity_proof,
@@ -325,12 +329,13 @@ public:
             }
         }
 
-        auto payload = FindOrCreatePayloadLocked(payload_start, instructions_length, code_object,
-                                                 explicit_payload_identity);
+        auto payload = FindOrCreatePayloadLocked(image_id, payload_start, instructions_length,
+                                                 code_object, explicit_payload_identity);
         if (payload == nullptr) return nullptr;
 
         auto target = std::make_shared<DartEntryTarget>();
         target->id = entry;
+        target->image_id = image_id;
         target->entry = entry;
         target->code_size = code_size;
         target->code_object = code_object;
@@ -338,7 +343,7 @@ public:
         target->reported_alias_count = std::max<uint32_t>(1, reported_alias_count);
         target->identity_proof =
             target->reported_alias_count > 1 ? DARTPLANT_CODE_IDENTITY_SHARED : identity_proof;
-        targets_[entry] = target;
+        targets_[target_key] = target;
         return target;
     }
 
@@ -349,17 +354,37 @@ public:
     }
 
 private:
-    std::shared_ptr<DartCodePayload> FindOrCreatePayloadLocked(uintptr_t payload_start,
+    struct ImageAddressKey {
+        uint64_t image_id = 0;
+        uintptr_t address = 0;
+
+        bool operator==(const ImageAddressKey& other) const {
+            return image_id == other.image_id && address == other.address;
+        }
+    };
+
+    struct ImageAddressKeyHash {
+        size_t operator()(const ImageAddressKey& key) const {
+            const size_t address_hash = std::hash<uintptr_t>{}(key.address);
+            const size_t image_hash = std::hash<uint64_t>{}(key.image_id);
+            return address_hash ^
+                   (image_hash + 0x9e3779b97f4a7c15ULL + (address_hash << 6) + (address_hash >> 2));
+        }
+    };
+
+    std::shared_ptr<DartCodePayload> FindOrCreatePayloadLocked(uint64_t image_id,
+                                                               uintptr_t payload_start,
                                                                uint32_t instructions_length,
                                                                uint64_t code_object,
                                                                bool exact_identity) {
+        const ImageAddressKey payload_key{.image_id = image_id, .address = payload_start};
         for (auto payload_it = payloads_.begin(); payload_it != payloads_.end();) {
             auto payload = payload_it->second.lock();
             if (payload == nullptr) {
                 payload_it = payloads_.erase(payload_it);
                 continue;
             }
-            if (payload->start == payload_start) {
+            if (payload->image_id == image_id && payload->start == payload_start) {
                 if (payload->instructions_length != instructions_length) return nullptr;
                 std::lock_guard payload_lock(payload->mutex);
                 if (payload->code_object != 0 && code_object != 0 &&
@@ -374,17 +399,20 @@ private:
         }
         auto payload = std::make_shared<DartCodePayload>();
         payload->id = payload_start;
+        payload->image_id = image_id;
         payload->start = payload_start;
         payload->instructions_length = instructions_length;
         payload->code_object = code_object;
         payload->exact_identity = exact_identity;
-        payloads_[payload_start] = payload;
+        payloads_[payload_key] = payload;
         return payload;
     }
 
     std::mutex mutex_;
-    std::unordered_map<uintptr_t, std::weak_ptr<DartEntryTarget>> targets_;
-    std::unordered_map<uintptr_t, std::weak_ptr<DartCodePayload>> payloads_;
+    std::unordered_map<ImageAddressKey, std::weak_ptr<DartEntryTarget>, ImageAddressKeyHash>
+        targets_;
+    std::unordered_map<ImageAddressKey, std::weak_ptr<DartCodePayload>, ImageAddressKeyHash>
+        payloads_;
 };
 
 }  // namespace dartplant

@@ -337,6 +337,75 @@ def _verify_class_table_num_cids_contract(
 
 
 
+def _verify_object_store_offsets_contract(
+    profile: dict[str, object], object_store_header: str, *, source_name: str
+) -> None:
+    """Verify ObjectStore pointer-field offsets from the exact SDK field list.
+
+    ObjectStore::libraries_offset()/loading_units_offset() are not emitted into
+    runtime_offsets_extracted.h. For the supported Android ARM64 profiles every
+    OBJECT_STORE_FIELD_LIST slot occupies one pointer-sized storage slot, so
+    exact source field order is the authoritative offset oracle. Fail closed
+    if the declaration machinery or field-list shape changes.
+    """
+
+    pointer_size = int(profile["machine"]["pointer_size"])
+    if pointer_size != 8:
+        raise ValueError(
+            f"{source_name}: unsupported ObjectStore pointer size: {pointer_size}"
+        )
+
+    for evidence in (
+        "#define DECLARE_OBJECT_STORE_FIELD(type, name) type##Ptr name##_;",
+        "std::atomic<type##Ptr> name##_;",
+        "AcqRelAtomic<type##Ptr> name##_;",
+    ):
+        if evidence not in object_store_header:
+            raise ValueError(
+                f"{source_name}: ObjectStore storage contract changed: {evidence}"
+            )
+
+    begin = object_store_header.find("#define OBJECT_STORE_FIELD_LIST")
+    end = object_store_header.find("#define ISOLATE_OBJECT_STORE_FIELD_LIST", begin)
+    if begin < 0 or end <= begin:
+        raise ValueError(f"{source_name}: ObjectStore field list is unavailable")
+    field_list = object_store_header[begin:end]
+    if "#if" in field_list or "#ifdef" in field_list or "#ifndef" in field_list:
+        raise ValueError(f"{source_name}: ObjectStore field list became configuration-dependent")
+
+    field_pattern = re.compile(
+        r"\b(?:R_|RW|ARW_RELAXED|ARW_AR|LAZY_CORE|LAZY_ASYNC|LAZY_ISOLATE|"
+        r"LAZY_INTERNAL|LAZY_FFI)\s*\(\s*[^,]+,\s*([A-Za-z0-9_]+)"
+    )
+    fields = field_pattern.findall(field_list)
+    if len(fields) != len(set(fields)):
+        raise ValueError(f"{source_name}: ObjectStore field names are not unique")
+    try:
+        libraries_index = fields.index("libraries")
+        loading_units_index = fields.index("loading_units")
+    except ValueError as exc:
+        raise ValueError(
+            f"{source_name}: ObjectStore libraries/loading_units fields are unavailable"
+        ) from exc
+    if loading_units_index <= libraries_index:
+        raise ValueError(f"{source_name}: ObjectStore loading_units field order changed")
+
+    expected_libraries = libraries_index * pointer_size
+    expected_loading_units = loading_units_index * pointer_size
+    manifest_libraries = int(profile["object_store"]["libraries"])
+    manifest_loading_units = int(profile["object_store"]["loading_units"])
+    if manifest_libraries != expected_libraries:
+        raise ValueError(
+            f"{profile['name']}: manifest object_store.libraries=0x{manifest_libraries:x} "
+            f"disagrees with source-proven {source_name} layout=0x{expected_libraries:x}"
+        )
+    if manifest_loading_units != expected_loading_units:
+        raise ValueError(
+            f"{profile['name']}: manifest object_store.loading_units=0x{manifest_loading_units:x} "
+            f"disagrees with source-proven {source_name} layout=0x{expected_loading_units:x}"
+        )
+
+
 def _verify_class_raw_layout_contract(
     profile: dict[str, object], raw_object: str, *, source_name: str
 ) -> None:
@@ -578,6 +647,7 @@ ABI_DOMAIN_FIELDS = {
         "thread.global_object_pool", "thread.isolate", "thread.isolate_group",
         "isolate_group.class_table", "isolate_group.cached_class_table_table",
         "isolate_group.object_store", "class_table.num_cids", "object_store.libraries",
+        "object_store.loading_units",
         "code.object_pool", "code.owner", "code.instructions_length", "function.name",
         "function.owner", "function.code", "class.name", "class.functions",
         "class.library", "library.url", "library.toplevel_class",
@@ -660,6 +730,7 @@ _RUNTIME_ROOT_FIELDS = (
     ("isolate_group.object_store", "profile.live_vm.isolate_group_object_store_offset"),
     ("class_table.num_cids", "profile.live_vm.class_table_num_cids_offset"),
     ("object_store.libraries", "profile.live_vm.object_store_libraries_offset"),
+    ("object_store.loading_units", "profile.live_vm.object_store_loading_units_offset"),
     ("array.length", "profile.live_vm.array_length_offset"),
     ("array.elements", "profile.live_vm.array_elements_offset"),
     ("growable_object_array.length", "profile.live_vm.growable_object_array_length_offset"),
@@ -1524,6 +1595,7 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         runtime_offsets = _git_show(
             sdk_root, version, "runtime/vm/compiler/runtime_offsets_extracted.h"
         )
+        object_store_header = _git_show(sdk_root, version, "runtime/vm/object_store.h")
         object_header = _git_show(sdk_root, version, "runtime/vm/object.h")
         app_snapshot = _git_show(sdk_root, version, "runtime/vm/app_snapshot.cc")
         raw_object = _git_show(sdk_root, version, "runtime/vm/raw_object.h")
@@ -1564,6 +1636,9 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
             runtime_offsets,
             class_table_header,
             source_name=f"Dart SDK {version}",
+        )
+        _verify_object_store_offsets_contract(
+            profile, object_store_header, source_name=f"Dart SDK {version}"
         )
         _verify_class_raw_layout_contract(
             profile, raw_object, source_name=f"Dart SDK {version}"
@@ -2051,6 +2126,7 @@ def _render_profile(profile: dict[str, object]) -> str:
             .code_monomorphic_entry_point_offset = {_u(int(code['monomorphic_entry_point']))},
             .code_monomorphic_unchecked_entry_point_offset = {_u(int(code['monomorphic_unchecked_entry_point']))},
             .function_unchecked_entry_point_offset = {_u(int(function['unchecked_entry_point']))},
+            .object_store_loading_units_offset = {_u(int(object_store['loading_units']))},
         }},
         .dart_sp_register = {r['spreg']}u,
         .arguments_descriptor_register = {r['args_desc']}u,

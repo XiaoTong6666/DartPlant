@@ -244,6 +244,10 @@ bool HasCapability(const State& state, uint64_t capability) {
     return (state.capabilities & capability) == capability;
 }
 
+uintptr_t BoundEngineLoadBias(const State& state) {
+    return state.artifacts.engines.size() == 1 ? state.artifacts.engines[0].load_bias : 0;
+}
+
 size_t CapabilityIndex(uint64_t capability);
 
 bool HasVerifiedCapability(const State& state, uint64_t capability) {
@@ -259,7 +263,9 @@ bool HasVerifiedCapability(const State& state, uint64_t capability) {
         const auto& record = state.proof_records[index];
         if (record.capability != bit || record.state != dartplant::vm_abi::ProofState::kVerified ||
             record.artifact_generation != artifact_generation ||
-            record.isolate_generation != state.identity.generation) {
+            record.isolate_generation != state.identity.generation ||
+            record.isolate_group != state.identity.isolate_group ||
+            record.engine_load_bias != BoundEngineLoadBias(state)) {
             return false;
         }
     }
@@ -303,6 +309,8 @@ void MarkCapabilityVerified(State& state, uint64_t capability) {
         record.state = dartplant::vm_abi::ProofState::kVerified;
         record.artifact_generation = artifact_generation;
         record.isolate_generation = state.identity.generation;
+        record.isolate_group = state.identity.isolate_group;
+        record.engine_load_bias = BoundEngineLoadBias(state);
     }
 }
 
@@ -318,6 +326,8 @@ void MarkCapabilityFailed(State& state, uint64_t capability) {
         record.state = dartplant::vm_abi::ProofState::kFailedForIncarnation;
         record.artifact_generation = artifact_generation;
         record.isolate_generation = state.identity.generation;
+        record.isolate_group = state.identity.isolate_group;
+        record.engine_load_bias = BoundEngineLoadBias(state);
     }
 }
 
@@ -503,7 +513,9 @@ bool CapabilityRecordCurrent(const State& state, uint64_t capability) {
     return record.capability == capability &&
            record.artifact_generation ==
                state.artifact_generation.load(std::memory_order_acquire) &&
-           record.isolate_generation == state.identity.generation;
+           record.isolate_generation == state.identity.generation &&
+           record.isolate_group == state.identity.isolate_group &&
+           record.engine_load_bias == BoundEngineLoadBias(state);
 }
 
 void SetProofRecordDomains(State& state, uint64_t capability,
@@ -2014,6 +2026,8 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
         record.state = dartplant::vm_abi::ProofState::kUnverified;
         record.artifact_generation = state.artifact_generation.load(std::memory_order_acquire);
         record.isolate_generation = state.identity.generation;
+        record.isolate_group = state.identity.isolate_group;
+        record.engine_load_bias = BoundEngineLoadBias(state);
     }
     if (!EstablishEagerCapabilityProofs(state)) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "eager VM capability domains are ambiguous");

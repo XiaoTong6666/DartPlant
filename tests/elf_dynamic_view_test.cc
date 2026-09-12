@@ -629,6 +629,109 @@ TEST_CASE(ElfDynamicLookupFindsSysvHashOnlySymbol) {
     EXPECT_EQ(0x1600U, result.symbol.value);
 }
 
+TEST_CASE(ElfSysvHashRejectsTruncatedUnusedChainTail) {
+    DynamicLookupFixture fixture;
+    fixture.WriteTargetSymbol();
+    fixture.view.sysv_hash_va = 0x1300;
+    // nbucket=1, nchain=3. bucket[0] -> symbol 1 and chain[1] terminates, so
+    // the old lookup could find the target without ever touching chain[2].
+    // The gABI table nevertheless declares all three chain words.
+    const std::array<uint32_t, 5> truncated_table = {1, 3, 1, 0, 0};
+    std::memcpy(fixture.image.data() + 0x300, truncated_table.data(), sizeof(truncated_table));
+    fixture.headers[0].file_size = 0x314;
+    fixture.headers[0].memory_size = 0x314;
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(ElfSysvHashRejectsNchainBeyondReadableDynsym) {
+    DynamicLookupFixture fixture;
+    fixture.WriteTargetSymbol();
+    fixture.view.sysv_hash_va = 0x1300;
+    const std::array<uint32_t, 6> table = {1, 3, 1, 0, 0, 0};
+    std::memcpy(fixture.image.data() + 0x300, table.data(), sizeof(table));
+
+    // Keep the hash table and string table independently readable, while the
+    // dynsym mapping contains exactly two Elf64_Sym entries. SysV nchain is
+    // parallel to dynsym, so claiming three entries is malformed.
+    const std::array<dartplant::ElfProgramHeaderView, 3> headers = {
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R,
+            .offset = 0x100,
+            .virtual_address = 0x1100,
+            .file_size = 2 * sizeof(Elf64_Sym),
+            .memory_size = 2 * sizeof(Elf64_Sym),
+        },
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R,
+            .offset = 0x200,
+            .virtual_address = 0x1200,
+            .file_size = 8,
+            .memory_size = 8,
+        },
+        dartplant::ElfProgramHeaderView{
+            .type = PT_LOAD,
+            .flags = PF_R,
+            .offset = 0x300,
+            .virtual_address = 0x1300,
+            .file_size = sizeof(table),
+            .memory_size = sizeof(table),
+        },
+    };
+    dartplant::FileElfReader reader(fixture.image, headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(ElfSysvHashRejectsMaximumNchainWithShortBacking) {
+    DynamicLookupFixture fixture;
+    fixture.WriteTargetSymbol();
+    fixture.view.sysv_hash_va = 0x1300;
+    const std::array<uint32_t, 2> header = {1, UINT32_MAX};
+    std::memcpy(fixture.image.data() + 0x300, header.data(), sizeof(header));
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(ElfSysvHashRejectsSelfCycle) {
+    DynamicLookupFixture fixture;
+    fixture.WriteTargetSymbol();
+    fixture.view.sysv_hash_va = 0x1300;
+    const std::array<uint32_t, 5> table = {1, 2, 1, 0, 1};
+    std::memcpy(fixture.image.data() + 0x300, table.data(), sizeof(table));
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(ElfSysvHashRejectsHugeDeclaredBucketTableWithShortBacking) {
+    DynamicLookupFixture fixture;
+    fixture.view.sysv_hash_va = 0x1300;
+    const std::array<uint32_t, 2> header = {UINT32_MAX, 2};
+    std::memcpy(fixture.image.data() + 0x300, header.data(), sizeof(header));
+    // SysVHash("a") == 97, so the bucket actually selected by the old lookup
+    // is still inside this small fixture and contains STN_UNDEF. The complete
+    // declared bucket array is not present and must dominate that early miss.
+    const uint32_t empty_bucket = STN_UNDEF;
+    WriteAt(&fixture.image, 0x300 + sizeof(header) + 97 * sizeof(uint32_t), empty_bucket);
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "a");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
 TEST_CASE(ElfDynamicLookupFindsGnuHashOnlySymbol) {
     DynamicLookupFixture fixture;
     fixture.WriteTargetSymbol();
@@ -638,6 +741,38 @@ TEST_CASE(ElfDynamicLookupFindsGnuHashOnlySymbol) {
     EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kFound),
               static_cast<uint32_t>(result.status));
     EXPECT_EQ(0x1600U, result.symbol.value);
+}
+
+TEST_CASE(ElfGnuHashRejectsTruncatedDeclaredBloomPrefixBeforeBloomMiss) {
+    DynamicLookupFixture fixture;
+    fixture.view.gnu_hash_va = 0x1400;
+    const std::array<uint32_t, 4> header = {1, 1, 2, 5};
+    std::memcpy(fixture.image.data() + 0x400, header.data(), sizeof(header));
+    const Elf64_Addr empty_bloom = 0;
+    WriteAt(&fixture.image, 0x410, empty_bloom);
+    // GnuHash("a") selects bloom word 0 for maskwords=2. The old lookup could
+    // return NotFound from that word without proving bloom[1] or bucket[0].
+    fixture.headers[0].file_size = 0x418;
+    fixture.headers[0].memory_size = 0x418;
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "a");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(ElfGnuHashRejectsHugeDeclaredBucketPrefixBeforeBloomMiss) {
+    DynamicLookupFixture fixture;
+    fixture.view.gnu_hash_va = 0x1400;
+    const std::array<uint32_t, 4> header = {UINT32_MAX, 1, 1, 5};
+    std::memcpy(fixture.image.data() + 0x400, header.data(), sizeof(header));
+    const Elf64_Addr empty_bloom = 0;
+    WriteAt(&fixture.image, 0x410, empty_bloom);
+
+    dartplant::FileElfReader reader(fixture.image, fixture.headers);
+    const auto result = dartplant::FindElfDynamicSymbol(reader, fixture.view, "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfDynamicLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
 }
 
 TEST_CASE(ElfGnuHashAcceptsLldBloomShift) {
@@ -987,6 +1122,25 @@ TEST_CASE(ElfProgramHeaderParserDoesNotNeedSectionHeaders) {
     EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfProgramHeaderLookupStatus::kFound),
               static_cast<uint32_t>(parsed_dynamic.status));
     EXPECT_EQ(0x40U, parsed_dynamic.header.virtual_address);
+}
+
+TEST_CASE(ElfProgramHeaderParserRejectsExtendedProgramHeaderNumberingUntilSupported) {
+    std::vector<uint8_t> bytes(sizeof(Elf64_Ehdr), 0);
+    Elf64_Ehdr header{};
+    std::memcpy(header.e_ident, ELFMAG, SELFMAG);
+    header.e_ident[EI_CLASS] = ELFCLASS64;
+    header.e_ident[EI_DATA] = ELFDATA2LSB;
+    header.e_ident[EI_VERSION] = EV_CURRENT;
+    header.e_type = ET_DYN;
+    header.e_machine = EM_AARCH64;
+    header.e_version = EV_CURRENT;
+    header.e_phoff = sizeof(Elf64_Ehdr);
+    header.e_phentsize = sizeof(Elf64_Phdr);
+    header.e_phnum = PN_XNUM;
+    WriteAt(&bytes, 0, header);
+
+    std::vector<dartplant::ElfProgramHeaderView> parsed;
+    EXPECT_TRUE(!dartplant::ParseElf64ProgramHeaders(bytes, &parsed));
 }
 
 TEST_CASE(ElfProgramHeaderParserValidatesLoadSegmentStructure) {

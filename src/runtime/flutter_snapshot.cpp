@@ -25,6 +25,8 @@ struct LoadedSnapshotSymbols {
 
 struct LoadedSnapshotLookup {
     const ModuleImage* module = nullptr;
+    const char* data_symbol = nullptr;
+    const char* instructions_symbol = nullptr;
     LoadedSnapshotSymbols symbols{};
     ElfDynamicLookupStatus status = ElfDynamicLookupStatus::kUnavailable;
     bool matched_module = false;
@@ -33,6 +35,7 @@ struct LoadedSnapshotLookup {
 int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
     auto* lookup = static_cast<LoadedSnapshotLookup*>(opaque);
     if (info == nullptr || lookup == nullptr || lookup->module == nullptr ||
+        lookup->data_symbol == nullptr || lookup->instructions_symbol == nullptr ||
         static_cast<uintptr_t>(info->dlpi_addr) != lookup->module->load_bias) {
         return 0;
     }
@@ -75,13 +78,12 @@ int FindLoadedSnapshotSymbols(dl_phdr_info* info, size_t, void* opaque) {
         lookup->status = ElfDynamicLookupStatus::kMalformed;
         return 1;
     }
-    const auto data = FindElfDynamicSymbol(reader, view.view, "_kDartIsolateSnapshotData");
+    const auto data = FindElfDynamicSymbol(reader, view.view, lookup->data_symbol);
     if (data.status != ElfDynamicLookupStatus::kFound) {
         lookup->status = data.status;
         return 1;
     }
-    const auto instructions =
-        FindElfDynamicSymbol(reader, view.view, "_kDartIsolateSnapshotInstructions");
+    const auto instructions = FindElfDynamicSymbol(reader, view.view, lookup->instructions_symbol);
     if (instructions.status != ElfDynamicLookupStatus::kFound) {
         lookup->status = instructions.status;
         return 1;
@@ -115,7 +117,9 @@ struct FileSnapshotLookup {
     ElfSectionSymbol isolate_instructions{};
 };
 
-FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& bytes) {
+FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& bytes,
+                                                  std::string_view data_symbol,
+                                                  std::string_view instructions_symbol) {
     std::vector<ElfProgramHeaderView> headers;
     if (!ParseElf64ProgramHeaders(bytes, &headers)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
@@ -136,10 +140,9 @@ FileSnapshotLookup FindFileDynamicSnapshotSymbols(const std::vector<uint8_t>& by
     if (view.status == ElfDynamicViewStatus::kMalformed) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
-    const auto data = FindElfDynamicSymbol(reader, view.view, "_kDartIsolateSnapshotData");
+    const auto data = FindElfDynamicSymbol(reader, view.view, data_symbol);
     if (data.status != ElfDynamicLookupStatus::kFound) return {.status = data.status};
-    const auto instructions =
-        FindElfDynamicSymbol(reader, view.view, "_kDartIsolateSnapshotInstructions");
+    const auto instructions = FindElfDynamicSymbol(reader, view.view, instructions_symbol);
     if (instructions.status != ElfDynamicLookupStatus::kFound) {
         return {.status = instructions.status};
     }
@@ -190,6 +193,28 @@ std::optional<DartSnapshotHeader> ReadSnapshotHeader(uintptr_t address, uint64_t
     if (address == 0 || size > SIZE_MAX) return std::nullopt;
     return ParseDartSnapshotHeader(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(address), static_cast<size_t>(size)));
+}
+
+std::optional<uint32_t> ReadDeferredProgramHash(const std::vector<uint8_t>& bytes,
+                                                const ElfSectionSymbol& symbol,
+                                                const DartSnapshotHeader& header) {
+    if (symbol.file_offset > bytes.size() || symbol.size > bytes.size() - symbol.file_offset ||
+        symbol.size > SIZE_MAX) {
+        return std::nullopt;
+    }
+    return ParseDartDeferredProgramHash(
+        std::span<const uint8_t>(bytes.data() + static_cast<size_t>(symbol.file_offset),
+                                 static_cast<size_t>(symbol.size)),
+        header);
+}
+
+std::optional<uint32_t> ReadDeferredProgramHash(uintptr_t address, uint64_t size,
+                                                const DartSnapshotHeader& header) {
+    if (address == 0 || size > SIZE_MAX) return std::nullopt;
+    return ParseDartDeferredProgramHash(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(address),
+                                 static_cast<size_t>(size)),
+        header);
 }
 
 bool HasFeature(std::string_view features, std::string_view feature) {
@@ -247,7 +272,16 @@ ElfSectionLookupResult FindElfSectionSymbol(std::span<const uint8_t> bytes,
         header.e_shentsize != sizeof(Elf64_Shdr)) {
         return {.status = ElfSectionLookupStatus::kMalformed};
     }
-    if (header.e_shnum == 0) return {.status = ElfSectionLookupStatus::kNotFound};
+    // ELF extended section numbering encodes the real section count in
+    // section-header[0].sh_size when e_shnum == 0 and a section table is
+    // present. DartPlant's section path is only a compatibility fallback for
+    // current Dart AOT producers, so do not silently reinterpret an extended
+    // table as "no sections". Keep the producer scope explicit and fail
+    // closed until SHN_XINDEX/SHT_SYMTAB_SHNDX are implemented together.
+    if (header.e_shnum == 0) {
+        return {.status = header.e_shoff == 0 ? ElfSectionLookupStatus::kNotFound
+                                              : ElfSectionLookupStatus::kMalformed};
+    }
     if (header.e_shoff > bytes.size() ||
         static_cast<uint64_t>(header.e_shnum) >
             (bytes.size() - static_cast<size_t>(header.e_shoff)) / sizeof(Elf64_Shdr)) {
@@ -335,9 +369,9 @@ ElfSectionLookupResult FindElfSectionSymbol(std::span<const uint8_t> bytes,
             if (symbol.st_value == 0) {
                 return {.status = ElfSectionLookupStatus::kMalformed};
             }
-            if (symbol.st_shndx == SHN_UNDEF || symbol.st_shndx >= header.e_shnum ||
-                symbol.st_size == 0 || symbol.st_size > SIZE_MAX ||
-                ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL ||
+            if (symbol.st_shndx == SHN_XINDEX || symbol.st_shndx == SHN_UNDEF ||
+                symbol.st_shndx >= header.e_shnum || symbol.st_size == 0 ||
+                symbol.st_size > SIZE_MAX || ELF64_ST_BIND(symbol.st_info) != STB_GLOBAL ||
                 ELF64_ST_TYPE(symbol.st_info) != STT_OBJECT) {
                 return {.status = ElfSectionLookupStatus::kMalformed};
             }
@@ -434,12 +468,33 @@ std::optional<DartSnapshotHeader> ParseDartSnapshotHeader(std::span<const uint8_
     const size_t remaining = static_cast<size_t>(declared_length) - kHeaderSize - kHashSize;
     const size_t feature_length = strnlen(features, remaining);
     if (feature_length == remaining) return std::nullopt;
+    const uint64_t payload_offset =
+        static_cast<uint64_t>(kHeaderSize + kHashSize + feature_length + 1);
+    if (payload_offset > declared_length) return std::nullopt;
     return DartSnapshotHeader{
         .declared_length = declared_length,
         .kind = static_cast<uint64_t>(kind),
+        .payload_offset = payload_offset,
         .snapshot_hash = std::string(reinterpret_cast<const char*>(hash), kHashSize),
         .features = std::string(features, feature_length),
     };
+}
+
+std::optional<uint32_t> ParseDartDeferredProgramHash(std::span<const uint8_t> bytes,
+                                                     const DartSnapshotHeader& header) {
+    constexpr uint64_t kProgramHashSize = sizeof(uint32_t);
+    if (header.payload_offset > header.declared_length ||
+        kProgramHashSize > header.declared_length - header.payload_offset ||
+        header.declared_length > bytes.size()) {
+        return std::nullopt;
+    }
+    const size_t offset = static_cast<size_t>(header.payload_offset);
+    // Supported DartPlant AOT producers are Android ARM64 little-endian. Read
+    // the serialized uint32_t explicitly so host endianness never leaks into
+    // artifact provenance.
+    return static_cast<uint32_t>(bytes[offset]) | (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<uint32_t>(bytes[offset + 3]) << 24);
 }
 
 std::optional<std::string> SelectFlutterSnapshotProfile(std::string_view features) {
@@ -506,10 +561,18 @@ std::optional<uintptr_t> FlutterSnapshotSource::ResolveInstructionOffset(
     return ResolveInstructionRange(module, instruction_offset, 4);
 }
 
-std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& module,
-                                                             std::string* error) {
+namespace {
+
+std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshotWithSymbols(
+    const ModuleImage& module, const char* data_symbol, const char* instructions_symbol,
+    bool deferred_unit, std::string* error) {
+    if (data_symbol == nullptr || instructions_symbol == nullptr) {
+        if (error != nullptr) *error = "Flutter snapshot symbol contract is invalid";
+        return std::nullopt;
+    }
     const auto build_source =
-        [&](const DartSnapshotHeader& header, uint64_t instructions_va, uint64_t instructions_size,
+        [&](const DartSnapshotHeader& header, std::optional<uint32_t> deferred_program_hash,
+            uint64_t instructions_va, uint64_t instructions_size,
             uintptr_t instructions_runtime) -> std::optional<FlutterSnapshotSource> {
         FlutterSnapshotSource source;
         source.module_name = module.name;
@@ -529,13 +592,18 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
         source.compressed_pointers =
             HasFeature(source.snapshot_features, "compressed-pointers") &&
             !HasFeature(source.snapshot_features, "no-compressed-pointers");
+        source.deferred_program_hash = deferred_program_hash;
         return source;
     };
 
     // Dynamic symbols are the canonical Dart AOT artifact contract. Resolve
     // them from the loaded PT_DYNAMIC view first so discovery does not depend
     // on section headers or the backing file remaining readable after load.
-    LoadedSnapshotLookup loaded{.module = &module};
+    LoadedSnapshotLookup loaded{
+        .module = &module,
+        .data_symbol = data_symbol,
+        .instructions_symbol = instructions_symbol,
+    };
     dl_iterate_phdr(FindLoadedSnapshotSymbols, &loaded);
     if (loaded.matched_module && loaded.status == ElfDynamicLookupStatus::kFound) {
         const auto header =
@@ -544,7 +612,15 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
             if (error != nullptr) *error = "loaded Dart isolate snapshot header is not recognized";
             return std::nullopt;
         }
-        return build_source(*header, loaded.symbols.isolate_instructions_va,
+        const auto program_hash =
+            deferred_unit ? ReadDeferredProgramHash(loaded.symbols.isolate_data,
+                                                    loaded.symbols.isolate_data_size, *header)
+                          : std::optional<uint32_t>{};
+        if (deferred_unit && !program_hash.has_value()) {
+            if (error != nullptr) *error = "loaded deferred Dart program hash is malformed";
+            return std::nullopt;
+        }
+        return build_source(*header, program_hash, loaded.symbols.isolate_instructions_va,
                             loaded.symbols.isolate_instructions_size,
                             loaded.symbols.isolate_instructions);
     }
@@ -565,11 +641,19 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
 
     // The same PT_DYNAMIC semantics work for the file image, except ELF VAs
     // are translated through PT_LOAD p_filesz instead of load_bias+p_vaddr.
-    const FileSnapshotLookup dynamic = FindFileDynamicSnapshotSymbols(*bytes);
+    const FileSnapshotLookup dynamic =
+        FindFileDynamicSnapshotSymbols(*bytes, data_symbol, instructions_symbol);
     if (dynamic.status == ElfDynamicLookupStatus::kFound) {
         const auto header = ReadSnapshotHeader(*bytes, dynamic.isolate_data);
         if (!header.has_value()) {
             if (error != nullptr) *error = "Dart isolate snapshot header is not recognized";
+            return std::nullopt;
+        }
+        const auto program_hash =
+            deferred_unit ? ReadDeferredProgramHash(*bytes, dynamic.isolate_data, *header)
+                          : std::optional<uint32_t>{};
+        if (deferred_unit && !program_hash.has_value()) {
+            if (error != nullptr) *error = "deferred Dart program hash is malformed";
             return std::nullopt;
         }
         if (dynamic.isolate_instructions.value > UINTPTR_MAX - module.load_bias) {
@@ -582,7 +666,7 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
             if (error != nullptr) *error = "Dart isolate snapshot instructions are not executable";
             return std::nullopt;
         }
-        return build_source(*header, dynamic.isolate_instructions.value,
+        return build_source(*header, program_hash, dynamic.isolate_instructions.value,
                             dynamic.isolate_instructions.size, runtime);
     }
     if (dynamic.status != ElfDynamicLookupStatus::kUnavailable) {
@@ -602,9 +686,8 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
         if (error != nullptr) *error = "Flutter app ELF program headers are malformed";
         return std::nullopt;
     }
-    const auto isolate_data = FindElfSectionSymbol(*bytes, headers, "_kDartIsolateSnapshotData");
-    const auto isolate_instr =
-        FindElfSectionSymbol(*bytes, headers, "_kDartIsolateSnapshotInstructions");
+    const auto isolate_data = FindElfSectionSymbol(*bytes, headers, data_symbol);
+    const auto isolate_instr = FindElfSectionSymbol(*bytes, headers, instructions_symbol);
     if (isolate_data.status == ElfSectionLookupStatus::kMalformed ||
         isolate_instr.status == ElfSectionLookupStatus::kMalformed) {
         if (error != nullptr) *error = "Flutter app section-table snapshot symbols are malformed";
@@ -627,12 +710,33 @@ std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& 
         if (error != nullptr) *error = "Dart isolate snapshot header is not recognized";
         return std::nullopt;
     }
+    const auto program_hash = deferred_unit
+                                  ? ReadDeferredProgramHash(*bytes, isolate_data.symbol, *header)
+                                  : std::optional<uint32_t>{};
+    if (deferred_unit && !program_hash.has_value()) {
+        if (error != nullptr) *error = "deferred Dart program hash is malformed";
+        return std::nullopt;
+    }
     if (isolate_instr.symbol.value > UINTPTR_MAX - module.load_bias) {
         if (error != nullptr) *error = "Dart isolate snapshot instructions VA overflows runtime";
         return std::nullopt;
     }
-    return build_source(*header, isolate_instr.symbol.value, isolate_instr.symbol.size,
-                        module.load_bias + isolate_instr.symbol.value);
+    return build_source(*header, program_hash, isolate_instr.symbol.value,
+                        isolate_instr.symbol.size, module.load_bias + isolate_instr.symbol.value);
+}
+
+}  // namespace
+
+std::optional<FlutterSnapshotSource> DiscoverFlutterSnapshot(const ModuleImage& module,
+                                                             std::string* error) {
+    return DiscoverFlutterSnapshotWithSymbols(module, "_kDartIsolateSnapshotData",
+                                              "_kDartIsolateSnapshotInstructions", false, error);
+}
+
+std::optional<FlutterSnapshotSource> DiscoverDeferredFlutterSnapshot(const ModuleImage& module,
+                                                                     std::string* error) {
+    return DiscoverFlutterSnapshotWithSymbols(module, "_kDartIsolateSnapshotData",
+                                              "_kDartIsolateSnapshotInstructions", true, error);
 }
 
 }  // namespace dartplant

@@ -91,6 +91,12 @@ typedef struct DartPlantLiveVmProfile {
     uint32_t code_monomorphic_entry_point_offset;
     uint32_t code_monomorphic_unchecked_entry_point_offset;
     uint32_t function_unchecked_entry_point_offset;
+
+    // V3 append-only extension. ObjectStore.loading_units is used only after
+    // the core runtime-root capability has been source/runtime proven. Entry
+    // zero contains the root program hash Smi used by Dart's deferred-loading
+    // reader to reject loading units from a different program.
+    uint32_t object_store_loading_units_offset;
 } DartPlantLiveVmProfile;
 
 typedef struct DartPlantLiveVmArm64Registers {
@@ -223,6 +229,15 @@ typedef struct DartPlantLiveVmFunctionInfo {
     uint8_t entry_kind_mask;
     uint8_t closure_call_entry_only;
     uint8_t reserved_entry_flags[6];
+
+    // V3 append-only runtime-image namespace. Zero means the caller used a
+    // legacy single-image enumeration path. A non-zero id names the exact
+    // RuntimeImage whose isolate-instructions coordinate system owns every
+    // entry VA in this record. loading_unit_id is 1 for the root unit and >1
+    // for source-identified deferred units.
+    uint64_t runtime_image_id;
+    uint32_t loading_unit_id;
+    uint32_t reserved_image;
 } DartPlantLiveVmFunctionInfo;
 
 typedef struct DartPlantLiveVmFunctionIndexInfo {

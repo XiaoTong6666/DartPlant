@@ -66,6 +66,7 @@ add_library(
     src/abi/runtime_evidence.cpp
     src/abi/value_codec.cpp
     src/runtime/flutter_snapshot.cpp
+    src/runtime/runtime_image_set.cpp
     src/runtime/snapshot_index.cpp
     src/runtime/dart_runtime_resolver.cpp
     src/runtime/default_runtime.cpp
@@ -395,6 +396,7 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
         tests/metadata_test.cc
         tests/hook_registry_test.cc
         tests/runtime_test.cc
+        tests/runtime_image_set_test.cc
         tests/live_vm_signature_test.cc
         tests/snapshot_index_test.cc
         tests/flutter_snapshot_test.cc

@@ -155,15 +155,24 @@ ElfDynamicLookupResult FindSysvSymbol(const ElfVaReader& reader, const ElfDynami
     }
     const uint32_t bucket_count = header[0];
     const uint32_t chain_count = header[1];
-    if (chain_count == 0) {
+    if (chain_count == 0 || view.symbol_entry_size != sizeof(Elf64_Sym)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     uint64_t buckets_va = 0;
     uint64_t bucket_va = 0;
     uint64_t buckets_size = 0;
+    uint64_t chains_size = 0;
+    uint64_t hash_table_size = 0;
+    uint64_t dynsym_size = 0;
     if (!CheckedAddVa(*view.sysv_hash_va, sizeof(header), &buckets_va) ||
-        !CheckedMulAddVa(buckets_va, SysvHash(name) % bucket_count, sizeof(uint32_t), &bucket_va) ||
-        !CheckedMul(bucket_count, sizeof(uint32_t), &buckets_size)) {
+        !CheckedMul(bucket_count, sizeof(uint32_t), &buckets_size) ||
+        !CheckedMul(chain_count, sizeof(uint32_t), &chains_size) ||
+        !CheckedAddVa(sizeof(header), buckets_size, &hash_table_size) ||
+        !CheckedAddVa(hash_table_size, chains_size, &hash_table_size) ||
+        !CheckedMul(chain_count, view.symbol_entry_size, &dynsym_size) ||
+        !DynamicAnchorReadable(reader, *view.sysv_hash_va, hash_table_size) ||
+        !DynamicAnchorReadable(reader, view.symtab_va, dynsym_size) ||
+        !CheckedMulAddVa(buckets_va, SysvHash(name) % bucket_count, sizeof(uint32_t), &bucket_va)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     uint32_t symbol_index = 0;
@@ -189,6 +198,9 @@ ElfDynamicLookupResult FindSysvSymbol(const ElfVaReader& reader, const ElfDynami
         uint64_t chain_va = 0;
         if (!CheckedMulAddVa(chains_va, symbol_index, sizeof(uint32_t), &chain_va) ||
             !ReadValue(reader, chain_va, &next)) {
+            return {.status = ElfDynamicLookupStatus::kMalformed};
+        }
+        if (next == symbol_index) {
             return {.status = ElfDynamicLookupStatus::kMalformed};
         }
         symbol_index = next;
@@ -222,12 +234,23 @@ ElfDynamicLookupResult FindGnuSymbol(const ElfVaReader& reader, const ElfDynamic
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
 
-    const uint32_t hash = GnuHash(name);
-    constexpr uint32_t kWordBits = sizeof(Elf64_Addr) * 8;
     uint64_t bloom_base = 0;
-    if (!CheckedAddVa(*view.gnu_hash_va, sizeof(header), &bloom_base)) {
+    uint64_t bloom_size = 0;
+    uint64_t buckets_va = 0;
+    uint64_t buckets_size = 0;
+    uint64_t fixed_table_size = 0;
+    if (!CheckedAddVa(*view.gnu_hash_va, sizeof(header), &bloom_base) ||
+        !CheckedMul(bloom_words, sizeof(Elf64_Addr), &bloom_size) ||
+        !CheckedAddVa(bloom_base, bloom_size, &buckets_va) ||
+        !CheckedMul(bucket_count, sizeof(uint32_t), &buckets_size) ||
+        !CheckedAddVa(sizeof(header), bloom_size, &fixed_table_size) ||
+        !CheckedAddVa(fixed_table_size, buckets_size, &fixed_table_size) ||
+        !DynamicAnchorReadable(reader, *view.gnu_hash_va, fixed_table_size)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
+
+    const uint32_t hash = GnuHash(name);
+    constexpr uint32_t kWordBits = sizeof(Elf64_Addr) * 8;
     const uint64_t bloom_index = (hash / kWordBits) & (bloom_words - 1);
     Elf64_Addr bloom = 0;
     uint64_t bloom_va = 0;
@@ -239,12 +262,8 @@ ElfDynamicLookupResult FindGnuSymbol(const ElfVaReader& reader, const ElfDynamic
                             (Elf64_Addr{1} << ((hash >> bloom_shift) % kWordBits));
     if ((bloom & mask) != mask) return {.status = ElfDynamicLookupStatus::kNotFound};
 
-    uint64_t bloom_size = 0;
-    uint64_t buckets_va = 0;
     uint64_t bucket_va = 0;
-    if (!CheckedMul(bloom_words, sizeof(Elf64_Addr), &bloom_size) ||
-        !CheckedAddVa(bloom_base, bloom_size, &buckets_va) ||
-        !CheckedMulAddVa(buckets_va, hash % bucket_count, sizeof(uint32_t), &bucket_va)) {
+    if (!CheckedMulAddVa(buckets_va, hash % bucket_count, sizeof(uint32_t), &bucket_va)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     uint32_t symbol_index = 0;
@@ -254,10 +273,8 @@ ElfDynamicLookupResult FindGnuSymbol(const ElfVaReader& reader, const ElfDynamic
     if (symbol_index == 0) return {.status = ElfDynamicLookupStatus::kNotFound};
     if (symbol_index < symbol_offset) return {.status = ElfDynamicLookupStatus::kMalformed};
 
-    uint64_t buckets_size = 0;
     uint64_t chains_va = 0;
-    if (!CheckedMul(bucket_count, sizeof(uint32_t), &buckets_size) ||
-        !CheckedAddVa(buckets_va, buckets_size, &chains_va)) {
+    if (!CheckedAddVa(buckets_va, buckets_size, &chains_va)) {
         return {.status = ElfDynamicLookupStatus::kMalformed};
     }
     const auto remaining = reader.ReadableBytes(chains_va);

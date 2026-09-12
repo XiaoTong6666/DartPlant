@@ -19,6 +19,7 @@
 #include "dartplant/invocation.h"
 #include "dartplant/runtime.h"
 #include "runtime/flutter_snapshot_internal.h"
+#include "runtime/runtime_image_set.h"
 #include "runtime/snapshot_index.h"
 #include "vm/object_bridge.h"
 #include "vm/runtime_profiles.h"
@@ -108,7 +109,15 @@ struct DartPlantRuntime {
     std::vector<dartplant::ModuleImage> modules;
     std::optional<dartplant::ModuleImage> selected_app_module;
     std::optional<dartplant::ModuleImage> selected_runtime_module;
+    // Optional executable address owned by the concrete Flutter engine that
+    // created/owns this runtime instance. Required to disambiguate multiple
+    // same-name/same-build libflutter.so mappings in one process.
+    uintptr_t engine_anchor = 0;
     std::optional<dartplant::FlutterSnapshotSource> snapshot;
+    // Complete Dart AOT instruction namespace for this app incarnation. The
+    // legacy selected_app_module/snapshot fields above are projections of the
+    // root loading unit kept for public ABI/source compatibility.
+    dartplant::RuntimeImageSet image_set;
     // Built automatically from live Class.functions/Library.toplevel_class.
     std::optional<dartplant::SnapshotIndex> live_snapshot_index;
     // Optional exact compiler/artifact sidecar for Functions deliberately

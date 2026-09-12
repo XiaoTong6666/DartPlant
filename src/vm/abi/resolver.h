@@ -49,6 +49,8 @@ struct CapabilityProofRecord {
     AbiDomainMask abi_domains = 0;
     uint64_t artifact_generation = 0;
     uint64_t isolate_generation = 0;
+    uint64_t isolate_group = 0;
+    uintptr_t engine_load_bias = 0;
 };
 
 struct CapabilityDescriptor {

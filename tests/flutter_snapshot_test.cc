@@ -125,10 +125,10 @@ uint32_t GnuHash(std::string_view name) {
     return hash;
 }
 
-std::vector<uint8_t> MakeDynamicSnapshotElf(DynamicHashStyle hash_style,
-                                            bool duplicate_dynamic = false,
-                                            bool add_valid_sections = false,
-                                            bool executable_instructions = true) {
+std::vector<uint8_t> MakeDynamicSnapshotElf(
+    DynamicHashStyle hash_style, bool duplicate_dynamic = false, bool add_valid_sections = false,
+    bool executable_instructions = true,
+    std::optional<uint32_t> deferred_program_hash = std::nullopt) {
     constexpr size_t kDynamicOffset = 0x400;
     constexpr uint64_t kDynamicVa = 0x400;
     constexpr size_t kSymtabOffset = 0x600;
@@ -143,8 +143,15 @@ std::vector<uint8_t> MakeDynamicSnapshotElf(DynamicHashStyle hash_style,
     constexpr std::string_view kDataName = "_kDartIsolateSnapshotData";
     constexpr std::string_view kInstructionsName = "_kDartIsolateSnapshotInstructions";
 
-    const auto snapshot =
+    auto snapshot =
         MakeFullAotSnapshotHeader("product arm64 android compressed-pointers null-safety");
+    if (deferred_program_hash.has_value()) {
+        const size_t payload_offset = snapshot.size();
+        snapshot.resize(snapshot.size() + sizeof(uint32_t));
+        WriteAt(&snapshot, payload_offset, *deferred_program_hash);
+        const int64_t stored_length = static_cast<int64_t>(snapshot.size() - sizeof(int32_t));
+        WriteAt(&snapshot, sizeof(int32_t), stored_length);
+    }
     std::vector<uint8_t> bytes(0x4000, 0);
 
     const Elf64_Half base_phnum = 5;  // R metadata/data, three RX loads, PT_DYNAMIC.
@@ -434,6 +441,25 @@ TEST_CASE(DartSnapshotHeaderValidatesDeclaredLengthAndFullAotKind) {
     EXPECT_EQ(std::string("0123456789abcdef0123456789abcdef"), parsed->snapshot_hash);
     EXPECT_EQ(std::string("product arm64 android compressed-pointers null-safety"),
               parsed->features);
+    EXPECT_EQ(bytes.size(), parsed->payload_offset);
+}
+
+TEST_CASE(DartDeferredProgramHashStartsImmediatelyAfterVersionAndFeatures) {
+    auto bytes = MakeFullAotSnapshotHeader("product arm64 android compressed-pointers null-safety");
+    const size_t program_hash_offset = bytes.size();
+    bytes.resize(bytes.size() + sizeof(uint32_t));
+    constexpr uint32_t kProgramHash = 0x1a30145f;
+    WriteAt(&bytes, program_hash_offset, kProgramHash);
+    const int64_t stored_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), stored_length);
+
+    const auto parsed = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(parsed.has_value());
+    EXPECT_EQ(program_hash_offset, parsed->payload_offset);
+    EXPECT_EQ(kProgramHash, dartplant::ParseDartDeferredProgramHash(bytes, *parsed).value_or(0));
+
+    bytes.resize(program_hash_offset + sizeof(uint32_t) - 1);
+    EXPECT_FALSE(dartplant::ParseDartDeferredProgramHash(bytes, *parsed).has_value());
 }
 
 TEST_CASE(DartSnapshotHeaderRejectsWrongKindAndLengthBeyondSymbol) {
@@ -464,6 +490,39 @@ TEST_CASE(FlutterSectionFallbackUsesBoundedStringTableLookup) {
               static_cast<uint32_t>(result.status));
     EXPECT_EQ(0x5000U, result.symbol.value);
     EXPECT_EQ(0x300U, result.symbol.file_offset);
+}
+
+TEST_CASE(FlutterSectionFallbackRejectsExtendedSectionNumberingUntilSupported) {
+    auto bytes = MakeSectionSymbolElf();
+    Elf64_Ehdr header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    // gABI extended numbering: e_shnum==0 with a non-zero section table
+    // means the actual count lives in section-header[0].sh_size. The fallback
+    // intentionally does not implement that producer shape yet.
+    header.e_shnum = 0;
+    WriteAt(&bytes, 0, header);
+    Elf64_Shdr section0{};
+    std::memcpy(&section0, bytes.data() + 0x100, sizeof(section0));
+    section0.sh_size = 4;
+    WriteAt(&bytes, 0x100, section0);
+
+    const auto result =
+        dartplant::FindElfSectionSymbol(bytes, SectionSymbolProgramHeaders(), "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfSectionLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
+}
+
+TEST_CASE(FlutterSectionFallbackRejectsShnXindexUntilSymtabShndxIsSupported) {
+    auto bytes = MakeSectionSymbolElf();
+    Elf64_Sym symbol{};
+    std::memcpy(&symbol, bytes.data() + 0x200 + sizeof(Elf64_Sym), sizeof(symbol));
+    symbol.st_shndx = SHN_XINDEX;
+    WriteAt(&bytes, 0x200 + sizeof(Elf64_Sym), symbol);
+
+    const auto result =
+        dartplant::FindElfSectionSymbol(bytes, SectionSymbolProgramHeaders(), "target");
+    EXPECT_EQ(static_cast<uint32_t>(dartplant::ElfSectionLookupStatus::kMalformed),
+              static_cast<uint32_t>(result.status));
 }
 
 TEST_CASE(FlutterSectionFallbackRejectsSectionMappingThatConflictsWithPtLoad) {
@@ -726,6 +785,36 @@ TEST_CASE(FlutterDynamicGnuDiscoveryRunsEndToEndWithoutSectionTable) {
     EXPECT_EQ(kSyntheticInstructionsVa, snapshot->isolate_instructions_va);
     EXPECT_EQ(kSyntheticLoadBias + kSyntheticInstructionsVa,
               snapshot->isolate_instructions_runtime);
+}
+
+TEST_CASE(FlutterDeferredDynamicDiscoveryUsesIsolateSnapshotSymbols) {
+    constexpr uint32_t kProgramHash = 0x1a30145f;
+    const auto bytes =
+        MakeDynamicSnapshotElf(DynamicHashStyle::kSysv, false, false, true, kProgramHash);
+    TemporaryElfFile file(bytes);
+    auto module = MakeSyntheticModule(bytes, file.path());
+    module.name = "libapp.so-2.part.so";
+
+    std::string error;
+    const auto snapshot = dartplant::DiscoverDeferredFlutterSnapshot(module, &error);
+    EXPECT_TRUE(snapshot.has_value());
+    EXPECT_TRUE(error.empty());
+    EXPECT_EQ(std::string("0123456789abcdef0123456789abcdef"), snapshot->snapshot_hash);
+    EXPECT_EQ(kSyntheticInstructionsVa, snapshot->isolate_instructions_va);
+    EXPECT_EQ(kSyntheticLoadBias + kSyntheticInstructionsVa,
+              snapshot->isolate_instructions_runtime);
+    EXPECT_EQ(kProgramHash, snapshot->deferred_program_hash.value_or(0));
+}
+
+TEST_CASE(FlutterDeferredDynamicDiscoveryRequiresSerializedProgramHash) {
+    const auto bytes = MakeDynamicSnapshotElf(DynamicHashStyle::kSysv);
+    TemporaryElfFile file(bytes);
+    auto module = MakeSyntheticModule(bytes, file.path());
+    module.name = "libapp.so-2.part.so";
+
+    std::string error;
+    EXPECT_FALSE(dartplant::DiscoverDeferredFlutterSnapshot(module, &error).has_value());
+    EXPECT_EQ(std::string("deferred Dart program hash is malformed"), error);
 }
 
 TEST_CASE(FlutterDynamicDiscoveryRequiresCanonicalProgramHeaderOffset) {

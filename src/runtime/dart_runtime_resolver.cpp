@@ -43,12 +43,14 @@ struct ModuleSelection {
 };
 
 ModuleSelection SelectProfileModule(const std::vector<ModuleImage>& modules,
-                                    const std::string& name, const std::string& build_id) {
+                                    const std::string& name, const std::string& build_id,
+                                    uintptr_t executable_anchor = 0) {
     const bool exact_path = name.find('/') != std::string::npos;
     ModuleSelection selection;
     for (const auto& module : modules) {
         const bool name_matches = exact_path ? module.path == name : module.name == name;
         if (!name_matches || !BuildIdMatches(module, build_id)) continue;
+        if (executable_anchor != 0 && !module.ContainsExecutable(executable_anchor, 1)) continue;
         if (selection.candidate_count != UINT32_MAX) ++selection.candidate_count;
         if (selection.module.has_value()) {
             selection.state = ModuleSelectionState::kAmbiguous;
@@ -113,7 +115,8 @@ bool SameSnapshotIdentity(const std::optional<FlutterSnapshotSource>& left,
            left->isolate_instructions_va == right->isolate_instructions_va &&
            left->isolate_instructions_size == right->isolate_instructions_size &&
            left->isolate_instructions_runtime == right->isolate_instructions_runtime &&
-           left->compressed_pointers == right->compressed_pointers;
+           left->compressed_pointers == right->compressed_pointers &&
+           left->deferred_program_hash == right->deferred_program_hash;
 }
 
 bool SameSemanticContext(const DartPlantLiveVmContext& left, uint64_t left_null,
@@ -127,6 +130,36 @@ bool SameSemanticContext(const DartPlantLiveVmContext& left, uint64_t left_null,
            left.pp == right.pp && left.global_object_pool == right.global_object_pool &&
            left.object_pool_length == right.object_pool_length && left_null == right_null &&
            left_bool_true == right_bool_true && left_bool_false == right_bool_false;
+}
+
+std::optional<RuntimeImageSet> BuildRuntimeImageSet(
+    const std::vector<ModuleImage>& modules, const std::optional<ModuleImage>& root_module,
+    const std::optional<FlutterSnapshotSource>& root_snapshot, uint64_t runtime_generation,
+    std::string* error) {
+    RuntimeImageSet result;
+    if (!root_module.has_value() || !root_snapshot.has_value()) return result;
+    if (!result.SetRoot(*root_module, *root_snapshot, runtime_generation, error)) {
+        return std::nullopt;
+    }
+
+    for (const auto& module : modules) {
+        const auto unit_id = ParseDeferredLoadingUnitId(root_module->name, module.name);
+        if (!unit_id.has_value()) continue;
+        std::string deferred_error;
+        const auto snapshot = DiscoverDeferredFlutterSnapshot(module, &deferred_error);
+        if (!snapshot.has_value()) {
+            if (error != nullptr) {
+                *error = deferred_error.empty()
+                             ? "deferred loading-unit module has no usable Dart snapshot source"
+                             : deferred_error;
+            }
+            return std::nullopt;
+        }
+        if (!result.AddDeferred(module, *snapshot, *unit_id, runtime_generation, error)) {
+            return std::nullopt;
+        }
+    }
+    return result;
 }
 
 std::mutex& RuntimeRegistryMutex() {
@@ -203,8 +236,8 @@ void ReleaseRuntimeOperation(std::shared_ptr<RuntimeRegistration>* registration)
 }
 
 DartPlantStatus ResolveLiveIndexedRuntimeMethod(
-    const SnapshotIndex& index, const ModuleImage& module, DartEntryTargetRegistry& entry_targets,
-    const DartPlantMethodQuery& query,
+    const SnapshotIndex& index, const RuntimeImageSet* image_set, const ModuleImage& root_module,
+    DartEntryTargetRegistry& entry_targets, const DartPlantMethodQuery& query,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
     uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
     bool ambiguous = false;
@@ -220,13 +253,34 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
         SetLastError("Dart method was not found in the live Function index");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
-    if (module.name != index.module_name ||
-        (!index.module_path.empty() && module.path != index.module_path) ||
-        !BuildIdMatches(module, index.build_id)) {
+    if (root_module.name != index.module_name ||
+        (!index.module_path.empty() && root_module.path != index.module_path) ||
+        !BuildIdMatches(root_module, index.build_id)) {
         SetLastError("live Function index module identity does not match the selected app image");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    if (!module.ContainsExecutable(record->runtime_entry, record->code_size)) {
+    const RuntimeImage* owning_image = nullptr;
+    const ModuleImage* module = &root_module;
+    uint64_t image_id = record->runtime_image_id;
+    if (image_id != kInvalidRuntimeImageId) {
+        if (image_set == nullptr || (owning_image = image_set->FindById(image_id)) == nullptr) {
+            SetLastError("live Function index references an unknown runtime image");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        if (record->loading_unit_id != 0 &&
+            record->loading_unit_id != owning_image->loading_unit_id) {
+            SetLastError("live Function loading-unit identity disagrees with runtime image");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        if (owning_image->runtime_generation != expected_runtime_generation ||
+            owning_image->live_entry_count == 0) {
+            SetLastError(
+                "live Function runtime image is not semantically bound to this runtime generation");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        module = &owning_image->module;
+    }
+    if (!module->ContainsExecutable(record->runtime_entry, record->code_size)) {
         SetLastError("live Function index entry is outside executable module ranges");
         return DARTPLANT_ADDRESS_OUTSIDE_EXECUTABLE;
     }
@@ -244,7 +298,8 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     auto code_target = entry_targets.GetOrCreate(
         record->runtime_entry, static_cast<uint32_t>(record->code_size), record->code_object,
         record->entry_alias_count, DARTPLANT_CODE_IDENTITY_UNKNOWN,
-        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length);
+        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length,
+        image_id);
     if (code_target == nullptr) {
         SetLastError("live Function index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
@@ -256,6 +311,7 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     }
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
+    function->image_id = image_id;
     function->function_object = record->function_object;
     function->code_object = record->code_object;
     function->source = DartFunctionSource::kLiveVm;
@@ -269,7 +325,7 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
 
     auto* method = new DartPlantMethod;
     method->record = std::move(method_record);
-    method->module = module;
+    method->module = *module;
     method->function = std::move(function);
     method->runtime_generation = runtime_generation;
     method->expected_runtime_generation = expected_runtime_generation;
@@ -280,7 +336,7 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
 
 DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     const SnapshotIndex& index, const FlutterSnapshotSource& snapshot, const ModuleImage& module,
-    DartEntryTargetRegistry& entry_targets, const DartPlantMethodQuery& query,
+    uint64_t image_id, DartEntryTargetRegistry& entry_targets, const DartPlantMethodQuery& query,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
     uint64_t expected_runtime_generation, DartPlantMethod** out_method) {
     bool ambiguous = false;
@@ -328,13 +384,15 @@ DartPlantStatus ResolveArtifactIndexedRuntimeMethod(
     auto code_target = entry_targets.GetOrCreate(
         record->runtime_entry, static_cast<uint32_t>(record->code_size), 0,
         std::max<uint32_t>(1, record->entry_alias_count), record->code_identity_proof,
-        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length);
+        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length,
+        image_id);
     if (code_target == nullptr) {
         SetLastError("artifact snapshot index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
     auto function = std::make_shared<DartFunctionHandle>();
     function->identity = MethodIdentityFromRecord(method_record);
+    function->image_id = image_id;
     function->source = DartFunctionSource::kOfflineSnapshotIndex;
     function->function_kind = record->function_kind;
     if (const RuntimeProfileRecord* profile =
@@ -688,8 +746,9 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     const auto old_dart_runtime = runtime->selected_runtime_module;
     const ModuleSelection app_selection = SelectProfileModule(
         modules, runtime->profile.app_module_name, runtime->profile.app_build_id);
-    const ModuleSelection dart_runtime_selection = SelectProfileModule(
-        modules, runtime->profile.runtime_module_name, runtime->profile.runtime_build_id);
+    const ModuleSelection dart_runtime_selection =
+        SelectProfileModule(modules, runtime->profile.runtime_module_name,
+                            runtime->profile.runtime_build_id, runtime->engine_anchor);
     runtime->diagnostics.module_candidate_count =
         app_selection.candidate_count + dart_runtime_selection.candidate_count;
     if (app_selection.state == ModuleSelectionState::kAmbiguous ||
@@ -714,6 +773,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->artifact_snapshot_index.reset();
         runtime->bound_artifact_snapshot_generation = 0;
         runtime->live_function_index_info = {};
+        runtime->image_set.Clear();
         runtime->modules = modules;
         runtime->selected_app_module.reset();
         runtime->selected_runtime_module.reset();
@@ -740,7 +800,21 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         snapshot = DiscoverFlutterSnapshot(*new_app, &snapshot_error);
     }
     const bool snapshot_changed = !SameSnapshotIdentity(runtime->snapshot, snapshot);
-    const bool relevant_identity_changed = app_changed || dart_runtime_changed || snapshot_changed;
+    std::string image_set_error;
+    auto image_set = BuildRuntimeImageSet(modules, new_app, snapshot,
+                                          runtime->generation->load(std::memory_order_acquire),
+                                          &image_set_error);
+    if (!image_set.has_value()) {
+        runtime->state = DARTPLANT_RUNTIME_FAILED;
+        SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY,
+                              DARTPLANT_RESOLVE_REJECTED, DARTPLANT_RUNTIME_NOT_READY,
+                              DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE);
+        SetLastError(image_set_error.empty() ? "runtime image set is malformed" : image_set_error);
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    const bool image_set_changed = !runtime->image_set.SameIdentity(*image_set);
+    const bool relevant_identity_changed =
+        app_changed || dart_runtime_changed || snapshot_changed || image_set_changed;
 
     runtime->modules = modules;
     // Publish the selected current incarnations before invalidation can fail,
@@ -750,6 +824,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     DartPlantStatus hook_invalidation_status = DARTPLANT_OK;
     if (relevant_identity_changed) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
+        image_set->BindGeneration(runtime->generation->load(std::memory_order_acquire));
         if (app_changed && old_app.has_value() && !old_app_mapping_present) {
             // The old app incarnation is confirmed absent. Its target address
             // may be unmapped or reused, so only retire registry ownership.
@@ -769,6 +844,9 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->artifact_snapshot_index.reset();
         runtime->bound_artifact_snapshot_generation = 0;
         runtime->live_function_index_info = {};
+        runtime->image_set = std::move(*image_set);
+    } else if (runtime->image_set.empty() && !image_set->empty()) {
+        runtime->image_set = std::move(*image_set);
     }
 
     if (hook_invalidation_status != DARTPLANT_OK) {
@@ -910,6 +988,13 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     const RuntimeProfileRecord* selected_profile = resolver.binding.core.representative;
     const DartPlantLiveVmProfile profile = selected_profile->live_vm;
     DartPlantStatus status = DARTPLANT_OK;
+    std::optional<uint32_t> root_program_hash;
+    if (runtime->image_set.size() > 1) {
+        uint32_t program_hash = 0;
+        status = ReadLiveVmRootProgramHashForProfile(context, *selected_profile, &program_hash);
+        if (status != DARTPLANT_OK) return status;
+        root_program_hash = program_hash;
+    }
     uint64_t bool_true_value = 0;
     uint64_t bool_false_value = 0;
     status = ResolveLiveVmCanonicalBoolRoots(context, profile, &bool_true_value, &bool_false_value);
@@ -918,16 +1003,50 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
     DartPlantLiveVmFunctionIndexInfo index_info{};
     index_info.struct_size = sizeof(index_info);
     std::string error;
-    auto index =
-        BuildLiveSnapshotIndex(context, snapshot_info, *selected_profile, &index_info, &error);
+    std::optional<SnapshotIndex> index;
+    if (!runtime->image_set.empty()) {
+        std::vector<LiveVmInstructionImage> instruction_images;
+        instruction_images.reserve(runtime->image_set.size());
+        for (const auto& image : runtime->image_set.images()) {
+            LiveVmInstructionImage descriptor{};
+            descriptor.runtime_image_id = image.id;
+            descriptor.loading_unit_id = image.loading_unit_id;
+            descriptor.snapshot.struct_size = sizeof(descriptor.snapshot);
+            FillSnapshotInfo(image.snapshot, &descriptor.snapshot);
+            instruction_images.push_back(descriptor);
+        }
+        index = BuildLiveSnapshotIndexForImages(context, instruction_images, *selected_profile,
+                                                &index_info, &error);
+    } else {
+        // Synthetic/legacy callers that seed runtime fields directly retain the
+        // single-image contract until they opt into RuntimeImageSet.
+        index =
+            BuildLiveSnapshotIndex(context, snapshot_info, *selected_profile, &index_info, &error);
+    }
     if (!index.has_value()) {
         SetLastError(error.empty() ? "failed to build live Function index" : error);
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    if (runtime->live_vm_context.has_value() &&
+    std::optional<RuntimeImageSet> semantically_bound_images;
+    if (!runtime->image_set.empty()) {
+        RuntimeImageSet rebound;
+        if (!BindLiveSnapshotImageSemantics(*index, runtime->image_set, &rebound, &error)) {
+            SetLastError(error.empty() ? "live Function image semantics are inconsistent" : error);
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        if (root_program_hash.has_value() && !rebound.BindDeferredProgramHash(*root_program_hash)) {
+            SetLastError(
+                "deferred runtime image program hash disagrees with the live isolate group");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        semantically_bound_images = std::move(rebound);
+    }
+    const bool semantic_context_changed =
+        runtime->live_vm_context.has_value() &&
         !SameSemanticContext(*runtime->live_vm_context, runtime->live_vm_null_value,
                              runtime->live_vm_bool_true_value, runtime->live_vm_bool_false_value,
-                             context, validated_null_value, bool_true_value, bool_false_value)) {
+                             context, validated_null_value, bool_true_value, bool_false_value);
+    if (semantic_context_changed) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
         const DartPlantStatus invalidation_status = InvalidateRuntimeHooks(runtime->generation);
         runtime->entry_targets.Clear();
@@ -936,6 +1055,11 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
             runtime->state = DARTPLANT_RUNTIME_FAILED;
             return invalidation_status;
         }
+    }
+    if (semantically_bound_images.has_value()) {
+        semantically_bound_images->BindGeneration(
+            runtime->generation->load(std::memory_order_acquire));
+        runtime->image_set = std::move(*semantically_bound_images);
     }
     runtime->live_vm_context = context;
     runtime->live_vm_core_candidates = resolver.binding.core.candidates.profiles;
@@ -1009,6 +1133,21 @@ DartPlantStatus dartplant_runtime_refresh_modules(DartPlantRuntime* runtime) {
     return dartplant::RefreshRuntimeModules(runtime, modules);
 }
 
+DartPlantStatus dartplant_runtime_bind_engine_anchor(DartPlantRuntime* runtime,
+                                                     const void* engine_address) {
+    if (runtime == nullptr) {
+        dartplant::SetLastError("runtime is null");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) return DARTPLANT_RUNTIME_NOT_READY;
+    {
+        std::lock_guard lock(runtime->mutex);
+        runtime->engine_anchor = reinterpret_cast<uintptr_t>(engine_address);
+    }
+    return dartplant::RefreshRuntimeModules(runtime, dartplant::EnumerateModules());
+}
+
 DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, const char*, void*) {
     return dartplant_runtime_refresh_modules(runtime);
 }
@@ -1027,6 +1166,7 @@ DartPlantStatus dartplant_runtime_on_module_unloading(DartPlantRuntime* runtime,
     runtime->live_snapshot_index.reset();
     runtime->artifact_snapshot_index.reset();
     runtime->bound_artifact_snapshot_generation = 0;
+    runtime->image_set.Clear();
     runtime->state = status == DARTPLANT_OK ? DARTPLANT_RUNTIME_CREATED : DARTPLANT_RUNTIME_FAILED;
     return status;
 }
@@ -1050,6 +1190,64 @@ DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
     out_info->runtime_module_loaded = runtime->selected_runtime_module.has_value() ? 1 : 0;
     out_info->live_function_index_ready = runtime->live_snapshot_index.has_value() ? 1 : 0;
     out_info->profile_matched = runtime->profile_matched ? 1 : 0;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_runtime_get_image_count(const DartPlantRuntime* runtime,
+                                                  uint32_t* out_count) {
+    if (runtime == nullptr || out_count == nullptr) {
+        dartplant::SetLastError("runtime image count arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) return DARTPLANT_RUNTIME_NOT_READY;
+    std::lock_guard lock(runtime->mutex);
+    if (runtime->image_set.size() > UINT32_MAX) {
+        dartplant::SetLastError("runtime image count exceeds public ABI range");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    *out_count = static_cast<uint32_t>(runtime->image_set.size());
+    dartplant::ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus dartplant_runtime_get_image_info(const DartPlantRuntime* runtime, uint32_t index,
+                                                 DartPlantRuntimeImageInfo* out_info) {
+    if (runtime == nullptr || out_info == nullptr || out_info->struct_size < sizeof(*out_info)) {
+        dartplant::SetLastError("runtime image info arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto operation = dartplant::AcquireRuntimeOperation(runtime);
+    if (!operation) return DARTPLANT_RUNTIME_NOT_READY;
+    std::lock_guard lock(runtime->mutex);
+    if (index >= runtime->image_set.size()) {
+        dartplant::SetLastError("runtime image index is out of range");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const auto& image = runtime->image_set.images()[index];
+    *out_info = {};
+    out_info->struct_size = sizeof(*out_info);
+    out_info->kind = image.kind == dartplant::RuntimeImageKind::kRoot
+                         ? DARTPLANT_RUNTIME_IMAGE_ROOT
+                         : DARTPLANT_RUNTIME_IMAGE_DEFERRED;
+    out_info->image_id = image.id;
+    out_info->runtime_generation = image.runtime_generation;
+    out_info->loading_unit_id = image.loading_unit_id;
+    out_info->module_name = image.module.name.c_str();
+    out_info->module_path = image.module.path.c_str();
+    out_info->module_build_id = image.module.build_id.c_str();
+    out_info->snapshot_hash = image.snapshot.snapshot_hash.c_str();
+    out_info->snapshot_features = image.snapshot.snapshot_features.c_str();
+    out_info->profile_name = image.snapshot.profile_name.c_str();
+    out_info->isolate_instructions_va = image.snapshot.isolate_instructions_va;
+    out_info->isolate_instructions_size = image.snapshot.isolate_instructions_size;
+    out_info->isolate_instructions_runtime = image.snapshot.isolate_instructions_runtime;
+    out_info->live_entry_count = image.live_entry_count;
+    out_info->live_semantic_bound = image.live_entry_count != 0 ? 1 : 0;
+    out_info->has_deferred_program_hash = image.snapshot.deferred_program_hash.has_value() ? 1 : 0;
+    out_info->deferred_program_hash_vm_bound = image.deferred_program_hash_vm_bound ? 1 : 0;
+    out_info->deferred_program_hash = image.snapshot.deferred_program_hash.value_or(0);
+    dartplant::ClearLastError();
     return DARTPLANT_OK;
 }
 
@@ -1619,10 +1817,17 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
     if (runtime->state == DARTPLANT_RUNTIME_READY && runtime->live_vm_context.has_value() &&
         runtime->live_snapshot_index.has_value()) {
         status = dartplant::ResolveLiveIndexedRuntimeMethod(
-            *runtime->live_snapshot_index, *runtime->selected_app_module, runtime->entry_targets,
-            *query, runtime->generation, runtime->generation->load(std::memory_order_acquire),
-            out_method);
-        if (status == DARTPLANT_OK && runtime->artifact_snapshot_index.has_value()) {
+            *runtime->live_snapshot_index,
+            runtime->image_set.empty() ? nullptr : &runtime->image_set,
+            *runtime->selected_app_module, runtime->entry_targets, *query, runtime->generation,
+            runtime->generation->load(std::memory_order_acquire), out_method);
+        const auto* root_image = runtime->image_set.Root();
+        const bool live_method_is_root =
+            status == DARTPLANT_OK && *out_method != nullptr &&
+            (*out_method)->function != nullptr &&
+            ((*out_method)->function->image_id == 0 ||
+             (root_image != nullptr && (*out_method)->function->image_id == root_image->id));
+        if (live_method_is_root && runtime->artifact_snapshot_index.has_value()) {
             const DartPlantStatus merge_status =
                 dartplant::MergeValidatedArtifactIdentityIntoLiveMethod(
                     *runtime->artifact_snapshot_index, *query, *out_method);
@@ -1634,10 +1839,11 @@ DartPlantStatus dartplant_runtime_find_method(DartPlantRuntime* runtime,
         }
     }
     if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->artifact_snapshot_index.has_value()) {
+        const auto* root_image = runtime->image_set.Root();
         status = dartplant::ResolveArtifactIndexedRuntimeMethod(
             *runtime->artifact_snapshot_index, *runtime->snapshot, *runtime->selected_app_module,
-            runtime->entry_targets, *query, runtime->generation,
-            runtime->generation->load(std::memory_order_acquire), out_method);
+            root_image == nullptr ? 0 : root_image->id, runtime->entry_targets, *query,
+            runtime->generation, runtime->generation->load(std::memory_order_acquire), out_method);
     }
     if (status == DARTPLANT_METHOD_NOT_FOUND && runtime->state != DARTPLANT_RUNTIME_READY) {
         dartplant::SetLastError(

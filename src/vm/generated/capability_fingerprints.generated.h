@@ -37,6 +37,7 @@ inline void AppendRuntimeRootsFields(std::string& key, const RuntimeProfileRecor
     AppendCapabilityValue(key, profile.live_vm.isolate_group_object_store_offset);  // isolate_group.object_store
     AppendCapabilityValue(key, profile.live_vm.class_table_num_cids_offset);  // class_table.num_cids
     AppendCapabilityValue(key, profile.live_vm.object_store_libraries_offset);  // object_store.libraries
+    AppendCapabilityValue(key, profile.live_vm.object_store_loading_units_offset);  // object_store.loading_units
     AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
     AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
     AppendCapabilityValue(key, profile.live_vm.growable_object_array_length_offset);  // growable_object_array.length
@@ -90,6 +91,7 @@ inline void AppendDartCoreFields(std::string& key, const RuntimeProfileRecord& p
     AppendCapabilityValue(key, profile.live_vm.isolate_group_object_store_offset);  // isolate_group.object_store
     AppendCapabilityValue(key, profile.live_vm.class_table_num_cids_offset);  // class_table.num_cids
     AppendCapabilityValue(key, profile.live_vm.object_store_libraries_offset);  // object_store.libraries
+    AppendCapabilityValue(key, profile.live_vm.object_store_loading_units_offset);  // object_store.loading_units
     AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
     AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
     AppendCapabilityValue(key, profile.live_vm.growable_object_array_length_offset);  // growable_object_array.length
@@ -126,6 +128,7 @@ inline void AppendSafepointStubsFields(std::string& key, const RuntimeProfileRec
     AppendCapabilityValue(key, profile.live_vm.isolate_group_object_store_offset);  // isolate_group.object_store
     AppendCapabilityValue(key, profile.live_vm.class_table_num_cids_offset);  // class_table.num_cids
     AppendCapabilityValue(key, profile.live_vm.object_store_libraries_offset);  // object_store.libraries
+    AppendCapabilityValue(key, profile.live_vm.object_store_loading_units_offset);  // object_store.loading_units
     AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
     AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
     AppendCapabilityValue(key, profile.live_vm.growable_object_array_length_offset);  // growable_object_array.length

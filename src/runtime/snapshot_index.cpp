@@ -1,7 +1,9 @@
 #include "runtime/snapshot_index.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <unordered_map>
 
 #include "core/internal.h"
 #include "vm/live_vm_internal.h"
@@ -80,6 +82,8 @@ bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& functio
         const uint64_t runtime_entry = RuntimeEntryForKind(function, kind);
         const uint64_t entry_va = EntryVaForKind(function, kind);
         index->functions.push_back({
+            .runtime_image_id = function.runtime_image_id,
+            .loading_unit_id = function.loading_unit_id,
             .library_uri = function.library_uri,
             .class_name = function.class_name,
             .function_name = function.function_name,
@@ -107,6 +111,107 @@ bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& functio
         });
     }
     index->live_function_infos.push_back(function);
+    return true;
+}
+
+bool BindLiveSnapshotImageSemantics(const SnapshotIndex& index,
+                                    const RuntimeImageSet& current_images,
+                                    RuntimeImageSet* out_images, std::string* error) {
+    if (out_images == nullptr) {
+        if (error != nullptr) *error = "live image semantic output is null";
+        return false;
+    }
+
+    struct FamilyState {
+        RuntimeImageId image_id = kInvalidRuntimeImageId;
+        uint32_t loading_unit_id = 0;
+        uint64_t code_object = 0;
+        uint8_t expected_entry_mask = 0;
+        uint8_t observed_entry_mask = 0;
+    };
+
+    std::unordered_map<uint64_t, FamilyState> families;
+    families.reserve(index.live_function_infos.size());
+    std::vector<RuntimeImageId> semantic_bindings;
+    semantic_bindings.reserve(index.live_function_infos.size());
+
+    for (const auto& function : index.live_function_infos) {
+        const uint8_t entry_mask = function.entry_kind_mask;
+        if (function.function == 0 || function.code == 0 || entry_mask == 0 ||
+            (entry_mask & ~uint8_t{0x0f}) != 0 ||
+            function.runtime_image_id == kInvalidRuntimeImageId) {
+            if (error != nullptr)
+                *error = "live Function entry family has incomplete image identity";
+            return false;
+        }
+        const RuntimeImage* image = current_images.FindById(function.runtime_image_id);
+        if (image == nullptr || function.loading_unit_id != image->loading_unit_id) {
+            if (error != nullptr)
+                *error = "live Function entry family disagrees with runtime image namespace";
+            return false;
+        }
+        const auto [_, inserted] =
+            families.emplace(function.function, FamilyState{
+                                                    .image_id = function.runtime_image_id,
+                                                    .loading_unit_id = function.loading_unit_id,
+                                                    .code_object = function.code,
+                                                    .expected_entry_mask = entry_mask,
+                                                });
+        if (!inserted) {
+            if (error != nullptr) *error = "live Function entry family is duplicated";
+            return false;
+        }
+        semantic_bindings.push_back(function.runtime_image_id);
+    }
+
+    for (const SnapshotFunction& record : index.functions) {
+        if (!record.live || record.function_object == 0 || record.code_object == 0 ||
+            record.runtime_image_id == kInvalidRuntimeImageId) {
+            if (error != nullptr) *error = "flattened live Function record is incomplete";
+            return false;
+        }
+        const auto family_it = families.find(record.function_object);
+        if (family_it == families.end()) {
+            if (error != nullptr)
+                *error = "flattened live Function record has no canonical entry family";
+            return false;
+        }
+        FamilyState& family = family_it->second;
+        if (record.code_object != family.code_object ||
+            record.runtime_image_id != family.image_id ||
+            record.loading_unit_id != family.loading_unit_id) {
+            if (error != nullptr)
+                *error = "flattened live Function record crosses runtime image identity";
+            return false;
+        }
+        const uint32_t raw_kind = static_cast<uint32_t>(record.entry_kind);
+        if (raw_kind >= 4) {
+            if (error != nullptr) *error = "flattened live Function record has invalid entry kind";
+            return false;
+        }
+        const uint8_t bit = static_cast<uint8_t>(1u << raw_kind);
+        if ((family.expected_entry_mask & bit) == 0 || (family.observed_entry_mask & bit) != 0) {
+            if (error != nullptr)
+                *error = "flattened live Function record disagrees with entry-family mask";
+            return false;
+        }
+        family.observed_entry_mask |= bit;
+    }
+
+    for (const auto& [_, family] : families) {
+        if (family.observed_entry_mask != family.expected_entry_mask) {
+            if (error != nullptr)
+                *error = "live Function entry family was only partially flattened";
+            return false;
+        }
+    }
+
+    RuntimeImageSet rebound = current_images;
+    if (!rebound.BindLiveEntries(semantic_bindings)) {
+        if (error != nullptr) *error = "live Function index references an unknown runtime image";
+        return false;
+    }
+    *out_images = std::move(rebound);
     return true;
 }
 
@@ -250,6 +355,36 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
                                                     const RuntimeProfileRecord& profile,
                                                     DartPlantLiveVmFunctionIndexInfo* out_info,
                                                     std::string* error) {
+    LiveVmInstructionImage image{};
+    image.runtime_image_id = 0;
+    image.loading_unit_id = 1;
+    image.snapshot = snapshot;
+    const std::array<LiveVmInstructionImage, 1> images = {image};
+    return BuildLiveSnapshotIndexForImages(context, images, profile, out_info, error);
+}
+
+std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& profile, DartPlantLiveVmFunctionIndexInfo* out_info,
+    std::string* error) {
+    if (images.empty()) {
+        if (error != nullptr) *error = "live snapshot index has no runtime images";
+        return std::nullopt;
+    }
+    const LiveVmInstructionImage* root_image = nullptr;
+    for (const auto& image : images) {
+        if (image.loading_unit_id != 1) continue;
+        if (root_image != nullptr) {
+            if (error != nullptr) *error = "live snapshot index has multiple root images";
+            return std::nullopt;
+        }
+        root_image = &image;
+    }
+    if (root_image == nullptr) {
+        if (error != nullptr) *error = "live snapshot index has no root image";
+        return std::nullopt;
+    }
+    const DartPlantFlutterSnapshotInfo& snapshot = root_image->snapshot;
     SnapshotIndex index;
     index.module_name = snapshot.module_name == nullptr ? "" : snapshot.module_name;
     index.module_path = snapshot.module_path == nullptr ? "" : snapshot.module_path;
@@ -263,8 +398,8 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
     LiveSnapshotBuildState state{.index = &index, .profile = &profile};
     DartPlantLiveVmFunctionIndexInfo local_info{};
     local_info.struct_size = sizeof(local_info);
-    const DartPlantStatus status = VisitLiveVmFunctionsForProfile(
-        context, snapshot, profile, AppendLiveSnapshotFunction, &state, &local_info);
+    const DartPlantStatus status = VisitLiveVmFunctionsForImages(
+        context, images, profile, AppendLiveSnapshotFunction, &state, &local_info);
     if (status != DARTPLANT_OK || state.failed || index.functions.empty()) {
         if (error != nullptr) {
             *error = status != DARTPLANT_OK ? dartplant_last_error()

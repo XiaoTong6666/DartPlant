@@ -178,8 +178,11 @@ ElfDynamicViewResult ReadElfDynamicView(const ElfVaReader& reader, uint64_t dyna
 
 // Exact dynamic-symbol lookup. At least one SysV/GNU hash index is required;
 // GNU hash is preferred when both styles are present, matching Android bionic.
-// GNU hash lookup uses bloom/bucket/chain semantics directly and does not
-// invent a SysV-style dynsym count.
+// SysV lookup first proves the complete declared bucket/chain table and the
+// nchain-parallel dynsym extent. GNU lookup proves the complete fixed
+// header/bloom/bucket prefix before applying Bloom rejection, then bounds the
+// selected chain by its readable backing; GNU hash has no SysV-style nchain,
+// so no synthetic dynsym count is invented.
 ElfDynamicLookupResult FindElfDynamicSymbol(const ElfVaReader& reader, const ElfDynamicView& view,
                                             std::string_view name);
 

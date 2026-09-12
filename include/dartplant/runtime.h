@@ -43,6 +43,39 @@ typedef struct DartPlantRuntimeInfo {
     uint8_t profile_matched;
 } DartPlantRuntimeInfo;
 
+typedef enum DartPlantRuntimeImageKind {
+    DARTPLANT_RUNTIME_IMAGE_ROOT = 0,
+    DARTPLANT_RUNTIME_IMAGE_DEFERRED,
+} DartPlantRuntimeImageKind;
+
+typedef struct DartPlantRuntimeImageInfo {
+    uint32_t struct_size;
+    DartPlantRuntimeImageKind kind;
+    uint64_t image_id;
+    uint64_t runtime_generation;
+    uint32_t loading_unit_id;
+    uint32_t reserved;
+    const char* module_name;
+    const char* module_path;
+    const char* module_build_id;
+    const char* snapshot_hash;
+    const char* snapshot_features;
+    const char* profile_name;
+    uint64_t isolate_instructions_va;
+    uint64_t isolate_instructions_size;
+    uint64_t isolate_instructions_runtime;
+    // Retained live Function entry families whose Code payloads uniquely
+    // resolve into this image for the current isolate-group generation. A
+    // non-zero count means the physical image has semantic live-VM ownership
+    // evidence, not merely filename/module/snapshot provenance.
+    uint32_t live_entry_count;
+    uint8_t live_semantic_bound;
+    uint8_t has_deferred_program_hash;
+    uint8_t deferred_program_hash_vm_bound;
+    uint8_t reserved_binding;
+    uint32_t deferred_program_hash;
+} DartPlantRuntimeImageInfo;
+
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_create(const DartPlantRuntimeProfile* profile,
                                                           DartPlantRuntime** out_runtime);
 DARTPLANT_EXPORT void dartplant_runtime_destroy(DartPlantRuntime* runtime);
@@ -62,8 +95,25 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_on_module_unloading(DartPlant
                                                                        void* module_handle);
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_refresh_modules(DartPlantRuntime* runtime);
 
+// Binds this runtime to the unique Flutter engine mapping containing one
+// engine-owned executable address (for example an API-DL function entry). This
+// is optional for the ordinary single-engine case and is the fail-closed
+// disambiguator when multiple matching libflutter.so incarnations coexist.
+// Passing nullptr clears the anchor and re-runs module selection.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_bind_engine_anchor(DartPlantRuntime* runtime,
+                                                                      const void* engine_address);
+
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_info(const DartPlantRuntime* runtime,
                                                             DartPlantRuntimeInfo* out_info);
+
+// Enumerates the source-proven Dart AOT instruction namespaces owned by the
+// current app incarnation. Index zero is not semantically special; callers
+// should use kind/loading_unit_id/image_id. image_id remains stable only for
+// the current runtime generation.
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_image_count(const DartPlantRuntime* runtime,
+                                                                   uint32_t* out_count);
+DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_image_info(
+    const DartPlantRuntime* runtime, uint32_t index, DartPlantRuntimeImageInfo* out_info);
 
 // Returns the latest structured proof/rejection snapshot. This is diagnostic
 // state only: callers must still use the operation's DartPlantStatus as the

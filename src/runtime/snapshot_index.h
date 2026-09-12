@@ -4,19 +4,24 @@
 #include <stdint.h>
 
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "dartplant/advanced/flutter_snapshot.h"
 #include "dartplant/advanced/live_vm.h"
+#include "runtime/runtime_image_set.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
 
 struct MetadataIndex;
+struct LiveVmInstructionImage;
 
 struct SnapshotFunction {
+    uint64_t runtime_image_id = 0;
+    uint32_t loading_unit_id = 0;
     std::string library_uri;
     std::string class_name;
     std::string function_name;
@@ -80,11 +85,24 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
                                                     const RuntimeProfileRecord& profile,
                                                     DartPlantLiveVmFunctionIndexInfo* out_info,
                                                     std::string* error);
+std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& profile, DartPlantLiveVmFunctionIndexInfo* out_info,
+    std::string* error);
 
 // Internal record adapter shared by the live-VM visitor and host regression
 // tests. Returns false rather than publishing a partial entry family.
 bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& function,
                                       uint32_t profile_version, SnapshotIndex* index);
+
+// Validates that the canonical live Function entry-family records and the
+// flattened per-entry SnapshotFunction records agree on one source-proven
+// RuntimeImage/loading-unit identity. On success, publishes one semantic
+// binding count per retained Dart Function into a copy of the current image
+// set. The input image set is never partially modified on failure.
+bool BindLiveSnapshotImageSemantics(const SnapshotIndex& index,
+                                    const RuntimeImageSet& current_images,
+                                    RuntimeImageSet* out_images, std::string* error);
 
 }  // namespace dartplant
 

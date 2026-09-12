@@ -5,6 +5,70 @@
 #include "core/internal.h"
 #include "test_runner.h"
 
+namespace {
+
+dartplant::RuntimeImageSet MakeLiveImageSet() {
+    dartplant::ModuleImage root;
+    root.name = "libapp.so";
+    root.path = "/base/libapp.so";
+    root.build_id = "root-build";
+    root.load_bias = 0x100000;
+    root.executable_ranges.push_back({
+        .start = 0x110000,
+        .end = 0x112000,
+        .file_offset = 0x10000,
+        .virtual_address = 0x10000,
+        .file_size = 0x2000,
+    });
+    dartplant::FlutterSnapshotSource root_snapshot;
+    root_snapshot.module_name = root.name;
+    root_snapshot.module_path = root.path;
+    root_snapshot.module_build_id = root.build_id;
+    root_snapshot.snapshot_hash = "0123456789abcdef0123456789abcdef";
+    root_snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    root_snapshot.profile_name = "flutter-arm64-product-compressed";
+    root_snapshot.isolate_instructions_va = 0x10000;
+    root_snapshot.isolate_instructions_size = 0x2000;
+    root_snapshot.isolate_instructions_runtime = 0x110000;
+    root_snapshot.compressed_pointers = true;
+
+    dartplant::RuntimeImageSet images;
+    std::string error;
+    EXPECT_TRUE(images.SetRoot(root, root_snapshot, 7, &error));
+    return images;
+}
+
+DartPlantLiveVmFunctionInfo MakeLiveFamily(uint64_t image_id) {
+    DartPlantLiveVmFunctionInfo function{};
+    function.struct_size = sizeof(function);
+    function.function = 0x7100000011;
+    function.code = 0x7100001011;
+    function.function_entry_point = 0x110100;
+    function.function_unchecked_entry_point = 0x110108;
+    function.code_entry_point = 0x110100;
+    function.code_unchecked_entry_point = 0x110108;
+    function.code_monomorphic_entry_point = 0x110100;
+    function.code_monomorphic_unchecked_entry_point = 0x110108;
+    function.entry_va = 0x10100;
+    function.unchecked_entry_va = 0x10108;
+    function.monomorphic_entry_va = 0x10100;
+    function.monomorphic_unchecked_entry_va = 0x10108;
+    function.code_section_va = 0x10000;
+    function.code_size = 0x40;
+    function.runtime_image_id = image_id;
+    function.loading_unit_id = 1;
+    function.entry_kind_mask = 0x03;
+    function.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
+    function.entry_alias_counts[DARTPLANT_ENTRY_UNCHECKED] = 1;
+    std::snprintf(function.library_uri, sizeof(function.library_uri), "%s",
+                  "package:app/main.dart");
+    std::snprintf(function.class_name, sizeof(function.class_name), "%s", "Global");
+    std::snprintf(function.function_name, sizeof(function.function_name), "%s", "target");
+    return function;
+}
+
+}  // namespace
+
 TEST_CASE(SnapshotIndexFindsExactFunctionIdentity) {
     dartplant::SnapshotIndex index;
     index.functions.push_back({
@@ -254,4 +318,58 @@ TEST_CASE(LiveSnapshotAdapterUsesDartPayloadStartForMonomorphicCode) {
     EXPECT_EQ(kLength - 8U, index.functions[2].code_size);
     EXPECT_EQ(DARTPLANT_ENTRY_MONOMORPHIC_UNCHECKED, index.functions[3].entry_kind);
     EXPECT_EQ(kLength - 16U, index.functions[3].code_size);
+}
+
+TEST_CASE(LiveSnapshotImageSemanticsBindsCompleteEntryFamilyTransactionally) {
+    auto images = MakeLiveImageSet();
+    const auto* root = images.Root();
+    EXPECT_TRUE(root != nullptr);
+    const uint64_t root_id = root->id;
+
+    dartplant::SnapshotIndex index;
+    const auto family = MakeLiveFamily(root_id);
+    EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
+    EXPECT_EQ(2U, index.functions.size());
+
+    dartplant::RuntimeImageSet rebound;
+    std::string error;
+    EXPECT_TRUE(dartplant::BindLiveSnapshotImageSemantics(index, images, &rebound, &error));
+    EXPECT_TRUE(error.empty());
+    EXPECT_EQ(0U, images.FindById(root_id)->live_entry_count);
+    EXPECT_EQ(1U, rebound.FindById(root_id)->live_entry_count);
+}
+
+TEST_CASE(LiveSnapshotImageSemanticsRejectsCrossImageFlattenedRecordWithoutPublishing) {
+    auto images = MakeLiveImageSet();
+    const auto* root = images.Root();
+    EXPECT_TRUE(root != nullptr);
+    const uint64_t root_id = root->id;
+
+    dartplant::SnapshotIndex index;
+    const auto family = MakeLiveFamily(root_id);
+    EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
+    index.functions[1].runtime_image_id = 0xfeedbeefULL;
+
+    dartplant::RuntimeImageSet rebound = images;
+    std::string error;
+    EXPECT_TRUE(!dartplant::BindLiveSnapshotImageSemantics(index, images, &rebound, &error));
+    EXPECT_TRUE(!error.empty());
+    EXPECT_EQ(0U, images.FindById(root_id)->live_entry_count);
+    EXPECT_EQ(0U, rebound.FindById(root_id)->live_entry_count);
+}
+
+TEST_CASE(LiveSnapshotImageSemanticsRejectsPartialFlattenedEntryFamily) {
+    auto images = MakeLiveImageSet();
+    const auto* root = images.Root();
+    EXPECT_TRUE(root != nullptr);
+
+    dartplant::SnapshotIndex index;
+    const auto family = MakeLiveFamily(root->id);
+    EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
+    index.functions.pop_back();
+
+    dartplant::RuntimeImageSet rebound;
+    std::string error;
+    EXPECT_TRUE(!dartplant::BindLiveSnapshotImageSemantics(index, images, &rebound, &error));
+    EXPECT_TRUE(!error.empty());
 }

@@ -49,6 +49,7 @@ bool SameEvidenceTarget(const RuntimeAbiEvidenceEntry& entry, const DartPlantMet
                         uint64_t generation) {
     return method != nullptr && method->function != nullptr &&
            entry.identity == method->function->identity &&
+           entry.image_id == method->function->image_id &&
            entry.code_target == MethodTarget(method) && entry.generation == generation;
 }
 
@@ -76,6 +77,13 @@ DartPlantMethodAbiState PublicAbiState(const RuntimeAbiEvidenceEntry& entry) {
 }
 
 }  // namespace
+
+void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id) {
+    if (runtime == nullptr || image_id == 0) return;
+    std::erase_if(runtime->abi_evidence, [image_id](const RuntimeAbiEvidenceEntry& entry) {
+        return entry.image_id == image_id;
+    });
+}
 
 std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
     const DartPlantRuntime* runtime, const DartPlantMethod* method) {
@@ -410,6 +418,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     if (existing == runtime->abi_evidence.end()) {
         dartplant::RuntimeAbiEvidenceEntry entry;
         entry.identity = method->function->identity;
+        entry.image_id = method->function->image_id;
         entry.code_target = dartplant::MethodTarget(method);
         entry.generation = generation;
         entry.formal_parameter_count = layout_parameter_count;

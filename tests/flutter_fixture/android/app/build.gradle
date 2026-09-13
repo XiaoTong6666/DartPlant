@@ -27,6 +27,7 @@ def dartplantDobbyRoot = System.getenv("DARTPLANT_DOBBY_ROOT")
 def dartplantSdkRoot = System.getenv("DARTPLANT_DART_SDK_ROOT")
 
 android {
+    dynamicFeatures = [":deferred_probe"]
     namespace = "dev.dartplant.dartplant_fixture"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "30.0.15729638"

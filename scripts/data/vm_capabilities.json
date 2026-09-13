@@ -153,6 +153,15 @@
       "cold_required": false,
       "verified_after_create": false,
       "ci_required_event": false
+    },
+    {
+      "key": "deferred_loading_unit_layout",
+      "cpp_symbol": "kCapabilityDeferredLoadingUnitLayout",
+      "diagnostic_name": "DeferredLoadingUnit",
+      "bit": 131072,
+      "cold_required": false,
+      "verified_after_create": false,
+      "ci_required_event": false
     }
   ]
 }

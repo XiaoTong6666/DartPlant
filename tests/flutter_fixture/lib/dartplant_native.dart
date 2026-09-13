@@ -34,6 +34,8 @@ typedef _ArtifactLifecycleProofNative = Uint64 Function();
 typedef _ArtifactLifecycleProofDart = int Function();
 typedef _SnapshotOffsetProofNative = Uint64 Function();
 typedef _SnapshotOffsetProofDart = int Function();
+typedef _DeferredLifecycleProofNative = Uint64 Function();
+typedef _DeferredLifecycleProofDart = int Function();
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -150,6 +152,16 @@ final class DartPlantNative {
   static final _SnapshotOffsetProofDart _snapshotOffsetProof = _library
       .lookup<NativeFunction<_SnapshotOffsetProofNative>>(
         'dartplant_fixture_snapshot_offset_proof',
+      )
+      .asFunction();
+  static final _DeferredLifecycleProofDart _deferredBeforeLoad = _library
+      .lookup<NativeFunction<_DeferredLifecycleProofNative>>(
+        'dartplant_fixture_deferred_before_load',
+      )
+      .asFunction();
+  static final _DeferredLifecycleProofDart _deferredAfterLoad = _library
+      .lookup<NativeFunction<_DeferredLifecycleProofNative>>(
+        'dartplant_fixture_deferred_after_load',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -311,6 +323,10 @@ final class DartPlantNative {
   static int artifactLifecycleProof() => _artifactLifecycleProof();
 
   static int snapshotOffsetProof() => _snapshotOffsetProof();
+
+  static int deferredBeforeLoad() => _deferredBeforeLoad();
+
+  static int deferredAfterLoad() => _deferredAfterLoad();
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

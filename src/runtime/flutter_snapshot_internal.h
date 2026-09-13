@@ -17,7 +17,8 @@ struct DartSnapshotHeader {
     uint64_t declared_length = 0;
     uint64_t kind = 0;
     // First byte after Snapshot header + version hash + NUL-terminated feature
-    // string. Deferred Full-AOT units place their uint32_t program hash here.
+    // string. Deferred Full-AOT units place their Serializer::Write(uint32_t)
+    // program hash here (Raw<4>, using Dart's kEndByteMarker encoding).
     uint64_t payload_offset = 0;
     std::string snapshot_hash;
     std::string features;

@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,17 @@ void WriteAt(std::vector<uint8_t>* bytes, size_t offset, const T& value) {
     EXPECT_TRUE(offset <= bytes->size());
     EXPECT_TRUE(sizeof(T) <= bytes->size() - offset);
     std::memcpy(bytes->data() + offset, &value, sizeof(T));
+}
+
+void AppendDartRawUint32(std::vector<uint8_t>* bytes, uint32_t value) {
+    constexpr uint8_t kDataMask = 0x7f;
+    constexpr int32_t kEndByteMarker = 0xc0;
+    int32_t remaining = std::bit_cast<int32_t>(value);
+    while (remaining < -64 || remaining > 63) {
+        bytes->push_back(static_cast<uint8_t>(static_cast<uint32_t>(remaining) & kDataMask));
+        remaining >>= 7;
+    }
+    bytes->push_back(static_cast<uint8_t>(remaining + kEndByteMarker));
 }
 
 std::vector<uint8_t> MakeSectionSymbolElf(uint32_t name_offset = 1, bool terminate_name = true) {
@@ -146,9 +158,7 @@ std::vector<uint8_t> MakeDynamicSnapshotElf(
     auto snapshot =
         MakeFullAotSnapshotHeader("product arm64 android compressed-pointers null-safety");
     if (deferred_program_hash.has_value()) {
-        const size_t payload_offset = snapshot.size();
-        snapshot.resize(snapshot.size() + sizeof(uint32_t));
-        WriteAt(&snapshot, payload_offset, *deferred_program_hash);
+        AppendDartRawUint32(&snapshot, *deferred_program_hash);
         const int64_t stored_length = static_cast<int64_t>(snapshot.size() - sizeof(int32_t));
         WriteAt(&snapshot, sizeof(int32_t), stored_length);
     }
@@ -444,22 +454,65 @@ TEST_CASE(DartSnapshotHeaderValidatesDeclaredLengthAndFullAotKind) {
     EXPECT_EQ(bytes.size(), parsed->payload_offset);
 }
 
-TEST_CASE(DartDeferredProgramHashStartsImmediatelyAfterVersionAndFeatures) {
+TEST_CASE(DartDeferredProgramHashUsesDartRawUint32EncodingAfterVersionAndFeatures) {
     auto bytes = MakeFullAotSnapshotHeader("product arm64 android compressed-pointers null-safety");
     const size_t program_hash_offset = bytes.size();
-    bytes.resize(bytes.size() + sizeof(uint32_t));
-    constexpr uint32_t kProgramHash = 0x1a30145f;
-    WriteAt(&bytes, program_hash_offset, kProgramHash);
+    constexpr uint32_t kProgramHash = 0x2539aeb8;
+    AppendDartRawUint32(&bytes, kProgramHash);
     const int64_t stored_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
     WriteAt(&bytes, sizeof(int32_t), stored_length);
 
     const auto parsed = dartplant::ParseDartSnapshotHeader(bytes);
     EXPECT_TRUE(parsed.has_value());
     EXPECT_EQ(program_hash_offset, parsed->payload_offset);
+    EXPECT_EQ(0x38U, bytes[program_hash_offset]);
+    EXPECT_EQ(0x5dU, bytes[program_hash_offset + 1]);
+    EXPECT_EQ(0x66U, bytes[program_hash_offset + 2]);
+    EXPECT_EQ(0x29U, bytes[program_hash_offset + 3]);
+    EXPECT_EQ(0xc2U, bytes[program_hash_offset + 4]);
     EXPECT_EQ(kProgramHash, dartplant::ParseDartDeferredProgramHash(bytes, *parsed).value_or(0));
 
-    bytes.resize(program_hash_offset + sizeof(uint32_t) - 1);
-    EXPECT_FALSE(dartplant::ParseDartDeferredProgramHash(bytes, *parsed).has_value());
+    bytes.resize(program_hash_offset + 4);
+    const int64_t truncated_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), truncated_length);
+    const auto truncated = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(truncated.has_value());
+    EXPECT_FALSE(dartplant::ParseDartDeferredProgramHash(bytes, *truncated).has_value());
+
+    bytes.resize(program_hash_offset);
+    bytes.insert(bytes.end(), {0x01, 0xc0});
+    const int64_t noncanonical_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), noncanonical_length);
+    const auto noncanonical = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(noncanonical.has_value());
+    EXPECT_FALSE(dartplant::ParseDartDeferredProgramHash(bytes, *noncanonical).has_value());
+
+    bytes.resize(program_hash_offset);
+    AppendDartRawUint32(&bytes, 0xffffffffU);
+    const int64_t negative_bits_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), negative_bits_length);
+    const auto negative_bits = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(negative_bits.has_value());
+    EXPECT_EQ(0xbfU, bytes[program_hash_offset]);
+    EXPECT_EQ(0xffffffffU,
+              dartplant::ParseDartDeferredProgramHash(bytes, *negative_bits).value_or(0));
+
+    bytes.resize(program_hash_offset);
+    AppendDartRawUint32(&bytes, 0x80000000U);
+    const int64_t high_bit_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), high_bit_length);
+    const auto high_bit = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(high_bit.has_value());
+    EXPECT_EQ(5U, bytes.size() - program_hash_offset);
+    EXPECT_EQ(0xb8U, bytes[program_hash_offset + 4]);
+    EXPECT_EQ(0x80000000U, dartplant::ParseDartDeferredProgramHash(bytes, *high_bit).value_or(0));
+
+    bytes.resize(program_hash_offset);
+    const int64_t empty_length = static_cast<int64_t>(bytes.size() - sizeof(int32_t));
+    WriteAt(&bytes, sizeof(int32_t), empty_length);
+    const auto empty = dartplant::ParseDartSnapshotHeader(bytes);
+    EXPECT_TRUE(empty.has_value());
+    EXPECT_FALSE(dartplant::ParseDartDeferredProgramHash(bytes, *empty).has_value());
 }
 
 TEST_CASE(DartSnapshotHeaderRejectsWrongKindAndLengthBeyondSymbol) {

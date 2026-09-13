@@ -83,6 +83,11 @@ public:
     // Compares only source/provenance identity. RuntimeImageId itself is a
     // per-set handle and is intentionally not part of incarnation equality.
     bool SameIdentity(const RuntimeImageSet& other) const;
+    // Keeps ids stable for images that survive an in-generation image-set
+    // refresh and assigns fresh ids to newly loaded secondary images.
+    bool PreserveIdsFrom(const RuntimeImageSet& previous);
+    bool ContainsIdentity(const RuntimeImage& image) const;
+    bool RemoveById(RuntimeImageId id);
     void BindGeneration(uint64_t runtime_generation);
     void ResetLiveEntryBindings();
     bool RecordLiveEntry(RuntimeImageId id);

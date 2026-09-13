@@ -221,6 +221,10 @@ void ReplaceModules(std::vector<ModuleImage> modules);
 DartPlantStatus InvalidateRuntimeHooks(
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
+DartPlantStatus InvalidateRuntimeImageHooks(
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id);
+void RetireRuntimeImageHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
+                             uint64_t image_id);
 DartPlantStatus QuiesceVmAdapterHooks(DartPlantVmAdapter* adapter);
 
 DartPlantStatus InstallHook(const std::shared_ptr<DartEntryTarget>& code_target, void* replacement,

@@ -21,9 +21,11 @@ for manifest in "${manifests[@]}"; do
   mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$manifest")"
   key="$family-$mode"
   apk="$(dirname "$manifest")/app-$mode.apk"
+  deferred_apk="$(dirname "$manifest")/deferred_probe-$mode.apk"
 
   if ! python3 scripts/ci/run_flutter_device.py \
     --apk "$apk" \
+    --deferred-apk "$deferred_apk" \
     --test normal \
     --runtime-tier translated-smoke \
     --log "$output_dir/logcat/$key.log" \

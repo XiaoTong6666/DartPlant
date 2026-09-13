@@ -1,0 +1,71 @@
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader("UTF-8") { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterVersionCode = localProperties.getProperty("flutter.versionCode", "1")
+def flutterVersionName = localProperties.getProperty("flutter.versionName", "1.0")
+
+apply plugin: "com.android.dynamic-feature"
+
+android {
+    namespace = "dev.dartplant.dartplant_fixture.deferred_probe"
+    // Keep the dynamic-feature module independent from Flutter's application
+    // Gradle extension. The Flutter plugin is applied only to :app.
+    compileSdk 34
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        applicationVariants.all { variant ->
+            main.assets.srcDirs += "${project.buildDir}/intermediates/flutter/${variant.name}/deferred_assets"
+            main.jniLibs.srcDirs += "${project.buildDir}/intermediates/flutter/${variant.name}/deferred_libs"
+        }
+    }
+
+    defaultConfig {
+        // Flutter 3.44 raised the app default to API 24. Dynamic features may
+        // not declare a lower minSdk than their base module. Keeping the
+        // fixture at 24 also remains valid for the older 3.22/3.24 base apps
+        // used by the compatibility matrix on our ARM64 test devices.
+        minSdkVersion 24
+        targetSdkVersion 33
+        versionCode = flutterVersionCode.toInteger()
+        versionName = flutterVersionName
+    }
+
+    // Dynamic-feature projects do not inherit Flutter's synthetic `profile`
+    // build type on older AGP/Flutter families. Without an explicit profile
+    // variant, a base `bundleProfile` resolves this feature through the debug
+    // fallback and never packages build/deferred_probe/intermediates/flutter/
+    // profile/deferred_libs. Keep the feature variant name aligned with the
+    // app variant so Flutter's deferred-component copy target has one exact
+    // destination on every supported family.
+    buildTypes {
+        profile {
+            initWith debug
+            matchingFallbacks = ["debug"]
+        }
+    }
+}
+
+dependencies {
+    implementation(project(":app"))
+}
+
+afterEvaluate {
+    tasks.configureEach { task ->
+        if (task.name.startsWith("merge") && task.name.endsWith("JniLibFolders")) {
+            task.dependsOn(":app:compileFlutterBuild${task.name.substring(5, task.name.length() - "JniLibFolders".length())}")
+        }
+        if (task.name.startsWith("merge") && task.name.endsWith("Assets")) {
+            task.dependsOn(":app:compileFlutterBuild${task.name.substring(5, task.name.length() - 6)}")
+        }
+    }
+}

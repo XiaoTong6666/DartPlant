@@ -129,6 +129,7 @@ AbiDomainMask CapabilityDomains(uint64_t capability) {
     case kCapabilityFunctionCodeLayout:
     case kCapabilityAotEntryLayout:
     case kCapabilityClosureCallLayout:
+    case kCapabilityDeferredLoadingUnitLayout:
         return core | call | object;
     case kCapabilityGeneratedTransitionLayout:
         return core | transition;
@@ -197,6 +198,9 @@ std::string BuildCapabilityAbiKey(const RuntimeProfileRecord& profile, uint64_t 
         generated::AppendArgumentsDescriptorLayoutFields(key, profile);
         generated::AppendFunctionTypeLayoutFields(key, profile);
         generated::AppendTypeArgumentsLayoutFields(key, profile);
+        break;
+    case kCapabilityDeferredLoadingUnitLayout:
+        generated::AppendDeferredLoadingUnitLayoutFields(key, profile);
         break;
     case kCapabilityArtifactLifecycle:
     case kCapabilityNone:

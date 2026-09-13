@@ -18,3 +18,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  deferred-components:
+    - name: deferred_probe
+      libraries:
+        - package:dartplant_fixture/deferred_probe.dart
+      assets: []

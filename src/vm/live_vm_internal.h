@@ -58,9 +58,18 @@ DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmConte
 // This is intentionally a live-VM relational proof: secondary ELF files carry
 // the same uint32_t in their serialized snapshot payload, while the root ELF
 // does not expose it at a stable artifact offset.
-DartPlantStatus ReadLiveVmRootProgramHashForProfile(const DartPlantLiveVmContext& context,
-                                                    const RuntimeProfileRecord& profile,
-                                                    uint32_t* out_program_hash);
+//
+// The current-profile helper preserves the historical exact-row contract used
+// after a LiveVmContext has already been bound to one source row. The candidate
+// probe deliberately does not require context.profile_version equality: it is
+// used while capability-scoped ABI selection is still comparing multiple rows
+// that share the same already-proven core ABI.
+DartPlantStatus ReadLiveVmRootProgramHashForCurrentProfile(const DartPlantLiveVmContext& context,
+                                                           const RuntimeProfileRecord& profile,
+                                                           uint32_t* out_program_hash);
+DartPlantStatus ProbeLiveVmRootProgramHashForCandidate(const DartPlantLiveVmContext& context,
+                                                       const RuntimeProfileRecord& candidate,
+                                                       uint32_t* out_program_hash);
 
 }  // namespace dartplant
 

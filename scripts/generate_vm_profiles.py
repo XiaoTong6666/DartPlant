@@ -406,6 +406,91 @@ def _verify_object_store_offsets_contract(
         )
 
 
+def _verify_loading_unit_layout_contract(
+    profile: dict[str, object],
+    runtime_offsets: str,
+    raw_object_header: str,
+    *,
+    source_name: str,
+) -> None:
+    """Verify the private UntaggedLoadingUnit layout used by deferred AOT traversal.
+
+    LoadingUnit field offsets are not all emitted as named runtime offsets. Derive
+    them from the exact SDK declaration plus the source-generated AOT Object and
+    LoadingUnit instance sizes. This keeps deferred base-object traversal on the
+    same finite source-verified ABI footing as every other private VM layout.
+    """
+
+    pointer_size = int(profile["machine"]["pointer_size"])
+    compressed_word_size = int(profile["raw_object"]["compressed_word_size"])
+    if pointer_size != 8 or compressed_word_size != 4:
+        raise ValueError(
+            f"{source_name}: unsupported LoadingUnit machine layout: "
+            f"pointer={pointer_size} compressed={compressed_word_size}"
+        )
+
+    normalized = " ".join(raw_object_header.split())
+    common_declaration = (
+        "class UntaggedLoadingUnit : public UntaggedObject { "
+        "RAW_HEAP_OBJECT_IMPLEMENTATION(LoadingUnit); "
+        "COMPRESSED_POINTER_FIELD(LoadingUnitPtr, parent) "
+        "VISIT_FROM(parent) "
+        "COMPRESSED_POINTER_FIELD(ArrayPtr, base_objects) "
+        "VISIT_TO(base_objects)"
+    )
+    legacy_declaration = (
+        f"{common_declaration} int32_t id_; bool load_outstanding_; bool loaded_;"
+    )
+    current_declaration = (
+        f"{common_declaration} const uint8_t* instructions_image_; "
+        "AtomicBitFieldContainer<intptr_t> packed_fields_;"
+    )
+    legacy_layout = legacy_declaration in normalized
+    current_layout = current_declaration in normalized
+    if legacy_layout == current_layout:
+        raise ValueError(f"{source_name}: UntaggedLoadingUnit field order changed")
+
+    block = _arm64_compressed_aot_block(
+        runtime_offsets, product=bool(profile["machine"]["product"])
+    )
+    object_size = _parse_aot_offset(block, "AOT_Object_InstanceSize")
+    instance_size = _parse_aot_offset(block, "AOT_LoadingUnit_InstanceSize")
+    parent_offset = object_size
+    base_objects_offset = parent_offset + compressed_word_size
+    instructions_image_offset = 0
+    packed_fields_offset = 0
+    if current_layout:
+        instructions_image_offset = (
+            (base_objects_offset + compressed_word_size + pointer_size - 1) // pointer_size
+        ) * pointer_size
+        packed_fields_offset = instructions_image_offset + pointer_size
+
+    layout = profile["loading_unit"]
+    expected = {
+        "parent": parent_offset,
+        "base_objects": base_objects_offset,
+        "instructions_image": instructions_image_offset,
+        "packed_fields": packed_fields_offset,
+        "instance_size": instance_size,
+    }
+    for field, value in expected.items():
+        actual = int(layout[field])
+        if actual != value:
+            raise ValueError(
+                f"{profile['name']}: manifest loading_unit.{field}=0x{actual:x} "
+                f"disagrees with source-proven {source_name} layout=0x{value:x}"
+            )
+    minimum_size = (
+        packed_fields_offset + pointer_size
+        if current_layout
+        else base_objects_offset + compressed_word_size + 4 + 2
+    )
+    if minimum_size > instance_size:
+        raise ValueError(
+            f"{source_name}: LoadingUnit fields exceed source instance size"
+        )
+
+
 def _verify_class_raw_layout_contract(
     profile: dict[str, object], raw_object: str, *, source_name: str
 ) -> None:
@@ -637,6 +722,7 @@ ABI_PROFILE_SECTIONS = (
     "arguments_descriptor",
     "function_kind",
     "type_arguments",
+    "loading_unit",
     "transition",
 )
 
@@ -689,7 +775,9 @@ ABI_DOMAIN_FIELDS = {
         "raw_object.smi_tag", "raw_object.smi_tag_mask", "raw_object.smi_tag_shift",
         "raw_object.class_id_tag_shift", "raw_object.class_id_tag_bits",
         "raw_object.compressed_word_size", "type_arguments.cid", "type_arguments.length",
-        "type_arguments.types",
+        "type_arguments.types", "loading_unit.cid", "loading_unit.parent",
+        "loading_unit.base_objects", "loading_unit.instructions_image",
+        "loading_unit.packed_fields", "loading_unit.instance_size",
     ),
     "transition": (
         "thread.enter_safepoint_stub", "thread.exit_safepoint_stub",
@@ -826,6 +914,67 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("cids.code", "profile.live_vm.cid_code"),
         ("code.entry_point", "profile.live_vm.code_entry_point_offset"),
         ("code.owner", "profile.live_vm.code_owner_offset"),
+    ),
+    "deferred_loading_unit_layout": (
+        ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
+        ("raw_object.smi_tag", "profile.raw_object.smi_tag"),
+        ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
+        ("raw_object.smi_tag_shift", "profile.raw_object.smi_tag_shift"),
+        ("raw_object.class_id_tag_shift", "profile.raw_object.class_id_tag_shift"),
+        ("raw_object.class_id_tag_bits", "profile.raw_object.class_id_tag_bits"),
+        ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
+        ("object_store.loading_units", "profile.live_vm.object_store_loading_units_offset"),
+        ("array.length", "profile.live_vm.array_length_offset"),
+        ("array.elements", "profile.live_vm.array_elements_offset"),
+        ("loading_unit.cid", "profile.loading_unit.cid"),
+        ("loading_unit.parent", "profile.loading_unit.parent_offset"),
+        ("loading_unit.base_objects", "profile.loading_unit.base_objects_offset"),
+        ("loading_unit.instructions_image", "profile.loading_unit.instructions_image_offset"),
+        ("loading_unit.packed_fields", "profile.loading_unit.packed_fields_offset"),
+        ("loading_unit.instance_size", "profile.loading_unit.instance_size"),
+        ("cids.class", "profile.live_vm.cid_class"),
+        ("cids.function", "profile.live_vm.cid_function"),
+        ("cids.library", "profile.live_vm.cid_library"),
+        ("cids.code", "profile.live_vm.cid_code"),
+        ("cids.array", "profile.live_vm.cid_array"),
+        ("cids.immutable_array", "profile.live_vm.cid_immutable_array"),
+        ("cids.one_byte_string", "profile.live_vm.cid_one_byte_string"),
+        ("cids.two_byte_string", "profile.live_vm.cid_two_byte_string"),
+        ("code.entry_point", "profile.live_vm.code_entry_point_offset"),
+        ("code.unchecked_entry_point", "profile.live_vm.code_unchecked_entry_point_offset"),
+        ("code.monomorphic_entry_point", "profile.live_vm.code_monomorphic_entry_point_offset"),
+        (
+            "code.monomorphic_unchecked_entry_point",
+            "profile.live_vm.code_monomorphic_unchecked_entry_point_offset",
+        ),
+        ("code.object_pool", "profile.live_vm.code_object_pool_offset"),
+        ("code.owner", "profile.live_vm.code_owner_offset"),
+        ("code.instructions_length", "profile.live_vm.code_instructions_length_offset"),
+        ("function.entry_point", "profile.live_vm.function_entry_point_offset"),
+        ("function.unchecked_entry_point", "profile.live_vm.function_unchecked_entry_point_offset"),
+        ("function.name", "profile.live_vm.function_name_offset"),
+        ("function.owner", "profile.live_vm.function_owner_offset"),
+        ("function.code", "profile.live_vm.function_code_offset"),
+        ("function.kind_tag", "profile.live_vm.function_kind_tag_offset"),
+        ("class.name", "profile.live_vm.class_name_offset"),
+        ("class.library", "profile.live_vm.class_library_offset"),
+        ("library.url", "profile.live_vm.library_url_offset"),
+        ("library.toplevel_class", "profile.live_vm.library_toplevel_class_offset"),
+        ("string.length", "profile.live_vm.string_length_offset"),
+        ("string.data", "profile.live_vm.string_data_offset"),
+        (
+            "instructions.monomorphic_entry_offset_aot",
+            "profile.instructions_monomorphic_entry_offset_aot",
+        ),
+        (
+            "instructions.polymorphic_entry_offset_aot",
+            "profile.instructions_polymorphic_entry_offset_aot",
+        ),
+        ("function_kind.regular", "profile.function_kind.regular"),
+        ("function_kind.closure", "profile.function_kind.closure"),
+        ("function_kind.implicit_closure", "profile.function_kind.implicit_closure"),
+        ("function_kind.tag_shift", "profile.function_kind.tag_shift"),
+        ("function_kind.tag_bits", "profile.function_kind.tag_bits"),
     ),
     "type_arguments_layout": (
         ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
@@ -1039,6 +1188,7 @@ def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
         "OneByteStringCid": int(cids["one_byte_string"]),
         "TwoByteStringCid": int(cids["two_byte_string"]),
         "TypeArgumentsCid": int(profile["type_arguments"]["cid"]),
+        "LoadingUnitCid": int(profile["loading_unit"]["cid"]),
         "BoolCid": int(profile["canonical_bool"]["cid"]),
         "TypeCid": int(function_type["cid_type"]),
         "FunctionTypeCid": int(function_type["cid_function_type"]),
@@ -1640,6 +1790,12 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         _verify_object_store_offsets_contract(
             profile, object_store_header, source_name=f"Dart SDK {version}"
         )
+        _verify_loading_unit_layout_contract(
+            profile,
+            runtime_offsets,
+            raw_object,
+            source_name=f"Dart SDK {version}",
+        )
         _verify_class_raw_layout_contract(
             profile, raw_object, source_name=f"Dart SDK {version}"
         )
@@ -1806,6 +1962,24 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
             or int(type_arguments["types"]) <= int(type_arguments["length"])
         ):
             raise ValueError(f"{name}: invalid TypeArguments layout")
+        loading_unit = profile["loading_unit"]
+        common_layout_invalid = (
+            int(loading_unit["cid"]) <= 0
+            or int(loading_unit["parent"]) <= 0
+            or int(loading_unit["base_objects"]) <= int(loading_unit["parent"])
+            or int(loading_unit["instance_size"]) <= int(loading_unit["base_objects"])
+        )
+        optional_offsets = (
+            int(loading_unit["instructions_image"]),
+            int(loading_unit["packed_fields"]),
+        )
+        optional_layout_invalid = optional_offsets != (0, 0) and (
+            optional_offsets[0] <= int(loading_unit["base_objects"])
+            or optional_offsets[1] <= optional_offsets[0]
+            or int(loading_unit["instance_size"]) <= optional_offsets[1]
+        )
+        if common_layout_invalid or optional_layout_invalid:
+            raise ValueError(f"{name}: invalid LoadingUnit layout")
         transition = profile["transition"]
         if (
             int(transition["execution_vm"]) != 0
@@ -2048,6 +2222,7 @@ def _render_profile(profile: dict[str, object]) -> str:
     arguments_descriptor = profile["arguments_descriptor"]
     function_kind = profile["function_kind"]
     type_arguments = profile["type_arguments"]
+    loading_unit = profile["loading_unit"]
     transition = profile["transition"]
     gp_args = ", ".join(str(value) for value in r["dart_gp_args"])
     fpu_args = ", ".join(str(value) for value in r["dart_fpu_args"])
@@ -2204,6 +2379,14 @@ def _render_profile(profile: dict[str, object]) -> str:
             .cid = {type_arguments['cid']}u,
             .length_offset = {_u(int(type_arguments['length']))},
             .types_offset = {_u(int(type_arguments['types']))},
+        }},
+        .loading_unit = {{
+            .cid = {loading_unit['cid']}u,
+            .parent_offset = {_u(int(loading_unit['parent']))},
+            .base_objects_offset = {_u(int(loading_unit['base_objects']))},
+            .instructions_image_offset = {_u(int(loading_unit['instructions_image']))},
+            .packed_fields_offset = {_u(int(loading_unit['packed_fields']))},
+            .instance_size = {_u(int(loading_unit['instance_size']))},
         }},
         .transition = {{
             .vm_tag_dart = {transition['vm_tag_dart']}u,

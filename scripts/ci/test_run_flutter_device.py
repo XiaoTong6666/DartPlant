@@ -28,7 +28,7 @@ class CleanInstallTest(unittest.TestCase):
 
             with patch.object(run_flutter_device, "_capture", side_effect=fake_capture):
                 uninstall = run_flutter_device._clean_install(
-                    "emulator-5554", apk, timeout=600.0
+                    "emulator-5554", [apk], timeout=600.0
                 )
 
             self.assertEqual(uninstall, "Success")
@@ -57,8 +57,42 @@ class CleanInstallTest(unittest.TestCase):
             with patch.object(run_flutter_device, "_capture", side_effect=fake_capture):
                 with self.assertRaisesRegex(RuntimeError, "clean package state"):
                     run_flutter_device._clean_install(
-                        "emulator-5554", apk, timeout=600.0
+                        "emulator-5554", [apk], timeout=600.0
                     )
+
+    def test_clean_install_installs_base_and_deferred_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir) / "base.apk"
+            deferred = Path(temp_dir) / "deferred.apk"
+            base.write_bytes(b"base")
+            deferred.write_bytes(b"deferred")
+            calls: list[list[str]] = []
+
+            def fake_capture(
+                command: list[str], *, check: bool = True, timeout: float = 30.0
+            ) -> str:
+                calls.append(command)
+                if command[-3:] == ["pm", "path", PACKAGE]:
+                    return ""
+                return "Success\n"
+
+            with patch.object(run_flutter_device, "_capture", side_effect=fake_capture):
+                run_flutter_device._clean_install(
+                    "emulator-5554", [base, deferred], timeout=600.0
+                )
+
+            self.assertEqual(
+                calls[2],
+                [
+                    "adb",
+                    "-s",
+                    "emulator-5554",
+                    "install-multiple",
+                    "-r",
+                    str(base.resolve()),
+                    str(deferred.resolve()),
+                ],
+            )
 
 
 if __name__ == "__main__":

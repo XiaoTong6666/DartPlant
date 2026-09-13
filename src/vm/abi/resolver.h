@@ -32,6 +32,7 @@ enum VmCapability : uint64_t {
     kCapabilityFunctionTypeLayout = 1ULL << 14,
     kCapabilityClosureCallLayout = 1ULL << 15,
     kCapabilityExceptionBridgeLayout = 1ULL << 16,
+    kCapabilityDeferredLoadingUnitLayout = 1ULL << 17,
 };
 
 enum class ProofState : uint8_t {

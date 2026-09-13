@@ -353,6 +353,14 @@ public:
         payloads_.clear();
     }
 
+    void EraseImage(uint64_t image_id) {
+        std::lock_guard lock(mutex_);
+        std::erase_if(targets_,
+                      [image_id](const auto& item) { return item.first.image_id == image_id; });
+        std::erase_if(payloads_,
+                      [image_id](const auto& item) { return item.first.image_id == image_id; });
+    }
+
 private:
     struct ImageAddressKey {
         uint64_t image_id = 0;

@@ -8,6 +8,7 @@ import subprocess as sp
 import sys
 import time
 import zipfile
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +73,11 @@ class ColdStartResult:
 class FlutterToolchain:
     flutter_version: str
     dart_version: str
+    channel: str
+    repository_url: str
+    framework_revision: str
+    engine_revision: str
+    injects_flutter_version_defines: bool
 
 
 def _normalize_flutter_mode(mode: str) -> str:
@@ -82,14 +88,137 @@ def _normalize_flutter_mode(mode: str) -> str:
 
 def flutter_fixture_apk_path(mode: str) -> Path:
     mode = _normalize_flutter_mode(mode)
+    return FIXTURE_DIR / "build" / "app" / "outputs" / "apk" / mode / f"app-{mode}.apk"
+
+
+def flutter_fixture_deferred_apk_path(mode: str) -> Path:
+    mode = _normalize_flutter_mode(mode)
     return (
         FIXTURE_DIR
         / "build"
-        / "app"
+        / "deferred_probe"
         / "outputs"
-        / "flutter-apk"
-        / f"app-{mode}.apk"
+        / "apk"
+        / mode
+        / f"deferred_probe-{mode}.apk"
     )
+
+
+def flutter_fixture_aab_path(mode: str) -> Path:
+    mode = _normalize_flutter_mode(mode)
+    return FIXTURE_DIR / "build" / "app" / "outputs" / "bundle" / mode / f"app-{mode}.aab"
+
+
+def _read_required_aab_entry(
+    archive: zipfile.ZipFile,
+    entry: str,
+    *,
+    build_mode: str,
+    aab_path: Path,
+) -> bytes:
+    try:
+        return archive.read(entry)
+    except KeyError as error:
+        related_entries = [
+            name
+            for name in archive.namelist()
+            if "libapp.so" in name or name.startswith("deferred_probe/")
+        ]
+        related = ", ".join(related_entries[:20]) or "<none>"
+        raise RuntimeError(
+            f"Flutter {build_mode} app bundle is missing required AOT entry {entry}: "
+            f"{aab_path}; related entries: {related}"
+        ) from error
+
+
+def _encode_gradle_dart_defines(defines: list[str]) -> str:
+    return ",".join(base64.b64encode(value.encode()).decode() for value in defines)
+
+
+def _gradle_dart_defines(toolchain: FlutterToolchain) -> str:
+    # Reproduce the exact BuildInfo.dartDefines sequence of the active Flutter
+    # toolchain. Flutter 3.44+ injects framework/version defines from
+    # FlutterCommand._addFlutterVersionToDartDefines; 3.22/3.24 do not. The
+    # deferred validator define is added by android/gradle.dart in all three
+    # supported families.
+    defines = [
+        f"DARTPLANT_CI_FLUTTER_VERSION={toolchain.flutter_version}",
+        f"DARTPLANT_CI_DART_VERSION={toolchain.dart_version}",
+        "DARTPLANT_CI_TARGET_ABI=arm64-v8a",
+    ]
+    if toolchain.injects_flutter_version_defines:
+        defines.extend(
+            [
+                f"FLUTTER_VERSION={toolchain.flutter_version}",
+                f"FLUTTER_CHANNEL={toolchain.channel}",
+                f"FLUTTER_GIT_URL={toolchain.repository_url}",
+                f"FLUTTER_FRAMEWORK_REVISION={toolchain.framework_revision[:10]}",
+                f"FLUTTER_ENGINE_REVISION={toolchain.engine_revision[:10]}",
+                f"FLUTTER_DART_VERSION={toolchain.dart_version}",
+            ]
+        )
+    defines.append("validate-deferred-components=false")
+    return _encode_gradle_dart_defines(defines)
+
+
+def _assemble_deferred_fixture_apks(
+    toolchain: FlutterToolchain, *, build_mode: str, env: dict[str, str]
+) -> tuple[Path, Path]:
+    build_mode = _normalize_flutter_mode(build_mode)
+    task = f"assemble{build_mode.capitalize()}"
+    run(
+        [
+            str(FIXTURE_DIR / "android" / "gradlew"),
+            "-q",
+            "-Ptarget-platform=android-arm64",
+            "-Ptarget=lib/main.dart",
+            "-Pbase-application-name=android.app.Application",
+            "-Pdeferred-components=true",
+            "-Pdeferred-component-names=deferred_probe",
+            "-Pvalidate-deferred-components=false",
+            "-Pshrink=false",
+            "-Pdart-obfuscation=false",
+            "-Ptrack-widget-creation=true",
+            "-Ptree-shake-icons=true",
+            f"-Pdart-defines={_gradle_dart_defines(toolchain)}",
+            task,
+        ],
+        cwd=FIXTURE_DIR / "android",
+        env=env,
+    )
+    base_apk = flutter_fixture_apk_path(build_mode)
+    deferred_apk = flutter_fixture_deferred_apk_path(build_mode)
+    if not base_apk.is_file() or not deferred_apk.is_file():
+        raise FileNotFoundError(
+            "Gradle deferred fixture packaging did not produce both base and feature APKs: "
+            f"base={base_apk} feature={deferred_apk}"
+        )
+
+    aab_path = flutter_fixture_aab_path(build_mode)
+    with zipfile.ZipFile(aab_path) as aab, zipfile.ZipFile(base_apk) as base, zipfile.ZipFile(
+        deferred_apk
+    ) as feature:
+        aab_root = _read_required_aab_entry(
+            aab,
+            "base/lib/arm64-v8a/libapp.so",
+            build_mode=build_mode,
+            aab_path=aab_path,
+        )
+        aab_deferred = _read_required_aab_entry(
+            aab,
+            "deferred_probe/lib/arm64-v8a/libapp.so-2.part.so",
+            build_mode=build_mode,
+            aab_path=aab_path,
+        )
+        apk_root = base.read("lib/arm64-v8a/libapp.so")
+        apk_deferred = feature.read("lib/arm64-v8a/libapp.so-2.part.so")
+        if apk_root != aab_root or apk_deferred != aab_deferred:
+            raise RuntimeError(
+                "split APK packaging rebuilt a different Dart AOT program than the exact AAB"
+            )
+        if feature.getinfo("lib/arm64-v8a/libapp.so-2.part.so").compress_type != zipfile.ZIP_STORED:
+            raise RuntimeError("deferred AOT image must remain uncompressed for apk! dlopen")
+    return base_apk, deferred_apk
 
 
 def flutter_gen_snapshot_path(flutter: str, mode: str) -> Path:
@@ -141,8 +270,28 @@ def _detect_flutter_toolchain(flutter: str) -> FlutterToolchain:
         raise RuntimeError("Flutter --version --machine did not return valid JSON") from error
     flutter_version = str(machine.get("frameworkVersion", "")).strip()
     dart_text = str(machine.get("dartSdkVersion", "")).strip()
+    channel = str(machine.get("channel", "")).strip()
+    repository_url = str(machine.get("repositoryUrl", "")).strip()
+    framework_revision = str(machine.get("frameworkRevision", "")).strip()
+    engine_revision = str(machine.get("engineRevision", "")).strip()
+    flutter_root = Path(flutter).resolve().parent.parent
+    flutter_command_source = (
+        flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "runner" / "flutter_command.dart"
+    )
+    if not flutter_command_source.is_file():
+        raise RuntimeError(f"Flutter command source is unavailable: {flutter_command_source}")
+    injects_flutter_version_defines = (
+        "_addFlutterVersionToDartDefines" in flutter_command_source.read_text()
+    )
     dart_match = re.search(r"\d+\.\d+\.\d+", dart_text)
-    if not flutter_version or dart_match is None:
+    if (
+        not flutter_version
+        or dart_match is None
+        or not channel
+        or not repository_url
+        or len(framework_revision) < 10
+        or len(engine_revision) < 10
+    ):
         raise RuntimeError(
             "Flutter toolchain version metadata is incomplete: "
             f"frameworkVersion={flutter_version!r} dartSdkVersion={dart_text!r}"
@@ -150,6 +299,11 @@ def _detect_flutter_toolchain(flutter: str) -> FlutterToolchain:
     return FlutterToolchain(
         flutter_version=flutter_version,
         dart_version=dart_match.group(0),
+        channel=channel,
+        repository_url=repository_url,
+        framework_revision=framework_revision,
+        engine_revision=engine_revision,
+        injects_flutter_version_defines=injects_flutter_version_defines,
     )
 
 
@@ -223,18 +377,19 @@ def _build_fixture(
     build_command = [
         flutter,
         "build",
-        "apk",
+        "appbundle",
         f"--{build_mode}",
         "--target-platform",
         "android-arm64",
+        "--no-validate-deferred-components",
         f"--dart-define=DARTPLANT_CI_FLUTTER_VERSION={toolchain.flutter_version}",
         f"--dart-define=DARTPLANT_CI_DART_VERSION={toolchain.dart_version}",
         "--dart-define=DARTPLANT_CI_TARGET_ABI=arm64-v8a",
     ]
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
-    apk_path = flutter_fixture_apk_path(build_mode)
-    if not apk_path.is_file():
-        raise FileNotFoundError(f"Flutter {build_mode} APK was not produced: {apk_path}")
+    aab_path = flutter_fixture_aab_path(build_mode)
+    if not aab_path.is_file():
+        raise FileNotFoundError(f"Flutter deferred app bundle was not produced: {aab_path}")
 
     dill_candidates = sorted(
         (FIXTURE_DIR / ".dart_tool" / "flutter_build").glob("*/app.dill"),
@@ -248,8 +403,21 @@ def _build_fixture(
     dill = GENERATED_DIR / "oracle_app.dill"
     shutil.copy2(dill_candidates[0], dill)
     libapp = GENERATED_DIR / "libapp.so"
-    with zipfile.ZipFile(apk_path) as archive:
-        libapp.write_bytes(archive.read("lib/arm64-v8a/libapp.so"))
+    with zipfile.ZipFile(aab_path) as archive:
+        libapp.write_bytes(
+            _read_required_aab_entry(
+                archive,
+                "base/lib/arm64-v8a/libapp.so",
+                build_mode=build_mode,
+                aab_path=aab_path,
+            )
+        )
+        deferred_libapp = _read_required_aab_entry(
+            archive,
+            "deferred_probe/lib/arm64-v8a/libapp.so-2.part.so",
+            build_mode=build_mode,
+            aab_path=aab_path,
+        )
 
     flutter_root = Path(flutter).resolve().parent.parent
     gen_snapshot = flutter_gen_snapshot_path(flutter, build_mode)
@@ -415,12 +583,28 @@ def _build_fixture(
     shutil.rmtree(FIXTURE_DIR / "android" / "app" / ".cxx", ignore_errors=True)
     shutil.rmtree(FIXTURE_DIR / "build" / "app" / "intermediates" / "cxx", ignore_errors=True)
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
-    with zipfile.ZipFile(apk_path) as archive:
-        rebuilt_libapp = archive.read("lib/arm64-v8a/libapp.so")
+    with zipfile.ZipFile(aab_path) as archive:
+        rebuilt_libapp = _read_required_aab_entry(
+            archive,
+            "base/lib/arm64-v8a/libapp.so",
+            build_mode=build_mode,
+            aab_path=aab_path,
+        )
+        rebuilt_deferred_libapp = _read_required_aab_entry(
+            archive,
+            "deferred_probe/lib/arm64-v8a/libapp.so-2.part.so",
+            build_mode=build_mode,
+            aab_path=aab_path,
+        )
     if rebuilt_libapp != libapp.read_bytes():
         raise RuntimeError(
             "second-stage native fixture rebuild changed libapp.so; generated sidecar is stale"
         )
+    if rebuilt_deferred_libapp != deferred_libapp:
+        raise RuntimeError(
+            "second-stage native fixture rebuild changed the deferred AOT loading unit"
+        )
+    _assemble_deferred_fixture_apks(toolchain, build_mode=build_mode, env=build_env)
     return toolchain
 
 
@@ -430,8 +614,23 @@ def build_flutter_fixture(
     flutter_bin = _resolve_flutter(flutter)
     build_mode = _normalize_flutter_mode(build_mode)
     lock_path = FIXTURE_DIR / "pubspec.lock"
+    local_properties_path = FIXTURE_DIR / "android" / "local.properties"
     lock_existed = lock_path.is_file()
     lock_contents = lock_path.read_bytes() if lock_existed else None
+    local_properties_existed = local_properties_path.is_file()
+    local_properties_contents = (
+        local_properties_path.read_bytes() if local_properties_existed else None
+    )
+    flutter_root = Path(flutter_bin).expanduser().resolve().parent.parent
+    lines = (
+        local_properties_path.read_text().splitlines()
+        if local_properties_existed
+        else []
+    )
+    filtered = [line for line in lines if not line.startswith("flutter.sdk=")]
+    filtered.append(f"flutter.sdk={flutter_root}")
+    local_properties_path.parent.mkdir(parents=True, exist_ok=True)
+    local_properties_path.write_text("\n".join(filtered) + "\n")
     try:
         return _build_fixture(flutter_bin, dobby_root=dobby_root, build_mode=build_mode)
     finally:
@@ -442,6 +641,15 @@ def build_flutter_fixture(
             lock_path.write_bytes(lock_contents)
         elif not lock_existed:
             lock_path.unlink(missing_ok=True)
+        # `flutter build` invokes Gradle, whose plugin loader resolves
+        # `flutter.sdk` from android/local.properties independently of the
+        # Flutter executable used to launch the command. Bind both halves of
+        # the build to the same SDK for cross-family runs, then restore the
+        # developer's original local configuration.
+        if local_properties_existed and local_properties_contents is not None:
+            local_properties_path.write_bytes(local_properties_contents)
+        elif not local_properties_existed:
+            local_properties_path.unlink(missing_ok=True)
 
 
 def _assert_no_packaged_runtime_metadata(apk_path: Path) -> None:
@@ -939,12 +1147,30 @@ def run_flutter_cold_bootstrap_test(
             flutter=flutter, dobby_root=dobby_root, build_mode=build_mode
         )
     apk_path = flutter_fixture_apk_path(build_mode)
+    deferred_apk_path = flutter_fixture_deferred_apk_path(build_mode)
     if not apk_path.is_file():
         raise FileNotFoundError(f"missing Flutter {build_mode} fixture APK: {apk_path}")
+    if not deferred_apk_path.is_file():
+        raise FileNotFoundError(
+            f"missing Flutter {build_mode} deferred feature APK: {deferred_apk_path}"
+        )
     _assert_no_packaged_runtime_metadata(apk_path)
+    _assert_no_packaged_runtime_metadata(deferred_apk_path)
 
     serial = find_arm64_device(device)
-    run(adb_cmd(["install", "-r", str(apk_path)], device=serial))
+    sp.run(
+        adb_cmd(["uninstall", PACKAGE], device=serial),
+        check=False,
+        stdout=sp.PIPE,
+        stderr=sp.STDOUT,
+        text=True,
+    )
+    run(
+        adb_cmd(
+            ["install-multiple", "-r", str(apk_path), str(deferred_apk_path)],
+            device=serial,
+        )
+    )
 
     results = [
         _validate_round(serial, index, timeout_seconds, build_mode)

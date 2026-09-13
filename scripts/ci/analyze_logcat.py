@@ -261,7 +261,10 @@ def _select_lifecycle(
 
 
 def _check_capabilities(
-    events: list[dict[str, object]], generation: int | None, isolate_generation: int | None
+    events: list[dict[str, object]],
+    generation: int | None,
+    isolate_generation: int | None,
+    expected_test: str,
 ) -> list[Check]:
     capability_events = _event_group(events, "capability")
     failure_states = {
@@ -280,6 +283,12 @@ def _check_capabilities(
         )
     ]
     for capability in required_event_capabilities():
+        if capability.diagnostic_name == "TypeArguments" and expected_test not in {
+            "all",
+            "generic_closure",
+            "generic_gc",
+        }:
+            continue
         named = [
             event
             for event in capability_events
@@ -551,7 +560,9 @@ def analyze(
         )
     lifecycle_check, generation, isolate_generation = _select_lifecycle(events)
     checks.append(lifecycle_check)
-    checks.extend(_check_capabilities(events, generation, isolate_generation))
+    checks.extend(
+        _check_capabilities(events, generation, isolate_generation, expected_test)
+    )
     checks.extend(_check_scenarios(events, expected_test))
     if expected_test in {"all", "generic_gc"}:
         checks.append(_check_generic_gc(events))

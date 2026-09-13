@@ -187,3 +187,45 @@ TEST_CASE(RuntimeImageSetBindsDeferredProgramHashTransactionallyToLiveRoot) {
     EXPECT_TRUE(images.BindDeferredProgramHash(0x12345678));
     EXPECT_TRUE(images.FindByLoadingUnitId(2)->deferred_program_hash_vm_bound);
 }
+
+TEST_CASE(RuntimeImageSetPreservesSurvivingIdsAcrossSecondaryImageChanges) {
+    const auto root_module =
+        MakeModule("libapp.so", "/base/libapp.so", "aaaa", 0x100000, 0x110000, 0x10000, 0x1000);
+    const auto unit2 = MakeModule("libapp.so-2.part.so", "/feature/libapp.so-2.part.so", "bbbb",
+                                  0x200000, 0x210000, 0x10000, 0x1000);
+    const auto unit3 = MakeModule("libapp.so-3.part.so", "/feature/libapp.so-3.part.so", "cccc",
+                                  0x300000, 0x310000, 0x10000, 0x1000);
+    std::string error;
+    dartplant::RuntimeImageSet previous;
+    EXPECT_TRUE(previous.SetRoot(root_module, MakeSnapshot(root_module, 0x110000, 0x10000, 0x1000),
+                                 5, &error));
+    EXPECT_TRUE(previous.AddDeferred(
+        unit2, MakeSnapshot(unit2, 0x210000, 0x10000, 0x1000, 0x12345678), 2, 5, &error));
+    const auto root_id = previous.Root()->id;
+    const auto unit2_id = previous.FindByLoadingUnitId(2)->id;
+
+    dartplant::RuntimeImageSet expanded;
+    EXPECT_TRUE(expanded.SetRoot(root_module, MakeSnapshot(root_module, 0x110000, 0x10000, 0x1000),
+                                 5, &error));
+    EXPECT_TRUE(expanded.AddDeferred(
+        unit3, MakeSnapshot(unit3, 0x310000, 0x10000, 0x1000, 0x12345678), 3, 5, &error));
+    EXPECT_TRUE(expanded.AddDeferred(
+        unit2, MakeSnapshot(unit2, 0x210000, 0x10000, 0x1000, 0x12345678), 2, 5, &error));
+    EXPECT_TRUE(expanded.PreserveIdsFrom(previous));
+    EXPECT_EQ(root_id, expanded.Root()->id);
+    EXPECT_EQ(unit2_id, expanded.FindByLoadingUnitId(2)->id);
+    EXPECT_TRUE(expanded.FindByLoadingUnitId(3)->id > unit2_id);
+    EXPECT_TRUE(expanded.RemoveById(expanded.FindByLoadingUnitId(3)->id));
+    EXPECT_TRUE(!expanded.RemoveById(root_id));
+
+    const auto old_unit2_id = expanded.FindByLoadingUnitId(2)->id;
+    EXPECT_TRUE(expanded.RemoveById(old_unit2_id));
+    dartplant::RuntimeImageSet reloaded;
+    EXPECT_TRUE(reloaded.SetRoot(root_module, MakeSnapshot(root_module, 0x110000, 0x10000, 0x1000),
+                                 5, &error));
+    EXPECT_TRUE(reloaded.AddDeferred(
+        unit2, MakeSnapshot(unit2, 0x210000, 0x10000, 0x1000, 0x12345678), 2, 5, &error));
+    EXPECT_TRUE(reloaded.PreserveIdsFrom(expanded));
+    EXPECT_EQ(root_id, reloaded.Root()->id);
+    EXPECT_TRUE(reloaded.FindByLoadingUnitId(2)->id > old_unit2_id);
+}

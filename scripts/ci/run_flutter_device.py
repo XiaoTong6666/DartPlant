@@ -54,7 +54,7 @@ def _dump_logcat(serial: str, path: Path) -> None:
     path.write_text(text, errors="replace")
 
 
-def _clean_install(serial: str, apk: Path, *, timeout: float) -> str:
+def _clean_install(serial: str, apks: list[Path], *, timeout: float) -> str:
     """Install one fixture from a clean package state and return uninstall output."""
     uninstall = _capture(
         _adb(serial, "uninstall", PACKAGE),
@@ -71,7 +71,13 @@ def _clean_install(serial: str, apk: Path, *, timeout: float) -> str:
             "failed to establish a clean package state before runtime: "
             f"{stale_package}"
         )
-    _capture(_adb(serial, "install", str(apk.resolve())), timeout=timeout)
+    resolved_apks = [str(apk.resolve()) for apk in apks]
+    install_args = (
+        ["install", resolved_apks[0]]
+        if len(resolved_apks) == 1
+        else ["install-multiple", "-r", *resolved_apks]
+    )
+    _capture(_adb(serial, *install_args), timeout=timeout)
     return uninstall.strip()
 
 def _write_metadata(path: Path, metadata: dict[str, object]) -> None:
@@ -84,6 +90,7 @@ def main() -> int:
         description="Run one prebuilt DartPlant Flutter APK and capture raw logcat"
     )
     parser.add_argument("--apk", type=Path, required=True)
+    parser.add_argument("--deferred-apk", type=Path)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--serial")
@@ -104,7 +111,7 @@ def main() -> int:
     }
     serial: str | None = None
     try:
-        metadata["apk"] = inspect_arm64_apk(args.apk)
+        metadata["apk"] = inspect_arm64_apk(args.apk, args.deferred_apk)
         serial = _resolve_serial(args.serial)
         metadata["serial"] = serial
         adb_wait_timeout = 120.0 if args.runtime_tier == "native" else 60.0
@@ -139,8 +146,11 @@ def main() -> int:
         # the same package with `adb install -r` therefore violates Android's
         # update-signature check. Runtime families must also not inherit app
         # data or extracted native libraries from the previous ABI proof.
+        install_apks = [args.apk]
+        if args.deferred_apk is not None:
+            install_apks.append(args.deferred_apk)
         metadata["uninstall"] = _clean_install(
-            serial, args.apk, timeout=install_timeout
+            serial, install_apks, timeout=install_timeout
         )
 
         _capture(_adb(serial, "logcat", "-G", "16M"), check=False)

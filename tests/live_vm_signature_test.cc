@@ -9,6 +9,7 @@
 #include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
 #include "vm/abi/proof.h"
+#include "vm/abi/resolver.h"
 #include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
@@ -367,14 +368,66 @@ TEST_CASE(LiveVmDeferredProgramHashReadsSourceVerifiedObjectStoreRoot) {
 
         uint32_t actual = 0;
         EXPECT_EQ(DARTPLANT_OK,
-                  dartplant::ReadLiveVmRootProgramHashForProfile(context, *record, &actual));
+                  dartplant::ReadLiveVmRootProgramHashForCurrentProfile(context, *record, &actual));
         EXPECT_EQ(kProgramHash, actual);
 
         heap.SetArraySmi(kLoadingUnits, 0, kProgramHash + 1);
         EXPECT_EQ(DARTPLANT_OK,
-                  dartplant::ReadLiveVmRootProgramHashForProfile(context, *record, &actual));
+                  dartplant::ReadLiveVmRootProgramHashForCurrentProfile(context, *record, &actual));
         EXPECT_EQ(kProgramHash + 1, actual);
     }
+}
+
+TEST_CASE(LiveVmDeferredCandidateProbeDoesNotCollapseCrossRowAmbiguity) {
+    constexpr uint32_t kProgramHash = 0x12345678;
+    const auto* source = dartplant::FindRuntimeProfileByVersion(1);
+    EXPECT_TRUE(source != nullptr);
+
+    SyntheticDartHeap heap;
+    constexpr size_t kObjectStore = 0x100;
+    constexpr size_t kLoadingUnits = 0x800;
+    heap.SetArray(kLoadingUnits, source->live_vm.cid_array, 3);
+    heap.SetArraySmi(kLoadingUnits, 0, kProgramHash);
+    heap.Store<uint64_t>(kObjectStore + source->live_vm.object_store_loading_units_offset,
+                         heap.Tagged(kLoadingUnits));
+
+    DartPlantLiveVmContext context{};
+    context.struct_size = sizeof(context);
+    context.profile_version = source->live_vm.profile_version;
+    context.heap_base = heap.base();
+    context.object_store = heap.base() + kObjectStore;
+
+    auto profiles = std::array<dartplant::RuntimeProfileRecord, 2>{*source, *source};
+    // Model a second real source row that happens to retain the same core/probe
+    // layout. Version 2 exists in the source-verified registry, so raw tagged
+    // object decoding remains a legitimate candidate-row operation; only the
+    // captured context remains bound to row 1.
+    profiles[1].live_vm.profile_version = 2;
+    profiles[1].loading_unit.base_objects_offset += sizeof(uint32_t);
+
+    uint32_t current_hash = 0;
+    EXPECT_EQ(DARTPLANT_INVALID_ARGUMENT, dartplant::ReadLiveVmRootProgramHashForCurrentProfile(
+                                              context, profiles[1], &current_hash));
+
+    std::vector<bool> compatible;
+    for (const auto& candidate : profiles) {
+        uint32_t candidate_hash = 0;
+        const bool matches = dartplant::ProbeLiveVmRootProgramHashForCandidate(
+                                 context, candidate, &candidate_hash) == DARTPLANT_OK &&
+                             candidate_hash == kProgramHash;
+        compatible.push_back(matches);
+    }
+    EXPECT_TRUE(compatible[0]);
+    EXPECT_TRUE(compatible[1]);
+
+    dartplant::vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = {&profiles[0], &profiles[1]};
+    candidates.representative = &profiles[0];
+    const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, compatible);
+    EXPECT_TRUE(selection.ambiguous());
+    EXPECT_EQ(2U, selection.compatible_rows);
+    EXPECT_EQ(2U, selection.distinct_domain_sets);
 }
 
 TEST_CASE(VmAbiProofClosesFunctionTypeDescriptorAndClosureRelations) {

@@ -31,6 +31,12 @@ int RetiredReplacement(int left, int right) { return left + right + 20; }
 
 int RetiredReplacementLater(int left, int right) { return left + right + 30; }
 
+int ImageScopedRootTarget(int left, int right) { return left + right + 40; }
+
+int ImageScopedDeferredTarget(int left, int right) { return left + right + 50; }
+
+int DeferredLifecycleTarget(int left, int right) { return left + right + 60; }
+
 int g_enter_calls = 0;
 int g_leave_calls = 0;
 uint32_t g_enter_depth = 0;
@@ -2397,6 +2403,41 @@ TEST_CASE(RetiredRuntimeHookDoesNotBlockLaterGenerationInvalidation) {
     dartplant_reset();
 }
 
+TEST_CASE(RuntimeImageHookInvalidationDoesNotTouchSiblingImages) {
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    auto generation = std::make_shared<std::atomic_uint64_t>(1);
+    DartPlantHook* root_hook = nullptr;
+    DartPlantHook* deferred_hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(ImageScopedRootTarget),
+                                     reinterpret_cast<void*>(Replacement), &backup, &root_hook));
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallHook(
+                                reinterpret_cast<uintptr_t>(ImageScopedDeferredTarget),
+                                reinterpret_cast<void*>(Replacement), &backup, &deferred_hook));
+    root_hook->runtime_generation = generation;
+    root_hook->expected_runtime_generation = 1;
+    root_hook->code_target->image_id = 1;
+    deferred_hook->runtime_generation = generation;
+    deferred_hook->expected_runtime_generation = 1;
+    deferred_hook->code_target->image_id = 2;
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InvalidateRuntimeImageHooks(generation, 2));
+    EXPECT_TRUE(root_hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(!deferred_hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_EQ(1U, generation->load(std::memory_order_acquire));
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(root_hook));
+    EXPECT_EQ(2, g_fake_unhook_calls);
+    dartplant_release_hook(root_hook);
+    dartplant_release_hook(deferred_hook);
+    dartplant_reset();
+}
+
 TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     InstallTestHost(FakeHook, FakeUnhook);
     g_fake_unhook_calls = 0;
@@ -2439,6 +2480,59 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     EXPECT_TRUE(hook != nullptr && hook->active.load(std::memory_order_acquire));
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
 
+    dartplant::ModuleImage deferred_module;
+    deferred_module.name = "libapp.so-2.part.so";
+    deferred_module.path = "/feature/libapp.so-2.part.so";
+    deferred_module.build_id = "deferred-build";
+    const uintptr_t deferred_entry = reinterpret_cast<uintptr_t>(DeferredLifecycleTarget);
+    deferred_module.load_bias = deferred_entry - 0x1000;
+    deferred_module.executable_ranges.push_back({
+        .start = deferred_entry,
+        .end = deferred_entry + 0x100,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x100,
+    });
+    dartplant::FlutterSnapshotSource deferred_snapshot;
+    deferred_snapshot.module_name = deferred_module.name;
+    deferred_snapshot.module_path = deferred_module.path;
+    deferred_snapshot.module_build_id = deferred_module.build_id;
+    deferred_snapshot.snapshot_hash = runtime->snapshot->snapshot_hash;
+    deferred_snapshot.snapshot_features = runtime->snapshot->snapshot_features;
+    deferred_snapshot.profile_name = runtime->snapshot->profile_name;
+    deferred_snapshot.isolate_instructions_va = 0x1000;
+    deferred_snapshot.isolate_instructions_size = 0x100;
+    deferred_snapshot.isolate_instructions_runtime = deferred_entry;
+    deferred_snapshot.compressed_pointers = runtime->snapshot->compressed_pointers;
+    deferred_snapshot.deferred_program_hash = 0x12345678;
+    std::string image_error;
+    EXPECT_TRUE(runtime->image_set.AddDeferred(deferred_module, deferred_snapshot, 2, generation,
+                                               &image_error));
+    const uint64_t deferred_image_id = runtime->image_set.FindByLoadingUnitId(2)->id;
+
+    DartPlantHook* deferred_hook = nullptr;
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(deferred_entry, reinterpret_cast<void*>(Replacement), &backup,
+                                     &deferred_hook));
+    deferred_hook->runtime_generation = runtime->generation;
+    deferred_hook->expected_runtime_generation = generation;
+    deferred_hook->code_target->image_id = deferred_image_id;
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_on_module_unloading(
+                                runtime, deferred_module.name.c_str(), nullptr));
+    EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(!deferred_hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(runtime->image_set.FindByLoadingUnitId(2) == nullptr);
+    EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, runtime->state);
+    EXPECT_EQ(1, g_fake_unhook_calls);
+
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_on_module_unloading(runtime, "libunrelated.so", nullptr));
+    EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+
     EXPECT_EQ(DARTPLANT_OK,
               dartplant_runtime_on_module_unloading(runtime, module->name.c_str(), fixture));
     EXPECT_EQ(generation + 1, runtime->generation->load(std::memory_order_acquire));
@@ -2451,7 +2545,7 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     EXPECT_EQ(0U, image_count);
     EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
     EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
-    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_EQ(2, g_fake_unhook_calls);
 
     DartPlantHook* stale_hook = nullptr;
     backup = nullptr;
@@ -2460,10 +2554,12 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
                   runtime, method, reinterpret_cast<void*>(Replacement), &backup, &stale_hook));
     EXPECT_TRUE(stale_hook == nullptr);
     EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(deferred_hook));
     dartplant_release_hook(hook);
+    dartplant_release_hook(deferred_hook);
     dartplant_release_method(method);
     dartplant_runtime_destroy(runtime);
-    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_EQ(2, g_fake_unhook_calls);
     dlclose(fixture);
 }
 

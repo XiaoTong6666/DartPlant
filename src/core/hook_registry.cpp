@@ -672,6 +672,47 @@ void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_gen
     }
 }
 
+DartPlantStatus InvalidateRuntimeImageHooks(
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id) {
+    if (runtime_generation == nullptr || image_id == 0) return DARTPLANT_OK;
+    std::lock_guard lock(State().mutex);
+    DartPlantStatus status = DARTPLANT_OK;
+    for (const auto& hook : Hooks()) {
+        if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
+            hook->code_target->image_id != image_id) {
+            continue;
+        }
+        {
+            std::lock_guard hook_lock(hook->mutex);
+            if (hook->state == HookRecordState::kRetired) continue;
+        }
+        const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
+        if (unhook_status != DARTPLANT_OK) status = unhook_status;
+    }
+    return status;
+}
+
+void RetireRuntimeImageHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
+                             uint64_t image_id) {
+    if (runtime_generation == nullptr || image_id == 0) return;
+    std::lock_guard lock(State().mutex);
+    for (const auto& hook : Hooks()) {
+        if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
+            hook->code_target->image_id != image_id) {
+            continue;
+        }
+        std::lock_guard hook_lock(hook->mutex);
+        if (hook->state == HookRecordState::kUnhooked) continue;
+        hook->active.store(false, std::memory_order_release);
+        for (const auto& listener : hook->listeners) {
+            listener->active.store(false, std::memory_order_release);
+        }
+        hook->listeners.clear();
+        hook->state = HookRecordState::kRetired;
+        ReleaseArm64ExceptionBridgeConsumer(hook.get());
+    }
+}
+
 DartPlantStatus QuiesceVmAdapterHooks(DartPlantVmAdapter* adapter) {
     if (adapter == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     // Serialize with callback-hook installation so closing admission and

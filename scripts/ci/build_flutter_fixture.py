@@ -44,12 +44,16 @@ def main() -> int:
         )
 
     apk = flutter_cold_bootstrap.flutter_fixture_apk_path(args.mode)
-    provenance = inspect_arm64_apk(apk)
+    deferred_apk = flutter_cold_bootstrap.flutter_fixture_deferred_apk_path(args.mode)
+    provenance = inspect_arm64_apk(apk, deferred_apk)
     output_dir = args.out.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_apk = output_dir / f"app-{args.mode}.apk"
+    output_deferred_apk = output_dir / f"deferred_probe-{args.mode}.apk"
     shutil.copy2(apk, output_apk)
+    shutil.copy2(deferred_apk, output_deferred_apk)
     provenance["apk"] = output_apk.name
+    provenance["deferred_apk"] = output_deferred_apk.name
     manifest = {
         "family": args.family,
         "flutter": toolchain.flutter_version,

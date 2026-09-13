@@ -45,6 +45,19 @@ struct VmTypeArgumentsLayout {
     uint32_t types_offset;
 };
 
+// Private LoadingUnit object layout used to traverse Dart's source-defined
+// deferred AOT base-object relation. The values are generated from the exact
+// SDK revision for each supported profile and are never inferred from a live
+// artifact or from adjacent fields at runtime.
+struct VmLoadingUnitLayout {
+    uint32_t cid;
+    uint32_t parent_offset;
+    uint32_t base_objects_offset;
+    uint32_t instructions_image_offset;
+    uint32_t packed_fields_offset;
+    uint32_t instance_size;
+};
+
 struct VmTransitionLayout {
     uint64_t vm_tag_dart;
     uint64_t execution_vm;
@@ -144,6 +157,7 @@ struct RuntimeProfileRecord {
     FunctionKindLayout function_kind;
     VmThreadBridgeLayout thread_bridge;
     VmTypeArgumentsLayout type_arguments;
+    VmLoadingUnitLayout loading_unit;
     VmTransitionLayout transition;
 };
 

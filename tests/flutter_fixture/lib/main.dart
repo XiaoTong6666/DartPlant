@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'dartplant_native.dart';
+import 'deferred_probe.dart' deferred as deferred_probe;
 import 'package:flutter/services.dart';
 
 const fixture = DartPlantFixture();
@@ -31,6 +32,7 @@ const _ciRuntimeTests = <String>{
   'exception',
   'transition',
   'artifact_revalidate',
+  'deferred_lifecycle',
 };
 final _ciScenarioResults = <String, bool>{};
 
@@ -663,6 +665,44 @@ Future<void> main() async {
       _ciScenario('snapshot_offset', snapshotOffsetPassed, <String, Object?>{
         'proof': DartPlantNative.snapshotOffsetProof(),
       });
+    }
+
+    if (wants('deferred_lifecycle')) {
+      final beforeLoad = DartPlantNative.deferredBeforeLoad();
+      await deferred_probe.loadLibrary();
+      final afterLoad = DartPlantNative.deferredAfterLoad();
+      final value = deferred_probe.deferredAdd(1);
+      DartPlantNative.resetInstrumentedAddProbe();
+      var postDeferredInstrumented = 0;
+      for (var index = 0; index < 5; ++index) {
+        postDeferredInstrumented = instrumentedAdd(2, 3);
+      }
+      final postDeferredInstrumentedNative =
+          DartPlantNative.instrumentedAddProbe();
+      _runTypeArgumentsProof(
+        'post_deferred',
+        scenario: 'deferred_type_arguments_post_load',
+        requireRelocation: false,
+      );
+      final postDeferredTypeArguments =
+          _ciScenarioResults['deferred_type_arguments_post_load'] == true;
+      _ciScenario(
+        'deferred_lifecycle',
+        beforeLoad == 1 &&
+            afterLoad == 1 &&
+            value == 42 &&
+            postDeferredInstrumented == 115 &&
+            postDeferredInstrumentedNative == 115 &&
+            postDeferredTypeArguments,
+        <String, Object?>{
+          'before_load': beforeLoad,
+          'after_load': afterLoad,
+          'value': value,
+          'post_deferred_instrumented': postDeferredInstrumented,
+          'post_deferred_instrumented_native': postDeferredInstrumentedNative,
+          'post_deferred_type_arguments': postDeferredTypeArguments,
+        },
+      );
     }
 
     final selectedNativeProofPassed = requestedTest == 'all'

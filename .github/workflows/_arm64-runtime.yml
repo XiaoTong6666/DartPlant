@@ -118,11 +118,13 @@ jobs:
             mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$manifest")"
             key="$family-$mode"
             apk="$(dirname "$manifest")/app-$mode.apk"
+            deferred_apk="$(dirname "$manifest")/deferred_probe-$mode.apk"
 
             echo "=== $key ==="
             if ! python3 scripts/ci/run_flutter_device.py \
               --serial "$serial" \
               --apk "$apk" \
+              --deferred-apk "$deferred_apk" \
               --test all \
               --runtime-tier native \
               --log "build/ci/logcat/$key.log" \

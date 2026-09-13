@@ -17,9 +17,11 @@
 #include "dartplant/runtime.h"
 #include "dartplant/runtime_profile.h"
 #include "fixture_host.h"
+#include "runtime/flutter_snapshot_internal.h"
 #include "runtime/runtime_internal.h"
 #include "simple_facade_consumer.h"
 #include "vm/abi/resolver.h"
+#include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 #if __has_include("ordinary_aot_sidecar.h")
 #include "ordinary_aot_sidecar.h"
@@ -102,6 +104,7 @@ std::atomic_bool g_type_arguments_callback_passed{false};
 std::atomic_bool g_type_arguments_require_relocation{true};
 std::atomic_bool g_artifact_lifecycle_passed{false};
 std::atomic<uint64_t> g_snapshot_offset_proof{0};
+std::atomic<uint64_t> g_deferred_root_generation{0};
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
 
@@ -905,6 +908,142 @@ DartPlantStatus InstallMethodHook(DartPlantMethod* method, const DartPlantRuntim
                                                       out_hook);
 }
 
+void ReleaseInstrumentedAddBindings() {
+    if (g_instrumented_add_hook != nullptr) {
+        if (g_instrumented_add_hook->active.load(std::memory_order_acquire)) {
+            (void) dartplant_unhook(g_instrumented_add_hook);
+        }
+        dartplant_release_hook(g_instrumented_add_hook);
+        g_instrumented_add_hook = nullptr;
+    }
+    if (g_add_int_listener != nullptr) {
+        (void) dartplant_remove_listener(g_add_int_listener);
+        if (dartplant_listener_is_idle(g_add_int_listener)) {
+            dartplant_release_listener(g_add_int_listener);
+        }
+        g_add_int_listener = nullptr;
+    }
+    if (g_add_int != nullptr) {
+        dartplant_release_method(g_add_int);
+        g_add_int = nullptr;
+    }
+    if (g_instrumented_add != nullptr) {
+        dartplant_release_method(g_instrumented_add);
+        g_instrumented_add = nullptr;
+    }
+}
+
+void ReleaseHookBinding(DartPlantHook** hook) {
+    if (hook == nullptr || *hook == nullptr) return;
+    if ((*hook)->active.load(std::memory_order_acquire)) {
+        (void) dartplant_unhook(*hook);
+    }
+    dartplant_release_hook(*hook);
+    *hook = nullptr;
+}
+
+void ReleaseMethodBinding(DartPlantMethod** method) {
+    if (method == nullptr || *method == nullptr) return;
+    dartplant_release_method(*method);
+    *method = nullptr;
+}
+
+void ReleaseStaleFixtureGenerationBindings() {
+    const DartPlantMethod* probe =
+        g_instrumented_add != nullptr ? g_instrumented_add : g_signature_probe;
+    if (probe == nullptr || dartplant::IsCurrentRuntimeMethod(g_runtime, probe)) return;
+
+    ReleaseInstrumentedAddBindings();
+    ReleaseHookBinding(&g_echo_object_hook);
+    ReleaseHookBinding(&g_negate_bool_hook);
+    ReleaseHookBinding(&g_forced_stack_closure_hook);
+    ReleaseHookBinding(&g_type_arguments_closure_hook);
+    if (g_verified_abi_double_hook != nullptr) {
+        (void) dartplant_unhook_handle(g_verified_abi_double_hook);
+        dartplant_release_hook_handle(g_verified_abi_double_hook);
+        g_verified_abi_double_hook = nullptr;
+    }
+    if (g_verified_abi_double_observer_hook != nullptr) {
+        (void) dartplant_unhook_handle(g_verified_abi_double_observer_hook);
+        dartplant_release_hook_handle(g_verified_abi_double_observer_hook);
+        g_verified_abi_double_observer_hook = nullptr;
+    }
+    ReleaseMethodBinding(&g_echo_object);
+    ReleaseMethodBinding(&g_negate_bool);
+    ReleaseMethodBinding(&g_signature_probe);
+    ReleaseMethodBinding(&g_verified_abi_double);
+    ReleaseMethodBinding(&g_forced_stack_closure);
+    ReleaseMethodBinding(&g_type_arguments_closure);
+    g_runtime_live_vm_ready.store(false, std::memory_order_release);
+}
+
+DartPlantStatus EnsureInstrumentedAddBindingsCurrent() {
+    const bool dedup_instructions =
+        SnapshotHasExactFeature(g_snapshot_info.snapshot_features, "dedup_instructions");
+    const bool current =
+        g_instrumented_add != nullptr && g_add_int != nullptr &&
+        dartplant::IsCurrentRuntimeMethod(g_runtime, g_instrumented_add) &&
+        dartplant::IsCurrentRuntimeMethod(g_runtime, g_add_int) &&
+        g_instrumented_add_hook != nullptr &&
+        g_instrumented_add_hook->active.load(std::memory_order_acquire) &&
+        (!dedup_instructions ||
+         (g_add_int_listener != nullptr && dartplant_listener_is_active(g_add_int_listener)));
+    if (current) return DARTPLANT_OK;
+
+    ReleaseInstrumentedAddBindings();
+    if (!FindLiveTopLevelMethod("instrumentedAdd", &g_instrumented_add)) {
+        return DARTPLANT_METHOD_NOT_FOUND;
+    }
+    const DartPlantMethodQuery add_int_query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/main.dart",
+        .class_name = "DartPlantFixture",
+        .function_name = "addInt",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantStatus status = dartplant_runtime_find_method(g_runtime, &add_int_query, &g_add_int);
+    if (status != DARTPLANT_OK) {
+        ReleaseInstrumentedAddBindings();
+        return status;
+    }
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT |
+                    DARTPLANT_PROFILE_TAGGED_GP_ARGUMENTS | DARTPLANT_PROFILE_TAGGED_GP_RESULT;
+    profile.argument_count = 2;
+    profile.argument_locations[0] = {DARTPLANT_ABI_GP_REGISTER, 1, {0, 0}};
+    profile.argument_locations[1] = {DARTPLANT_ABI_GP_REGISTER, 2, {0, 0}};
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+    status = InstallMethodHook(g_instrumented_add, profile, OnInstrumentedAddLeave,
+                               &g_instrumented_add_hook, OnInstrumentedAddEnter,
+                               dedup_instructions ? DARTPLANT_HOOK_ALLOW_SHARED_CODE : 0);
+    if (status != DARTPLANT_OK) {
+        ReleaseInstrumentedAddBindings();
+        return status;
+    }
+    if (dedup_instructions) {
+        DartPlantHookOptions listener_options = {
+            .struct_size = sizeof(DartPlantHookOptions),
+            .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
+            .on_enter = OnSharedAddIntListenerEnter,
+            .on_leave = nullptr,
+            .user_data = nullptr,
+            .vm_adapter = nullptr,
+        };
+        status = dartplant_runtime_add_listener(g_runtime, g_add_int, &listener_options, -100,
+                                                &g_add_int_listener);
+        if (status != DARTPLANT_OK) {
+            ReleaseInstrumentedAddBindings();
+            return status;
+        }
+    }
+    g_expect_deduplicated_shared_code.store(dedup_instructions, std::memory_order_release);
+    g_shared_policy_ok.store(true, std::memory_order_release);
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus InstallForcedStackClosureHook() {
     if (g_forced_stack_closure_hook != nullptr) return DARTPLANT_ALREADY_HOOKED;
     const DartPlantMethodQuery query = {
@@ -977,7 +1116,23 @@ DartPlantStatus InstallForcedStackClosureHook() {
 }
 
 DartPlantStatus InstallTypeArgumentsProofHook(Dart_Handle retained_closure) {
-    if (g_type_arguments_closure_hook != nullptr) return DARTPLANT_OK;
+    if (g_type_arguments_closure_hook != nullptr &&
+        g_type_arguments_closure_hook->active.load(std::memory_order_acquire) &&
+        g_type_arguments_closure != nullptr &&
+        dartplant::IsCurrentRuntimeMethod(g_runtime, g_type_arguments_closure)) {
+        return DARTPLANT_OK;
+    }
+    if (g_type_arguments_closure_hook != nullptr) {
+        if (g_type_arguments_closure_hook->active.load(std::memory_order_acquire)) {
+            (void) dartplant_unhook(g_type_arguments_closure_hook);
+        }
+        dartplant_release_hook(g_type_arguments_closure_hook);
+        g_type_arguments_closure_hook = nullptr;
+    }
+    if (g_type_arguments_closure != nullptr) {
+        dartplant_release_method(g_type_arguments_closure);
+        g_type_arguments_closure = nullptr;
+    }
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(DartPlantMethodQuery),
         .library_uri = "package:dartplant_fixture/main.dart",
@@ -1243,6 +1398,13 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         g_cold_bootstrap_status.store(DARTPLANT_RUNTIME_NOT_READY, std::memory_order_release);
         return;
     }
+
+    // A root/engine incarnation change advances the runtime generation. Any
+    // fixture-owned method/hook handles from the previous generation must be
+    // released before this bootstrap republishes the current live graph.
+    // Secondary image add/remove keeps the generation stable and therefore
+    // does not disturb valid root bindings.
+    ReleaseStaleFixtureGenerationBindings();
 
     // Bind the generated artifact/evidence to this advanced runtime while the
     // target bytes are still pristine. The independent simple consumer will
@@ -1799,6 +1961,12 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_release
 
 extern "C" __attribute__((visibility("default"))) void
 dartplant_fixture_reset_instrumented_add_probe() {
+    const DartPlantStatus rebind_status = EnsureInstrumentedAddBindingsCurrent();
+    if (rebind_status != DARTPLANT_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "instrumentedAdd interactive rebind failed status=%d error=%s",
+                            rebind_status, dartplant_last_error());
+    }
     g_instrumented_add_enter.store(0, std::memory_order_relaxed);
     g_instrumented_add_leave.store(0, std::memory_order_relaxed);
     g_instrumented_add_last_result.store(0, std::memory_order_relaxed);
@@ -2217,6 +2385,450 @@ dartplant_fixture_snapshot_offset_proof() {
     return g_snapshot_offset_proof.load(std::memory_order_acquire);
 }
 
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_deferred_before_load() {
+    if (g_runtime == nullptr) return 0;
+    if (g_runtime->live_vm_context.has_value()) {
+        const auto* profile =
+            dartplant::FindRuntimeProfileByVersion(g_runtime->live_vm_context->profile_version);
+        uint32_t root_program_hash = 0;
+        const DartPlantStatus hash_status =
+            profile == nullptr ? DARTPLANT_PROFILE_MISMATCH
+                               : dartplant::ReadLiveVmRootProgramHashForCurrentProfile(
+                                     *g_runtime->live_vm_context, *profile, &root_program_hash);
+        __android_log_print(
+            hash_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+            "deferred program-hash lifecycle phase=before_load status=%d group=0x%llx "
+            "object_store=0x%llx value=0x%08x error=%s",
+            hash_status, static_cast<unsigned long long>(g_runtime->live_vm_context->isolate_group),
+            static_cast<unsigned long long>(g_runtime->live_vm_context->object_store),
+            root_program_hash, hash_status == DARTPLANT_OK ? "none" : dartplant_last_error());
+    }
+    uint32_t image_count = 0;
+    DartPlantRuntimeImageInfo root{};
+    root.struct_size = sizeof(root);
+    const DartPlantStatus count_status = dartplant_runtime_get_image_count(g_runtime, &image_count);
+    const DartPlantStatus image_status = count_status == DARTPLANT_OK && image_count == 1
+                                             ? dartplant_runtime_get_image_info(g_runtime, 0, &root)
+                                             : DARTPLANT_RUNTIME_NOT_READY;
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/deferred_probe.dart",
+        .class_name = "Global",
+        .function_name = "deferredAdd",
+        .signature = nullptr,
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* unexpected_method = nullptr;
+    const DartPlantStatus lookup_status =
+        dartplant_runtime_find_method(g_runtime, &query, &unexpected_method);
+    if (unexpected_method != nullptr) dartplant_release_method(unexpected_method);
+
+    const bool passed = count_status == DARTPLANT_OK && image_status == DARTPLANT_OK &&
+                        root.kind == DARTPLANT_RUNTIME_IMAGE_ROOT && root.loading_unit_id == 1 &&
+                        root.live_semantic_bound != 0 &&
+                        lookup_status == DARTPLANT_METHOD_NOT_FOUND;
+    if (passed) {
+        g_deferred_root_generation.store(root.runtime_generation, std::memory_order_release);
+    }
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"deferred_before_load\",\"state\":\"%s\","
+                        "\"count_status\":%d,\"image_status\":%d,\"lookup_status\":%d,"
+                        "\"image_count\":%u,\"generation\":%llu,\"live_entries\":%u}",
+                        passed ? "pass" : "fail", count_status, image_status, lookup_status,
+                        image_count, static_cast<unsigned long long>(root.runtime_generation),
+                        root.live_entry_count);
+    return passed ? 1 : 0;
+}
+
+void LogDeferredProgramHashMemory(const DartPlantLiveVmArm64Registers& registers,
+                                  const char* phase) {
+    DartPlantLiveVmContext context{};
+    context.struct_size = sizeof(context);
+    const DartPlantStatus context_status =
+        dartplant_live_vm_context_from_arm64_registers(&g_snapshot_info, &registers, &context);
+    if (context_status != DARTPLANT_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "deferred program-hash raw phase=%s context_status=%d error=%s", phase,
+                            context_status, dartplant_last_error());
+        return;
+    }
+    const auto* profile = dartplant::FindRuntimeProfileByVersion(context.profile_version);
+    if (profile == nullptr || profile->live_vm.object_store_loading_units_offset == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "deferred program-hash raw phase=%s profile unavailable version=%u",
+                            phase, context.profile_version);
+        return;
+    }
+
+    uint64_t loading_units = 0;
+    std::memcpy(&loading_units,
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(context.object_store) +
+                                              profile->live_vm.object_store_loading_units_offset),
+                sizeof(loading_units));
+    const uintptr_t array =
+        static_cast<uintptr_t>(loading_units - profile->raw_object.heap_object_tag);
+    uint64_t tags = 0;
+    uint32_t length_raw = 0;
+    uint32_t element0_raw = 0;
+    uint32_t element1_raw = 0;
+    uint32_t element2_raw = 0;
+    std::memcpy(&tags, reinterpret_cast<const void*>(array), sizeof(tags));
+    std::memcpy(&length_raw,
+                reinterpret_cast<const void*>(array + profile->live_vm.array_length_offset),
+                sizeof(length_raw));
+    std::memcpy(&element0_raw,
+                reinterpret_cast<const void*>(array + profile->live_vm.array_elements_offset),
+                sizeof(element0_raw));
+    std::memcpy(&element1_raw,
+                reinterpret_cast<const void*>(array + profile->live_vm.array_elements_offset + 4),
+                sizeof(element1_raw));
+    std::memcpy(&element2_raw,
+                reinterpret_cast<const void*>(array + profile->live_vm.array_elements_offset + 8),
+                sizeof(element2_raw));
+
+    uint32_t parsed_hash = 0;
+    const DartPlantStatus hash_status =
+        dartplant::ReadLiveVmRootProgramHashForCurrentProfile(context, *profile, &parsed_hash);
+    __android_log_print(
+        ANDROID_LOG_INFO, kTag,
+        "deferred program-hash raw phase=%s context_status=%d hash_status=%d profile=%u "
+        "group=0x%llx object_store=0x%llx loading_units=0x%llx array=0x%llx "
+        "offset=0x%x array_len_off=0x%x array_data_off=0x%x tags=0x%llx length_raw=0x%08x "
+        "element0_raw=0x%08x element0_value=0x%08x element1_raw=0x%08x element2_raw=0x%08x "
+        "parsed=0x%08x",
+        phase, context_status, hash_status, context.profile_version,
+        static_cast<unsigned long long>(context.isolate_group),
+        static_cast<unsigned long long>(context.object_store),
+        static_cast<unsigned long long>(loading_units), static_cast<unsigned long long>(array),
+        profile->live_vm.object_store_loading_units_offset, profile->live_vm.array_length_offset,
+        profile->live_vm.array_elements_offset, static_cast<unsigned long long>(tags), length_raw,
+        element0_raw, element0_raw >> profile->raw_object.smi_tag_shift, element1_raw, element2_raw,
+        parsed_hash);
+
+    if (element2_raw != 0 && (element2_raw & profile->raw_object.smi_tag_mask) != 0) {
+        constexpr uint32_t kLoadingUnitCid = 39;
+        constexpr uint32_t kLoadingUnitBaseObjectsOffset = 0x0c;
+        constexpr uint32_t kLoadingUnitInstructionsImageOffset = 0x10;
+        constexpr uint32_t kLoadingUnitPackedFieldsOffset = 0x18;
+        const uint64_t unit = context.heap_base + element2_raw;
+        const uintptr_t unit_address =
+            static_cast<uintptr_t>(unit - profile->raw_object.heap_object_tag);
+        uint64_t unit_tags = 0;
+        uint32_t base_objects_raw = 0;
+        uint64_t instructions_image = 0;
+        uint64_t packed_fields = 0;
+        std::memcpy(&unit_tags, reinterpret_cast<const void*>(unit_address), sizeof(unit_tags));
+        std::memcpy(&base_objects_raw,
+                    reinterpret_cast<const void*>(unit_address + kLoadingUnitBaseObjectsOffset),
+                    sizeof(base_objects_raw));
+        std::memcpy(
+            &instructions_image,
+            reinterpret_cast<const void*>(unit_address + kLoadingUnitInstructionsImageOffset),
+            sizeof(instructions_image));
+        std::memcpy(&packed_fields,
+                    reinterpret_cast<const void*>(unit_address + kLoadingUnitPackedFieldsOffset),
+                    sizeof(packed_fields));
+        const uint64_t cid_mask = (uint64_t{1} << profile->raw_object.class_id_tag_bits) - 1;
+        const uint32_t unit_cid =
+            static_cast<uint32_t>((unit_tags >> profile->raw_object.class_id_tag_shift) & cid_mask);
+
+        uint64_t base_objects = 0;
+        uint32_t base_cid = 0;
+        uint32_t base_length_raw = 0;
+        uint64_t base_length = 0;
+        uint32_t code_objects = 0;
+        uint32_t deferred_code_objects = 0;
+        uint64_t first_deferred_code = 0;
+        uint64_t first_deferred_entry = 0;
+        uint64_t first_deferred_owner = 0;
+        uint32_t first_deferred_owner_cid = 0;
+        char first_deferred_name[96] = {};
+        char first_deferred_uri[192] = {};
+        uint64_t deferred_start = 0;
+        uint64_t deferred_end = 0;
+        for (const auto& module : dartplant::EnumerateModules()) {
+            const auto unit_id = dartplant::ParseDeferredLoadingUnitId("libapp.so", module.name);
+            if (!unit_id.has_value() || *unit_id != 2) continue;
+            std::string error;
+            const auto source = dartplant::DiscoverDeferredFlutterSnapshot(module, &error);
+            if (!source.has_value()) continue;
+            deferred_start = source->isolate_instructions_runtime;
+            deferred_end = deferred_start + source->isolate_instructions_size;
+            break;
+        }
+        if (base_objects_raw != 0 && (base_objects_raw & profile->raw_object.smi_tag_mask) != 0) {
+            base_objects = context.heap_base + base_objects_raw;
+            const uintptr_t base_address =
+                static_cast<uintptr_t>(base_objects - profile->raw_object.heap_object_tag);
+            uint64_t base_tags = 0;
+            std::memcpy(&base_tags, reinterpret_cast<const void*>(base_address), sizeof(base_tags));
+            base_cid = static_cast<uint32_t>((base_tags >> profile->raw_object.class_id_tag_shift) &
+                                             cid_mask);
+            std::memcpy(
+                &base_length_raw,
+                reinterpret_cast<const void*>(base_address + profile->live_vm.array_length_offset),
+                sizeof(base_length_raw));
+            base_length = base_length_raw >> profile->raw_object.smi_tag_shift;
+            if ((base_cid == profile->live_vm.cid_array ||
+                 base_cid == profile->live_vm.cid_immutable_array) &&
+                base_length <= 200000) {
+                for (uint64_t index = 0; index < base_length; ++index) {
+                    uint32_t raw = 0;
+                    std::memcpy(
+                        &raw,
+                        reinterpret_cast<const void*>(
+                            base_address + profile->live_vm.array_elements_offset + index * 4),
+                        sizeof(raw));
+                    if (raw == 0 || (raw & profile->raw_object.smi_tag_mask) == 0) continue;
+                    const uint64_t tagged = context.heap_base + raw;
+                    const uintptr_t object_address =
+                        static_cast<uintptr_t>(tagged - profile->raw_object.heap_object_tag);
+                    uint64_t object_tags = 0;
+                    std::memcpy(&object_tags, reinterpret_cast<const void*>(object_address),
+                                sizeof(object_tags));
+                    const uint32_t cid = static_cast<uint32_t>(
+                        (object_tags >> profile->raw_object.class_id_tag_shift) & cid_mask);
+                    if (cid != profile->live_vm.cid_code) continue;
+                    ++code_objects;
+                    uint64_t entry = 0;
+                    std::memcpy(&entry,
+                                reinterpret_cast<const void*>(
+                                    object_address + profile->live_vm.code_entry_point_offset),
+                                sizeof(entry));
+                    if (deferred_start != 0 && entry >= deferred_start && entry < deferred_end) {
+                        ++deferred_code_objects;
+                        if (first_deferred_code == 0) {
+                            first_deferred_code = tagged;
+                            first_deferred_entry = entry;
+                            std::memcpy(&first_deferred_owner,
+                                        reinterpret_cast<const void*>(
+                                            object_address + profile->live_vm.code_owner_offset),
+                                        sizeof(first_deferred_owner));
+                            if (first_deferred_owner != 0 &&
+                                (first_deferred_owner & profile->raw_object.smi_tag_mask) != 0) {
+                                const uintptr_t owner_address = static_cast<uintptr_t>(
+                                    first_deferred_owner - profile->raw_object.heap_object_tag);
+                                uint64_t owner_tags = 0;
+                                std::memcpy(&owner_tags,
+                                            reinterpret_cast<const void*>(owner_address),
+                                            sizeof(owner_tags));
+                                first_deferred_owner_cid = static_cast<uint32_t>(
+                                    (owner_tags >> profile->raw_object.class_id_tag_shift) &
+                                    cid_mask);
+                                if (first_deferred_owner_cid == profile->live_vm.cid_function) {
+                                    const auto read_compressed = [&](uintptr_t address,
+                                                                     uint32_t offset) {
+                                        uint32_t compressed = 0;
+                                        std::memcpy(&compressed,
+                                                    reinterpret_cast<const void*>(address + offset),
+                                                    sizeof(compressed));
+                                        return context.heap_base + compressed;
+                                    };
+                                    const auto read_string = [&](uint64_t tagged_string,
+                                                                 char* output, size_t output_size) {
+                                        if (tagged_string == 0 || output == nullptr ||
+                                            output_size == 0)
+                                            return;
+                                        const uintptr_t string_address = static_cast<uintptr_t>(
+                                            tagged_string - profile->raw_object.heap_object_tag);
+                                        uint64_t string_tags = 0;
+                                        uint32_t string_length_raw = 0;
+                                        std::memcpy(&string_tags,
+                                                    reinterpret_cast<const void*>(string_address),
+                                                    sizeof(string_tags));
+                                        const uint32_t string_cid = static_cast<uint32_t>(
+                                            (string_tags >>
+                                             profile->raw_object.class_id_tag_shift) &
+                                            cid_mask);
+                                        if (string_cid != profile->live_vm.cid_one_byte_string)
+                                            return;
+                                        std::memcpy(&string_length_raw,
+                                                    reinterpret_cast<const void*>(
+                                                        string_address +
+                                                        profile->live_vm.string_length_offset),
+                                                    sizeof(string_length_raw));
+                                        const size_t string_length = std::min<size_t>(
+                                            string_length_raw >> profile->raw_object.smi_tag_shift,
+                                            output_size - 1);
+                                        std::memcpy(output,
+                                                    reinterpret_cast<const void*>(
+                                                        string_address +
+                                                        profile->live_vm.string_data_offset),
+                                                    string_length);
+                                        output[string_length] = '\0';
+                                    };
+                                    const uint64_t function_name = read_compressed(
+                                        owner_address, profile->live_vm.function_name_offset);
+                                    const uint64_t owner_class = read_compressed(
+                                        owner_address, profile->live_vm.function_owner_offset);
+                                    read_string(function_name, first_deferred_name,
+                                                sizeof(first_deferred_name));
+                                    if (owner_class != 0 &&
+                                        (owner_class & profile->raw_object.smi_tag_mask) != 0) {
+                                        const uintptr_t class_address = static_cast<uintptr_t>(
+                                            owner_class - profile->raw_object.heap_object_tag);
+                                        const uint64_t library = read_compressed(
+                                            class_address, profile->live_vm.class_library_offset);
+                                        if (library != 0 &&
+                                            (library & profile->raw_object.smi_tag_mask) != 0) {
+                                            const uintptr_t library_address =
+                                                static_cast<uintptr_t>(
+                                                    library - profile->raw_object.heap_object_tag);
+                                            const uint64_t uri = read_compressed(
+                                                library_address,
+                                                profile->live_vm.library_url_offset);
+                                            read_string(uri, first_deferred_uri,
+                                                        sizeof(first_deferred_uri));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "deferred loading-unit raw phase=%s unit=0x%llx cid=%u expected_cid=%u "
+            "base_raw=0x%08x base=0x%llx base_cid=%u base_len=%llu instructions=0x%llx "
+            "packed=0x%llx deferred_range=[0x%llx,0x%llx) code_objects=%u "
+            "deferred_code_objects=%u first_code=0x%llx first_entry=0x%llx owner=0x%llx "
+            "owner_cid=%u name=%s uri=%s",
+            phase, static_cast<unsigned long long>(unit), unit_cid, kLoadingUnitCid,
+            base_objects_raw, static_cast<unsigned long long>(base_objects), base_cid,
+            static_cast<unsigned long long>(base_length),
+            static_cast<unsigned long long>(instructions_image),
+            static_cast<unsigned long long>(packed_fields),
+            static_cast<unsigned long long>(deferred_start),
+            static_cast<unsigned long long>(deferred_end), code_objects, deferred_code_objects,
+            static_cast<unsigned long long>(first_deferred_code),
+            static_cast<unsigned long long>(first_deferred_entry),
+            static_cast<unsigned long long>(first_deferred_owner), first_deferred_owner_cid,
+            first_deferred_name, first_deferred_uri);
+    }
+}
+
+extern "C" __attribute__((visibility("hidden"))) uint64_t
+dartplant_fixture_deferred_after_load_with_registers(uint64_t null_value, uint64_t thr, uint64_t pp,
+                                                     uint64_t heap_bits) {
+    if (g_runtime == nullptr) return 0;
+    const uint64_t generation_before = g_deferred_root_generation.load(std::memory_order_acquire);
+    DartPlantLiveVmArm64Registers registers{};
+    registers.struct_size = sizeof(registers);
+    registers.thr = thr;
+    registers.pp = pp;
+    registers.heap_bits = heap_bits;
+    registers.null_value = null_value;
+    LogDeferredProgramHashMemory(registers, "before_runtime_invalidation");
+    // Flutter keeps a loaded loading unit mapped for the VM lifetime and does
+    // not expose a physical dlclose operation. Exercise the host lifecycle
+    // boundary nevertheless: invalidate the old generation at the unload
+    // notification, then re-enumerate and rebind the still-mapped unit.
+    const DartPlantStatus unload_status =
+        dartplant_runtime_on_module_unloading(g_runtime, "libapp.so-2.part.so", nullptr);
+    const DartPlantStatus refresh_status = dartplant_runtime_refresh_modules(g_runtime);
+
+    DartPlantDartFunctionSignatureInfo stale_signature{};
+    stale_signature.struct_size = sizeof(stale_signature);
+    const DartPlantStatus stale_before_bootstrap =
+        g_signature_probe == nullptr ? DARTPLANT_INVALID_ARGUMENT
+                                     : dartplant_runtime_get_method_signature(
+                                           g_runtime, g_signature_probe, &stale_signature);
+
+    DartPlantLiveVmBootstrapInfo bootstrap{};
+    bootstrap.struct_size = sizeof(bootstrap);
+    const DartPlantStatus bootstrap_status =
+        refresh_status == DARTPLANT_OK ? dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
+                                             g_runtime, &registers, &bootstrap)
+                                       : refresh_status;
+    const std::string bootstrap_error =
+        bootstrap_status == DARTPLANT_OK ? std::string() : std::string(dartplant_last_error());
+
+    stale_signature = {};
+    stale_signature.struct_size = sizeof(stale_signature);
+    const DartPlantStatus root_handle_after_bootstrap =
+        g_signature_probe == nullptr ? DARTPLANT_INVALID_ARGUMENT
+                                     : dartplant_runtime_get_method_signature(
+                                           g_runtime, g_signature_probe, &stale_signature);
+
+    uint32_t image_count = 0;
+    const DartPlantStatus count_status = dartplant_runtime_get_image_count(g_runtime, &image_count);
+    DartPlantRuntimeImageInfo root{};
+    DartPlantRuntimeImageInfo deferred{};
+    bool found_root = false;
+    bool found_deferred = false;
+    for (uint32_t index = 0; count_status == DARTPLANT_OK && index < image_count; ++index) {
+        DartPlantRuntimeImageInfo info{};
+        info.struct_size = sizeof(info);
+        if (dartplant_runtime_get_image_info(g_runtime, index, &info) != DARTPLANT_OK) continue;
+        if (info.kind == DARTPLANT_RUNTIME_IMAGE_ROOT) {
+            root = info;
+            found_root = true;
+        } else if (info.kind == DARTPLANT_RUNTIME_IMAGE_DEFERRED && info.loading_unit_id == 2) {
+            deferred = info;
+            found_deferred = true;
+        }
+    }
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:dartplant_fixture/deferred_probe.dart",
+        .class_name = "Global",
+        .function_name = "deferredAdd",
+        .signature = nullptr,
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    const DartPlantStatus lookup_status =
+        bootstrap_status == DARTPLANT_OK ? dartplant_runtime_find_method(g_runtime, &query, &method)
+                                         : bootstrap_status;
+    const uintptr_t method_address =
+        method == nullptr ? 0 : dartplant_method_runtime_address(method);
+    const uint64_t deferred_end =
+        found_deferred ? deferred.isolate_instructions_runtime + deferred.isolate_instructions_size
+                       : 0;
+    const bool method_in_deferred = found_deferred &&
+                                    method_address >= deferred.isolate_instructions_runtime &&
+                                    method_address < deferred_end;
+    if (method != nullptr) dartplant_release_method(method);
+
+    const bool passed =
+        generation_before != 0 && unload_status == DARTPLANT_OK && refresh_status == DARTPLANT_OK &&
+        stale_before_bootstrap == DARTPLANT_RUNTIME_NOT_READY && bootstrap_status == DARTPLANT_OK &&
+        root_handle_after_bootstrap == DARTPLANT_OK && count_status == DARTPLANT_OK &&
+        image_count == 2 && found_root && found_deferred &&
+        root.runtime_generation == generation_before &&
+        deferred.runtime_generation == root.runtime_generation &&
+        deferred.has_deferred_program_hash != 0 && deferred.deferred_program_hash_vm_bound != 0 &&
+        deferred.live_semantic_bound != 0 && deferred.live_entry_count != 0 &&
+        g_instrumented_add_hook != nullptr &&
+        g_instrumented_add_hook->active.load(std::memory_order_acquire) &&
+        lookup_status == DARTPLANT_OK && method_in_deferred;
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"deferred_after_load\",\"state\":\"%s\","
+                        "\"unload_status\":%d,\"refresh_status\":%d,"
+                        "\"bootstrap_status\":%d,\"count_status\":%d,"
+                        "\"lookup_status\":%d,\"root_before_bootstrap\":%d,"
+                        "\"root_after_bootstrap\":%d,"
+                        "\"image_count\":%u,\"generation_before\":%llu,\"generation_after\":%llu,"
+                        "\"loading_unit_id\":%u,\"program_hash_bound\":%u,\"live_entries\":%u,"
+                        "\"method_address\":\"0x%llx\",\"instructions_start\":\"0x%llx\","
+                        "\"bootstrap_error\":\"%s\"}",
+                        passed ? "pass" : "fail", unload_status, refresh_status, bootstrap_status,
+                        count_status, lookup_status, stale_before_bootstrap,
+                        root_handle_after_bootstrap, image_count,
+                        static_cast<unsigned long long>(generation_before),
+                        static_cast<unsigned long long>(root.runtime_generation),
+                        deferred.loading_unit_id, deferred.deferred_program_hash_vm_bound,
+                        deferred.live_entry_count, static_cast<unsigned long long>(method_address),
+                        static_cast<unsigned long long>(deferred.isolate_instructions_runtime),
+                        bootstrap_error.c_str());
+    return passed ? 1 : 0;
+}
+
 extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
@@ -2441,6 +3053,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     }
 
     g_cold_bootstrap_status.store(-1, std::memory_order_release);
+    g_deferred_root_generation.store(0, std::memory_order_release);
     g_runtime_live_vm_ready.store(false, std::memory_order_release);
     g_shared_policy_ok.store(false, std::memory_order_release);
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
@@ -2480,6 +3093,16 @@ DartPlantVmAdapter* dartplant_fixture_dart_api_adapter() {
 }
 
 #if defined(__aarch64__)
+extern "C"
+    __attribute__((naked, visibility("default"))) uint64_t dartplant_fixture_deferred_after_load() {
+    __asm__ volatile(
+        "mov x0, x22\n"
+        "mov x1, x26\n"
+        "mov x2, x27\n"
+        "mov x3, x28\n"
+        "b dartplant_fixture_deferred_after_load_with_registers\n");
+}
+
 extern "C" __attribute__((naked, visibility("default"))) int dartplant_fixture_initialize(void*) {
     __asm__ volatile(
         "mov x1, x22\n"
@@ -2489,8 +3112,12 @@ extern "C" __attribute__((naked, visibility("default"))) int dartplant_fixture_i
         "b dartplant_fixture_initialize_with_registers\n");
 }
 #else
-extern "C"
-    __attribute__((visibility("default"))) int dartplant_fixture_initialize(void* api_dl_data) {
+extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_deferred_after_load() {
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"))) int dartplant_fixture_initialize(
+    void* api_dl_data) {
     return dartplant_fixture_initialize_with_registers(api_dl_data, 0, 0, 0, 0);
 }
 #endif

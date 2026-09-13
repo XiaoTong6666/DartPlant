@@ -637,6 +637,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
 #define CLASS_LIST(V) \
   V(Object) \
   V(Class) \
+  V(LoadingUnit) \
   V(Function) \
   V(Library) \
   V(Code) \
@@ -676,6 +677,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
             profile["cids"][field] = actual[name]
         profile["type_arguments"]["cid"] = actual["TypeArgumentsCid"]
         profile["canonical_bool"]["cid"] = actual["BoolCid"]
+        profile["loading_unit"]["cid"] = actual["LoadingUnitCid"]
         type_fields = {
             "cid_type": "TypeCid",
             "cid_function_type": "FunctionTypeCid",
@@ -691,6 +693,11 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
         generate_vm_profiles._verify_class_ids(profile, source)
         profile["cids"]["function"] += 1
         with self.assertRaisesRegex(ValueError, "FunctionCid"):
+            generate_vm_profiles._verify_class_ids(profile, source)
+
+        profile["cids"]["function"] = actual["FunctionCid"]
+        profile["loading_unit"]["cid"] += 1
+        with self.assertRaisesRegex(ValueError, "LoadingUnitCid"):
             generate_vm_profiles._verify_class_ids(profile, source)
 
     def test_abi_layer_separation_rejects_provenance_and_artifact_facts(self) -> None:

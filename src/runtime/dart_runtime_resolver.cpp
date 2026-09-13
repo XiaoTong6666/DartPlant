@@ -103,6 +103,13 @@ bool ContainsModuleIdentity(const std::vector<ModuleImage>& modules,
     });
 }
 
+bool ModuleMatchesEvent(const ModuleImage& module, const char* module_name) {
+    if (module_name == nullptr || module_name[0] == '\0') return false;
+    const std::string_view requested(module_name);
+    return requested.find('/') == std::string_view::npos ? module.name == requested
+                                                         : module.path == requested;
+}
+
 bool SameSnapshotIdentity(const std::optional<FlutterSnapshotSource>& left,
                           const std::optional<FlutterSnapshotSource>& right) {
     if (left.has_value() != right.has_value()) return false;
@@ -619,10 +626,18 @@ bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right) {
 }
 
 bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMethod* method) {
-    return runtime != nullptr && method != nullptr &&
-           method->runtime_generation == runtime->generation &&
-           method->expected_runtime_generation ==
-               runtime->generation->load(std::memory_order_acquire);
+    if (runtime == nullptr || method == nullptr ||
+        method->runtime_generation != runtime->generation ||
+        method->expected_runtime_generation !=
+            runtime->generation->load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard lock(runtime->mutex);
+    if (runtime->image_set.empty()) return true;
+    if (method->function == nullptr || method->function->image_id == 0) return false;
+    const RuntimeImage* image = runtime->image_set.FindById(method->function->image_id);
+    return image != nullptr && SameModuleIdentity(std::optional<ModuleImage>(image->module),
+                                                  std::optional<ModuleImage>(method->module));
 }
 
 DartPlantStatus ReplaceRuntimeArtifactSnapshotIndex(DartPlantRuntime* runtime,
@@ -813,8 +828,13 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         return DARTPLANT_RUNTIME_NOT_READY;
     }
     const bool image_set_changed = !runtime->image_set.SameIdentity(*image_set);
-    const bool relevant_identity_changed =
-        app_changed || dart_runtime_changed || snapshot_changed || image_set_changed;
+    const bool incarnation_changed = app_changed || dart_runtime_changed || snapshot_changed;
+    if (!incarnation_changed && image_set_changed &&
+        !image_set->PreserveIdsFrom(runtime->image_set)) {
+        runtime->state = DARTPLANT_RUNTIME_FAILED;
+        SetLastError("runtime image ids could not be preserved across an in-generation refresh");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
 
     runtime->modules = modules;
     // Publish the selected current incarnations before invalidation can fail,
@@ -822,7 +842,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
     runtime->selected_app_module = new_app;
     runtime->selected_runtime_module = new_dart_runtime;
     DartPlantStatus hook_invalidation_status = DARTPLANT_OK;
-    if (relevant_identity_changed) {
+    if (incarnation_changed) {
         runtime->generation->fetch_add(1, std::memory_order_acq_rel);
         image_set->BindGeneration(runtime->generation->load(std::memory_order_acquire));
         if (app_changed && old_app.has_value() && !old_app_mapping_present) {
@@ -845,6 +865,30 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
         runtime->bound_artifact_snapshot_generation = 0;
         runtime->live_function_index_info = {};
         runtime->image_set = std::move(*image_set);
+    } else if (image_set_changed) {
+        for (const auto& old_image : runtime->image_set.images()) {
+            if (image_set->ContainsIdentity(old_image)) continue;
+            const bool mapping_present = std::any_of(
+                modules.begin(), modules.end(), [&old_image](const ModuleImage& module) {
+                    return SameModuleIdentity(std::optional<ModuleImage>(module),
+                                              std::optional<ModuleImage>(old_image.module));
+                });
+            if (mapping_present) {
+                const DartPlantStatus status =
+                    InvalidateRuntimeImageHooks(runtime->generation, old_image.id);
+                if (status != DARTPLANT_OK && hook_invalidation_status == DARTPLANT_OK) {
+                    hook_invalidation_status = status;
+                }
+            } else {
+                RetireRuntimeImageHooks(runtime->generation, old_image.id);
+            }
+            runtime->entry_targets.EraseImage(old_image.id);
+            EraseRuntimeAbiEvidenceForImage(runtime, old_image.id);
+        }
+        image_set->BindGeneration(runtime->generation->load(std::memory_order_acquire));
+        runtime->image_set = std::move(*image_set);
+        runtime->live_snapshot_index.reset();
+        runtime->live_function_index_info = {};
     } else if (runtime->image_set.empty() && !image_set->empty()) {
         runtime->image_set = std::move(*image_set);
     }
@@ -875,7 +919,7 @@ DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                          : snapshot_error);
         return DARTPLANT_RUNTIME_NOT_READY;
     }
-    if (relevant_identity_changed || runtime->state != DARTPLANT_RUNTIME_READY) {
+    if (incarnation_changed || image_set_changed || runtime->state != DARTPLANT_RUNTIME_READY) {
         runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
     }
     SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_SNAPSHOT_IDENTITY, DARTPLANT_RESOLVE_RESOLVED,
@@ -986,15 +1030,58 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         return DARTPLANT_PROFILE_MISMATCH;
     }
     const RuntimeProfileRecord* selected_profile = resolver.binding.core.representative;
-    const DartPlantLiveVmProfile profile = selected_profile->live_vm;
     DartPlantStatus status = DARTPLANT_OK;
     std::optional<uint32_t> root_program_hash;
     if (runtime->image_set.size() > 1) {
-        uint32_t program_hash = 0;
-        status = ReadLiveVmRootProgramHashForProfile(context, *selected_profile, &program_hash);
-        if (status != DARTPLANT_OK) return status;
-        root_program_hash = program_hash;
+        std::vector<bool> compatible;
+        std::vector<uint32_t> candidate_program_hashes;
+        compatible.reserve(resolver.binding.core.candidates.profiles.size());
+        candidate_program_hashes.reserve(resolver.binding.core.candidates.profiles.size());
+        for (const RuntimeProfileRecord* candidate : resolver.binding.core.candidates.profiles) {
+            uint32_t program_hash = 0;
+            bool matches =
+                candidate != nullptr && ProbeLiveVmRootProgramHashForCandidate(
+                                            context, *candidate, &program_hash) == DARTPLANT_OK;
+            if (matches) {
+                for (const auto& image : runtime->image_set.images()) {
+                    if (image.kind != RuntimeImageKind::kDeferred) continue;
+                    if (!image.snapshot.deferred_program_hash.has_value() ||
+                        *image.snapshot.deferred_program_hash != program_hash) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            compatible.push_back(matches);
+            candidate_program_hashes.push_back(program_hash);
+        }
+        const auto deferred_selection = vm_abi::SelectCapabilityAbiSet(
+            resolver.binding.core.candidates, vm_abi::kCapabilityDeferredLoadingUnitLayout,
+            compatible);
+        if (!deferred_selection.passed() || deferred_selection.representative == nullptr) {
+            SetLastError(
+                deferred_selection.ambiguous()
+                    ? "deferred LoadingUnit capability is ambiguous across VM ABI candidates"
+                    : "deferred LoadingUnit capability rejected every VM ABI candidate");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        selected_profile = deferred_selection.representative;
+        const auto selected_it =
+            std::find(resolver.binding.core.candidates.profiles.begin(),
+                      resolver.binding.core.candidates.profiles.end(), selected_profile);
+        if (selected_it == resolver.binding.core.candidates.profiles.end()) {
+            SetLastError("deferred LoadingUnit capability selected an unknown VM ABI row");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        const size_t selected_index =
+            static_cast<size_t>(selected_it - resolver.binding.core.candidates.profiles.begin());
+        if (!compatible[selected_index]) {
+            SetLastError("deferred LoadingUnit capability lost its runtime proof");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        root_program_hash = candidate_program_hashes[selected_index];
     }
+    const DartPlantLiveVmProfile profile = selected_profile->live_vm;
     uint64_t bool_true_value = 0;
     uint64_t bool_false_value = 0;
     status = ResolveLiveVmCanonicalBoolRoots(context, profile, &bool_true_value, &bool_false_value);
@@ -1035,8 +1122,25 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
             return DARTPLANT_PROFILE_MISMATCH;
         }
         if (root_program_hash.has_value() && !rebound.BindDeferredProgramHash(*root_program_hash)) {
+            char mismatch[192] = {};
+            for (const auto& image : rebound.images()) {
+                if (image.kind != RuntimeImageKind::kDeferred) continue;
+                if (!image.snapshot.deferred_program_hash.has_value() ||
+                    *image.snapshot.deferred_program_hash == *root_program_hash) {
+                    continue;
+                }
+                std::snprintf(mismatch, sizeof(mismatch),
+                              "deferred runtime image program hash disagrees with the live isolate "
+                              "group (unit=%u artifact=0x%08x live_root=0x%08x)",
+                              image.loading_unit_id, *image.snapshot.deferred_program_hash,
+                              *root_program_hash);
+                break;
+            }
             SetLastError(
-                "deferred runtime image program hash disagrees with the live isolate group");
+                mismatch[0] == '\0'
+                    ? "deferred runtime image program hash disagrees with the live isolate "
+                      "group"
+                    : mismatch);
             return DARTPLANT_PROFILE_MISMATCH;
         }
         semantically_bound_images = std::move(rebound);
@@ -1152,14 +1256,41 @@ DartPlantStatus dartplant_runtime_on_module_loaded(DartPlantRuntime* runtime, co
     return dartplant_runtime_refresh_modules(runtime);
 }
 
-DartPlantStatus dartplant_runtime_on_module_unloading(DartPlantRuntime* runtime, const char*,
-                                                      void*) {
+DartPlantStatus dartplant_runtime_on_module_unloading(DartPlantRuntime* runtime,
+                                                      const char* module_name, void*) {
     if (runtime == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     auto operation = dartplant::AcquireRuntimeOperation(runtime);
     if (!operation) return DARTPLANT_RUNTIME_NOT_READY;
+    std::lock_guard lock(runtime->mutex);
+    const auto deferred =
+        std::find_if(runtime->image_set.images().begin(), runtime->image_set.images().end(),
+                     [module_name](const dartplant::RuntimeImage& image) {
+                         return image.kind == dartplant::RuntimeImageKind::kDeferred &&
+                                dartplant::ModuleMatchesEvent(image.module, module_name);
+                     });
+    if (deferred != runtime->image_set.images().end()) {
+        const uint64_t image_id = deferred->id;
+        const DartPlantStatus status =
+            dartplant::InvalidateRuntimeImageHooks(runtime->generation, image_id);
+        runtime->entry_targets.EraseImage(image_id);
+        dartplant::EraseRuntimeAbiEvidenceForImage(runtime, image_id);
+        runtime->image_set.RemoveById(image_id);
+        runtime->live_snapshot_index.reset();
+        runtime->live_function_index_info = {};
+        runtime->state =
+            status == DARTPLANT_OK ? DARTPLANT_RUNTIME_IMAGES_READY : DARTPLANT_RUNTIME_FAILED;
+        return status;
+    }
+    const bool root_or_engine =
+        module_name == nullptr || module_name[0] == '\0' ||
+        (runtime->selected_app_module.has_value() &&
+         dartplant::ModuleMatchesEvent(*runtime->selected_app_module, module_name)) ||
+        (runtime->selected_runtime_module.has_value() &&
+         dartplant::ModuleMatchesEvent(*runtime->selected_runtime_module, module_name));
+    if (!root_or_engine) return DARTPLANT_OK;
+
     runtime->generation->fetch_add(1, std::memory_order_acq_rel);
     const DartPlantStatus status = dartplant::InvalidateRuntimeHooks(runtime->generation);
-    std::lock_guard lock(runtime->mutex);
     runtime->entry_targets.Clear();
     runtime->abi_evidence.clear();
     runtime->live_vm_context.reset();

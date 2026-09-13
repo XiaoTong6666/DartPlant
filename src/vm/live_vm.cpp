@@ -1007,7 +1007,7 @@ bool CollectFunctionsInClass(
             ++*skipped_function_count;
             continue;
         }
-        if (!seen_functions->insert(function).second) continue;
+        if (seen_functions->contains(function)) continue;
 
         const uintptr_t function_address = Untag(profile, function);
         uint32_t kind_tag = 0;
@@ -1034,20 +1034,217 @@ bool CollectFunctionsInClass(
                     static_cast<unsigned long long>(function), kind, function_stage,
                     profile.function_kind_tag_offset, profile.code_instructions_length_offset);
             }
+        } else {
+            seen_functions->insert(function);
         }
     }
     if (out_stage != nullptr) *out_stage = "complete";
     return true;
 }
 
+bool CollectDeferredFunction(
+    const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+    uint64_t function, uint64_t expected_code, const LiveVmInstructionImage& target_image,
+    const DartPlantFlutterSnapshotInfo& root_snapshot,
+    std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
+    std::vector<CollectedLiveFunction>* functions, const char** out_stage) {
+    if (out_stage != nullptr) *out_stage = "function-cid";
+    if (seen_functions == nullptr || functions == nullptr ||
+        !RequireCid(reader, profile, function, profile.cid_function)) {
+        return false;
+    }
+    if (seen_functions->contains(function)) {
+        const auto found = std::find_if(functions->begin(), functions->end(),
+                                        [function](const CollectedLiveFunction& existing) {
+                                            return existing.info.function == function;
+                                        });
+        if (found == functions->end() || found->info.code != expected_code ||
+            found->info.runtime_image_id != target_image.runtime_image_id ||
+            found->info.loading_unit_id != target_image.loading_unit_id) {
+            return FailFunctionCollection(out_stage, "duplicate-image-conflict");
+        }
+        if (out_stage != nullptr) *out_stage = "already-covered";
+        return true;
+    }
+
+    const uintptr_t function_address = Untag(profile, function);
+    uint32_t kind_tag = 0;
+    uint32_t kind = 0;
+    uint64_t owner_class = 0;
+    if (!reader.Read(function_address + profile.function_kind_tag_offset, &kind_tag) ||
+        !DecodeFunctionKind(profile, kind_tag, &kind) ||
+        !ReadCompressedObject(reader, function_address, profile, profile.function_owner_offset,
+                              heap_base, &owner_class) ||
+        !RequireCid(reader, profile, owner_class, profile.cid_class)) {
+        return FailFunctionCollection(out_stage, "function-owner");
+    }
+
+    uint64_t library = 0;
+    uint64_t top_level_class = 0;
+    if (!ReadClassLibrary(reader, profile, heap_base, owner_class, &library) ||
+        !ReadCompressedObject(reader, Untag(profile, library), profile,
+                              profile.library_toplevel_class_offset, heap_base, &top_level_class)) {
+        return FailFunctionCollection(out_stage, "function-library");
+    }
+    const bool is_top_level = owner_class == top_level_class;
+    char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
+    char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
+    if (!ReadLibraryUri(reader, profile, heap_base, library, library_uri, sizeof(library_uri))) {
+        return FailFunctionCollection(out_stage, "library-uri");
+    }
+    if (is_top_level) {
+        std::snprintf(class_name, sizeof(class_name), "%s", "Global");
+    } else {
+        uint64_t class_name_object = 0;
+        if (!ReadCompressedObject(reader, Untag(profile, owner_class), profile,
+                                  profile.class_name_offset, heap_base, &class_name_object) ||
+            !ReadDartString(reader, profile, class_name_object, class_name, sizeof(class_name))) {
+            return FailFunctionCollection(out_stage, "class-name");
+        }
+    }
+
+    const size_t before = functions->size();
+    if (!CollectLiveFunction(reader, profile, heap_base, function, kind, owner_class, library,
+                             is_top_level, library_uri, class_name, root_snapshot, images,
+                             functions, out_stage)) {
+        return false;
+    }
+    if (functions->size() != before + 1 ||
+        functions->back().info.runtime_image_id != target_image.runtime_image_id ||
+        functions->back().info.loading_unit_id != target_image.loading_unit_id) {
+        functions->resize(before);
+        return FailFunctionCollection(out_stage, "deferred-image");
+    }
+    seen_functions->insert(function);
+    return true;
+}
+
+bool CollectDeferredLoadingUnitFunctions(
+    const ProcessMemoryReader& reader, const RuntimeProfileRecord& profile_record,
+    const DartPlantLiveVmContext& context, const DartPlantFlutterSnapshotInfo& root_snapshot,
+    std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
+    std::vector<CollectedLiveFunction>* functions, uint32_t* skipped_function_count) {
+    if (images.size() <= 1) return true;
+    if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr) {
+        return false;
+    }
+    const auto& profile = profile_record.live_vm;
+    const auto& loading_unit = profile_record.loading_unit;
+    if (profile.object_store_loading_units_offset == 0 || loading_unit.cid == 0 ||
+        loading_unit.base_objects_offset == 0) {
+        LogLiveIndex("deferred traversal unavailable profile=%s", profile.name);
+        return false;
+    }
+
+    uint64_t loading_units = 0;
+    if (!reader.Read(static_cast<uintptr_t>(context.object_store) +
+                         profile.object_store_loading_units_offset,
+                     &loading_units) ||
+        !RequireCid(reader, profile, loading_units, profile.cid_array)) {
+        LogLiveIndex("deferred loading_units root rejected raw=0x%llx",
+                     static_cast<unsigned long long>(loading_units));
+        return false;
+    }
+    uint64_t loading_unit_count = 0;
+    if (!ReadArrayLength(reader, profile, loading_units, &loading_unit_count) ||
+        loading_unit_count > kMaxClassFunctions) {
+        LogLiveIndex("deferred loading_units length rejected count=%llu",
+                     static_cast<unsigned long long>(loading_unit_count));
+        return false;
+    }
+
+    for (const auto& image : images) {
+        if (image.loading_unit_id <= 1) continue;
+        if (image.loading_unit_id >= loading_unit_count) {
+            LogLiveIndex("deferred loading unit missing id=%u count=%llu", image.loading_unit_id,
+                         static_cast<unsigned long long>(loading_unit_count));
+            return false;
+        }
+        uint64_t unit = 0;
+        uint64_t base_objects = 0;
+        if (!ReadArrayElement(reader, profile, context.heap_base, loading_units,
+                              image.loading_unit_id, &unit) ||
+            !RequireCid(reader, profile, unit, loading_unit.cid) ||
+            !ReadCompressedObject(reader, Untag(profile, unit), profile,
+                                  loading_unit.base_objects_offset, context.heap_base,
+                                  &base_objects)) {
+            LogLiveIndex("deferred LoadingUnit rejected id=%u raw=0x%llx", image.loading_unit_id,
+                         static_cast<unsigned long long>(unit));
+            return false;
+        }
+        uint32_t base_objects_cid = 0;
+        uint64_t base_object_count = 0;
+        if (!ReadCid(reader, profile, base_objects, &base_objects_cid) ||
+            (base_objects_cid != profile.cid_array &&
+             base_objects_cid != profile.cid_immutable_array) ||
+            !ReadArrayLength(reader, profile, base_objects, &base_object_count) ||
+            base_object_count > kMaxClassFunctions) {
+            LogLiveIndex("deferred base_objects rejected id=%u raw=0x%llx count=%llu",
+                         image.loading_unit_id, static_cast<unsigned long long>(base_objects),
+                         static_cast<unsigned long long>(base_object_count));
+            return false;
+        }
+
+        uint32_t accepted = 0;
+        uint32_t code_objects = 0;
+        for (uint64_t index = 0; index < base_object_count; ++index) {
+            uint64_t code = 0;
+            uint32_t cid = 0;
+            if (!ReadArrayElement(reader, profile, context.heap_base, base_objects, index, &code) ||
+                !ReadCid(reader, profile, code, &cid) || cid != profile.cid_code) {
+                continue;
+            }
+            ++code_objects;
+            uint64_t entry = 0;
+            uint64_t entry_va = 0;
+            if (!reader.Read(Untag(profile, code) + profile.code_entry_point_offset, &entry) ||
+                ResolveRuntimeInstructionImage(images, entry, 4, &entry_va) != &image) {
+                continue;
+            }
+            uint64_t function = 0;
+            if (!reader.Read(Untag(profile, code) + profile.code_owner_offset, &function) ||
+                !RequireCid(reader, profile, function, profile.cid_function)) {
+                ++*skipped_function_count;
+                continue;
+            }
+            const char* stage = "unknown";
+            if (CollectDeferredFunction(reader, profile, context.heap_base, function, code, image,
+                                        root_snapshot, images, seen_functions, functions, &stage)) {
+                ++accepted;
+            } else {
+                ++*skipped_function_count;
+                if (*skipped_function_count <= 20) {
+                    LogLiveIndex(
+                        "deferred function rejected unit=%u index=%llu code=0x%llx function=0x%llx "
+                        "stage=%s",
+                        image.loading_unit_id, static_cast<unsigned long long>(index),
+                        static_cast<unsigned long long>(code),
+                        static_cast<unsigned long long>(function), stage);
+                }
+            }
+        }
+        LogLiveIndex("deferred unit id=%u base_objects=%llu code_objects=%u functions=%u",
+                     image.loading_unit_id, static_cast<unsigned long long>(base_object_count),
+                     code_objects, accepted);
+        // A valid secondary image need not contribute a new Function here.
+        // Retained Functions may already have been recovered through
+        // Class.functions/Library.toplevel_class; PRODUCT-dropped logical
+        // aliases remain the exact artifact bundle's responsibility. Physical
+        // image provenance and live semantic coverage are deliberately
+        // independent, so zero additional Functions is not malformed.
+    }
+    return true;
+}
+
 bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
-                             const DartPlantLiveVmProfile& profile,
+                             const RuntimeProfileRecord& profile_record,
                              const DartPlantLiveVmContext& context,
                              const DartPlantFlutterSnapshotInfo& root_snapshot,
                              std::span<const LiveVmInstructionImage> images,
                              std::vector<CollectedLiveFunction>* functions,
                              DartPlantLiveVmFunctionIndexInfo* out_info) {
     if (functions == nullptr || out_info == nullptr) return false;
+    const auto& profile = profile_record.live_vm;
     functions->clear();
     uint32_t skipped = 0;
     std::unordered_set<uint64_t> seen_functions;
@@ -1181,6 +1378,12 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
                              static_cast<unsigned long long>(top_level_class), stage);
             }
         }
+    }
+
+    if (!CollectDeferredLoadingUnitFunctions(reader, profile_record, context, root_snapshot, images,
+                                             &seen_functions, functions, &skipped)) {
+        LogLiveIndex("deferred loading-unit traversal failed profile=%s", profile.name);
+        return false;
     }
 
     std::array<std::unordered_map<uint64_t, uint32_t>, 4> aliases_by_kind;
@@ -1540,13 +1743,12 @@ DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& co
     return DARTPLANT_OK;
 }
 
-DartPlantStatus ReadLiveVmRootProgramHashForProfile(const DartPlantLiveVmContext& context,
-                                                    const RuntimeProfileRecord& profile,
-                                                    uint32_t* out_program_hash) {
+DartPlantStatus ProbeLiveVmRootProgramHashForCandidate(const DartPlantLiveVmContext& context,
+                                                       const RuntimeProfileRecord& candidate,
+                                                       uint32_t* out_program_hash) {
     if (out_program_hash == nullptr || context.object_store == 0 || context.heap_base == 0 ||
-        context.profile_version != profile.live_vm.profile_version ||
-        profile.live_vm.object_store_loading_units_offset == 0) {
-        SetLastError("live VM deferred program-hash arguments/profile are invalid");
+        candidate.live_vm.object_store_loading_units_offset == 0) {
+        SetLastError("live VM deferred program-hash candidate arguments/profile are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
     ProcessMemoryReader reader;
@@ -1557,24 +1759,24 @@ DartPlantStatus ReadLiveVmRootProgramHashForProfile(const DartPlantLiveVmContext
 
     uint64_t loading_units = 0;
     if (!reader.Read(static_cast<uintptr_t>(context.object_store) +
-                         profile.live_vm.object_store_loading_units_offset,
+                         candidate.live_vm.object_store_loading_units_offset,
                      &loading_units) ||
-        !RequireCid(reader, profile.live_vm, loading_units, profile.live_vm.cid_array)) {
+        !RequireCid(reader, candidate.live_vm, loading_units, candidate.live_vm.cid_array)) {
         SetLastError("ObjectStore.loading_units is unavailable for deferred program proof");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    const uintptr_t array = Untag(profile.live_vm, loading_units);
+    const uintptr_t array = Untag(candidate.live_vm, loading_units);
     uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader, array + profile.live_vm.array_length_offset,
-                                   profile.live_vm, &length) ||
+    if (!ReadPositiveCompressedSmi(reader, array + candidate.live_vm.array_length_offset,
+                                   candidate.live_vm, &length) ||
         length <= 1) {
         SetLastError("ObjectStore.loading_units has no deferred-program root entry");
         return DARTPLANT_PROFILE_MISMATCH;
     }
 
     uint64_t program_hash = 0;
-    if (!ReadPositiveCompressedSmi(reader, array + profile.live_vm.array_elements_offset,
-                                   profile.live_vm, &program_hash) ||
+    if (!ReadPositiveCompressedSmi(reader, array + candidate.live_vm.array_elements_offset,
+                                   candidate.live_vm, &program_hash) ||
         program_hash > UINT32_MAX) {
         SetLastError("ObjectStore.loading_units[0] is not a valid program-hash Smi");
         return DARTPLANT_PROFILE_MISMATCH;
@@ -1582,6 +1784,16 @@ DartPlantStatus ReadLiveVmRootProgramHashForProfile(const DartPlantLiveVmContext
     *out_program_hash = static_cast<uint32_t>(program_hash);
     ClearLastError();
     return DARTPLANT_OK;
+}
+
+DartPlantStatus ReadLiveVmRootProgramHashForCurrentProfile(const DartPlantLiveVmContext& context,
+                                                           const RuntimeProfileRecord& profile,
+                                                           uint32_t* out_program_hash) {
+    if (context.profile_version != profile.live_vm.profile_version) {
+        SetLastError("live VM deferred program-hash profile does not match the captured context");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    return ProbeLiveVmRootProgramHashForCandidate(context, profile, out_program_hash);
 }
 
 DartPlantStatus ReadLiveVmFunctionSignatureForProfile(
@@ -1850,8 +2062,8 @@ DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& cont
     std::vector<CollectedLiveFunction> functions;
     DartPlantLiveVmFunctionIndexInfo info{};
     info.struct_size = sizeof(info);
-    if (!CollectAllLiveFunctions(reader, profile_record.live_vm, context, root_image->snapshot,
-                                 images, &functions, &info)) {
+    if (!CollectAllLiveFunctions(reader, profile_record, context, root_image->snapshot, images,
+                                 &functions, &info)) {
         return FailProbe("failed to enumerate live Dart Function graph");
     }
     for (const auto& function : functions) {

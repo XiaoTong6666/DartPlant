@@ -123,7 +123,7 @@ TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapsho
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     const auto* profiles = dartplant::RuntimeProfiles();
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-c43e7867dd748a37d2ceb96b",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-69d68b244dcc4c416a44bb35",
               std::string_view(profiles[0].abi_identity.full));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[1].abi_id));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[2].abi_id));
@@ -132,7 +132,7 @@ TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
               std::string_view(profiles[0].abi_identity.core));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
               std::string_view(profiles[0].abi_identity.call));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-d33d204969c0855db9521564",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-80b636199984528525fdf3b9",
               std::string_view(profiles[0].abi_identity.object));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
               std::string_view(profiles[0].abi_identity.transition));
@@ -150,6 +150,29 @@ TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     EXPECT_EQ(0x770U, dart344->thread_bridge.execution_state_offset);
     EXPECT_EQ(0x780U, dart344->thread_bridge.exit_through_ffi_offset);
     EXPECT_EQ(46U, dart344->type_arguments.cid);
+}
+
+TEST_CASE(RuntimeProfilesTrackVersionedLoadingUnitLayoutsExactly) {
+    const auto* profiles = dartplant::RuntimeProfiles();
+    EXPECT_EQ(38U, profiles[0].loading_unit.cid);
+    EXPECT_EQ(12U, profiles[0].loading_unit.base_objects_offset);
+    EXPECT_EQ(0U, profiles[0].loading_unit.instructions_image_offset);
+    EXPECT_EQ(0U, profiles[0].loading_unit.packed_fields_offset);
+    EXPECT_EQ(24U, profiles[0].loading_unit.instance_size);
+
+    EXPECT_EQ(38U, profiles[1].loading_unit.cid);
+    EXPECT_EQ(16U, profiles[1].loading_unit.instructions_image_offset);
+    EXPECT_EQ(24U, profiles[1].loading_unit.packed_fields_offset);
+    EXPECT_EQ(32U, profiles[1].loading_unit.instance_size);
+
+    EXPECT_EQ(39U, profiles[2].loading_unit.cid);
+    EXPECT_EQ(16U, profiles[2].loading_unit.instructions_image_offset);
+    EXPECT_EQ(24U, profiles[2].loading_unit.packed_fields_offset);
+    EXPECT_EQ(32U, profiles[2].loading_unit.instance_size);
+
+    EXPECT_EQ(profiles[0].loading_unit.cid, profiles[3].loading_unit.cid);
+    EXPECT_EQ(profiles[1].loading_unit.cid, profiles[4].loading_unit.cid);
+    EXPECT_EQ(profiles[2].loading_unit.cid, profiles[5].loading_unit.cid);
 }
 
 TEST_CASE(RuntimeProfileDomainCandidateSelectionIsIndependent) {
@@ -239,7 +262,7 @@ TEST_CASE(RuntimeProfileDependentDomainsRejectMixedCallAndObjectRows) {
 }
 
 TEST_CASE(VmCapabilityRegistryDefinesColdAndEagerMasks) {
-    EXPECT_EQ(17U, dartplant::vm_abi::CapabilityRegistrySize());
+    EXPECT_EQ(18U, dartplant::vm_abi::CapabilityRegistrySize());
     uint64_t all = 0;
     for (size_t index = 0; index < dartplant::vm_abi::CapabilityRegistrySize(); ++index) {
         const auto& capability = dartplant::vm_abi::CapabilityRegistry()[index];
@@ -252,9 +275,27 @@ TEST_CASE(VmCapabilityRegistryDefinesColdAndEagerMasks) {
         EXPECT_EQ(0U, all & capability.capability);
         all |= capability.capability;
     }
-    EXPECT_EQ(UINT64_C(0x1ffff), all);
+    EXPECT_EQ(UINT64_C(0x3ffff), all);
     EXPECT_EQ(UINT64_C(0xfff7), dartplant::vm_abi::ColdRequiredCapabilityMask());
     EXPECT_EQ(UINT64_C(0x237), dartplant::vm_abi::VerifiedAfterCreateCapabilityMask());
+}
+
+TEST_CASE(DeferredLoadingUnitCapabilityOwnsLoadingUnitPrivateLayout) {
+    auto profiles = std::array<dartplant::RuntimeProfileRecord, 2>{dartplant::RuntimeProfiles()[0],
+                                                                   dartplant::RuntimeProfiles()[0]};
+    dartplant::vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = {&profiles[0], &profiles[1]};
+    candidates.representative = &profiles[0];
+
+    profiles[1].loading_unit.base_objects_offset += 4;
+    const auto runtime_roots = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityRuntimeRoots, {true, true});
+    EXPECT_TRUE(runtime_roots.passed());
+
+    const auto deferred = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, {true, true});
+    EXPECT_TRUE(deferred.ambiguous());
+    EXPECT_EQ(2U, deferred.distinct_domain_sets);
 }
 
 TEST_CASE(VmCapabilitySelectionRetainsEveryRowForTheSelectedKey) {

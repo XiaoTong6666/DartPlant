@@ -43,6 +43,7 @@ struct RuntimeRegistration;
 
 struct RuntimeAbiEvidenceEntry {
     DartMethodIdentity identity;
+    uint64_t image_id = 0;
     uintptr_t code_target = 0;
     uint64_t generation = 0;
     uint32_t formal_parameter_count = 0;
@@ -51,6 +52,8 @@ struct RuntimeAbiEvidenceEntry {
     abi::DartCallLayoutStatus layout_status = abi::DartCallLayoutStatus::kIncompleteEvidence;
     std::shared_ptr<const abi::DartCallLayout> call_layout;
 };
+
+void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id);
 
 using RuntimeModuleRefreshReporter = void (*)(DartPlantStatus status, const char* error);
 

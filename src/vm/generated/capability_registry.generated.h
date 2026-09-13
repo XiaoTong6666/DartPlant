@@ -23,6 +23,7 @@ inline constexpr CapabilityDescriptor kCapabilityRegistry[] = {
     {kCapabilityFunctionTypeLayout, "function_type_layout", "FunctionType", true, false, false},
     {kCapabilityClosureCallLayout, "closure_call_layout", "ClosureCall", true, false, false},
     {kCapabilityExceptionBridgeLayout, "exception_bridge_layout", "ExceptionBridge", false, false, false},
+    {kCapabilityDeferredLoadingUnitLayout, "deferred_loading_unit_layout", "DeferredLoadingUnit", false, false, false},
 };
 
 inline constexpr uint64_t kColdRequiredCapabilityMask =
@@ -66,5 +67,6 @@ static_assert(static_cast<uint64_t>(kCapabilityAotEntryLayout) == UINT64_C(8192)
 static_assert(static_cast<uint64_t>(kCapabilityFunctionTypeLayout) == UINT64_C(16384));
 static_assert(static_cast<uint64_t>(kCapabilityClosureCallLayout) == UINT64_C(32768));
 static_assert(static_cast<uint64_t>(kCapabilityExceptionBridgeLayout) == UINT64_C(65536));
+static_assert(static_cast<uint64_t>(kCapabilityDeferredLoadingUnitLayout) == UINT64_C(131072));
 
 }  // namespace dartplant::vm_abi::generated

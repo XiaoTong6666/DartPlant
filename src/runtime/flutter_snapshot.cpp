@@ -2,6 +2,8 @@
 #include <link.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -482,19 +484,58 @@ std::optional<DartSnapshotHeader> ParseDartSnapshotHeader(std::span<const uint8_
 
 std::optional<uint32_t> ParseDartDeferredProgramHash(std::span<const uint8_t> bytes,
                                                      const DartSnapshotHeader& header) {
-    constexpr uint64_t kProgramHashSize = sizeof(uint32_t);
-    if (header.payload_offset > header.declared_length ||
-        kProgramHashSize > header.declared_length - header.payload_offset ||
-        header.declared_length > bytes.size()) {
+    if (header.payload_offset >= header.declared_length || header.declared_length > bytes.size()) {
         return std::nullopt;
     }
-    const size_t offset = static_cast<size_t>(header.payload_offset);
-    // Supported DartPlant AOT producers are Android ARM64 little-endian. Read
-    // the serialized uint32_t explicitly so host endianness never leaks into
-    // artifact provenance.
-    return static_cast<uint32_t>(bytes[offset]) | (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
-           (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
-           (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+
+    // FullSnapshotWriter::WriteUnitSnapshot writes program_hash through
+    // Serializer::Write(uint32_t), whose Raw<4> specialization bit-casts the
+    // value to int32_t and uses BaseWriteStream::Write. The matching
+    // Deserializer::Read<uint32_t>() goes through ReadStream::Read32 with
+    // kEndByteMarker (0xc0), not ReadUnsigned/kEndUnsignedByteMarker (0x80).
+    // Preserve that exact source contract and require the canonical writer
+    // representation instead of accepting arbitrary reader-tolerated aliases.
+    constexpr uint32_t kDataMask = 0x7f;
+    constexpr uint32_t kEndByteMarker = 0xc0;
+    constexpr size_t kMaxEncodedBytes = 5;
+    uint32_t value = 0;
+    size_t encoded_size = 0;
+    const size_t payload_offset = static_cast<size_t>(header.payload_offset);
+    for (; encoded_size < kMaxEncodedBytes; ++encoded_size) {
+        const size_t offset = payload_offset + encoded_size;
+        if (offset >= static_cast<size_t>(header.declared_length)) return std::nullopt;
+        const uint32_t byte = bytes[offset];
+        const uint32_t shift = static_cast<uint32_t>(encoded_size * 7);
+        if (byte <= kDataMask) {
+            // ReadStream::Read32 requires its fifth byte to be terminal.
+            if (encoded_size + 1 == kMaxEncodedBytes) return std::nullopt;
+            value |= byte << shift;
+            continue;
+        }
+
+        value |= (byte - kEndByteMarker) << shift;
+        ++encoded_size;
+        break;
+    }
+    if (encoded_size == 0 || encoded_size > kMaxEncodedBytes) return std::nullopt;
+
+    std::array<uint8_t, kMaxEncodedBytes> canonical{};
+    size_t canonical_size = 0;
+    int32_t remaining = std::bit_cast<int32_t>(value);
+    while (remaining < -64 || remaining > 63) {
+        if (canonical_size >= canonical.size()) return std::nullopt;
+        canonical[canonical_size++] =
+            static_cast<uint8_t>(static_cast<uint32_t>(remaining) & kDataMask);
+        remaining >>= 7;
+    }
+    if (canonical_size >= canonical.size()) return std::nullopt;
+    canonical[canonical_size++] = static_cast<uint8_t>(remaining + kEndByteMarker);
+    if (canonical_size != encoded_size ||
+        !std::equal(canonical.begin(), canonical.begin() + canonical_size,
+                    bytes.begin() + payload_offset)) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 std::optional<std::string> SelectFlutterSnapshotProfile(std::string_view features) {

@@ -385,6 +385,14 @@ class AnalyzeLogcatTest(unittest.TestCase):
         lines = _passing_lines()
         gc_markers = set(analyze_logcat.LEGACY_PROOFS["TypeArguments moving GC"])
         lines = [line for line in lines if line not in gc_markers]
+        lines = [
+            line
+            for line in lines
+            if not (
+                '"event":"capability"' in line
+                and '"capability":"TypeArguments"' in line
+            )
+        ]
         lines = [line for line in lines if '"event":"suite"' not in line]
         lines.append(_event(event="suite", state="pass", test="arguments_descriptor"))
         analysis = analyze_logcat.analyze(

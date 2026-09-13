@@ -236,6 +236,47 @@ bool RuntimeImageSet::SameIdentity(const RuntimeImageSet& other) const {
     return true;
 }
 
+bool RuntimeImageSet::ContainsIdentity(const RuntimeImage& image) const {
+    return std::any_of(images_.begin(), images_.end(), [&image](const RuntimeImage& candidate) {
+        return SameImageIdentity(candidate, image);
+    });
+}
+
+bool RuntimeImageSet::PreserveIdsFrom(const RuntimeImageSet& previous) {
+    // next_id_ is a lifetime-scoped monotonic allocator, not merely one plus
+    // the largest currently present id. Keeping the previous allocator cursor
+    // prevents a removed image id from being reused when the same loading unit
+    // is mapped again in the same runtime generation; stale DartPlantMethod
+    // handles must never become current again by id aliasing.
+    RuntimeImageId next_id = previous.next_id_;
+    if (next_id == kInvalidRuntimeImageId) return false;
+    for (const auto& previous_image : previous.images_) {
+        if (previous_image.id == kInvalidRuntimeImageId || previous_image.id >= next_id) {
+            return false;
+        }
+    }
+    for (auto& image : images_) {
+        const auto found =
+            std::find_if(previous.images_.begin(), previous.images_.end(),
+                         [&image](const auto& old) { return SameImageIdentity(image, old); });
+        image.id = found == previous.images_.end() ? kInvalidRuntimeImageId : found->id;
+    }
+    for (auto& image : images_) {
+        if (image.id == kInvalidRuntimeImageId) image.id = next_id++;
+        if (image.kind == RuntimeImageKind::kRoot) root_id_ = image.id;
+    }
+    next_id_ = next_id;
+    return root_id_ != kInvalidRuntimeImageId;
+}
+
+bool RuntimeImageSet::RemoveById(RuntimeImageId id) {
+    const auto found = std::find_if(images_.begin(), images_.end(),
+                                    [id](const auto& image) { return image.id == id; });
+    if (found == images_.end() || id == root_id_) return false;
+    images_.erase(found);
+    return true;
+}
+
 void RuntimeImageSet::BindGeneration(uint64_t runtime_generation) {
     for (auto& image : images_) image.runtime_generation = runtime_generation;
 }

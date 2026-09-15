@@ -35,10 +35,12 @@ dartplant::RuntimeImageSet MakeLiveImageSet() {
     dartplant::RuntimeImageSet images;
     std::string error;
     EXPECT_TRUE(images.SetRoot(root, root_snapshot, 7, &error));
+    images.BindOwnerEpochs(3, 5);
+    images.ActivateAll();
     return images;
 }
 
-DartPlantLiveVmFunctionInfo MakeLiveFamily(uint64_t image_id) {
+DartPlantLiveVmFunctionInfo MakeLiveFamily(const dartplant::RuntimeImage& image) {
     DartPlantLiveVmFunctionInfo function{};
     function.struct_size = sizeof(function);
     function.function = 0x7100000011;
@@ -55,7 +57,11 @@ DartPlantLiveVmFunctionInfo MakeLiveFamily(uint64_t image_id) {
     function.monomorphic_unchecked_entry_va = 0x10108;
     function.code_section_va = 0x10000;
     function.code_size = 0x40;
-    function.runtime_image_id = image_id;
+    function.runtime_image_id = image.id;
+    function.runtime_image_incarnation_epoch = image.incarnation_epoch;
+    function.engine_incarnation_epoch = image.engine_incarnation_epoch;
+    function.isolate_group_incarnation_epoch = image.isolate_group_incarnation_epoch;
+    function.runtime_generation = image.runtime_generation;
     function.loading_unit_id = 1;
     function.entry_kind_mask = 0x03;
     function.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
@@ -327,7 +333,7 @@ TEST_CASE(LiveSnapshotImageSemanticsBindsCompleteEntryFamilyTransactionally) {
     const uint64_t root_id = root->id;
 
     dartplant::SnapshotIndex index;
-    const auto family = MakeLiveFamily(root_id);
+    const auto family = MakeLiveFamily(*root);
     EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
     EXPECT_EQ(2U, index.functions.size());
 
@@ -346,7 +352,7 @@ TEST_CASE(LiveSnapshotImageSemanticsRejectsCrossImageFlattenedRecordWithoutPubli
     const uint64_t root_id = root->id;
 
     dartplant::SnapshotIndex index;
-    const auto family = MakeLiveFamily(root_id);
+    const auto family = MakeLiveFamily(*root);
     EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
     index.functions[1].runtime_image_id = 0xfeedbeefULL;
 
@@ -364,7 +370,7 @@ TEST_CASE(LiveSnapshotImageSemanticsRejectsPartialFlattenedEntryFamily) {
     EXPECT_TRUE(root != nullptr);
 
     dartplant::SnapshotIndex index;
-    const auto family = MakeLiveFamily(root->id);
+    const auto family = MakeLiveFamily(*root);
     EXPECT_TRUE(dartplant::AppendLiveSnapshotFunctionRecord(family, 1, &index));
     index.functions.pop_back();
 

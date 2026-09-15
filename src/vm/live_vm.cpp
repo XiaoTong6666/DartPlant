@@ -73,11 +73,6 @@ void CopyOutputPrefix(const T& source, T* destination) {
     destination->struct_size = static_cast<uint32_t>(written_size);
 }
 
-const CanonicalBoolLayout* FindCanonicalBoolLayout(uint32_t profile_version) {
-    const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
-    return profile == nullptr ? nullptr : &profile->canonical_bool;
-}
-
 const FunctionTypeLayout* FindFunctionTypeLayout(uint32_t profile_version) {
     const RuntimeProfileRecord* profile = FindRuntimeProfileByVersion(profile_version);
     return profile == nullptr ? nullptr : &profile->function_type;
@@ -944,6 +939,10 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
     collected.info.entry_kind_mask = closure_call_entry_only ? 0x1u : 0x0fu;
     collected.info.code_section_va = entry_image->snapshot.isolate_instructions_va;
     collected.info.runtime_image_id = entry_image->runtime_image_id;
+    collected.info.runtime_image_incarnation_epoch = entry_image->runtime_image_incarnation_epoch;
+    collected.info.engine_incarnation_epoch = entry_image->engine_incarnation_epoch;
+    collected.info.isolate_group_incarnation_epoch = entry_image->isolate_group_incarnation_epoch;
+    collected.info.runtime_generation = entry_image->runtime_generation;
     collected.info.loading_unit_id = entry_image->loading_unit_id;
     functions->push_back(collected);
     if (out_stage != nullptr) *out_stage = "complete";
@@ -1120,16 +1119,17 @@ bool CollectDeferredFunction(
 }
 
 bool CollectDeferredLoadingUnitFunctions(
-    const ProcessMemoryReader& reader, const RuntimeProfileRecord& profile_record,
-    const DartPlantLiveVmContext& context, const DartPlantFlutterSnapshotInfo& root_snapshot,
+    const ProcessMemoryReader& reader, const RuntimeProfileRecord& deferred_profile_record,
+    const RuntimeProfileRecord& live_index_profile_record, const DartPlantLiveVmContext& context,
+    const DartPlantFlutterSnapshotInfo& root_snapshot,
     std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
     std::vector<CollectedLiveFunction>* functions, uint32_t* skipped_function_count) {
     if (images.size() <= 1) return true;
     if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr) {
         return false;
     }
-    const auto& profile = profile_record.live_vm;
-    const auto& loading_unit = profile_record.loading_unit;
+    const auto& profile = deferred_profile_record.live_vm;
+    const auto& loading_unit = deferred_profile_record.loading_unit;
     if (profile.object_store_loading_units_offset == 0 || loading_unit.cid == 0 ||
         loading_unit.base_objects_offset == 0) {
         LogLiveIndex("deferred traversal unavailable profile=%s", profile.name);
@@ -1208,8 +1208,9 @@ bool CollectDeferredLoadingUnitFunctions(
                 continue;
             }
             const char* stage = "unknown";
-            if (CollectDeferredFunction(reader, profile, context.heap_base, function, code, image,
-                                        root_snapshot, images, seen_functions, functions, &stage)) {
+            if (CollectDeferredFunction(reader, live_index_profile_record.live_vm,
+                                        context.heap_base, function, code, image, root_snapshot,
+                                        images, seen_functions, functions, &stage)) {
                 ++accepted;
             } else {
                 ++*skipped_function_count;
@@ -1238,6 +1239,7 @@ bool CollectDeferredLoadingUnitFunctions(
 
 bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
                              const RuntimeProfileRecord& profile_record,
+                             const RuntimeProfileRecord* deferred_profile_record,
                              const DartPlantLiveVmContext& context,
                              const DartPlantFlutterSnapshotInfo& root_snapshot,
                              std::span<const LiveVmInstructionImage> images,
@@ -1380,8 +1382,11 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
         }
     }
 
-    if (!CollectDeferredLoadingUnitFunctions(reader, profile_record, context, root_snapshot, images,
-                                             &seen_functions, functions, &skipped)) {
+    const RuntimeProfileRecord& deferred_profile =
+        deferred_profile_record == nullptr ? profile_record : *deferred_profile_record;
+    if (!CollectDeferredLoadingUnitFunctions(reader, deferred_profile, profile_record, context,
+                                             root_snapshot, images, &seen_functions, functions,
+                                             &skipped)) {
         LogLiveIndex("deferred loading-unit traversal failed profile=%s", profile.name);
         return false;
     }
@@ -1703,14 +1708,27 @@ DartPlantStatus PrepareFunctionSignatureRead(const DartPlantLiveVmContext& conte
 DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& context,
                                                 const DartPlantLiveVmProfile& profile,
                                                 uint64_t* out_true, uint64_t* out_false) {
-    const CanonicalBoolLayout* layout = FindCanonicalBoolLayout(profile.profile_version);
-    if (out_true == nullptr || out_false == nullptr || context.thread == 0 || layout == nullptr) {
-        SetLastError("live VM Bool root arguments/profile are invalid");
-        return DARTPLANT_INVALID_ARGUMENT;
-    }
     if (context.profile_version != profile.profile_version) {
         SetLastError("live VM Bool root profile does not match the captured context");
         return DARTPLANT_PROFILE_MISMATCH;
+    }
+    const RuntimeProfileRecord* record = FindRuntimeProfileByVersion(profile.profile_version);
+    if (record == nullptr || record->live_vm.name == nullptr || profile.name == nullptr ||
+        std::strcmp(record->live_vm.name, profile.name) != 0) {
+        SetLastError("live VM Bool root profile is not a known source row");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+    return ProbeLiveVmCanonicalBoolRootsForCandidate(context, *record, out_true, out_false);
+}
+
+DartPlantStatus ProbeLiveVmCanonicalBoolRootsForCandidate(const DartPlantLiveVmContext& context,
+                                                          const RuntimeProfileRecord& candidate,
+                                                          uint64_t* out_true, uint64_t* out_false) {
+    const DartPlantLiveVmProfile& profile = candidate.live_vm;
+    const CanonicalBoolLayout& layout = candidate.canonical_bool;
+    if (out_true == nullptr || out_false == nullptr || context.thread == 0 || layout.cid == 0) {
+        SetLastError("live VM Bool root arguments/profile are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
     }
     ProcessMemoryReader reader;
     if (!reader.Refresh()) {
@@ -1719,20 +1737,20 @@ DartPlantStatus ResolveLiveVmCanonicalBoolRoots(const DartPlantLiveVmContext& co
     }
     uint64_t bool_true = 0;
     uint64_t bool_false = 0;
-    if (!reader.Read(static_cast<uintptr_t>(context.thread) + layout->thread_true_offset,
+    if (!reader.Read(static_cast<uintptr_t>(context.thread) + layout.thread_true_offset,
                      &bool_true) ||
-        !reader.Read(static_cast<uintptr_t>(context.thread) + layout->thread_false_offset,
+        !reader.Read(static_cast<uintptr_t>(context.thread) + layout.thread_false_offset,
                      &bool_false) ||
         bool_true == 0 || bool_false == 0 || bool_true == bool_false ||
-        !RequireCid(reader, profile, bool_true, layout->cid) ||
-        !RequireCid(reader, profile, bool_false, layout->cid)) {
+        !RequireCid(reader, profile, bool_true, layout.cid) ||
+        !RequireCid(reader, profile, bool_false, layout.cid)) {
         SetLastError("Dart canonical Bool roots failed CID validation");
         return DARTPLANT_PROFILE_MISMATCH;
     }
     uint8_t true_value = 0;
     uint8_t false_value = 0xff;
-    if (!reader.Read(Untag(profile, bool_true) + layout->value_offset, &true_value) ||
-        !reader.Read(Untag(profile, bool_false) + layout->value_offset, &false_value) ||
+    if (!reader.Read(Untag(profile, bool_true) + layout.value_offset, &true_value) ||
+        !reader.Read(Untag(profile, bool_false) + layout.value_offset, &false_value) ||
         true_value != 1 || false_value != 0) {
         SetLastError("Dart canonical Bool roots failed value validation");
         return DARTPLANT_PROFILE_MISMATCH;
@@ -2017,13 +2035,14 @@ DartPlantStatus VisitLiveVmFunctionsForProfile(const DartPlantLiveVmContext& con
     image.loading_unit_id = 1;
     image.snapshot = snapshot;
     const std::array<LiveVmInstructionImage, 1> images = {image};
-    return VisitLiveVmFunctionsForImages(context, images, profile_record, visitor, user_data,
-                                         out_info);
+    return VisitLiveVmFunctionsForImages(context, images, profile_record, nullptr, visitor,
+                                         user_data, out_info);
 }
 
 DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& context,
                                               std::span<const LiveVmInstructionImage> images,
                                               const RuntimeProfileRecord& profile_record,
+                                              const RuntimeProfileRecord* deferred_profile_record,
                                               DartPlantLiveVmFunctionVisitor visitor,
                                               void* user_data,
                                               DartPlantLiveVmFunctionIndexInfo* out_info) {
@@ -2062,8 +2081,8 @@ DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& cont
     std::vector<CollectedLiveFunction> functions;
     DartPlantLiveVmFunctionIndexInfo info{};
     info.struct_size = sizeof(info);
-    if (!CollectAllLiveFunctions(reader, profile_record, context, root_image->snapshot, images,
-                                 &functions, &info)) {
+    if (!CollectAllLiveFunctions(reader, profile_record, deferred_profile_record, context,
+                                 root_image->snapshot, images, &functions, &info)) {
         return FailProbe("failed to enumerate live Dart Function graph");
     }
     for (const auto& function : functions) {

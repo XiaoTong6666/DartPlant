@@ -123,7 +123,7 @@ TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapsho
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     const auto* profiles = dartplant::RuntimeProfiles();
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-69d68b244dcc4c416a44bb35",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
               std::string_view(profiles[0].abi_identity.full));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[1].abi_id));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[2].abi_id));
@@ -132,7 +132,7 @@ TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
               std::string_view(profiles[0].abi_identity.core));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
               std::string_view(profiles[0].abi_identity.call));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-80b636199984528525fdf3b9",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
               std::string_view(profiles[0].abi_identity.object));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
               std::string_view(profiles[0].abi_identity.transition));
@@ -262,7 +262,7 @@ TEST_CASE(RuntimeProfileDependentDomainsRejectMixedCallAndObjectRows) {
 }
 
 TEST_CASE(VmCapabilityRegistryDefinesColdAndEagerMasks) {
-    EXPECT_EQ(18U, dartplant::vm_abi::CapabilityRegistrySize());
+    EXPECT_EQ(19U, dartplant::vm_abi::CapabilityRegistrySize());
     uint64_t all = 0;
     for (size_t index = 0; index < dartplant::vm_abi::CapabilityRegistrySize(); ++index) {
         const auto& capability = dartplant::vm_abi::CapabilityRegistry()[index];
@@ -275,9 +275,108 @@ TEST_CASE(VmCapabilityRegistryDefinesColdAndEagerMasks) {
         EXPECT_EQ(0U, all & capability.capability);
         all |= capability.capability;
     }
-    EXPECT_EQ(UINT64_C(0x3ffff), all);
+    EXPECT_EQ(UINT64_C(0x7ffff), all);
     EXPECT_EQ(UINT64_C(0xfff7), dartplant::vm_abi::ColdRequiredCapabilityMask());
     EXPECT_EQ(UINT64_C(0x237), dartplant::vm_abi::VerifiedAfterCreateCapabilityMask());
+}
+
+TEST_CASE(CapabilityBindingsKeepCrossRowWinnersIndependent) {
+    auto profiles = std::array<dartplant::RuntimeProfileRecord, 2>{dartplant::RuntimeProfiles()[0],
+                                                                   dartplant::RuntimeProfiles()[0]};
+    dartplant::vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = {&profiles[0], &profiles[1]};
+    candidates.representative = &profiles[0];
+
+    // Deliberately make the two capabilities disagree about their source row.
+    // The live-index consumer accepts only row 0 while the deferred runtime
+    // proof accepts only row 1. No mutable "current profile" is allowed to
+    // collapse those independent winners into one row.
+    const auto live = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, {true, false});
+    const auto deferred = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, {false, true});
+    EXPECT_TRUE(live.passed());
+    EXPECT_TRUE(deferred.passed());
+
+    dartplant::vm_abi::CapabilityBindingSet bindings;
+    EXPECT_TRUE(bindings.Bind(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, live));
+    EXPECT_TRUE(bindings.Bind(dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, deferred));
+    EXPECT_EQ(&profiles[0],
+              bindings.Find(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout)->representative);
+    EXPECT_EQ(
+        &profiles[1],
+        bindings.Find(dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout)->representative);
+
+    const std::array<uint64_t, 2> both = {
+        dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+        dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout,
+    };
+    EXPECT_TRUE(dartplant::vm_abi::ResolveCapabilityConsumerProfile(bindings, both) == nullptr);
+}
+
+TEST_CASE(CapabilityBindingOwnerStampRejectsEngineOrGroupRestart) {
+    auto profile = dartplant::RuntimeProfiles()[0];
+    dartplant::vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = {&profile};
+    candidates.representative = &profile;
+    const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, {true});
+    EXPECT_TRUE(selection.passed());
+
+    dartplant::vm_abi::CapabilityBindingSet bindings;
+    const dartplant::vm_abi::CapabilityOwnerStamp owner{
+        .runtime_generation = 7,
+        .engine_incarnation_epoch = 11,
+        .isolate_group_incarnation_epoch = 13,
+    };
+    bindings.StampOwner(owner);
+    EXPECT_TRUE(bindings.Bind(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, selection));
+    EXPECT_TRUE(bindings.FindForOwner(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+                                      owner) != nullptr);
+
+    auto restarted_engine = owner;
+    restarted_engine.engine_incarnation_epoch++;
+    EXPECT_TRUE(bindings.FindForOwner(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+                                      restarted_engine) == nullptr);
+    auto restarted_group = owner;
+    restarted_group.isolate_group_incarnation_epoch++;
+    EXPECT_TRUE(bindings.FindForOwner(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+                                      restarted_group) == nullptr);
+    auto next_runtime = owner;
+    next_runtime.runtime_generation++;
+    EXPECT_TRUE(bindings.FindForOwner(dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+                                      next_runtime) == nullptr);
+}
+
+TEST_CASE(CanonicalNullCapabilityOwnsCanonicalBoolRoots) {
+    const auto& base = dartplant::RuntimeProfiles()[0];
+    const auto capability = dartplant::vm_abi::kCapabilityCanonicalNull;
+    const auto baseline = dartplant::vm_abi::BuildCapabilityAbiKey(base, capability);
+    const auto expect_change = [&](auto mutate) {
+        auto profile = base;
+        mutate(profile);
+        EXPECT_TRUE(dartplant::vm_abi::BuildCapabilityAbiKey(profile, capability) != baseline);
+    };
+    expect_change([](auto& p) { ++p.canonical_bool.thread_true_offset; });
+    expect_change([](auto& p) { ++p.canonical_bool.thread_false_offset; });
+    expect_change([](auto& p) { ++p.canonical_bool.value_offset; });
+    expect_change([](auto& p) { ++p.canonical_bool.cid; });
+}
+
+TEST_CASE(LiveFunctionIndexCapabilityOwnsFunctionGraphFields) {
+    const auto& base = dartplant::RuntimeProfiles()[0];
+    const auto capability = dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout;
+    const auto baseline = dartplant::vm_abi::BuildCapabilityAbiKey(base, capability);
+    const auto expect_change = [&](auto mutate) {
+        auto profile = base;
+        mutate(profile);
+        EXPECT_TRUE(dartplant::vm_abi::BuildCapabilityAbiKey(profile, capability) != baseline);
+    };
+    expect_change([](auto& p) { ++p.live_vm.class_functions_offset; });
+    expect_change([](auto& p) { ++p.live_vm.function_kind_tag_offset; });
+    expect_change([](auto& p) { ++p.live_vm.code_instructions_length_offset; });
+    expect_change([](auto& p) { ++p.instructions_monomorphic_entry_offset_aot; });
+    expect_change([](auto& p) { ++p.function_kind.closure; });
 }
 
 TEST_CASE(DeferredLoadingUnitCapabilityOwnsLoadingUnitPrivateLayout) {
@@ -370,6 +469,7 @@ TEST_CASE(RuntimeProfileFunctionTypeFingerprintCoversEveryConsumedField) {
     expect_change([](auto& p) { ++p.raw_object.compressed_word_size; });
     expect_change([](auto& p) { ++p.live_vm.thread_heap_base_offset; });
     expect_change([](auto& p) { ++p.function_type.function_signature_offset; });
+    expect_change([](auto& p) { ++p.closure.function_offset; });
     expect_change([](auto& p) { ++p.live_vm.array_length_offset; });
     expect_change([](auto& p) { ++p.live_vm.array_elements_offset; });
     expect_change([](auto& p) { ++p.live_vm.string_length_offset; });

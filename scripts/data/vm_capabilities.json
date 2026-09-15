@@ -162,6 +162,15 @@
       "cold_required": false,
       "verified_after_create": false,
       "ci_required_event": false
+    },
+    {
+      "key": "live_function_index_layout",
+      "cpp_symbol": "kCapabilityLiveFunctionIndexLayout",
+      "diagnostic_name": "LiveFunctionIndex",
+      "bit": 262144,
+      "cold_required": false,
+      "verified_after_create": false,
+      "ci_required_event": false
     }
   ]
 }

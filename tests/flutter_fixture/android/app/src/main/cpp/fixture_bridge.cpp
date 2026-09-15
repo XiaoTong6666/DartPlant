@@ -59,6 +59,12 @@ DartPlantHookHandle* g_verified_abi_double_hook = nullptr;
 DartPlantHookHandle* g_verified_abi_double_observer_hook = nullptr;
 DartPlantListener* g_add_int_listener = nullptr;
 DartPlantFlutterSnapshotInfo g_snapshot_info{};
+std::string g_snapshot_module_name;
+std::string g_snapshot_module_path;
+std::string g_snapshot_module_build_id;
+std::string g_snapshot_hash;
+std::string g_snapshot_features;
+std::string g_snapshot_profile_name;
 std::atomic_flag g_object_bridge_probe = ATOMIC_FLAG_INIT;
 DartPlantObjectHandle* g_weak_object_handle = nullptr;
 DartPlantObjectHandle* g_replacement_object_handle = nullptr;
@@ -110,6 +116,34 @@ std::thread g_cold_bootstrap_thread;
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
+}
+
+void StoreSnapshotInfo(const DartPlantFlutterSnapshotInfo& source) {
+    const auto copy = [](const char* value) { return value == nullptr ? std::string{} : value; };
+    g_snapshot_module_name = copy(source.module_name);
+    g_snapshot_module_path = copy(source.module_path);
+    g_snapshot_module_build_id = copy(source.module_build_id);
+    g_snapshot_hash = copy(source.snapshot_hash);
+    g_snapshot_features = copy(source.snapshot_features);
+    g_snapshot_profile_name = copy(source.profile_name);
+
+    g_snapshot_info = source;
+    g_snapshot_info.module_name = g_snapshot_module_name.c_str();
+    g_snapshot_info.module_path = g_snapshot_module_path.c_str();
+    g_snapshot_info.module_build_id = g_snapshot_module_build_id.c_str();
+    g_snapshot_info.snapshot_hash = g_snapshot_hash.c_str();
+    g_snapshot_info.snapshot_features = g_snapshot_features.c_str();
+    g_snapshot_info.profile_name = g_snapshot_profile_name.c_str();
+}
+
+void ClearStoredSnapshotInfo() {
+    g_snapshot_info = {};
+    g_snapshot_module_name.clear();
+    g_snapshot_module_path.clear();
+    g_snapshot_module_build_id.clear();
+    g_snapshot_hash.clear();
+    g_snapshot_features.clear();
+    g_snapshot_profile_name.clear();
 }
 
 uint64_t VerifySnapshotOffsetPublicAndLegacy() {
@@ -211,8 +245,17 @@ bool ResolveRetainedClosureFunction(Dart_Handle closure_handle, uintptr_t expect
                                     uint32_t* out_field_offset) {
     if (closure_handle == nullptr || out_closure_raw == nullptr || out_function_raw == nullptr ||
         out_field_offset == nullptr || g_runtime == nullptr ||
-        !g_runtime->live_vm_context.has_value() || g_snapshot_info.snapshot_hash == nullptr ||
-        g_snapshot_info.snapshot_hash[0] == '\0') {
+        !dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context.has_value() ||
+        g_snapshot_info.snapshot_hash == nullptr || g_snapshot_info.snapshot_hash[0] == '\0') {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments retained closure prerequisites failed handle=%p runtime=%p live=%u "
+            "snapshot=%s",
+            closure_handle, g_runtime,
+            static_cast<unsigned>(
+                g_runtime != nullptr &&
+                dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context.has_value()),
+            g_snapshot_info.snapshot_hash == nullptr ? "<null>" : g_snapshot_info.snapshot_hash);
         return false;
     }
     const auto* profile = dartplant::FindRuntimeProfileBySnapshot(
@@ -220,66 +263,106 @@ bool ResolveRetainedClosureFunction(Dart_Handle closure_handle, uintptr_t expect
                                            ? std::string_view{}
                                            : std::string_view{g_snapshot_info.profile_name});
     if (profile == nullptr || profile->raw_object.compressed_word_size != sizeof(uint32_t)) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments retained closure profile unavailable profile=%p "
+            "snapshot=%s profile_name=%s",
+            profile, g_snapshot_info.snapshot_hash,
+            g_snapshot_info.profile_name == nullptr ? "<null>" : g_snapshot_info.profile_name);
         return false;
     }
 
-    // Dart 3.4.4 FFI Handle is a VM LocalHandle and its ObjectPtr slot is at
-    // offset zero (runtime/vm/dart_api_state.h). This fixture is deliberately
-    // built only against the exact 3.4.4 private VM adapter; do not generalize
-    // this test-only unwrap to unknown SDKs.
+    // Dart FFI Handle is a VM LocalHandle and its ObjectPtr slot is at offset
+    // zero (runtime/vm/dart_api_state.h) for every source-verified SDK row.
     uint64_t closure_raw = 0;
     std::memcpy(&closure_raw, closure_handle, sizeof(closure_raw));
     const auto& raw = profile->raw_object;
     if ((closure_raw & raw.smi_tag_mask) != raw.heap_object_tag ||
         closure_raw < raw.heap_object_tag) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments retained closure handle unwrap invalid handle=%p "
+                            "raw=0x%llx heap_tag=%u tag_mask=%u",
+                            closure_handle, static_cast<unsigned long long>(closure_raw),
+                            raw.heap_object_tag, raw.smi_tag_mask);
         return false;
     }
     const uintptr_t closure_address = static_cast<uintptr_t>(closure_raw - raw.heap_object_tag);
-    const uint64_t heap_base = g_runtime->live_vm_context->heap_base;
-    if (heap_base == 0) return false;
-
-    // Search only the fixed header-sized prefix of UntaggedClosure. Candidate
-    // compressed heap pointers are accepted solely when the public live-VM
-    // FunctionType parser validates them and their Function entry matches the
-    // exact artifact closure target. This avoids baking Closure::function_
-    // offset into the fixture while retaining a fail-closed exact-profile check.
-    constexpr uint32_t kClosureHeaderScanStart = 8;
-    constexpr uint32_t kClosureHeaderScanEnd = 32;
-    for (uint32_t offset = kClosureHeaderScanStart; offset < kClosureHeaderScanEnd;
-         offset += raw.compressed_word_size) {
-        uint32_t compressed = 0;
-        std::memcpy(&compressed, reinterpret_cast<const void*>(closure_address + offset),
-                    sizeof(compressed));
-        if ((compressed & raw.smi_tag_mask) != raw.heap_object_tag) continue;
-        const uint64_t function_raw = heap_base + static_cast<uint64_t>(compressed);
-
-        DartPlantDartFunctionSignatureInfo signature{};
-        signature.struct_size = sizeof(signature);
-        const DartPlantStatus signature_status = dartplant_live_vm_read_function_signature(
-            &*g_runtime->live_vm_context, &g_snapshot_info, function_raw, &signature);
-        if (signature_status != DARTPLANT_OK || signature.parameter_count != 4 ||
-            signature.implicit_parameter_count != 1 || signature.fixed_parameter_count != 2 ||
-            signature.optional_parameter_count != 2 || signature.type_parameter_count != 1 ||
-            signature.parent_type_argument_count != 0 ||
-            signature.has_named_optional_parameters == 0 || function_raw < raw.heap_object_tag) {
-            continue;
-        }
-
-        uint64_t function_entry = 0;
-        const uintptr_t function_address =
-            static_cast<uintptr_t>(function_raw - raw.heap_object_tag);
-        std::memcpy(&function_entry,
-                    reinterpret_cast<const void*>(function_address +
-                                                  profile->live_vm.function_entry_point_offset),
-                    sizeof(function_entry));
-        if (function_entry != expected_entry) continue;
-
-        *out_closure_raw = closure_raw;
-        *out_function_raw = function_raw;
-        *out_field_offset = offset;
-        return true;
+    const uint64_t heap_base = dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context->heap_base;
+    if (heap_base == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments retained closure heap base unavailable raw=0x%llx",
+                            static_cast<unsigned long long>(closure_raw));
+        return false;
     }
-    return false;
+
+    if (profile->closure.function_offset == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments retained closure function offset unavailable profile=%u",
+                            profile->live_vm.profile_version);
+        return false;
+    }
+    uint32_t compressed = 0;
+    std::memcpy(&compressed,
+                reinterpret_cast<const void*>(closure_address + profile->closure.function_offset),
+                sizeof(compressed));
+    if ((compressed & raw.smi_tag_mask) != raw.heap_object_tag) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments retained closure raw invalid closure=0x%llx "
+                            "function_offset=%u compressed=0x%08x heap=0x%llx",
+                            static_cast<unsigned long long>(closure_raw),
+                            profile->closure.function_offset, compressed,
+                            static_cast<unsigned long long>(heap_base));
+        return false;
+    }
+    const uint64_t function_raw = heap_base + static_cast<uint64_t>(compressed);
+
+    DartPlantDartFunctionSignatureInfo signature{};
+    signature.struct_size = sizeof(signature);
+    const DartPlantStatus signature_status = dartplant_live_vm_read_function_signature(
+        &*dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context, &g_snapshot_info, function_raw,
+        &signature);
+    if (signature_status != DARTPLANT_OK || signature.parameter_count != 4 ||
+        signature.implicit_parameter_count != 1 || signature.fixed_parameter_count != 2 ||
+        signature.optional_parameter_count != 2 || signature.type_parameter_count != 1 ||
+        signature.parent_type_argument_count != 0 || signature.has_named_optional_parameters == 0 ||
+        function_raw < raw.heap_object_tag) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "TypeArguments retained closure signature mismatch closure=0x%llx function=0x%llx "
+            "offset=%u compressed=0x%08x status=%d params=%u implicit=%u fixed=%u optional=%u "
+            "type_params=%u parent_type_args=%u named=%u",
+            static_cast<unsigned long long>(closure_raw),
+            static_cast<unsigned long long>(function_raw), profile->closure.function_offset,
+            compressed, signature_status, signature.parameter_count,
+            signature.implicit_parameter_count, signature.fixed_parameter_count,
+            signature.optional_parameter_count, signature.type_parameter_count,
+            signature.parent_type_argument_count,
+            static_cast<unsigned>(signature.has_named_optional_parameters));
+        return false;
+    }
+
+    uint64_t function_entry = 0;
+    const uintptr_t function_address = static_cast<uintptr_t>(function_raw - raw.heap_object_tag);
+    std::memcpy(&function_entry,
+                reinterpret_cast<const void*>(function_address +
+                                              profile->live_vm.function_entry_point_offset),
+                sizeof(function_entry));
+    if (function_entry != expected_entry) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "TypeArguments retained closure entry mismatch closure=0x%llx "
+                            "function=0x%llx offset=%u entry=0x%llx expected=0x%llx",
+                            static_cast<unsigned long long>(closure_raw),
+                            static_cast<unsigned long long>(function_raw),
+                            profile->closure.function_offset,
+                            static_cast<unsigned long long>(function_entry),
+                            static_cast<unsigned long long>(expected_entry));
+        return false;
+    }
+
+    *out_closure_raw = closure_raw;
+    *out_function_raw = function_raw;
+    *out_field_offset = profile->closure.function_offset;
+    return true;
 }
 
 void ResetTypeArgumentsProofState() {
@@ -2388,20 +2471,24 @@ dartplant_fixture_snapshot_offset_proof() {
 extern "C" __attribute__((visibility("default"))) uint64_t
 dartplant_fixture_deferred_before_load() {
     if (g_runtime == nullptr) return 0;
-    if (g_runtime->live_vm_context.has_value()) {
-        const auto* profile =
-            dartplant::FindRuntimeProfileByVersion(g_runtime->live_vm_context->profile_version);
+    if (dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context.has_value()) {
+        const auto* profile = dartplant::FindRuntimeProfileByVersion(
+            dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context->profile_version);
         uint32_t root_program_hash = 0;
         const DartPlantStatus hash_status =
             profile == nullptr ? DARTPLANT_PROFILE_MISMATCH
                                : dartplant::ReadLiveVmRootProgramHashForCurrentProfile(
-                                     *g_runtime->live_vm_context, *profile, &root_program_hash);
+                                     *dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context,
+                                     *profile, &root_program_hash);
         __android_log_print(
             hash_status == DARTPLANT_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
             "deferred program-hash lifecycle phase=before_load status=%d group=0x%llx "
             "object_store=0x%llx value=0x%08x error=%s",
-            hash_status, static_cast<unsigned long long>(g_runtime->live_vm_context->isolate_group),
-            static_cast<unsigned long long>(g_runtime->live_vm_context->object_store),
+            hash_status,
+            static_cast<unsigned long long>(
+                dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context->isolate_group),
+            static_cast<unsigned long long>(
+                dartplant::RuntimeIsolateGroup(g_runtime).live_vm_context->object_store),
             root_program_hash, hash_status == DARTPLANT_OK ? "none" : dartplant_last_error());
     }
     uint32_t image_count = 0;
@@ -2872,7 +2959,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
         g_cold_bootstrap_status.store(snapshot_status, std::memory_order_release);
         return snapshot_status;
     }
-    g_snapshot_info = snapshot_info;
+    StoreSnapshotInfo(snapshot_info);
     __android_log_print(ANDROID_LOG_INFO, kTag, "snapshot for VM adapter hash=%s features=%s",
                         snapshot_info.snapshot_hash, snapshot_info.snapshot_features);
     constexpr uint64_t kSnapshotOffsetProofAll = (1U << 5) - 1;
@@ -3195,7 +3282,7 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     g_verified_abi_double_observer_hook = nullptr;
     g_add_int_listener = nullptr;
     g_runtime = nullptr;
-    g_snapshot_info = {};
+    ClearStoredSnapshotInfo();
     g_cold_bootstrap_status.store(-1, std::memory_order_release);
     g_runtime_live_vm_ready.store(false, std::memory_order_release);
     g_shared_policy_ok.store(false, std::memory_order_release);

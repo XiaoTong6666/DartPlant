@@ -229,3 +229,77 @@ TEST_CASE(RuntimeImageSetPreservesSurvivingIdsAcrossSecondaryImageChanges) {
     EXPECT_EQ(root_id, reloaded.Root()->id);
     EXPECT_TRUE(reloaded.FindByLoadingUnitId(2)->id > old_unit2_id);
 }
+
+TEST_CASE(RuntimeImageSetReconcileKeepsLogicalIdButAdvancesEpochForSameVaRemap) {
+    const auto root_module =
+        MakeModule("libapp.so", "/base/libapp.so", "aaaa", 0x100000, 0x110000, 0x10000, 0x1000);
+    const auto old_unit = MakeModule("libapp.so-2.part.so", "/feature/libapp.so-2.part.so", "bbbb",
+                                     0x200000, 0x210000, 0x10000, 0x1000);
+    const auto new_unit = MakeModule("libapp.so-2.part.so", "/feature/libapp.so-2.part.so", "cccc",
+                                     0x200000, 0x210000, 0x10000, 0x1000);
+    std::string error;
+
+    dartplant::RuntimeImageSet previous;
+    EXPECT_TRUE(previous.SetRoot(root_module, MakeSnapshot(root_module, 0x110000, 0x10000, 0x1000),
+                                 9, &error));
+    EXPECT_TRUE(previous.AddDeferred(
+        old_unit, MakeSnapshot(old_unit, 0x210000, 0x10000, 0x1000, 0x12345678), 2, 9, &error));
+    previous.BindOwnerEpochs(11, 13);
+    previous.ActivateAll();
+    const auto* old_image = previous.FindByLoadingUnitId(2);
+    EXPECT_TRUE(old_image != nullptr);
+    const auto old_owner = old_image->OwnerIdentity();
+
+    dartplant::RuntimeImageSet remapped;
+    EXPECT_TRUE(remapped.SetRoot(root_module, MakeSnapshot(root_module, 0x110000, 0x10000, 0x1000),
+                                 9, &error));
+    EXPECT_TRUE(remapped.AddDeferred(
+        new_unit, MakeSnapshot(new_unit, 0x210000, 0x10000, 0x1000, 0x12345678), 2, 9, &error));
+    EXPECT_TRUE(remapped.ReconcileOwnershipFrom(previous));
+    remapped.BindOwnerEpochs(11, 13);
+    remapped.ActivateAll();
+
+    const auto* new_image = remapped.FindByLoadingUnitId(2);
+    EXPECT_TRUE(new_image != nullptr);
+    EXPECT_EQ(old_image->id, new_image->id);
+    EXPECT_TRUE(old_image->incarnation_epoch != new_image->incarnation_epoch);
+    EXPECT_EQ(old_image->snapshot.isolate_instructions_runtime,
+              new_image->snapshot.isolate_instructions_runtime);
+
+    dartplant::DartEntryTargetRegistry registry;
+    auto old_target = registry.GetOrCreate(0x210100, 4, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                           0x210100, 4, old_image->id, old_owner);
+    auto new_target = registry.GetOrCreate(0x210100, 4, 0x2001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                           0x210100, 4, new_image->id, new_image->OwnerIdentity());
+    EXPECT_TRUE(old_target != nullptr);
+    EXPECT_TRUE(new_target != nullptr);
+    EXPECT_TRUE(old_target != new_target);
+}
+
+TEST_CASE(EntryTargetRegistrySeparatesEngineAndIsolateGroupIncarnations) {
+    dartplant::DartEntryTargetRegistry registry;
+    dartplant::DartRuntimeOwnerIdentity first{
+        .runtime_generation = 7,
+        .engine_incarnation_epoch = 3,
+        .isolate_group_incarnation_epoch = 5,
+        .image_id = 2,
+        .image_incarnation_epoch = 11,
+    };
+    auto second = first;
+    second.engine_incarnation_epoch = 4;
+    auto third = first;
+    third.isolate_group_incarnation_epoch = 6;
+
+    auto first_target = registry.GetOrCreate(0x220100, 4, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                             0x220100, 4, 2, first);
+    auto first_again = registry.GetOrCreate(0x220100, 4, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE,
+                                            0x220100, 4, 2, first);
+    auto engine_restarted = registry.GetOrCreate(
+        0x220100, 4, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x220100, 4, 2, second);
+    auto group_restarted = registry.GetOrCreate(
+        0x220100, 4, 0x1001, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x220100, 4, 2, third);
+    EXPECT_TRUE(first_target != nullptr);
+    EXPECT_TRUE(first_target == first_again);
+    EXPECT_TRUE(engine_restarted != nullptr && engine_restarted != first_target);
+    EXPECT_TRUE(group_restarted != nullptr && group_restarted != first_target);
+}

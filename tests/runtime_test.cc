@@ -19,6 +19,7 @@
 #include "dartplant/runtime_profile.h"
 #include "dartplant/vm_adapter.h"
 #include "runtime/default_runtime.h"
+#include "runtime/runtime_image_transition.h"
 #include "runtime/runtime_internal.h"
 #include "test_runner.h"
 #include "vm/runtime_profiles.h"
@@ -535,10 +536,14 @@ void InstallTestHost(TestHostHook hook, TestHostUnhook unhook) {
 void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
                                     void* target) {
     EXPECT_TRUE(runtime != nullptr);
-    runtime->modules = dartplant::EnumerateModules();
-    runtime->selected_app_module = module;
-    runtime->selected_runtime_module = module;
-    runtime->profile_matched = true;
+    dartplant::RuntimeProcess(runtime).modules = dartplant::EnumerateModules();
+    dartplant::RuntimeEngine(runtime).retired = false;
+    dartplant::RuntimeIsolateGroup(runtime).retired = false;
+    dartplant::RuntimeIsolateGroup(runtime).app_module = module;
+    dartplant::RuntimeEngine(runtime).module = module;
+    dartplant::RuntimeEngine(runtime).incarnation_epoch = 1;
+    dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch = 1;
+    dartplant::SetActiveProfileMatched(runtime, true);
 
     dartplant::FlutterSnapshotSource snapshot;
     snapshot.module_name = module.name;
@@ -559,16 +564,20 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
             std::min<uint64_t>(0x100, range.end - snapshot.isolate_instructions_runtime);
         break;
     }
-    runtime->snapshot = snapshot;
+    dartplant::RuntimeIsolateGroup(runtime).snapshot = snapshot;
     std::string image_error;
-    EXPECT_TRUE(runtime->image_set.SetRoot(
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).image_set.SetRoot(
         module, snapshot, runtime->generation->load(std::memory_order_acquire), &image_error));
-    const auto* root_image = runtime->image_set.Root();
+    dartplant::RuntimeIsolateGroup(runtime).image_set.BindOwnerEpochs(
+        dartplant::RuntimeEngine(runtime).incarnation_epoch,
+        dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    dartplant::RuntimeIsolateGroup(runtime).image_set.ActivateAll();
+    const auto* root_image = dartplant::RuntimeIsolateGroup(runtime).image_set.Root();
     EXPECT_TRUE(root_image != nullptr);
 
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
-    runtime->live_vm_context = context;
+    dartplant::RuntimeIsolateGroup(runtime).live_vm_context = context;
 
     dartplant::SnapshotIndex index;
     index.module_name = module.name;
@@ -579,6 +588,10 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     index.profile_version = "synthetic-live-index";
     dartplant::SnapshotFunction function;
     function.runtime_image_id = root_image->id;
+    function.runtime_image_incarnation_epoch = root_image->incarnation_epoch;
+    function.engine_incarnation_epoch = root_image->engine_incarnation_epoch;
+    function.isolate_group_incarnation_epoch = root_image->isolate_group_incarnation_epoch;
+    function.runtime_generation = root_image->runtime_generation;
     function.loading_unit_id = 1;
     function.library_uri = "package:fixture/main.dart";
     function.class_name = "Fixture";
@@ -606,6 +619,10 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     live_info.code_section_va = 0x1000;
     live_info.code_size = 1;
     live_info.runtime_image_id = root_image->id;
+    live_info.runtime_image_incarnation_epoch = root_image->incarnation_epoch;
+    live_info.engine_incarnation_epoch = root_image->engine_incarnation_epoch;
+    live_info.isolate_group_incarnation_epoch = root_image->isolate_group_incarnation_epoch;
+    live_info.runtime_generation = root_image->runtime_generation;
     live_info.loading_unit_id = 1;
     live_info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
     live_info.entry_kind_mask = 0x01;
@@ -615,21 +632,26 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     std::snprintf(live_info.function_name, sizeof(live_info.function_name), "%s", "add");
     index.live_function_infos.push_back(live_info);
     const std::array<dartplant::RuntimeImageId, 1> live_bindings = {root_image->id};
-    EXPECT_TRUE(runtime->image_set.BindLiveEntries(live_bindings));
-    runtime->live_snapshot_index = std::move(index);
-    runtime->live_function_index_info.struct_size = sizeof(DartPlantLiveVmFunctionIndexInfo);
-    runtime->live_function_index_info.function_count = 1;
-    runtime->live_function_index_info.code_target_count = 1;
-    runtime->state = DARTPLANT_RUNTIME_READY;
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).image_set.BindLiveEntries(live_bindings));
+    dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index = std::move(index);
+    dartplant::RuntimeIsolateGroup(runtime).live_function_index_info.struct_size =
+        sizeof(DartPlantLiveVmFunctionIndexInfo);
+    dartplant::RuntimeIsolateGroup(runtime).live_function_index_info.function_count = 1;
+    dartplant::RuntimeIsolateGroup(runtime).live_function_index_info.code_target_count = 1;
+    dartplant::SetActiveRuntimeState(runtime, DARTPLANT_RUNTIME_READY);
 }
 
 void SeedSyntheticArtifactImage(DartPlantRuntime* runtime, const dartplant::ModuleImage& module,
                                 void* target, const char* snapshot_hash) {
     EXPECT_TRUE(runtime != nullptr);
-    runtime->modules = dartplant::EnumerateModules();
-    runtime->selected_app_module = module;
-    runtime->selected_runtime_module = module;
-    runtime->profile_matched = true;
+    dartplant::RuntimeProcess(runtime).modules = dartplant::EnumerateModules();
+    dartplant::RuntimeEngine(runtime).retired = false;
+    dartplant::RuntimeIsolateGroup(runtime).retired = false;
+    dartplant::RuntimeIsolateGroup(runtime).app_module = module;
+    dartplant::RuntimeEngine(runtime).module = module;
+    dartplant::RuntimeEngine(runtime).incarnation_epoch = 1;
+    dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch = 1;
+    dartplant::SetActiveProfileMatched(runtime, true);
 
     dartplant::FlutterSnapshotSource snapshot;
     snapshot.module_name = module.name;
@@ -650,11 +672,15 @@ void SeedSyntheticArtifactImage(DartPlantRuntime* runtime, const dartplant::Modu
             std::min<uint64_t>(0x100, range.end - snapshot.isolate_instructions_runtime);
         break;
     }
-    runtime->snapshot = snapshot;
+    dartplant::RuntimeIsolateGroup(runtime).snapshot = snapshot;
     std::string image_error;
-    EXPECT_TRUE(runtime->image_set.SetRoot(
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).image_set.SetRoot(
         module, snapshot, runtime->generation->load(std::memory_order_acquire), &image_error));
-    runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
+    dartplant::RuntimeIsolateGroup(runtime).image_set.BindOwnerEpochs(
+        dartplant::RuntimeEngine(runtime).incarnation_epoch,
+        dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    dartplant::RuntimeIsolateGroup(runtime).image_set.ActivateAll();
+    dartplant::SetActiveRuntimeState(runtime, DARTPLANT_RUNTIME_IMAGES_READY);
 }
 
 }  // namespace
@@ -2063,7 +2089,7 @@ TEST_CASE(RuntimeEngineAnchorDisambiguatesSameNameFlutterMappings) {
         profile.app_module_name = "libapp.so";
         profile.runtime_module_name = "libflutter.so";
         runtime->profile.Assign(profile);
-        runtime->selected_app_module = app;
+        dartplant::RuntimeIsolateGroup(runtime).app_module = app;
         dartplant::FlutterSnapshotSource snapshot;
         snapshot.module_name = app.name;
         snapshot.module_path = app.path;
@@ -2075,33 +2101,652 @@ TEST_CASE(RuntimeEngineAnchorDisambiguatesSameNameFlutterMappings) {
         snapshot.isolate_instructions_size = 0x1000;
         snapshot.isolate_instructions_runtime = 0x100000;
         snapshot.compressed_pointers = true;
-        runtime->snapshot = snapshot;
+        dartplant::RuntimeIsolateGroup(runtime).snapshot = snapshot;
         std::string error;
-        EXPECT_TRUE(runtime->image_set.SetRoot(app, snapshot, 1, &error));
+        EXPECT_TRUE(
+            dartplant::RuntimeIsolateGroup(runtime).image_set.SetRoot(app, snapshot, 1, &error));
     };
 
     DartPlantRuntime ambiguous;
     seed_runtime(&ambiguous);
     EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY, dartplant::RefreshRuntimeModules(&ambiguous, modules));
-    EXPECT_TRUE(!ambiguous.selected_runtime_module.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeEngine(&ambiguous).module.has_value());
 
     DartPlantRuntime anchored;
     seed_runtime(&anchored);
-    anchored.engine_anchor = 0x300100;
+    dartplant::RuntimeEngine(&anchored).anchor = 0x300100;
     EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&anchored, modules));
-    EXPECT_TRUE(anchored.selected_runtime_module.has_value());
-    EXPECT_EQ(engine_b.path, anchored.selected_runtime_module->path);
+    EXPECT_TRUE(dartplant::RuntimeEngine(&anchored).module.has_value());
+    EXPECT_EQ(engine_b.path, dartplant::RuntimeEngine(&anchored).module->path);
     EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, anchored.state);
 
     const uint64_t engine_b_generation = anchored.generation->load(std::memory_order_acquire);
-    anchored.live_snapshot_index.emplace();
-    anchored.engine_anchor = 0x200100;
+    dartplant::RuntimeIsolateGroup(&anchored).live_snapshot_index.emplace();
+    dartplant::RuntimeEngine(&anchored).anchor = 0x200100;
     EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&anchored, modules));
-    EXPECT_TRUE(anchored.selected_runtime_module.has_value());
-    EXPECT_EQ(engine_a.path, anchored.selected_runtime_module->path);
+    EXPECT_TRUE(dartplant::RuntimeEngine(&anchored).module.has_value());
+    EXPECT_EQ(engine_a.path, dartplant::RuntimeEngine(&anchored).module->path);
     EXPECT_EQ(engine_b_generation + 1, anchored.generation->load(std::memory_order_acquire));
-    EXPECT_TRUE(!anchored.live_snapshot_index.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(&anchored).live_snapshot_index.has_value());
     EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, anchored.state);
+}
+
+TEST_CASE(RuntimeOwnerTreePreservesEngineChildrenAcrossAnchorSwitches) {
+    auto make_module = [](const char* name, const char* path, uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = "same-build";
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+    const auto app = make_module("libapp.so", "/app/libapp.so", 0x100000);
+    const auto engine_a = make_module("libflutter.so", "/engine/a/libflutter.so", 0x200000);
+    const auto engine_b = make_module("libflutter.so", "/engine/b/libflutter.so", 0x300000);
+    const std::vector<dartplant::ModuleImage> modules = {app, engine_a, engine_b};
+
+    DartPlantRuntime runtime;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libapp.so";
+    profile.runtime_module_name = "libflutter.so";
+    runtime.profile.Assign(profile);
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = app.name;
+    snapshot.module_path = app.path;
+    snapshot.module_build_id = app.build_id;
+    snapshot.snapshot_hash = "synthetic-owner-tree";
+    snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    snapshot.profile_name = "flutter-arm64-product-compressed";
+    snapshot.isolate_instructions_va = 0x1000;
+    snapshot.isolate_instructions_size = 0x1000;
+    snapshot.isolate_instructions_runtime = 0x100000;
+    snapshot.compressed_pointers = true;
+
+    auto seed_active_group = [&] {
+        auto& group = dartplant::RuntimeIsolateGroup(&runtime);
+        group.app_module = app;
+        group.snapshot = snapshot;
+        if (group.image_set.empty()) {
+            std::string error;
+            EXPECT_TRUE(group.image_set.SetRoot(
+                app, snapshot, group.generation->load(std::memory_order_acquire), &error));
+        }
+    };
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, modules, 0x300100);
+    seed_active_group();
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, modules));
+    const size_t engine_b_index = runtime.process.active_engine_index;
+    const auto engine_b_generation = dartplant::RuntimeIsolateGroup(&runtime).generation;
+    const uint64_t engine_b_epoch = dartplant::RuntimeEngine(&runtime).incarnation_epoch;
+    const uint64_t group_b_epoch = dartplant::RuntimeIsolateGroup(&runtime).incarnation_epoch;
+    dartplant::RuntimeIsolateGroup(&runtime).live_snapshot_index.emplace();
+    dartplant::SetRuntimeDiagnostics(&runtime, DARTPLANT_RESOLVE_COMPLETE,
+                                     DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
+    dartplant::RuntimeDiagnostics(&runtime).function_candidate_count = 7;
+    dartplant::ProjectActiveDiagnostics(&runtime);
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, modules, 0x200100);
+    EXPECT_TRUE(runtime.process.active_engine_index != engine_b_index);
+    seed_active_group();
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, modules));
+    const size_t engine_a_index = runtime.process.active_engine_index;
+    const auto engine_a_generation = dartplant::RuntimeIsolateGroup(&runtime).generation;
+    EXPECT_TRUE(engine_a_generation != engine_b_generation);
+    EXPECT_TRUE(runtime.process.engines.size() >= 2);
+    EXPECT_EQ(engine_a.path, dartplant::RuntimeEngine(&runtime).module->path);
+    dartplant::SetRuntimeDiagnostics(&runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
+                                     DARTPLANT_RESOLVE_REJECTED, DARTPLANT_METHOD_NOT_FOUND,
+                                     DARTPLANT_REJECT_FUNCTION_NOT_FOUND);
+    dartplant::RuntimeDiagnostics(&runtime).function_candidate_count = 3;
+    dartplant::ProjectActiveDiagnostics(&runtime);
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, modules, 0x300100);
+    EXPECT_EQ(engine_b_index, runtime.process.active_engine_index);
+    EXPECT_TRUE(runtime.generation == engine_b_generation);
+    EXPECT_EQ(engine_b.path, dartplant::RuntimeEngine(&runtime).module->path);
+    EXPECT_EQ(engine_b_epoch, dartplant::RuntimeEngine(&runtime).incarnation_epoch);
+    EXPECT_EQ(group_b_epoch, dartplant::RuntimeIsolateGroup(&runtime).incarnation_epoch);
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(&runtime).live_snapshot_index.has_value());
+    EXPECT_EQ(7U, runtime.diagnostics.function_candidate_count);
+    EXPECT_EQ(static_cast<uint8_t>(DARTPLANT_RESOLVE_COMPLETE),
+              static_cast<uint8_t>(runtime.diagnostics.stage));
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, modules, 0x200100);
+    EXPECT_EQ(engine_a_index, runtime.process.active_engine_index);
+    EXPECT_TRUE(runtime.generation == engine_a_generation);
+    EXPECT_EQ(engine_a.path, dartplant::RuntimeEngine(&runtime).module->path);
+    EXPECT_EQ(3U, runtime.diagnostics.function_candidate_count);
+    EXPECT_EQ(static_cast<uint8_t>(DARTPLANT_RESOLVE_FUNCTION_IDENTITY),
+              static_cast<uint8_t>(runtime.diagnostics.stage));
+
+    // A process refresh must maintain every live owner, not only the active
+    // projection. Force both subtrees back to CREATED and verify the owner-tree
+    // dispatcher republishes them while restoring the caller's active engine.
+    runtime.process.active_engine_index = engine_b_index;
+    for (const auto& engine : runtime.process.engines) {
+        if (engine == nullptr || engine->retired) continue;
+        for (const auto& group : engine->isolate_groups) {
+            if (group == nullptr || group->retired) continue;
+            group->runtime_state = DARTPLANT_RUNTIME_CREATED;
+            group->profile_matched = false;
+        }
+    }
+    dartplant::ProjectActiveGeneration(&runtime);
+    dartplant::ProjectActiveRuntimeState(&runtime);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeOwnerTree(&runtime, modules));
+    EXPECT_EQ(engine_b_index, runtime.process.active_engine_index);
+    EXPECT_TRUE(runtime.generation == engine_b_generation);
+    for (const auto& engine : runtime.process.engines) {
+        if (engine == nullptr || engine->retired) continue;
+        for (const auto& group : engine->isolate_groups) {
+            if (group == nullptr || group->retired) continue;
+            EXPECT_TRUE(group->profile_matched);
+            EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, group->runtime_state);
+        }
+    }
+}
+
+TEST_CASE(RuntimeOwnerTreePreservesIsolateGroupImagesAndCapabilityBindings) {
+    DartPlantRuntime runtime;
+    auto& process = dartplant::RuntimeProcess(&runtime);
+    auto& engine = dartplant::RuntimeEngine(&runtime);
+    engine.incarnation_epoch = 7;
+    process.next_isolate_group_incarnation_epoch = 12;
+
+    dartplant::ModuleImage app;
+    app.name = "libapp.so";
+    app.path = "/app/libapp.so";
+    app.build_id = "app-build";
+    app.load_bias = 0x100000;
+    app.executable_ranges.push_back({
+        .start = 0x110000,
+        .end = 0x112000,
+        .file_offset = 0x10000,
+        .virtual_address = 0x10000,
+        .file_size = 0x2000,
+    });
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = app.name;
+    snapshot.module_path = app.path;
+    snapshot.module_build_id = app.build_id;
+    snapshot.snapshot_hash = "group-owner-tree";
+    snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    snapshot.profile_name = "flutter-arm64-product-compressed";
+    snapshot.isolate_instructions_va = 0x10000;
+    snapshot.isolate_instructions_size = 0x2000;
+    snapshot.isolate_instructions_runtime = 0x110000;
+    snapshot.compressed_pointers = true;
+
+    auto& group_a = dartplant::RuntimeIsolateGroup(&runtime);
+    group_a.incarnation_epoch = 11;
+    group_a.isolate_group_identity = 0xaaaa;
+    group_a.isolate_generation = 1;
+    group_a.app_module = app;
+    group_a.snapshot = snapshot;
+    std::string error;
+    EXPECT_TRUE(group_a.image_set.SetRoot(app, snapshot, 1, &error));
+    group_a.image_set.BindOwnerEpochs(engine.incarnation_epoch, group_a.incarnation_epoch);
+    const auto group_a_generation = group_a.generation;
+
+    dartplant::vm_abi::AbiCandidateSet candidates{};
+    candidates.profiles = {&dartplant::RuntimeProfiles()[0]};
+    candidates.representative = candidates.profiles[0];
+    const auto live_selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, {true});
+    EXPECT_TRUE(group_a.capability_bindings.Bind(
+        dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, live_selection));
+    group_a.capability_bindings.StampOwner({
+        .runtime_generation = 1,
+        .engine_incarnation_epoch = 7,
+        .isolate_group_incarnation_epoch = 11,
+    });
+    group_a.live_snapshot_index.emplace();
+
+    DartPlantLiveVmContext context_b{};
+    context_b.struct_size = sizeof(context_b);
+    context_b.isolate_group = 0xbbbb;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::ActivateRuntimeIsolateGroupOwnerForContextLocked(
+                                &runtime, context_b, snapshot));
+    EXPECT_EQ(2U, engine.isolate_groups.size());
+    EXPECT_TRUE(runtime.generation != group_a_generation);
+    auto& group_b = dartplant::RuntimeIsolateGroup(&runtime);
+    EXPECT_EQ(0xbbbbU, group_b.isolate_group_identity);
+    EXPECT_EQ(12U, group_b.incarnation_epoch);
+    EXPECT_EQ(0U, group_b.capability_bindings.bindings.size());
+    EXPECT_TRUE(!group_b.live_snapshot_index.has_value());
+    EXPECT_EQ(7U, group_b.image_set.Root()->engine_incarnation_epoch);
+    EXPECT_EQ(12U, group_b.image_set.Root()->isolate_group_incarnation_epoch);
+    EXPECT_EQ(0U, group_b.image_set.Root()->live_entry_count);
+
+    DartPlantLiveVmContext context_a{};
+    context_a.struct_size = sizeof(context_a);
+    context_a.isolate_group = 0xaaaa;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::ActivateRuntimeIsolateGroupOwnerForContextLocked(
+                                &runtime, context_a, snapshot));
+    EXPECT_TRUE(runtime.generation == group_a_generation);
+    EXPECT_EQ(11U, dartplant::RuntimeIsolateGroup(&runtime).incarnation_epoch);
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(&runtime).live_snapshot_index.has_value());
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(&runtime).capability_bindings.FindForOwner(
+                    dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout,
+                    {.runtime_generation = 1,
+                     .engine_incarnation_epoch = 7,
+                     .isolate_group_incarnation_epoch = 11}) != nullptr);
+}
+
+TEST_CASE(RuntimeOwnerTreeRecreatesRetiredEngineAsANewPhysicalIncarnation) {
+    auto make_module = [](const char* name, const char* path, uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = "stable-build";
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+
+    const auto app = make_module("libapp.so", "/app/libapp.so", 0x100000);
+    const auto engine_module = make_module("libflutter.so", "/engine/libflutter.so", 0x200000);
+    const std::vector<dartplant::ModuleImage> full_modules = {app, engine_module};
+    const std::vector<dartplant::ModuleImage> app_only_modules = {app};
+
+    DartPlantRuntime runtime;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libapp.so";
+    profile.runtime_module_name = "libflutter.so";
+    runtime.profile.Assign(profile);
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = app.name;
+    snapshot.module_path = app.path;
+    snapshot.module_build_id = app.build_id;
+    snapshot.snapshot_hash = "retired-engine-remap";
+    snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    snapshot.profile_name = "flutter-arm64-product-compressed";
+    snapshot.isolate_instructions_va = 0x1000;
+    snapshot.isolate_instructions_size = 0x1000;
+    snapshot.isolate_instructions_runtime = 0x100000;
+    snapshot.compressed_pointers = true;
+
+    auto seed_group_snapshot = [&] {
+        auto& group = dartplant::RuntimeIsolateGroup(&runtime);
+        group.app_module = app;
+        group.snapshot = snapshot;
+        group.retired = false;
+        if (group.image_set.empty()) {
+            std::string error;
+            EXPECT_TRUE(group.image_set.SetRoot(
+                app, snapshot, group.generation->load(std::memory_order_acquire), &error));
+        }
+    };
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, full_modules, 0x200100);
+    seed_group_snapshot();
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, full_modules));
+    auto* first_engine = &dartplant::RuntimeEngine(&runtime);
+    auto* first_group = &dartplant::RuntimeIsolateGroup(&runtime);
+    const uint64_t first_engine_epoch = first_engine->incarnation_epoch;
+    const uint64_t first_group_epoch = first_group->incarnation_epoch;
+    const auto first_generation = first_group->generation;
+    EXPECT_TRUE(first_engine_epoch != 0);
+    EXPECT_TRUE(first_group_epoch != 0);
+
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant::RefreshRuntimeModules(&runtime, app_only_modules));
+    EXPECT_TRUE(first_engine->retired);
+    EXPECT_TRUE(first_group->retired);
+    EXPECT_EQ(first_engine_epoch, first_engine->incarnation_epoch);
+    EXPECT_EQ(first_group_epoch, first_group->incarnation_epoch);
+    EXPECT_TRUE(runtime.generation == first_generation);
+
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, full_modules, 0x200100);
+    EXPECT_TRUE(&dartplant::RuntimeEngine(&runtime) != first_engine);
+    EXPECT_TRUE(runtime.generation != first_generation);
+    seed_group_snapshot();
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, full_modules));
+    const auto& second_engine = dartplant::RuntimeEngine(&runtime);
+    const auto& second_group = dartplant::RuntimeIsolateGroup(&runtime);
+    EXPECT_TRUE(!second_engine.retired);
+    EXPECT_TRUE(!second_group.retired);
+    EXPECT_TRUE(second_engine.incarnation_epoch != first_engine_epoch);
+    EXPECT_TRUE(second_group.incarnation_epoch != first_group_epoch);
+    EXPECT_TRUE(runtime.process.engines.size() >= 2);
+    EXPECT_TRUE(first_engine->retired);
+    EXPECT_EQ(first_engine_epoch, first_engine->incarnation_epoch);
+}
+
+TEST_CASE(RuntimeOwnerTreeDetectsEngineRemapWithoutPreUnload) {
+    auto make_module = [](const char* name, const char* path, const char* build_id,
+                          uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = build_id;
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+
+    const auto app = make_module("libapp.so", "/app/libapp.so", "app", 0x100000);
+    const auto engine_v1 =
+        make_module("libflutter.so", "/engine/libflutter.so", "engine-v1", 0x200000);
+    const auto engine_v2 =
+        make_module("libflutter.so", "/engine/libflutter.so", "engine-v2", 0x200000);
+
+    DartPlantRuntime runtime;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libapp.so";
+    profile.runtime_module_name = "libflutter.so";
+    runtime.profile.Assign(profile);
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = app.name;
+    snapshot.module_path = app.path;
+    snapshot.module_build_id = app.build_id;
+    snapshot.snapshot_hash = "engine-remap-without-pre-unload";
+    snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    snapshot.profile_name = "flutter-arm64-product-compressed";
+    snapshot.isolate_instructions_va = 0x1000;
+    snapshot.isolate_instructions_size = 0x1000;
+    snapshot.isolate_instructions_runtime = 0x100000;
+    snapshot.compressed_pointers = true;
+
+    const std::vector<dartplant::ModuleImage> first_modules = {app, engine_v1};
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, first_modules, 0x200100);
+    auto& first_group_seed = dartplant::RuntimeIsolateGroup(&runtime);
+    first_group_seed.app_module = app;
+    first_group_seed.snapshot = snapshot;
+    std::string error;
+    EXPECT_TRUE(first_group_seed.image_set.SetRoot(
+        app, snapshot, first_group_seed.generation->load(std::memory_order_acquire), &error));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, first_modules));
+
+    auto* first_engine = &dartplant::RuntimeEngine(&runtime);
+    auto* first_group = &dartplant::RuntimeIsolateGroup(&runtime);
+    const uint64_t first_engine_epoch = first_engine->incarnation_epoch;
+    const uint64_t first_group_epoch = first_group->incarnation_epoch;
+    const auto first_generation = first_group->generation;
+    EXPECT_TRUE(first_engine_epoch != 0);
+    EXPECT_TRUE(first_group_epoch != 0);
+
+    const std::vector<dartplant::ModuleImage> remapped_modules = {app, engine_v2};
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant::RefreshRuntimeOwnerTree(&runtime, remapped_modules));
+    EXPECT_TRUE(first_engine->retired);
+    EXPECT_TRUE(first_group->retired);
+    EXPECT_EQ(first_engine_epoch, first_engine->incarnation_epoch);
+    EXPECT_EQ(first_group_epoch, first_group->incarnation_epoch);
+    EXPECT_TRUE(first_engine->module.has_value());
+    EXPECT_EQ("engine-v1", first_engine->module->build_id);
+
+    auto& second_engine = dartplant::RuntimeEngine(&runtime);
+    auto& second_group = dartplant::RuntimeIsolateGroup(&runtime);
+    EXPECT_TRUE(&second_engine != first_engine);
+    EXPECT_TRUE(second_engine.module.has_value());
+    EXPECT_EQ("engine-v2", second_engine.module->build_id);
+    EXPECT_TRUE(second_engine.incarnation_epoch != 0);
+    EXPECT_TRUE(second_engine.incarnation_epoch != first_engine_epoch);
+    EXPECT_TRUE(second_group.generation != first_generation);
+    EXPECT_TRUE(!second_engine.retired);
+}
+
+TEST_CASE(RuntimeOwnerTreeDetectsAppRemapWithoutPreUnload) {
+    auto make_module = [](const char* name, const char* path, const char* build_id,
+                          uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = build_id;
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+
+    const auto app_v1 = make_module("libapp.so", "/app/libapp.so", "app-v1", 0x100000);
+    const auto app_v2 = make_module("libapp.so", "/app/libapp.so", "app-v2", 0x100000);
+    const auto engine = make_module("libflutter.so", "/engine/libflutter.so", "engine", 0x200000);
+
+    DartPlantRuntime runtime;
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libapp.so";
+    profile.runtime_module_name = "libflutter.so";
+    runtime.profile.Assign(profile);
+
+    dartplant::FlutterSnapshotSource snapshot;
+    snapshot.module_name = app_v1.name;
+    snapshot.module_path = app_v1.path;
+    snapshot.module_build_id = app_v1.build_id;
+    snapshot.snapshot_hash = "app-remap-without-pre-unload";
+    snapshot.snapshot_features = "arm64 android product compressed-pointers";
+    snapshot.profile_name = "flutter-arm64-product-compressed";
+    snapshot.isolate_instructions_va = 0x1000;
+    snapshot.isolate_instructions_size = 0x1000;
+    snapshot.isolate_instructions_runtime = 0x100000;
+    snapshot.compressed_pointers = true;
+
+    const std::vector<dartplant::ModuleImage> first_modules = {app_v1, engine};
+    dartplant::ActivateRuntimeEngineOwnerForAnchorLocked(&runtime, first_modules, 0x200100);
+    auto& first_group_seed = dartplant::RuntimeIsolateGroup(&runtime);
+    first_group_seed.app_module = app_v1;
+    first_group_seed.snapshot = snapshot;
+    std::string error;
+    EXPECT_TRUE(first_group_seed.image_set.SetRoot(
+        app_v1, snapshot, first_group_seed.generation->load(std::memory_order_acquire), &error));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::RefreshRuntimeModules(&runtime, first_modules));
+
+    auto* first_engine = &dartplant::RuntimeEngine(&runtime);
+    auto* first_group = &dartplant::RuntimeIsolateGroup(&runtime);
+    const uint64_t first_engine_epoch = first_engine->incarnation_epoch;
+    const uint64_t first_group_epoch = first_group->incarnation_epoch;
+    const auto first_generation = first_group->generation;
+
+    const std::vector<dartplant::ModuleImage> remapped_modules = {app_v2, engine};
+    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
+              dartplant::RefreshRuntimeOwnerTree(&runtime, remapped_modules));
+    EXPECT_TRUE(!first_engine->retired);
+    EXPECT_EQ(first_engine_epoch, first_engine->incarnation_epoch);
+    EXPECT_TRUE(first_group->retired);
+    EXPECT_EQ(first_group_epoch, first_group->incarnation_epoch);
+    EXPECT_TRUE(first_group->app_module.has_value());
+    EXPECT_EQ("app-v1", first_group->app_module->build_id);
+
+    auto& second_group = dartplant::RuntimeIsolateGroup(&runtime);
+    EXPECT_TRUE(&second_group != first_group);
+    EXPECT_TRUE(second_group.generation != first_generation);
+    EXPECT_TRUE(!second_group.retired);
+    EXPECT_TRUE(second_group.app_module.has_value());
+    EXPECT_EQ("app-v2", second_group.app_module->build_id);
+    EXPECT_EQ(0U, second_group.incarnation_epoch);
+}
+
+TEST_CASE(RuntimeDestroyDrainsHooksOwnedByInactiveEngineGroups) {
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant-owner-tree-missing-app.so";
+    profile.runtime_module_name = "libdartplant-owner-tree-missing-engine.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+
+    auto& first_group = dartplant::RuntimeIsolateGroup(runtime);
+    first_group.app_module = *module;
+    const auto first_generation = first_group.generation;
+
+    auto second_engine = std::make_unique<dartplant::RuntimeEngineState>();
+    auto& second_group = *second_engine->isolate_groups[0];
+    second_group.app_module = *module;
+    const auto second_generation = second_group.generation;
+    runtime->process.engines.push_back(std::move(second_engine));
+    EXPECT_TRUE(first_generation != second_generation);
+
+    DartPlantHook* first_hook = nullptr;
+    DartPlantHook* second_hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(ImageScopedRootTarget),
+                                     reinterpret_cast<void*>(Replacement), &backup, &first_hook));
+    backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InstallHook(reinterpret_cast<uintptr_t>(ImageScopedDeferredTarget),
+                                     reinterpret_cast<void*>(Replacement), &backup, &second_hook));
+    first_hook->runtime_generation = first_generation;
+    first_hook->expected_runtime_generation = first_generation->load(std::memory_order_acquire);
+    second_hook->runtime_generation = second_generation;
+    second_hook->expected_runtime_generation = second_generation->load(std::memory_order_acquire);
+
+    dartplant_runtime_destroy(runtime);
+    EXPECT_TRUE(!first_hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(!second_hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(2, g_fake_unhook_calls);
+
+    dartplant_release_hook(first_hook);
+    dartplant_release_hook(second_hook);
+    dartplant_reset();
+    dlclose(fixture);
+}
+
+TEST_CASE(RuntimeEnginePreUnloadRetiresOnlyTheMatchingOwnerSubtree) {
+    auto make_module = [](const char* name, const char* path, uintptr_t start) {
+        dartplant::ModuleImage module;
+        module.name = name;
+        module.path = path;
+        module.build_id = path;
+        module.load_bias = start - 0x1000;
+        module.executable_ranges.push_back({
+            .start = start,
+            .end = start + 0x1000,
+            .file_offset = 0x1000,
+            .virtual_address = 0x1000,
+            .file_size = 0x1000,
+        });
+        return module;
+    };
+    auto make_snapshot = [](const dartplant::ModuleImage& app, uintptr_t instructions) {
+        dartplant::FlutterSnapshotSource snapshot;
+        snapshot.module_name = app.name;
+        snapshot.module_path = app.path;
+        snapshot.module_build_id = app.build_id;
+        snapshot.snapshot_hash = app.path;
+        snapshot.snapshot_features = "arm64 android product compressed-pointers";
+        snapshot.profile_name = "flutter-arm64-product-compressed";
+        snapshot.isolate_instructions_va = 0x1000;
+        snapshot.isolate_instructions_size = 0x1000;
+        snapshot.isolate_instructions_runtime = instructions;
+        snapshot.compressed_pointers = true;
+        return snapshot;
+    };
+
+    const auto app_a = make_module("libapp.so", "/app/a/libapp.so", 0x100000);
+    const auto app_b = make_module("libapp.so", "/app/b/libapp.so", 0x180000);
+    const auto engine_a = make_module("libflutter.so", "/engine/a/libflutter.so", 0x200000);
+    const auto engine_b = make_module("libflutter.so", "/engine/b/libflutter.so", 0x300000);
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant-owner-tree-missing-app.so";
+    profile.runtime_module_name = "libdartplant-owner-tree-missing-engine.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+
+    {
+        std::lock_guard lock(runtime->mutex);
+        runtime->process.engines.clear();
+        runtime->process.modules = {app_a, app_b, engine_a, engine_b};
+
+        auto owner_a = std::make_unique<dartplant::RuntimeEngineState>();
+        owner_a->module = engine_a;
+        owner_a->anchor = 0x200100;
+        owner_a->incarnation_epoch = 11;
+        auto& group_a = *owner_a->isolate_groups[0];
+        group_a.app_module = app_a;
+        group_a.snapshot = make_snapshot(app_a, 0x100000);
+        group_a.incarnation_epoch = 21;
+        group_a.runtime_state = DARTPLANT_RUNTIME_READY;
+        group_a.profile_matched = true;
+        std::string error;
+        EXPECT_TRUE(group_a.image_set.SetRoot(
+            app_a, *group_a.snapshot, group_a.generation->load(std::memory_order_acquire), &error));
+        group_a.image_set.BindOwnerEpochs(owner_a->incarnation_epoch, group_a.incarnation_epoch);
+        group_a.image_set.ActivateAll();
+
+        auto owner_b = std::make_unique<dartplant::RuntimeEngineState>();
+        owner_b->module = engine_b;
+        owner_b->anchor = 0x300100;
+        owner_b->incarnation_epoch = 12;
+        auto& group_b = *owner_b->isolate_groups[0];
+        group_b.app_module = app_b;
+        group_b.snapshot = make_snapshot(app_b, 0x180000);
+        group_b.incarnation_epoch = 22;
+        group_b.runtime_state = DARTPLANT_RUNTIME_READY;
+        group_b.profile_matched = true;
+        EXPECT_TRUE(group_b.image_set.SetRoot(
+            app_b, *group_b.snapshot, group_b.generation->load(std::memory_order_acquire), &error));
+        group_b.image_set.BindOwnerEpochs(owner_b->incarnation_epoch, group_b.incarnation_epoch);
+        group_b.image_set.ActivateAll();
+
+        runtime->process.engines.push_back(std::move(owner_a));
+        runtime->process.engines.push_back(std::move(owner_b));
+        runtime->process.active_engine_index = 1;
+        dartplant::ProjectActiveGeneration(runtime);
+        dartplant::ProjectActiveRuntimeState(runtime);
+    }
+
+    const auto sibling_generation = dartplant::RuntimeIsolateGroup(runtime).generation;
+    const uint64_t sibling_engine_epoch = dartplant::RuntimeEngine(runtime).incarnation_epoch;
+    const uint64_t sibling_group_epoch = dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_on_module_unloading(runtime, "/engine/a/libflutter.so", nullptr));
+
+    EXPECT_EQ(1U, runtime->process.active_engine_index);
+    EXPECT_TRUE(runtime->generation == sibling_generation);
+    EXPECT_EQ(sibling_engine_epoch, dartplant::RuntimeEngine(runtime).incarnation_epoch);
+    EXPECT_EQ(sibling_group_epoch, dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    EXPECT_TRUE(!dartplant::RuntimeEngine(runtime).retired);
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).retired);
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).image_set.empty());
+    EXPECT_TRUE(runtime->process.engines[0]->retired);
+    EXPECT_TRUE(runtime->process.engines[0]->isolate_groups[0]->retired);
+
+    dartplant_runtime_destroy(runtime);
 }
 
 TEST_CASE(RuntimeDiagnosticsReportStructuredModuleRejection) {
@@ -2219,6 +2864,16 @@ TEST_CASE(RuntimeHookMethodHandleKeepsOuterOperationPinnedAcrossHelpers) {
     EXPECT_EQ(1U, image_info.live_entry_count);
     EXPECT_EQ(1U, static_cast<uint32_t>(image_info.live_semantic_bound));
 
+    alignas(DartPlantRuntimeImageInfo)
+        std::array<std::byte, offsetof(DartPlantRuntimeImageInfo, incarnation_epoch)>
+            legacy_image_storage{};
+    auto* legacy_image = reinterpret_cast<DartPlantRuntimeImageInfo*>(legacy_image_storage.data());
+    legacy_image->struct_size = static_cast<uint32_t>(legacy_image_storage.size());
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_info(runtime, 0, legacy_image));
+    EXPECT_EQ(legacy_image_storage.size(), legacy_image->struct_size);
+    EXPECT_EQ(image_info.image_id, legacy_image->image_id);
+    EXPECT_EQ(image_info.live_entry_count, legacy_image->live_entry_count);
+
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
         .library_uri = "package:fixture/main.dart",
@@ -2317,6 +2972,156 @@ TEST_CASE(FailedRuntimeHookInvalidationRetainsTargetOwnership) {
     g_fake_fail_unhook_enabled = false;
     EXPECT_EQ(DARTPLANT_OK, dartplant_unhook(hook));
     dartplant_release_hook(hook);
+}
+
+TEST_CASE(RuntimeImageTransitionDoesNotPublishReplacementWhenDrainFails) {
+    InstallTestHost(FakeHook, FakeFailUnhook);
+    g_fake_unhook_calls = 0;
+    g_fake_fail_unhook_enabled = true;
+
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &method));
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_hook_method_raw(
+                  runtime, method, reinterpret_cast<void*>(Replacement), &backup, &hook));
+
+    const auto* old_root = dartplant::RuntimeIsolateGroup(runtime).image_set.Root();
+    EXPECT_TRUE(old_root != nullptr);
+    const auto old_id = old_root->id;
+    const auto old_epoch = old_root->incarnation_epoch;
+
+    auto replacement_module = *module;
+    replacement_module.build_id = module->build_id + "-replacement";
+    auto replacement_snapshot = *dartplant::RuntimeIsolateGroup(runtime).snapshot;
+    replacement_snapshot.module_build_id = replacement_module.build_id;
+    dartplant::RuntimeImageSet staged;
+    std::string error;
+    EXPECT_TRUE(staged.SetRoot(replacement_module, replacement_snapshot,
+                               runtime->generation->load(std::memory_order_acquire), &error));
+    EXPECT_TRUE(staged.ReconcileOwnershipFrom(dartplant::RuntimeIsolateGroup(runtime).image_set));
+    staged.BindOwnerEpochs(dartplant::RuntimeEngine(runtime).incarnation_epoch,
+                           dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    const auto* staged_root = staged.Root();
+    EXPECT_TRUE(staged_root != nullptr);
+    EXPECT_EQ(old_id, staged_root->id);
+    EXPECT_TRUE(old_epoch != staged_root->incarnation_epoch);
+
+    const DartPlantStatus status = dartplant::TransitionRuntimeImages(
+        runtime, std::move(staged), dartplant::RuntimeProcess(runtime).modules, false);
+    EXPECT_EQ(DARTPLANT_UNHOOK_FAILED, status);
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    const auto* retained_root = dartplant::RuntimeIsolateGroup(runtime).image_set.Root();
+    EXPECT_TRUE(retained_root != nullptr);
+    EXPECT_EQ(old_id, retained_root->id);
+    EXPECT_EQ(old_epoch, retained_root->incarnation_epoch);
+    EXPECT_EQ(static_cast<uint8_t>(dartplant::RuntimeImageLifecycleState::kDraining),
+              static_cast<uint8_t>(retained_root->lifecycle));
+    // Admission closes before backend drain. A failed physical unhook therefore
+    // leaves the hook logically inactive but still backend-owned, while the
+    // old RuntimeImage remains published only in DRAINING state.
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->backend_installed.load(std::memory_order_acquire));
+    EXPECT_TRUE(!dartplant::IsCurrentRuntimeMethod(runtime, method));
+
+    g_fake_fail_unhook_enabled = false;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::InvalidateRuntimeImageHooks(runtime->generation, old_id, old_epoch));
+    dartplant_release_hook(hook);
+    dartplant_release_method(method);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
+TEST_CASE(RuntimePreUnloadDoesNotRetireOwnerWhenHookDrainFails) {
+    InstallTestHost(FakeHook, FakeFailUnhook);
+    g_fake_unhook_calls = 0;
+    g_fake_fail_unhook_enabled = true;
+
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &method));
+    DartPlantHook* hook = nullptr;
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_hook_method_raw(
+                  runtime, method, reinterpret_cast<void*>(Replacement), &backup, &hook));
+
+    const uint64_t engine_epoch = dartplant::RuntimeEngine(runtime).incarnation_epoch;
+    const uint64_t group_epoch = dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch;
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value());
+
+    EXPECT_EQ(DARTPLANT_UNHOOK_FAILED,
+              dartplant_runtime_on_module_unloading(runtime, module->path.c_str(), nullptr));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_TRUE(!dartplant::RuntimeEngine(runtime).retired);
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).retired);
+    EXPECT_EQ(engine_epoch, dartplant::RuntimeEngine(runtime).incarnation_epoch);
+    EXPECT_EQ(group_epoch, dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value());
+    const auto* retained_root = dartplant::RuntimeIsolateGroup(runtime).image_set.Root();
+    EXPECT_TRUE(retained_root != nullptr);
+    EXPECT_EQ(static_cast<uint8_t>(dartplant::RuntimeImageLifecycleState::kDraining),
+              static_cast<uint8_t>(retained_root->lifecycle));
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->backend_installed.load(std::memory_order_acquire));
+
+    g_fake_fail_unhook_enabled = false;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InvalidateRuntimeHooks(runtime->generation));
+    dartplant_release_hook(hook);
+    dartplant_release_method(method);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
 }
 
 TEST_CASE(HookUnhooksWithItsInstallingBackend) {
@@ -2497,34 +3302,53 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
     deferred_snapshot.module_name = deferred_module.name;
     deferred_snapshot.module_path = deferred_module.path;
     deferred_snapshot.module_build_id = deferred_module.build_id;
-    deferred_snapshot.snapshot_hash = runtime->snapshot->snapshot_hash;
-    deferred_snapshot.snapshot_features = runtime->snapshot->snapshot_features;
-    deferred_snapshot.profile_name = runtime->snapshot->profile_name;
+    deferred_snapshot.snapshot_hash =
+        dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash;
+    deferred_snapshot.snapshot_features =
+        dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_features;
+    deferred_snapshot.profile_name = dartplant::RuntimeIsolateGroup(runtime).snapshot->profile_name;
     deferred_snapshot.isolate_instructions_va = 0x1000;
     deferred_snapshot.isolate_instructions_size = 0x100;
     deferred_snapshot.isolate_instructions_runtime = deferred_entry;
-    deferred_snapshot.compressed_pointers = runtime->snapshot->compressed_pointers;
+    deferred_snapshot.compressed_pointers =
+        dartplant::RuntimeIsolateGroup(runtime).snapshot->compressed_pointers;
     deferred_snapshot.deferred_program_hash = 0x12345678;
+    // This is a pre-unload event: the mapping must still be visible to the
+    // image transaction so it physically unhooks rather than merely retiring
+    // an already-unmapped owner.
+    dartplant::RuntimeProcess(runtime).modules.push_back(deferred_module);
     std::string image_error;
-    EXPECT_TRUE(runtime->image_set.AddDeferred(deferred_module, deferred_snapshot, 2, generation,
-                                               &image_error));
-    const uint64_t deferred_image_id = runtime->image_set.FindByLoadingUnitId(2)->id;
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).image_set.AddDeferred(
+        deferred_module, deferred_snapshot, 2, generation, &image_error));
+    dartplant::RuntimeIsolateGroup(runtime).image_set.BindOwnerEpochs(
+        dartplant::RuntimeEngine(runtime).incarnation_epoch,
+        dartplant::RuntimeIsolateGroup(runtime).incarnation_epoch);
+    dartplant::RuntimeIsolateGroup(runtime).image_set.ActivateAll();
+    const auto* deferred_image =
+        dartplant::RuntimeIsolateGroup(runtime).image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(deferred_image != nullptr);
+    const uint64_t deferred_image_id = deferred_image->id;
+    const auto deferred_owner = deferred_image->OwnerIdentity();
+    auto deferred_target = dartplant::RuntimeIsolateGroup(runtime).entry_targets.GetOrCreate(
+        deferred_entry, 1, 0, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, deferred_entry, 1,
+        deferred_image_id, deferred_owner);
+    EXPECT_TRUE(deferred_target != nullptr);
 
     DartPlantHook* deferred_hook = nullptr;
     backup = nullptr;
     EXPECT_EQ(DARTPLANT_OK,
-              dartplant::InstallHook(deferred_entry, reinterpret_cast<void*>(Replacement), &backup,
+              dartplant::InstallHook(deferred_target, reinterpret_cast<void*>(Replacement), &backup,
                                      &deferred_hook));
     deferred_hook->runtime_generation = runtime->generation;
     deferred_hook->expected_runtime_generation = generation;
-    deferred_hook->code_target->image_id = deferred_image_id;
 
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_on_module_unloading(
                                 runtime, deferred_module.name.c_str(), nullptr));
     EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
     EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
     EXPECT_TRUE(!deferred_hook->active.load(std::memory_order_acquire));
-    EXPECT_TRUE(runtime->image_set.FindByLoadingUnitId(2) == nullptr);
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).image_set.FindByLoadingUnitId(2) ==
+                nullptr);
     EXPECT_EQ(DARTPLANT_RUNTIME_IMAGES_READY, runtime->state);
     EXPECT_EQ(1, g_fake_unhook_calls);
 
@@ -2537,9 +3361,9 @@ TEST_CASE(RuntimePreUnloadInvalidatesHooksAndRejectsStaleMethods) {
               dartplant_runtime_on_module_unloading(runtime, module->name.c_str(), fixture));
     EXPECT_EQ(generation + 1, runtime->generation->load(std::memory_order_acquire));
     EXPECT_EQ(DARTPLANT_RUNTIME_CREATED, runtime->state);
-    EXPECT_TRUE(!runtime->live_vm_context.has_value());
-    EXPECT_TRUE(!runtime->live_snapshot_index.has_value());
-    EXPECT_TRUE(!runtime->artifact_snapshot_index.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).live_vm_context.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).artifact_snapshot_index.has_value());
     image_count = 123;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_get_image_count(runtime, &image_count));
     EXPECT_EQ(0U, image_count);
@@ -2634,7 +3458,7 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
 
     auto resolver_duplicate = *module;
     resolver_duplicate.path += ".resolver-copy";
-    runtime->modules.push_back(std::move(resolver_duplicate));
+    dartplant::RuntimeProcess(runtime).modules.push_back(std::move(resolver_duplicate));
     DartPlantMethod* duplicate_safe_method = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &duplicate_safe_method));
     EXPECT_EQ(reinterpret_cast<uintptr_t>(target),
@@ -2658,7 +3482,7 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_EQ(DARTPLANT_OK, dartplant::WaitForRuntimeModuleRefresh(first_refresh_epoch));
     EXPECT_EQ(generation, runtime->generation->load(std::memory_order_acquire));
     EXPECT_EQ(DARTPLANT_RUNTIME_READY, runtime->state);
-    EXPECT_TRUE(runtime->live_snapshot_index.has_value());
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value());
     EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
     EXPECT_EQ(0, g_fake_unhook_calls);
 
@@ -2673,8 +3497,10 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
     EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
     EXPECT_EQ(1, g_fake_unhook_calls);
-    EXPECT_TRUE(!runtime->selected_app_module.has_value());
-    EXPECT_TRUE(!runtime->selected_runtime_module.has_value());
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).retired);
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).app_module.has_value());
+    EXPECT_TRUE(dartplant::RuntimeEngine(runtime).retired);
+    EXPECT_TRUE(dartplant::RuntimeEngine(runtime).module.has_value());
     DartPlantHook* duplicate_hook = nullptr;
     backup = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant::InstallHook(reinterpret_cast<uintptr_t>(target),
@@ -2688,7 +3514,7 @@ TEST_CASE(RuntimeResolvesMethodFromLiveFunctionIndexAndUsesHostHook) {
     EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
               dartplant::RefreshRuntimeModules(runtime, missing_modules));
     EXPECT_EQ(generation + 2, runtime->generation->load(std::memory_order_acquire));
-    EXPECT_TRUE(!runtime->live_snapshot_index.has_value());
+    EXPECT_TRUE(!dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value());
     EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
     EXPECT_EQ(2, g_fake_unhook_calls);
     EXPECT_TRUE(method->function->code_target->HookRecord() == nullptr);
@@ -2745,7 +3571,7 @@ TEST_CASE(RuntimeLiveIndexResolvesExactEntryKindsWithoutSplittingLogicalFunction
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
     SeedSyntheticLiveFunctionIndex(runtime, *module, target);
 
-    auto& index = *runtime->live_snapshot_index;
+    auto& index = *dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index;
     index.functions[0].entry_va = 0x1000;
     index.functions[0].code_size = 16;
     index.functions[0].code_payload_start = base;
@@ -2816,7 +3642,7 @@ TEST_CASE(RuntimeLiveIndexResolvesExactEntryKindsWithoutSplittingLogicalFunction
     EXPECT_EQ(base + 8, info.code_monomorphic_unchecked_entry_point);
     EXPECT_EQ(1U, info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT]);
     EXPECT_EQ(1U, info.entry_alias_counts[DARTPLANT_ENTRY_UNCHECKED]);
-    EXPECT_EQ(1U, runtime->live_function_index_info.function_count);
+    EXPECT_EQ(1U, dartplant::RuntimeIsolateGroup(runtime).live_function_index_info.function_count);
 
     DartPlantLiveVmFunctionInfo legacy_info{};
     legacy_info.struct_size = offsetof(DartPlantLiveVmFunctionInfo, entry_alias_counts);
@@ -3109,8 +3935,9 @@ TEST_CASE(RuntimeArtifactSnapshotIndexBindsDroppedFunctionFailClosed) {
     EXPECT_EQ(0U, static_cast<uint32_t>(dropped_abi.has_verified_call_layout));
     dartplant_release_method(dropped);
 
-    EXPECT_TRUE(runtime->artifact_snapshot_index.has_value());
-    runtime->artifact_snapshot_index->functions[0].fingerprint = "ffffffffffffffff";
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).artifact_snapshot_index.has_value());
+    dartplant::RuntimeIsolateGroup(runtime).artifact_snapshot_index->functions[0].fingerprint =
+        "ffffffffffffffff";
     dropped = nullptr;
     EXPECT_EQ(DARTPLANT_FINGERPRINT_MISMATCH,
               dartplant_runtime_find_method(runtime, &dropped_query, &dropped));
@@ -3218,8 +4045,10 @@ TEST_CASE(EmbeddedArtifactRegistryOwnsDataAndMergesLateSnapshotBundles) {
     // A registry generation change must rebuild the already-bound merged index
     // instead of silently ignoring a sidecar from a later-loaded DSO.
     EXPECT_EQ(DARTPLANT_OK, dartplant::BindRegisteredArtifactIndexIfReady(runtime));
-    EXPECT_TRUE(runtime->artifact_snapshot_index.has_value());
-    EXPECT_EQ(2U, static_cast<uint32_t>(runtime->artifact_snapshot_index->functions.size()));
+    EXPECT_TRUE(dartplant::RuntimeIsolateGroup(runtime).artifact_snapshot_index.has_value());
+    EXPECT_EQ(
+        2U, static_cast<uint32_t>(
+                dartplant::RuntimeIsolateGroup(runtime).artifact_snapshot_index->functions.size()));
     const DartPlantMethodQuery second_query = {
         .struct_size = sizeof(second_query),
         .library_uri = "package:artifact_owned/main.dart",
@@ -3532,8 +4361,8 @@ TEST_CASE(RuntimeLiveVmCaptureRejectsForeignAndStaleInvocation) {
     snapshot.module_name = "libapp.so";
     snapshot.module_path = "/data/app/libapp.so";
     snapshot.snapshot_hash = "capture-generation-test";
-    first->snapshot = snapshot;
-    second->snapshot = snapshot;
+    dartplant::RuntimeIsolateGroup(first).snapshot = snapshot;
+    dartplant::RuntimeIsolateGroup(second).snapshot = snapshot;
 
     DartPlantMethod method{};
     method.runtime_generation = first->generation;
@@ -3558,8 +4387,8 @@ TEST_CASE(RuntimeMethodResolutionRequiresAutomaticLiveFunctionIndex) {
     dartplant_runtime_profile_init_arm64_aot(&profile);
     DartPlantRuntime* runtime = nullptr;
     EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
-    runtime->profile_matched = true;
-    runtime->state = DARTPLANT_RUNTIME_IMAGES_READY;
+    dartplant::SetActiveProfileMatched(runtime, true);
+    dartplant::SetActiveRuntimeState(runtime, DARTPLANT_RUNTIME_IMAGES_READY);
 
     const DartPlantMethodQuery query = {
         .struct_size = sizeof(query),
@@ -3911,7 +4740,7 @@ TEST_CASE(RuntimeAbiEvidenceBindingRequiresIdentityTargetGenerationAndUniqueCode
     evidence_entry.generation = 1;
     evidence_entry.layout_status = dartplant::abi::DartCallLayoutStatus::kOk;
     evidence_entry.call_layout = layout;
-    runtime.abi_evidence.push_back(std::move(evidence_entry));
+    dartplant::RuntimeIsolateGroup(&runtime).abi_evidence.push_back(std::move(evidence_entry));
 
     EXPECT_TRUE(dartplant::FindRuntimeCallLayoutLocked(&runtime, &method) == nullptr);
     method.function->code_target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;

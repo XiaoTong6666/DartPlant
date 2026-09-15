@@ -74,6 +74,15 @@ typedef struct DartPlantRuntimeImageInfo {
     uint8_t deferred_program_hash_vm_bound;
     uint8_t reserved_binding;
     uint32_t deferred_program_hash;
+
+    // V2 append-only physical owner identity. image_id may remain stable when
+    // the same logical loading unit is remapped; incarnation_epoch changes for
+    // every replacement physical mapping.
+    uint64_t incarnation_epoch;
+    uint64_t engine_incarnation_epoch;
+    uint64_t isolate_group_incarnation_epoch;
+    uint32_t lifecycle_state;
+    uint32_t reserved_owner;
 } DartPlantRuntimeImageInfo;
 
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_create(const DartPlantRuntimeProfile* profile,

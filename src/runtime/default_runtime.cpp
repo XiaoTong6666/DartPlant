@@ -356,16 +356,18 @@ DartPlantStatus BindArtifactIndexIfReady(DartPlantRuntime* runtime,
     std::string snapshot_hash;
     {
         std::lock_guard lock(runtime->mutex);
-        if (runtime->bound_artifact_snapshot_generation == registry.snapshot_generation) {
+        if (dartplant::RuntimeIsolateGroup(runtime).bound_artifact_snapshot_generation ==
+            registry.snapshot_generation) {
             return DARTPLANT_OK;
         }
-        if (!runtime->profile_matched || !runtime->selected_app_module.has_value() ||
-            !runtime->snapshot.has_value()) {
+        if (!runtime->profile_matched ||
+            !dartplant::RuntimeIsolateGroup(runtime).app_module.has_value() ||
+            !dartplant::RuntimeIsolateGroup(runtime).snapshot.has_value()) {
             return DARTPLANT_OK;
         }
-        module_name = runtime->selected_app_module->name;
-        module_build_id = runtime->selected_app_module->build_id;
-        snapshot_hash = runtime->snapshot->snapshot_hash;
+        module_name = dartplant::RuntimeIsolateGroup(runtime).app_module->name;
+        module_build_id = dartplant::RuntimeIsolateGroup(runtime).app_module->build_id;
+        snapshot_hash = dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash;
     }
 
     const DartPlantSnapshotIndexInfo* first = nullptr;
@@ -439,7 +441,8 @@ DartPlantStatus BindArtifactIndexIfReady(DartPlantRuntime* runtime,
     }
     if (first == nullptr) {
         std::lock_guard lock(runtime->mutex);
-        runtime->bound_artifact_snapshot_generation = registry.snapshot_generation;
+        dartplant::RuntimeIsolateGroup(runtime).bound_artifact_snapshot_generation =
+            registry.snapshot_generation;
         return DARTPLANT_OK;
     }
 
@@ -504,14 +507,17 @@ bool EvidenceMatchesCurrentArtifact(DartPlantRuntime* runtime,
         return false;
     }
     std::lock_guard lock(runtime->mutex);
-    if (!runtime->snapshot.has_value() || !runtime->selected_app_module.has_value()) return false;
-    if (runtime->snapshot->snapshot_hash != evidence.snapshot_hash ||
-        !EqualsIgnoreCaseAscii(runtime->selected_app_module->build_id, evidence.app_build_id) ||
+    if (!dartplant::RuntimeIsolateGroup(runtime).snapshot.has_value() ||
+        !dartplant::RuntimeIsolateGroup(runtime).app_module.has_value())
+        return false;
+    if (dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash != evidence.snapshot_hash ||
+        !EqualsIgnoreCaseAscii(dartplant::RuntimeIsolateGroup(runtime).app_module->build_id,
+                               evidence.app_build_id) ||
         evidence.code_size != MethodCodeSize(method)) {
         return false;
     }
-    const auto target =
-        runtime->snapshot->ResolveInstructionVa(*runtime->selected_app_module, evidence.entry_va);
+    const auto target = dartplant::RuntimeIsolateGroup(runtime).snapshot->ResolveInstructionVa(
+        *dartplant::RuntimeIsolateGroup(runtime).app_module, evidence.entry_va);
     if (!target.has_value() || *target != MethodTarget(method)) return false;
     if (!method->record.fingerprint.empty() &&
         method->record.fingerprint != evidence.code_fingerprint) {

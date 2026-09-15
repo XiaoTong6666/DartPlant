@@ -5,6 +5,7 @@
 #define DARTPLANT_VM_ABI_RESOLVER_H_
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@ enum VmCapability : uint64_t {
     kCapabilityClosureCallLayout = 1ULL << 15,
     kCapabilityExceptionBridgeLayout = 1ULL << 16,
     kCapabilityDeferredLoadingUnitLayout = 1ULL << 17,
+    kCapabilityLiveFunctionIndexLayout = 1ULL << 18,
 };
 
 enum class ProofState : uint8_t {
@@ -113,13 +115,56 @@ struct VerifiedCoreBinding {
     uint64_t capabilities = kCapabilityNone;
 };
 
+struct DomainSetSelection;
+
+struct CapabilityOwnerStamp {
+    uint64_t runtime_generation = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+
+    bool valid() const {
+        return runtime_generation != 0 && engine_incarnation_epoch != 0 &&
+               isolate_group_incarnation_epoch != 0;
+    }
+    bool operator==(const CapabilityOwnerStamp&) const = default;
+};
+
+// One independently selected capability domain. A representative is only a
+// source row for fields owned by this capability; it must never be treated as
+// the process-wide/current VM profile. selected_rows retains every source row
+// carrying the same unique capability fingerprint so downstream consumers can
+// explicitly intersect multiple capabilities when they truly require one
+// coherent source row.
+struct CapabilityBinding {
+    uint64_t capability = kCapabilityNone;
+    const RuntimeProfileRecord* representative = nullptr;
+    std::string abi_domain_key;
+    std::vector<const RuntimeProfileRecord*> selected_rows;
+    CapabilityOwnerStamp owner{};
+
+    bool bound() const { return capability != kCapabilityNone && representative != nullptr; }
+    bool bound_for(const CapabilityOwnerStamp& expected) const {
+        return bound() && owner.valid() && owner == expected;
+    }
+    bool Contains(const RuntimeProfileRecord* profile) const;
+};
+
+struct CapabilityBindingSet {
+    std::vector<CapabilityBinding> bindings;
+    CapabilityOwnerStamp owner{};
+
+    const CapabilityBinding* Find(uint64_t capability) const;
+    const CapabilityBinding* FindForOwner(uint64_t capability,
+                                          const CapabilityOwnerStamp& expected) const;
+    bool Bind(uint64_t capability, const DomainSetSelection& selection);
+    void StampOwner(const CapabilityOwnerStamp& new_owner);
+    void Clear(uint64_t capability);
+};
+
 struct VerifiedBinding {
     VerifiedCoreBinding core{};
-    // Compatibility projection. New private-layout consumers must resolve the
-    // owning domain from core.candidates rather than trust this whole row.
-    const RuntimeProfileRecord* profile = nullptr;
-    CandidateProbe probe{};
-    uint64_t capabilities = kCapabilityNone;
+    CapabilityBindingSet capability_bindings{};
+    uint64_t capability_mask = kCapabilityNone;
     ArtifactSet artifacts{};
 };
 
@@ -159,6 +204,13 @@ DomainSetSelection SelectDomainAbiSet(const AbiCandidateSet& candidates, AbiDoma
                                       const std::vector<bool>& compatible);
 DomainSetSelection SelectCapabilityAbiSet(const AbiCandidateSet& candidates, uint64_t capability,
                                           const std::vector<bool>& compatible);
+
+// Returns a deterministic source row only when every requested capability is
+// bound and at least one source row belongs to all selected-row sets. This is
+// the only supported way to obtain a whole RuntimeProfileRecord for a legacy
+// helper that genuinely consumes fields from multiple capabilities.
+const RuntimeProfileRecord* ResolveCapabilityConsumerProfile(
+    const CapabilityBindingSet& bindings, std::span<const uint64_t> capabilities);
 
 ResolverResult ResolveVerifiedBinding(const ResolverInput& input);
 

@@ -81,6 +81,19 @@ uint64_t CapabilitiesFor(const RuntimeProfileRecord& profile, const CandidatePro
         profile.arguments_descriptor.named_entry_size != 0) {
         capabilities |= kCapabilityClosureCallLayout;
     }
+    if (profile.live_vm.class_table_num_cids_offset != 0 &&
+        profile.live_vm.object_store_libraries_offset != 0 &&
+        profile.live_vm.growable_object_array_length_offset != 0 &&
+        profile.live_vm.growable_object_array_data_offset != 0 &&
+        profile.live_vm.class_name_offset != 0 && profile.live_vm.class_functions_offset != 0 &&
+        profile.live_vm.class_library_offset != 0 &&
+        profile.live_vm.library_toplevel_class_offset != 0 &&
+        profile.live_vm.function_entry_point_offset != 0 &&
+        profile.live_vm.function_code_offset != 0 && profile.live_vm.code_entry_point_offset != 0 &&
+        profile.live_vm.code_instructions_length_offset != 0 && profile.live_vm.cid_function != 0 &&
+        profile.live_vm.cid_code != 0) {
+        capabilities |= kCapabilityLiveFunctionIndexLayout;
+    }
     return capabilities;
 }
 
@@ -130,6 +143,7 @@ AbiDomainMask CapabilityDomains(uint64_t capability) {
     case kCapabilityAotEntryLayout:
     case kCapabilityClosureCallLayout:
     case kCapabilityDeferredLoadingUnitLayout:
+    case kCapabilityLiveFunctionIndexLayout:
         return core | call | object;
     case kCapabilityGeneratedTransitionLayout:
         return core | transition;
@@ -202,6 +216,9 @@ std::string BuildCapabilityAbiKey(const RuntimeProfileRecord& profile, uint64_t 
     case kCapabilityDeferredLoadingUnitLayout:
         generated::AppendDeferredLoadingUnitLayoutFields(key, profile);
         break;
+    case kCapabilityLiveFunctionIndexLayout:
+        generated::AppendLiveFunctionIndexLayoutFields(key, profile);
+        break;
     case kCapabilityArtifactLifecycle:
     case kCapabilityNone:
         return {};
@@ -209,6 +226,80 @@ std::string BuildCapabilityAbiKey(const RuntimeProfileRecord& profile, uint64_t 
         return {};
     }
     return key;
+}
+
+bool CapabilityBinding::Contains(const RuntimeProfileRecord* profile) const {
+    return profile != nullptr &&
+           std::find(selected_rows.begin(), selected_rows.end(), profile) != selected_rows.end();
+}
+
+const CapabilityBinding* CapabilityBindingSet::Find(uint64_t capability) const {
+    const auto found = std::find_if(bindings.begin(), bindings.end(),
+                                    [capability](const CapabilityBinding& binding) {
+                                        return binding.capability == capability;
+                                    });
+    return found == bindings.end() ? nullptr : &*found;
+}
+
+const CapabilityBinding* CapabilityBindingSet::FindForOwner(
+    uint64_t capability, const CapabilityOwnerStamp& expected) const {
+    if (!expected.valid() || owner != expected) return nullptr;
+    const CapabilityBinding* binding = Find(capability);
+    return binding != nullptr && binding->bound_for(expected) ? binding : nullptr;
+}
+
+bool CapabilityBindingSet::Bind(uint64_t capability, const DomainSetSelection& selection) {
+    if (capability == kCapabilityNone || !selection.passed() ||
+        selection.representative == nullptr || selection.selected_rows.empty()) {
+        return false;
+    }
+    CapabilityBinding replacement{};
+    replacement.capability = capability;
+    replacement.representative = selection.representative;
+    replacement.abi_domain_key = selection.abi_domain_key;
+    replacement.selected_rows = selection.selected_rows;
+    replacement.owner = owner;
+    const auto found = std::find_if(bindings.begin(), bindings.end(),
+                                    [capability](const CapabilityBinding& binding) {
+                                        return binding.capability == capability;
+                                    });
+    if (found == bindings.end()) {
+        bindings.push_back(std::move(replacement));
+    } else {
+        *found = std::move(replacement);
+    }
+    return true;
+}
+
+void CapabilityBindingSet::StampOwner(const CapabilityOwnerStamp& new_owner) {
+    owner = new_owner;
+    for (auto& binding : bindings) binding.owner = new_owner;
+}
+
+void CapabilityBindingSet::Clear(uint64_t capability) {
+    std::erase_if(bindings, [capability](const CapabilityBinding& binding) {
+        return binding.capability == capability;
+    });
+}
+
+const RuntimeProfileRecord* ResolveCapabilityConsumerProfile(
+    const CapabilityBindingSet& bindings, std::span<const uint64_t> capabilities) {
+    if (capabilities.empty()) return nullptr;
+    const CapabilityBinding* first = bindings.Find(capabilities.front());
+    if (first == nullptr || !first->bound()) return nullptr;
+    for (const RuntimeProfileRecord* candidate : first->selected_rows) {
+        if (candidate == nullptr) continue;
+        bool compatible = true;
+        for (size_t index = 1; index < capabilities.size(); ++index) {
+            const CapabilityBinding* binding = bindings.Find(capabilities[index]);
+            if (binding == nullptr || !binding->bound() || !binding->Contains(candidate)) {
+                compatible = false;
+                break;
+            }
+        }
+        if (compatible) return candidate;
+    }
+    return nullptr;
 }
 
 CandidateSelection SelectUniquePassingCandidate(
@@ -409,8 +500,6 @@ ResolverResult ResolveVerifiedBinding(const ResolverInput& input) {
         return result;
     }
 
-    result.binding.profile = selected->profile;
-    result.binding.probe = selected->probe;
     result.binding.core.representative = selected->profile;
     result.binding.core.core_abi_id = selected->profile->abi_identity.core;
     result.binding.core.core_probe = selected->probe;
@@ -436,10 +525,37 @@ ResolverResult ResolveVerifiedBinding(const ResolverInput& input) {
         }
     }
     if (result.binding.artifacts.engines.empty()) return result;
-    result.binding.capabilities = CapabilitiesFor(*result.binding.profile, result.binding.probe,
-                                                  input.registers, result.binding.artifacts);
+    for (const CapabilityDescriptor* descriptor = CapabilityRegistry();
+         descriptor != CapabilityRegistry() + CapabilityRegistrySize(); ++descriptor) {
+        if (descriptor->capability == kCapabilityArtifactLifecycle ||
+            descriptor->capability == kCapabilityDeferredLoadingUnitLayout) {
+            continue;
+        }
+        std::vector<bool> compatible;
+        compatible.reserve(result.binding.core.candidates.profiles.size());
+        for (const RuntimeProfileRecord* candidate : result.binding.core.candidates.profiles) {
+            const auto diagnostic = std::find_if(
+                result.candidates.begin(), result.candidates.end(),
+                [candidate](const CandidateDiagnostic& item) { return item.profile == candidate; });
+            const uint64_t available =
+                diagnostic == result.candidates.end() || candidate == nullptr
+                    ? kCapabilityNone
+                    : CapabilitiesFor(*candidate, diagnostic->probe, input.registers,
+                                      result.binding.artifacts);
+            compatible.push_back((available & descriptor->capability) != 0);
+        }
+        const DomainSetSelection capability_selection = SelectCapabilityAbiSet(
+            result.binding.core.candidates, descriptor->capability, compatible);
+        if (!capability_selection.passed()) continue;
+        if (result.binding.capability_bindings.Bind(descriptor->capability, capability_selection)) {
+            result.binding.capability_mask |= descriptor->capability;
+        }
+    }
+    if (!result.binding.artifacts.app.path.empty() && !result.binding.artifacts.engines.empty()) {
+        result.binding.capability_mask |= kCapabilityArtifactLifecycle;
+    }
     result.binding.core.capabilities =
-        result.binding.capabilities &
+        result.binding.capability_mask &
         (kCapabilityRuntimeRoots | kCapabilityOwnerIdentity | kCapabilityCanonicalNull |
          kCapabilityRegisterSemantics | kCapabilityDartCore | kCapabilitySafepointStubs);
     result.passed = true;

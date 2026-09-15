@@ -18,6 +18,10 @@ struct LiveVmCandidateResolution {
 
 struct LiveVmInstructionImage {
     uint64_t runtime_image_id = 0;
+    uint64_t runtime_image_incarnation_epoch = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+    uint64_t runtime_generation = 0;
     uint32_t loading_unit_id = 0;
     DartPlantFlutterSnapshotInfo snapshot{};
 };
@@ -40,10 +44,19 @@ DartPlantStatus VisitLiveVmFunctionsForProfile(const DartPlantLiveVmContext& con
 // method resolution never assumes the root isolate-instructions namespace.
 DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& context,
                                               std::span<const LiveVmInstructionImage> images,
-                                              const RuntimeProfileRecord& profile,
+                                              const RuntimeProfileRecord& live_index_profile,
+                                              const RuntimeProfileRecord* deferred_profile,
                                               DartPlantLiveVmFunctionVisitor visitor,
                                               void* user_data,
                                               DartPlantLiveVmFunctionIndexInfo* out_info);
+
+// Candidate-scoped canonical Bool proof used before capability selection has
+// chosen a whole source row. Unlike ResolveLiveVmCanonicalBoolRoots(), this
+// deliberately does not compare context.profile_version; the candidate's own
+// raw-object/CID/Bool layout is used for the complete proof.
+DartPlantStatus ProbeLiveVmCanonicalBoolRootsForCandidate(const DartPlantLiveVmContext& context,
+                                                          const RuntimeProfileRecord& candidate,
+                                                          uint64_t* out_true, uint64_t* out_false);
 
 DartPlantStatus ReadLiveVmFunctionSignatureForProfile(
     const DartPlantLiveVmContext& context, const RuntimeProfileRecord& profile, uint64_t function,

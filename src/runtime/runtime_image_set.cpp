@@ -102,11 +102,19 @@ void RuntimeImageSet::Clear() {
     images_.clear();
     root_id_ = kInvalidRuntimeImageId;
     next_id_ = 1;
+    next_incarnation_epoch_ = 1;
 }
 
 RuntimeImageId RuntimeImageSet::AllocateId() {
     if (next_id_ == kInvalidRuntimeImageId) return kInvalidRuntimeImageId;
     return next_id_++;
+}
+
+RuntimeImageIncarnationEpoch RuntimeImageSet::AllocateIncarnationEpoch() {
+    if (next_incarnation_epoch_ == kInvalidRuntimeImageIncarnationEpoch) {
+        return kInvalidRuntimeImageIncarnationEpoch;
+    }
+    return next_incarnation_epoch_++;
 }
 
 bool RuntimeImageSet::SetRoot(const ModuleImage& module, const FlutterSnapshotSource& snapshot,
@@ -122,8 +130,10 @@ bool RuntimeImageSet::SetRoot(const ModuleImage& module, const FlutterSnapshotSo
     }
     RuntimeImage image;
     image.id = AllocateId();
-    if (image.id == kInvalidRuntimeImageId) {
-        if (error != nullptr) *error = "runtime image id space is exhausted";
+    image.incarnation_epoch = AllocateIncarnationEpoch();
+    if (image.id == kInvalidRuntimeImageId ||
+        image.incarnation_epoch == kInvalidRuntimeImageIncarnationEpoch) {
+        if (error != nullptr) *error = "runtime image ownership id space is exhausted";
         return false;
     }
     image.kind = RuntimeImageKind::kRoot;
@@ -174,8 +184,10 @@ bool RuntimeImageSet::AddDeferred(const ModuleImage& module, const FlutterSnapsh
 
     RuntimeImage image;
     image.id = AllocateId();
-    if (image.id == kInvalidRuntimeImageId) {
-        if (error != nullptr) *error = "runtime image id space is exhausted";
+    image.incarnation_epoch = AllocateIncarnationEpoch();
+    if (image.id == kInvalidRuntimeImageId ||
+        image.incarnation_epoch == kInvalidRuntimeImageIncarnationEpoch) {
+        if (error != nullptr) *error = "runtime image ownership id space is exhausted";
         return false;
     }
     image.kind = RuntimeImageKind::kDeferred;
@@ -243,30 +255,55 @@ bool RuntimeImageSet::ContainsIdentity(const RuntimeImage& image) const {
 }
 
 bool RuntimeImageSet::PreserveIdsFrom(const RuntimeImageSet& previous) {
-    // next_id_ is a lifetime-scoped monotonic allocator, not merely one plus
-    // the largest currently present id. Keeping the previous allocator cursor
-    // prevents a removed image id from being reused when the same loading unit
-    // is mapped again in the same runtime generation; stale DartPlantMethod
-    // handles must never become current again by id aliasing.
+    return ReconcileOwnershipFrom(previous);
+}
+
+bool RuntimeImageSet::ReconcileOwnershipFrom(const RuntimeImageSet& previous) {
+    // Both allocators are lifetime-scoped monotonic cursors, not merely one
+    // plus the largest currently present value. Carrying them across refreshes
+    // prevents stale logical ids or physical incarnation epochs from becoming
+    // current again after an unload/reload cycle.
     RuntimeImageId next_id = previous.next_id_;
-    if (next_id == kInvalidRuntimeImageId) return false;
+    RuntimeImageIncarnationEpoch next_epoch = previous.next_incarnation_epoch_;
+    if (next_id == kInvalidRuntimeImageId || next_epoch == kInvalidRuntimeImageIncarnationEpoch) {
+        return false;
+    }
     for (const auto& previous_image : previous.images_) {
-        if (previous_image.id == kInvalidRuntimeImageId || previous_image.id >= next_id) {
+        if (previous_image.id == kInvalidRuntimeImageId || previous_image.id >= next_id ||
+            previous_image.incarnation_epoch == kInvalidRuntimeImageIncarnationEpoch ||
+            previous_image.incarnation_epoch >= next_epoch) {
             return false;
         }
     }
     for (auto& image : images_) {
-        const auto found =
+        const auto exact =
             std::find_if(previous.images_.begin(), previous.images_.end(),
                          [&image](const auto& old) { return SameImageIdentity(image, old); });
-        image.id = found == previous.images_.end() ? kInvalidRuntimeImageId : found->id;
+        if (exact != previous.images_.end()) {
+            image.id = exact->id;
+            image.incarnation_epoch = exact->incarnation_epoch;
+            continue;
+        }
+        const auto logical = std::find_if(
+            previous.images_.begin(), previous.images_.end(), [&image](const RuntimeImage& old) {
+                return image.kind == old.kind && image.loading_unit_id == old.loading_unit_id;
+            });
+        image.id = logical == previous.images_.end() ? kInvalidRuntimeImageId : logical->id;
+        image.incarnation_epoch = kInvalidRuntimeImageIncarnationEpoch;
     }
     for (auto& image : images_) {
         if (image.id == kInvalidRuntimeImageId) image.id = next_id++;
+        if (image.incarnation_epoch == kInvalidRuntimeImageIncarnationEpoch) {
+            image.incarnation_epoch = next_epoch++;
+        }
         if (image.kind == RuntimeImageKind::kRoot) root_id_ = image.id;
     }
     next_id_ = next_id;
-    return root_id_ != kInvalidRuntimeImageId;
+    next_incarnation_epoch_ = next_epoch;
+    // A missing app/engine legitimately stages an empty set so the image
+    // transaction can drain every currently published owner and then publish
+    // no replacement. Only non-empty staged sets require a root namespace.
+    return images_.empty() || root_id_ != kInvalidRuntimeImageId;
 }
 
 bool RuntimeImageSet::RemoveById(RuntimeImageId id) {
@@ -281,8 +318,47 @@ void RuntimeImageSet::BindGeneration(uint64_t runtime_generation) {
     for (auto& image : images_) image.runtime_generation = runtime_generation;
 }
 
+void RuntimeImageSet::BindOwnerEpochs(uint64_t engine_incarnation_epoch,
+                                      uint64_t isolate_group_incarnation_epoch) {
+    for (auto& image : images_) {
+        image.engine_incarnation_epoch = engine_incarnation_epoch;
+        image.isolate_group_incarnation_epoch = isolate_group_incarnation_epoch;
+    }
+}
+
+void RuntimeImageSet::ActivateAll() {
+    for (auto& image : images_) image.lifecycle = RuntimeImageLifecycleState::kActive;
+}
+
+bool RuntimeImageSet::BeginDrain(RuntimeImageId id,
+                                 RuntimeImageIncarnationEpoch incarnation_epoch) {
+    for (auto& image : images_) {
+        if (image.id != id || image.incarnation_epoch != incarnation_epoch) continue;
+        if (image.lifecycle == RuntimeImageLifecycleState::kRetired) return false;
+        image.lifecycle = RuntimeImageLifecycleState::kDraining;
+        return true;
+    }
+    return false;
+}
+
+bool RuntimeImageSet::Retire(RuntimeImageId id, RuntimeImageIncarnationEpoch incarnation_epoch) {
+    for (auto& image : images_) {
+        if (image.id != id || image.incarnation_epoch != incarnation_epoch) continue;
+        image.lifecycle = RuntimeImageLifecycleState::kRetired;
+        return true;
+    }
+    return false;
+}
+
 void RuntimeImageSet::ResetLiveEntryBindings() {
     for (auto& image : images_) image.live_entry_count = 0;
+}
+
+void RuntimeImageSet::ResetSemanticBindings() {
+    for (auto& image : images_) {
+        image.live_entry_count = 0;
+        image.deferred_program_hash_vm_bound = false;
+    }
 }
 
 bool RuntimeImageSet::RecordLiveEntry(RuntimeImageId id) {

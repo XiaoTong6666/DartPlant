@@ -83,6 +83,10 @@ bool AppendLiveSnapshotFunctionRecord(const DartPlantLiveVmFunctionInfo& functio
         const uint64_t entry_va = EntryVaForKind(function, kind);
         index->functions.push_back({
             .runtime_image_id = function.runtime_image_id,
+            .runtime_image_incarnation_epoch = function.runtime_image_incarnation_epoch,
+            .engine_incarnation_epoch = function.engine_incarnation_epoch,
+            .isolate_group_incarnation_epoch = function.isolate_group_incarnation_epoch,
+            .runtime_generation = function.runtime_generation,
             .loading_unit_id = function.loading_unit_id,
             .library_uri = function.library_uri,
             .class_name = function.class_name,
@@ -124,6 +128,10 @@ bool BindLiveSnapshotImageSemantics(const SnapshotIndex& index,
 
     struct FamilyState {
         RuntimeImageId image_id = kInvalidRuntimeImageId;
+        RuntimeImageIncarnationEpoch image_incarnation_epoch = 0;
+        uint64_t engine_incarnation_epoch = 0;
+        uint64_t isolate_group_incarnation_epoch = 0;
+        uint64_t runtime_generation = 0;
         uint32_t loading_unit_id = 0;
         uint64_t code_object = 0;
         uint8_t expected_entry_mask = 0;
@@ -145,18 +153,27 @@ bool BindLiveSnapshotImageSemantics(const SnapshotIndex& index,
             return false;
         }
         const RuntimeImage* image = current_images.FindById(function.runtime_image_id);
-        if (image == nullptr || function.loading_unit_id != image->loading_unit_id) {
+        if (image == nullptr || function.loading_unit_id != image->loading_unit_id ||
+            function.runtime_image_incarnation_epoch != image->incarnation_epoch ||
+            function.engine_incarnation_epoch != image->engine_incarnation_epoch ||
+            function.isolate_group_incarnation_epoch != image->isolate_group_incarnation_epoch ||
+            function.runtime_generation != image->runtime_generation) {
             if (error != nullptr)
                 *error = "live Function entry family disagrees with runtime image namespace";
             return false;
         }
-        const auto [_, inserted] =
-            families.emplace(function.function, FamilyState{
-                                                    .image_id = function.runtime_image_id,
-                                                    .loading_unit_id = function.loading_unit_id,
-                                                    .code_object = function.code,
-                                                    .expected_entry_mask = entry_mask,
-                                                });
+        const auto [_, inserted] = families.emplace(
+            function.function,
+            FamilyState{
+                .image_id = function.runtime_image_id,
+                .image_incarnation_epoch = function.runtime_image_incarnation_epoch,
+                .engine_incarnation_epoch = function.engine_incarnation_epoch,
+                .isolate_group_incarnation_epoch = function.isolate_group_incarnation_epoch,
+                .runtime_generation = function.runtime_generation,
+                .loading_unit_id = function.loading_unit_id,
+                .code_object = function.code,
+                .expected_entry_mask = entry_mask,
+            });
         if (!inserted) {
             if (error != nullptr) *error = "live Function entry family is duplicated";
             return false;
@@ -179,6 +196,10 @@ bool BindLiveSnapshotImageSemantics(const SnapshotIndex& index,
         FamilyState& family = family_it->second;
         if (record.code_object != family.code_object ||
             record.runtime_image_id != family.image_id ||
+            record.runtime_image_incarnation_epoch != family.image_incarnation_epoch ||
+            record.engine_incarnation_epoch != family.engine_incarnation_epoch ||
+            record.isolate_group_incarnation_epoch != family.isolate_group_incarnation_epoch ||
+            record.runtime_generation != family.runtime_generation ||
             record.loading_unit_id != family.loading_unit_id) {
             if (error != nullptr)
                 *error = "flattened live Function record crosses runtime image identity";
@@ -360,13 +381,13 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
     image.loading_unit_id = 1;
     image.snapshot = snapshot;
     const std::array<LiveVmInstructionImage, 1> images = {image};
-    return BuildLiveSnapshotIndexForImages(context, images, profile, out_info, error);
+    return BuildLiveSnapshotIndexForImages(context, images, profile, nullptr, out_info, error);
 }
 
 std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
-    const RuntimeProfileRecord& profile, DartPlantLiveVmFunctionIndexInfo* out_info,
-    std::string* error) {
+    const RuntimeProfileRecord& profile, const RuntimeProfileRecord* deferred_profile,
+    DartPlantLiveVmFunctionIndexInfo* out_info, std::string* error) {
     if (images.empty()) {
         if (error != nullptr) *error = "live snapshot index has no runtime images";
         return std::nullopt;
@@ -398,8 +419,9 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     LiveSnapshotBuildState state{.index = &index, .profile = &profile};
     DartPlantLiveVmFunctionIndexInfo local_info{};
     local_info.struct_size = sizeof(local_info);
-    const DartPlantStatus status = VisitLiveVmFunctionsForImages(
-        context, images, profile, AppendLiveSnapshotFunction, &state, &local_info);
+    const DartPlantStatus status =
+        VisitLiveVmFunctionsForImages(context, images, profile, deferred_profile,
+                                      AppendLiveSnapshotFunction, &state, &local_info);
     if (status != DARTPLANT_OK || state.failed || index.functions.empty()) {
         if (error != nullptr) {
             *error = status != DARTPLANT_OK ? dartplant_last_error()

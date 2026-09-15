@@ -67,6 +67,7 @@ add_library(
     src/abi/value_codec.cpp
     src/runtime/flutter_snapshot.cpp
     src/runtime/runtime_image_set.cpp
+    src/runtime/runtime_image_transition.cpp
     src/runtime/snapshot_index.cpp
     src/runtime/dart_runtime_resolver.cpp
     src/runtime/default_runtime.cpp
@@ -385,6 +386,17 @@ if(DARTPLANT_BUILD_TESTS AND NOT ANDROID)
     add_library(dartplant_fixture SHARED tests/fixtures/hook_fixture.cc)
     target_compile_features(dartplant_fixture PRIVATE cxx_std_20)
     target_compile_options(dartplant_fixture PRIVATE -Wall -Wextra -Werror)
+
+    add_executable(dartplant_elf_contract_probe tests/tools/elf_contract_probe.cpp)
+    target_compile_features(dartplant_elf_contract_probe PRIVATE cxx_std_20)
+    target_compile_options(dartplant_elf_contract_probe PRIVATE -Wall -Wextra -Werror)
+    target_include_directories(
+        dartplant_elf_contract_probe
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(dartplant_elf_contract_probe PRIVATE dartplant_core ${CMAKE_DL_LIBS})
 
     add_executable(
         dartplant_tests

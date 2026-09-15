@@ -19,9 +19,19 @@ namespace dartplant {
 using RuntimeImageId = uint64_t;
 constexpr RuntimeImageId kInvalidRuntimeImageId = 0;
 
+using RuntimeImageIncarnationEpoch = uint64_t;
+constexpr RuntimeImageIncarnationEpoch kInvalidRuntimeImageIncarnationEpoch = 0;
+
 enum class RuntimeImageKind : uint8_t {
     kRoot = 0,
     kDeferred,
+};
+
+enum class RuntimeImageLifecycleState : uint8_t {
+    kStaged = 0,
+    kActive,
+    kDraining,
+    kRetired,
 };
 
 // One independently mapped Dart AOT instruction namespace. A runtime image is
@@ -30,12 +40,16 @@ enum class RuntimeImageKind : uint8_t {
 // coordinate system for Functions in this image.
 struct RuntimeImage {
     RuntimeImageId id = kInvalidRuntimeImageId;
+    RuntimeImageIncarnationEpoch incarnation_epoch = kInvalidRuntimeImageIncarnationEpoch;
     RuntimeImageKind kind = RuntimeImageKind::kRoot;
     // Dart LoadingUnit::kRootId is 1. A zero id means the host/packager did not
     // expose a source-proven loading-unit id and the image may only be selected
     // by its exact module/instruction identity.
     uint32_t loading_unit_id = 0;
     uint64_t runtime_generation = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+    RuntimeImageLifecycleState lifecycle = RuntimeImageLifecycleState::kStaged;
     // Number of retained live Dart Function entry families observed from the
     // currently bound isolate-group object graph whose Code payload resolves
     // uniquely into this image. A non-zero count is the semantic binding that
@@ -51,6 +65,16 @@ struct RuntimeImage {
 
     bool ContainsRuntimeRange(uintptr_t address, size_t size = 1) const;
     std::optional<uint64_t> RuntimeAddressToElfVa(uintptr_t address, size_t size = 1) const;
+    bool IsActive() const { return lifecycle == RuntimeImageLifecycleState::kActive; }
+    DartRuntimeOwnerIdentity OwnerIdentity() const {
+        return {
+            .runtime_generation = runtime_generation,
+            .engine_incarnation_epoch = engine_incarnation_epoch,
+            .isolate_group_incarnation_epoch = isolate_group_incarnation_epoch,
+            .image_id = id,
+            .image_incarnation_epoch = incarnation_epoch,
+        };
+    }
 };
 
 class RuntimeImageSet final {
@@ -86,10 +110,23 @@ public:
     // Keeps ids stable for images that survive an in-generation image-set
     // refresh and assigns fresh ids to newly loaded secondary images.
     bool PreserveIdsFrom(const RuntimeImageSet& previous);
+    // Reconciles logical image ids and physical incarnation epochs against the
+    // previous published set. Exact physical survivors preserve both id and
+    // epoch. A replacement for the same logical loading unit preserves only
+    // its id and receives a fresh epoch. New logical units receive both a new
+    // id and a new epoch. Allocators are monotonic across refreshes so a stale
+    // owner token can never become current again through numeric reuse.
+    bool ReconcileOwnershipFrom(const RuntimeImageSet& previous);
     bool ContainsIdentity(const RuntimeImage& image) const;
     bool RemoveById(RuntimeImageId id);
     void BindGeneration(uint64_t runtime_generation);
+    void BindOwnerEpochs(uint64_t engine_incarnation_epoch,
+                         uint64_t isolate_group_incarnation_epoch);
+    void ActivateAll();
+    bool BeginDrain(RuntimeImageId id, RuntimeImageIncarnationEpoch incarnation_epoch);
+    bool Retire(RuntimeImageId id, RuntimeImageIncarnationEpoch incarnation_epoch);
     void ResetLiveEntryBindings();
+    void ResetSemanticBindings();
     bool RecordLiveEntry(RuntimeImageId id);
     // Transactionally replaces semantic live-entry bindings. Every id must
     // refer to an image in this set; otherwise the existing counts are left
@@ -103,8 +140,10 @@ public:
 
 private:
     RuntimeImageId AllocateId();
+    RuntimeImageIncarnationEpoch AllocateIncarnationEpoch();
 
     RuntimeImageId next_id_ = 1;
+    RuntimeImageIncarnationEpoch next_incarnation_epoch_ = 1;
     RuntimeImageId root_id_ = kInvalidRuntimeImageId;
     std::vector<RuntimeImage> images_;
 };

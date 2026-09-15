@@ -673,13 +673,16 @@ void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_gen
 }
 
 DartPlantStatus InvalidateRuntimeImageHooks(
-    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id) {
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id,
+    uint64_t image_incarnation_epoch) {
     if (runtime_generation == nullptr || image_id == 0) return DARTPLANT_OK;
     std::lock_guard lock(State().mutex);
     DartPlantStatus status = DARTPLANT_OK;
     for (const auto& hook : Hooks()) {
         if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
-            hook->code_target->image_id != image_id) {
+            hook->code_target->image_id != image_id ||
+            (image_incarnation_epoch != 0 &&
+             hook->code_target->owner.image_incarnation_epoch != image_incarnation_epoch)) {
             continue;
         }
         {
@@ -693,12 +696,14 @@ DartPlantStatus InvalidateRuntimeImageHooks(
 }
 
 void RetireRuntimeImageHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
-                             uint64_t image_id) {
+                             uint64_t image_id, uint64_t image_incarnation_epoch) {
     if (runtime_generation == nullptr || image_id == 0) return;
     std::lock_guard lock(State().mutex);
     for (const auto& hook : Hooks()) {
         if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
-            hook->code_target->image_id != image_id) {
+            hook->code_target->image_id != image_id ||
+            (image_incarnation_epoch != 0 &&
+             hook->code_target->owner.image_incarnation_epoch != image_incarnation_epoch)) {
             continue;
         }
         std::lock_guard hook_lock(hook->mutex);

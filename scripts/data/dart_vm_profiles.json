@@ -194,14 +194,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-product-compressed/abi-69d68b244dcc4c416a44bb35",
+        "full": "dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
         "core": "dart-vm-arm64-product-compressed/abi-core-e1061561f58d7c038f469012",
         "call": "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
-        "object": "dart-vm-arm64-product-compressed/abi-object-80b636199984528525fdf3b9",
+        "object": "dart-vm-arm64-product-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
         "transition": "dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
         "exception": "dart-vm-arm64-product-compressed/abi-exception-8dfdfa0cfa1b4e788769f837"
       },
-      "abi_id": "dart-vm-arm64-product-compressed/abi-69d68b244dcc4c416a44bb35",
+      "abi_id": "dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
       "loading_unit": {
         "cid": 38,
         "parent": 8,
@@ -209,6 +209,9 @@
         "instructions_image": 0,
         "packed_fields": 0,
         "instance_size": 24
+      },
+      "closure": {
+        "function": 20
       }
     },
     {
@@ -404,14 +407,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-product-compressed/abi-c56f1a3a550c7561a2f8b51c",
+        "full": "dart-vm-arm64-product-compressed/abi-3f13b69db97aa2cb5a3de306",
         "core": "dart-vm-arm64-product-compressed/abi-core-74cbbf9ab54b6ae8aa33a065",
         "call": "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
-        "object": "dart-vm-arm64-product-compressed/abi-object-23b4c6b8b5fea69a4b7cb4f8",
+        "object": "dart-vm-arm64-product-compressed/abi-object-46872db6f99fcbf3e15995eb",
         "transition": "dart-vm-arm64-product-compressed/abi-transition-16277c21148bf7ba2a41fca9",
         "exception": "dart-vm-arm64-product-compressed/abi-exception-f458cbc09509db7e9046a128"
       },
-      "abi_id": "dart-vm-arm64-product-compressed/abi-c56f1a3a550c7561a2f8b51c",
+      "abi_id": "dart-vm-arm64-product-compressed/abi-3f13b69db97aa2cb5a3de306",
       "loading_unit": {
         "cid": 38,
         "parent": 8,
@@ -419,6 +422,9 @@
         "instructions_image": 16,
         "packed_fields": 24,
         "instance_size": 32
+      },
+      "closure": {
+        "function": 20
       }
     },
     {
@@ -614,14 +620,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-product-compressed/abi-f047edce6448f9a5789d00af",
+        "full": "dart-vm-arm64-product-compressed/abi-c27b22695a443c9104275a3d",
         "core": "dart-vm-arm64-product-compressed/abi-core-bc6b59e7b5831ae761fbdc1b",
         "call": "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
-        "object": "dart-vm-arm64-product-compressed/abi-object-65369c0d077e9949fd233a5f",
+        "object": "dart-vm-arm64-product-compressed/abi-object-237770f1261bebf48864be03",
         "transition": "dart-vm-arm64-product-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
         "exception": "dart-vm-arm64-product-compressed/abi-exception-36b6aa25e8ddf9ce95925268"
       },
-      "abi_id": "dart-vm-arm64-product-compressed/abi-f047edce6448f9a5789d00af",
+      "abi_id": "dart-vm-arm64-product-compressed/abi-c27b22695a443c9104275a3d",
       "loading_unit": {
         "cid": 39,
         "parent": 8,
@@ -629,6 +635,9 @@
         "instructions_image": 16,
         "packed_fields": 24,
         "instance_size": 32
+      },
+      "closure": {
+        "function": 20
       }
     },
     {
@@ -824,14 +833,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-nonproduct-compressed/abi-d9a565393beacd6d455b7e84",
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-3711845109817a7cca664ead",
         "core": "dart-vm-arm64-nonproduct-compressed/abi-core-db1d640d9b121f8cfe7d67e4",
         "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
-        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-80b636199984528525fdf3b9",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
         "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
         "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-8dfdfa0cfa1b4e788769f837"
       },
-      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-d9a565393beacd6d455b7e84",
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-3711845109817a7cca664ead",
       "loading_unit": {
         "cid": 38,
         "parent": 8,
@@ -839,6 +848,9 @@
         "instructions_image": 0,
         "packed_fields": 0,
         "instance_size": 24
+      },
+      "closure": {
+        "function": 20
       }
     },
     {
@@ -1034,14 +1046,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-nonproduct-compressed/abi-efc1ecea8eb713a9dbd935f9",
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-6996dc6e32dec3eb67bf6cbb",
         "core": "dart-vm-arm64-nonproduct-compressed/abi-core-3948b87f17c744121b9a9d24",
         "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
-        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-23b4c6b8b5fea69a4b7cb4f8",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-46872db6f99fcbf3e15995eb",
         "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-16277c21148bf7ba2a41fca9",
         "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-f458cbc09509db7e9046a128"
       },
-      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-efc1ecea8eb713a9dbd935f9",
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-6996dc6e32dec3eb67bf6cbb",
       "loading_unit": {
         "cid": 38,
         "parent": 8,
@@ -1049,6 +1061,9 @@
         "instructions_image": 16,
         "packed_fields": 24,
         "instance_size": 32
+      },
+      "closure": {
+        "function": 20
       }
     },
     {
@@ -1244,14 +1259,14 @@
         "exit_through_runtime_call": 2
       },
       "abi_identity": {
-        "full": "dart-vm-arm64-nonproduct-compressed/abi-674e4493a6275629e17c0fe4",
+        "full": "dart-vm-arm64-nonproduct-compressed/abi-5d734370885acbff761d0a9b",
         "core": "dart-vm-arm64-nonproduct-compressed/abi-core-8a4f6459376d7e69bed0a194",
         "call": "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
-        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-65369c0d077e9949fd233a5f",
+        "object": "dart-vm-arm64-nonproduct-compressed/abi-object-237770f1261bebf48864be03",
         "transition": "dart-vm-arm64-nonproduct-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
         "exception": "dart-vm-arm64-nonproduct-compressed/abi-exception-36b6aa25e8ddf9ce95925268"
       },
-      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-674e4493a6275629e17c0fe4",
+      "abi_id": "dart-vm-arm64-nonproduct-compressed/abi-5d734370885acbff761d0a9b",
       "loading_unit": {
         "cid": 39,
         "parent": 8,
@@ -1259,6 +1274,9 @@
         "instructions_image": 16,
         "packed_fields": 24,
         "instance_size": 32
+      },
+      "closure": {
+        "function": 20
       }
     }
   ]

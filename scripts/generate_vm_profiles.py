@@ -157,6 +157,7 @@ AOT_OFFSET_BINDINGS = {
     ("arguments_descriptor", "position"): "AOT_ArgumentsDescriptor_position_offset",
     ("type_arguments", "length"): "AOT_TypeArguments_length_offset",
     ("type_arguments", "types"): "AOT_TypeArguments_types_offset",
+    ("closure", "function"): "AOT_Closure_function_offset",
 }
 
 # CodeEntryKind order is defined by runtime/vm/code_entry_kind.h:
@@ -722,6 +723,7 @@ ABI_PROFILE_SECTIONS = (
     "arguments_descriptor",
     "function_kind",
     "type_arguments",
+    "closure",
     "loading_unit",
     "transition",
 )
@@ -775,7 +777,7 @@ ABI_DOMAIN_FIELDS = {
         "raw_object.smi_tag", "raw_object.smi_tag_mask", "raw_object.smi_tag_shift",
         "raw_object.class_id_tag_shift", "raw_object.class_id_tag_bits",
         "raw_object.compressed_word_size", "type_arguments.cid", "type_arguments.length",
-        "type_arguments.types", "loading_unit.cid", "loading_unit.parent",
+        "type_arguments.types", "closure.function", "loading_unit.cid", "loading_unit.parent",
         "loading_unit.base_objects", "loading_unit.instructions_image",
         "loading_unit.packed_fields", "loading_unit.instance_size",
     ),
@@ -870,6 +872,10 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
         ("thread.object_null", "profile.live_vm.thread_object_null_offset"),
         ("function_type.cid_null", "profile.function_type.cid_null"),
+        ("canonical_bool.thread_true", "profile.canonical_bool.thread_true_offset"),
+        ("canonical_bool.thread_false", "profile.canonical_bool.thread_false_offset"),
+        ("canonical_bool.value", "profile.canonical_bool.value_offset"),
+        ("canonical_bool.cid", "profile.canonical_bool.cid"),
     ),
     "register_semantics": (
         ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
@@ -976,6 +982,44 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("function_kind.tag_shift", "profile.function_kind.tag_shift"),
         ("function_kind.tag_bits", "profile.function_kind.tag_bits"),
     ),
+    "live_function_index_layout": _RUNTIME_ROOT_FIELDS
+    + (
+        ("cids.function", "profile.live_vm.cid_function"),
+        ("cids.code", "profile.live_vm.cid_code"),
+        ("function.entry_point", "profile.live_vm.function_entry_point_offset"),
+        ("function.unchecked_entry_point", "profile.live_vm.function_unchecked_entry_point_offset"),
+        ("function.name", "profile.live_vm.function_name_offset"),
+        ("function.owner", "profile.live_vm.function_owner_offset"),
+        ("function.code", "profile.live_vm.function_code_offset"),
+        ("function.kind_tag", "profile.live_vm.function_kind_tag_offset"),
+        ("class.name", "profile.live_vm.class_name_offset"),
+        ("class.functions", "profile.live_vm.class_functions_offset"),
+        ("class.library", "profile.live_vm.class_library_offset"),
+        ("library.toplevel_class", "profile.live_vm.library_toplevel_class_offset"),
+        ("code.entry_point", "profile.live_vm.code_entry_point_offset"),
+        ("code.unchecked_entry_point", "profile.live_vm.code_unchecked_entry_point_offset"),
+        ("code.monomorphic_entry_point", "profile.live_vm.code_monomorphic_entry_point_offset"),
+        (
+            "code.monomorphic_unchecked_entry_point",
+            "profile.live_vm.code_monomorphic_unchecked_entry_point_offset",
+        ),
+        ("code.object_pool", "profile.live_vm.code_object_pool_offset"),
+        ("code.owner", "profile.live_vm.code_owner_offset"),
+        ("code.instructions_length", "profile.live_vm.code_instructions_length_offset"),
+        (
+            "instructions.monomorphic_entry_offset_aot",
+            "profile.instructions_monomorphic_entry_offset_aot",
+        ),
+        (
+            "instructions.polymorphic_entry_offset_aot",
+            "profile.instructions_polymorphic_entry_offset_aot",
+        ),
+        ("function_kind.regular", "profile.function_kind.regular"),
+        ("function_kind.closure", "profile.function_kind.closure"),
+        ("function_kind.implicit_closure", "profile.function_kind.implicit_closure"),
+        ("function_kind.tag_shift", "profile.function_kind.tag_shift"),
+        ("function_kind.tag_bits", "profile.function_kind.tag_bits"),
+    ),
     "type_arguments_layout": (
         ("raw_object.heap_object_tag", "profile.raw_object.heap_object_tag"),
         ("raw_object.smi_tag_mask", "profile.raw_object.smi_tag_mask"),
@@ -1036,6 +1080,7 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
         ("thread.heap_base", "profile.live_vm.thread_heap_base_offset"),
         ("function.signature", "profile.function_type.function_signature_offset"),
+        ("closure.function", "profile.closure.function_offset"),
         ("array.length", "profile.live_vm.array_length_offset"),
         ("array.elements", "profile.live_vm.array_elements_offset"),
         ("string.length", "profile.live_vm.string_length_offset"),
@@ -1962,6 +2007,9 @@ def _load_manifest(path: Path = MANIFEST) -> list[dict[str, object]]:
             or int(type_arguments["types"]) <= int(type_arguments["length"])
         ):
             raise ValueError(f"{name}: invalid TypeArguments layout")
+        closure = profile["closure"]
+        if int(closure["function"]) <= 0:
+            raise ValueError(f"{name}: invalid Closure layout")
         loading_unit = profile["loading_unit"]
         common_layout_invalid = (
             int(loading_unit["cid"]) <= 0
@@ -2222,6 +2270,7 @@ def _render_profile(profile: dict[str, object]) -> str:
     arguments_descriptor = profile["arguments_descriptor"]
     function_kind = profile["function_kind"]
     type_arguments = profile["type_arguments"]
+    closure = profile["closure"]
     loading_unit = profile["loading_unit"]
     transition = profile["transition"]
     gp_args = ", ".join(str(value) for value in r["dart_gp_args"])
@@ -2379,6 +2428,9 @@ def _render_profile(profile: dict[str, object]) -> str:
             .cid = {type_arguments['cid']}u,
             .length_offset = {_u(int(type_arguments['length']))},
             .types_offset = {_u(int(type_arguments['types']))},
+        }},
+        .closure = {{
+            .function_offset = {_u(int(closure['function']))},
         }},
         .loading_unit = {{
             .cid = {loading_unit['cid']}u,

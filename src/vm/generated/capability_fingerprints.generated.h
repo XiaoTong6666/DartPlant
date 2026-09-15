@@ -66,6 +66,10 @@ inline void AppendCanonicalNullFields(std::string& key, const RuntimeProfileReco
     AppendCapabilityValue(key, profile.live_vm.thread_heap_base_offset);  // thread.heap_base
     AppendCapabilityValue(key, profile.live_vm.thread_object_null_offset);  // thread.object_null
     AppendCapabilityValue(key, profile.function_type.cid_null);  // function_type.cid_null
+    AppendCapabilityValue(key, profile.canonical_bool.thread_true_offset);  // canonical_bool.thread_true
+    AppendCapabilityValue(key, profile.canonical_bool.thread_false_offset);  // canonical_bool.thread_false
+    AppendCapabilityValue(key, profile.canonical_bool.value_offset);  // canonical_bool.value
+    AppendCapabilityValue(key, profile.canonical_bool.cid);  // canonical_bool.cid
 }
 inline void AppendRegisterSemanticsFields(std::string& key, const RuntimeProfileRecord& profile) {
     AppendCapabilityValue(key, profile.raw_object.heap_object_tag);  // raw_object.heap_object_tag
@@ -233,6 +237,69 @@ inline void AppendDeferredLoadingUnitLayoutFields(std::string& key, const Runtim
     AppendCapabilityValue(key, profile.function_kind.tag_shift);  // function_kind.tag_shift
     AppendCapabilityValue(key, profile.function_kind.tag_bits);  // function_kind.tag_bits
 }
+inline void AppendLiveFunctionIndexLayoutFields(std::string& key, const RuntimeProfileRecord& profile) {
+    AppendCapabilityValue(key, profile.raw_object.heap_object_tag);  // raw_object.heap_object_tag
+    AppendCapabilityValue(key, profile.raw_object.smi_tag);  // raw_object.smi_tag
+    AppendCapabilityValue(key, profile.raw_object.smi_tag_mask);  // raw_object.smi_tag_mask
+    AppendCapabilityValue(key, profile.raw_object.smi_tag_shift);  // raw_object.smi_tag_shift
+    AppendCapabilityValue(key, profile.raw_object.class_id_tag_shift);  // raw_object.class_id_tag_shift
+    AppendCapabilityValue(key, profile.raw_object.class_id_tag_bits);  // raw_object.class_id_tag_bits
+    AppendCapabilityValue(key, profile.raw_object.compressed_word_size);  // raw_object.compressed_word_size
+    AppendCapabilityValue(key, profile.live_vm.thread_heap_base_offset);  // thread.heap_base
+    AppendCapabilityValue(key, profile.live_vm.thread_object_null_offset);  // thread.object_null
+    AppendCapabilityValue(key, profile.live_vm.thread_global_object_pool_offset);  // thread.global_object_pool
+    AppendCapabilityValue(key, profile.live_vm.thread_isolate_offset);  // thread.isolate
+    AppendCapabilityValue(key, profile.live_vm.thread_isolate_group_offset);  // thread.isolate_group
+    AppendCapabilityValue(key, profile.live_vm.isolate_group_class_table_offset);  // isolate_group.class_table
+    AppendCapabilityValue(key, profile.live_vm.isolate_group_cached_class_table_table_offset);  // isolate_group.cached_class_table_table
+    AppendCapabilityValue(key, profile.live_vm.isolate_group_object_store_offset);  // isolate_group.object_store
+    AppendCapabilityValue(key, profile.live_vm.class_table_num_cids_offset);  // class_table.num_cids
+    AppendCapabilityValue(key, profile.live_vm.object_store_libraries_offset);  // object_store.libraries
+    AppendCapabilityValue(key, profile.live_vm.object_store_loading_units_offset);  // object_store.loading_units
+    AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
+    AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
+    AppendCapabilityValue(key, profile.live_vm.growable_object_array_length_offset);  // growable_object_array.length
+    AppendCapabilityValue(key, profile.live_vm.growable_object_array_data_offset);  // growable_object_array.data
+    AppendCapabilityValue(key, profile.live_vm.library_url_offset);  // library.url
+    AppendCapabilityValue(key, profile.live_vm.string_length_offset);  // string.length
+    AppendCapabilityValue(key, profile.live_vm.string_data_offset);  // string.data
+    AppendCapabilityValue(key, profile.live_vm.object_pool_length_offset);  // object_pool.length
+    AppendCapabilityValue(key, profile.live_vm.cid_class);  // cids.class
+    AppendCapabilityValue(key, profile.live_vm.cid_library);  // cids.library
+    AppendCapabilityValue(key, profile.live_vm.cid_object_pool);  // cids.object_pool
+    AppendCapabilityValue(key, profile.live_vm.cid_array);  // cids.array
+    AppendCapabilityValue(key, profile.live_vm.cid_immutable_array);  // cids.immutable_array
+    AppendCapabilityValue(key, profile.live_vm.cid_growable_object_array);  // cids.growable_object_array
+    AppendCapabilityValue(key, profile.live_vm.cid_one_byte_string);  // cids.one_byte_string
+    AppendCapabilityValue(key, profile.live_vm.cid_two_byte_string);  // cids.two_byte_string
+    AppendCapabilityValue(key, profile.function_type.cid_null);  // function_type.cid_null
+    AppendCapabilityValue(key, profile.live_vm.cid_function);  // cids.function
+    AppendCapabilityValue(key, profile.live_vm.cid_code);  // cids.code
+    AppendCapabilityValue(key, profile.live_vm.function_entry_point_offset);  // function.entry_point
+    AppendCapabilityValue(key, profile.live_vm.function_unchecked_entry_point_offset);  // function.unchecked_entry_point
+    AppendCapabilityValue(key, profile.live_vm.function_name_offset);  // function.name
+    AppendCapabilityValue(key, profile.live_vm.function_owner_offset);  // function.owner
+    AppendCapabilityValue(key, profile.live_vm.function_code_offset);  // function.code
+    AppendCapabilityValue(key, profile.live_vm.function_kind_tag_offset);  // function.kind_tag
+    AppendCapabilityValue(key, profile.live_vm.class_name_offset);  // class.name
+    AppendCapabilityValue(key, profile.live_vm.class_functions_offset);  // class.functions
+    AppendCapabilityValue(key, profile.live_vm.class_library_offset);  // class.library
+    AppendCapabilityValue(key, profile.live_vm.library_toplevel_class_offset);  // library.toplevel_class
+    AppendCapabilityValue(key, profile.live_vm.code_entry_point_offset);  // code.entry_point
+    AppendCapabilityValue(key, profile.live_vm.code_unchecked_entry_point_offset);  // code.unchecked_entry_point
+    AppendCapabilityValue(key, profile.live_vm.code_monomorphic_entry_point_offset);  // code.monomorphic_entry_point
+    AppendCapabilityValue(key, profile.live_vm.code_monomorphic_unchecked_entry_point_offset);  // code.monomorphic_unchecked_entry_point
+    AppendCapabilityValue(key, profile.live_vm.code_object_pool_offset);  // code.object_pool
+    AppendCapabilityValue(key, profile.live_vm.code_owner_offset);  // code.owner
+    AppendCapabilityValue(key, profile.live_vm.code_instructions_length_offset);  // code.instructions_length
+    AppendCapabilityValue(key, profile.instructions_monomorphic_entry_offset_aot);  // instructions.monomorphic_entry_offset_aot
+    AppendCapabilityValue(key, profile.instructions_polymorphic_entry_offset_aot);  // instructions.polymorphic_entry_offset_aot
+    AppendCapabilityValue(key, profile.function_kind.regular);  // function_kind.regular
+    AppendCapabilityValue(key, profile.function_kind.closure);  // function_kind.closure
+    AppendCapabilityValue(key, profile.function_kind.implicit_closure);  // function_kind.implicit_closure
+    AppendCapabilityValue(key, profile.function_kind.tag_shift);  // function_kind.tag_shift
+    AppendCapabilityValue(key, profile.function_kind.tag_bits);  // function_kind.tag_bits
+}
 inline void AppendTypeArgumentsLayoutFields(std::string& key, const RuntimeProfileRecord& profile) {
     AppendCapabilityValue(key, profile.raw_object.heap_object_tag);  // raw_object.heap_object_tag
     AppendCapabilityValue(key, profile.raw_object.smi_tag_mask);  // raw_object.smi_tag_mask
@@ -304,6 +371,7 @@ inline void AppendFunctionTypeLayoutFields(std::string& key, const RuntimeProfil
     AppendCapabilityValue(key, profile.raw_object.compressed_word_size);  // raw_object.compressed_word_size
     AppendCapabilityValue(key, profile.live_vm.thread_heap_base_offset);  // thread.heap_base
     AppendCapabilityValue(key, profile.function_type.function_signature_offset);  // function.signature
+    AppendCapabilityValue(key, profile.closure.function_offset);  // closure.function
     AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
     AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
     AppendCapabilityValue(key, profile.live_vm.string_length_offset);  // string.length

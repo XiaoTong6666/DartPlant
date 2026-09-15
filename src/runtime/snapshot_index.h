@@ -21,6 +21,10 @@ struct LiveVmInstructionImage;
 
 struct SnapshotFunction {
     uint64_t runtime_image_id = 0;
+    uint64_t runtime_image_incarnation_epoch = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+    uint64_t runtime_generation = 0;
     uint32_t loading_unit_id = 0;
     std::string library_uri;
     std::string class_name;
@@ -87,8 +91,8 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext
                                                     std::string* error);
 std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
-    const RuntimeProfileRecord& profile, DartPlantLiveVmFunctionIndexInfo* out_info,
-    std::string* error);
+    const RuntimeProfileRecord& live_index_profile, const RuntimeProfileRecord* deferred_profile,
+    DartPlantLiveVmFunctionIndexInfo* out_info, std::string* error);
 
 // Internal record adapter shared by the live-VM visitor and host regression
 // tests. Returns false rather than publishing a partial entry family.

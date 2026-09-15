@@ -21,6 +21,7 @@
 #include "runtime/flutter_snapshot_internal.h"
 #include "runtime/runtime_image_set.h"
 #include "runtime/snapshot_index.h"
+#include "vm/abi/resolver.h"
 #include "vm/object_bridge.h"
 #include "vm/runtime_profiles.h"
 
@@ -44,6 +45,7 @@ struct RuntimeRegistration;
 struct RuntimeAbiEvidenceEntry {
     DartMethodIdentity identity;
     uint64_t image_id = 0;
+    DartRuntimeOwnerIdentity owner{};
     uintptr_t code_target = 0;
     uint64_t generation = 0;
     uint32_t formal_parameter_count = 0;
@@ -53,7 +55,62 @@ struct RuntimeAbiEvidenceEntry {
     std::shared_ptr<const abi::DartCallLayout> call_layout;
 };
 
-void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id);
+// Process -> Engine -> IsolateGroup is the ownership hierarchy exposed by the
+// Dart VM itself. The process owns a collection of physical Flutter engines;
+// each engine owns a collection of isolate-group semantic owners. Public APIs
+// currently project one active engine/group at a time, but switching that
+// projection must never overwrite the state retained by another owner.
+struct RuntimeIsolateGroupState {
+    // Generation is isolate-group scoped. A process may have multiple live
+    // groups whose methods/hooks remain valid independently while another
+    // group advances its own semantic generation.
+    std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
+    DartPlantRuntimeState runtime_state = DARTPLANT_RUNTIME_CREATED;
+    bool profile_matched = false;
+    DartPlantResolutionDiagnostics diagnostics{};
+    bool retired = false;
+    uint64_t incarnation_epoch = 0;
+    uint64_t isolate_group_identity = 0;
+    uint64_t isolate_generation = 0;
+    std::optional<ModuleImage> app_module;
+    std::optional<FlutterSnapshotSource> snapshot;
+    RuntimeImageSet image_set;
+    std::optional<SnapshotIndex> live_snapshot_index;
+    std::optional<SnapshotIndex> artifact_snapshot_index;
+    uint64_t bound_artifact_snapshot_generation = 0;
+    DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
+    std::optional<DartPlantLiveVmContext> live_vm_context;
+    vm_abi::CapabilityBindingSet capability_bindings;
+    uint64_t live_vm_null_value = 0;
+    uint64_t live_vm_bool_true_value = 0;
+    uint64_t live_vm_bool_false_value = 0;
+    DartEntryTargetRegistry entry_targets;
+    std::vector<RuntimeAbiEvidenceEntry> abi_evidence;
+};
+
+struct RuntimeEngineState {
+    RuntimeEngineState() { isolate_groups.push_back(std::make_unique<RuntimeIsolateGroupState>()); }
+
+    uint64_t incarnation_epoch = 0;
+    uintptr_t anchor = 0;
+    bool retired = false;
+    std::optional<ModuleImage> module;
+    std::vector<std::unique_ptr<RuntimeIsolateGroupState>> isolate_groups;
+    size_t active_isolate_group_index = 0;
+};
+
+struct RuntimeProcessState {
+    RuntimeProcessState() { engines.push_back(std::make_unique<RuntimeEngineState>()); }
+
+    std::vector<ModuleImage> modules;
+    uint64_t next_engine_incarnation_epoch = 1;
+    uint64_t next_isolate_group_incarnation_epoch = 1;
+    std::vector<std::unique_ptr<RuntimeEngineState>> engines;
+    size_t active_engine_index = 0;
+};
+
+void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id,
+                                     uint64_t image_incarnation_epoch = 0);
 
 using RuntimeModuleRefreshReporter = void (*)(DartPlantStatus status, const char* error);
 
@@ -77,6 +134,14 @@ RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime);
 size_t RuntimeActiveOperationCountForTesting(const DartPlantRuntime* runtime);
 DartPlantStatus RefreshRuntimeModules(DartPlantRuntime* runtime,
                                       const std::vector<ModuleImage>& modules);
+DartPlantStatus RefreshRuntimeOwnerTree(DartPlantRuntime* runtime,
+                                        const std::vector<ModuleImage>& modules);
+void ActivateRuntimeEngineOwnerForAnchorLocked(DartPlantRuntime* runtime,
+                                               const std::vector<ModuleImage>& modules,
+                                               uintptr_t engine_anchor);
+DartPlantStatus ActivateRuntimeIsolateGroupOwnerForContextLocked(
+    DartPlantRuntime* runtime, const DartPlantLiveVmContext& context,
+    const FlutterSnapshotSource& snapshot);
 void StartRuntimeModuleRefreshWorker(RuntimeModuleRefreshReporter reporter);
 uint64_t ScheduleRuntimeModuleRefresh();
 DartPlantStatus WaitForRuntimeModuleRefresh(uint64_t epoch);
@@ -109,42 +174,79 @@ typedef struct DartPlantArm64ReturnDispatchResult {
 struct DartPlantRuntime {
     mutable std::recursive_mutex mutex;
     dartplant::RuntimeProfileStorage profile;
-    std::vector<dartplant::ModuleImage> modules;
-    std::optional<dartplant::ModuleImage> selected_app_module;
-    std::optional<dartplant::ModuleImage> selected_runtime_module;
-    // Optional executable address owned by the concrete Flutter engine that
-    // created/owns this runtime instance. Required to disambiguate multiple
-    // same-name/same-build libflutter.so mappings in one process.
-    uintptr_t engine_anchor = 0;
-    std::optional<dartplant::FlutterSnapshotSource> snapshot;
-    // Complete Dart AOT instruction namespace for this app incarnation. The
-    // legacy selected_app_module/snapshot fields above are projections of the
-    // root loading unit kept for public ABI/source compatibility.
-    dartplant::RuntimeImageSet image_set;
-    // Built automatically from live Class.functions/Library.toplevel_class.
-    std::optional<dartplant::SnapshotIndex> live_snapshot_index;
-    // Optional exact compiler/artifact sidecar for Functions deliberately
-    // dropped from the PRODUCT object graph. Bound to one app/snapshot
-    // incarnation and cleared when that artifact identity changes.
-    std::optional<dartplant::SnapshotIndex> artifact_snapshot_index;
-    uint64_t bound_artifact_snapshot_generation = 0;
-    DartPlantLiveVmFunctionIndexInfo live_function_index_info{};
-    std::optional<DartPlantLiveVmContext> live_vm_context;
-    std::vector<const dartplant::RuntimeProfileRecord*> live_vm_core_candidates;
-    // Canonical semantic roots are captured only from an exact, validated live
-    // VM profile and are scoped to this runtime generation.
-    uint64_t live_vm_null_value = 0;
-    uint64_t live_vm_bool_true_value = 0;
-    uint64_t live_vm_bool_false_value = 0;
-    std::shared_ptr<std::atomic_uint64_t> generation = std::make_shared<std::atomic_uint64_t>(1);
-    dartplant::DartEntryTargetRegistry entry_targets;
-    std::vector<dartplant::RuntimeAbiEvidenceEntry> abi_evidence;
+    dartplant::RuntimeProcessState process;
+    // Compatibility projection of the active isolate-group generation token.
+    // The token itself is owned by RuntimeIsolateGroupState and is swapped
+    // when the active owner changes.
+    std::shared_ptr<std::atomic_uint64_t> generation =
+        process.engines[0]->isolate_groups[0]->generation;
     DartPlantResolutionDiagnostics diagnostics{};
     DartPlantRuntimeState state = DARTPLANT_RUNTIME_CREATED;
     bool profile_matched = false;
 };
 
 namespace dartplant {
+
+inline RuntimeProcessState& RuntimeProcess(DartPlantRuntime* runtime) { return runtime->process; }
+inline const RuntimeProcessState& RuntimeProcess(const DartPlantRuntime* runtime) {
+    return runtime->process;
+}
+inline RuntimeEngineState& RuntimeEngine(DartPlantRuntime* runtime) {
+    return *runtime->process.engines[runtime->process.active_engine_index];
+}
+inline const RuntimeEngineState& RuntimeEngine(const DartPlantRuntime* runtime) {
+    return *runtime->process.engines[runtime->process.active_engine_index];
+}
+inline RuntimeIsolateGroupState& RuntimeIsolateGroup(DartPlantRuntime* runtime) {
+    auto& engine = RuntimeEngine(runtime);
+    return *engine.isolate_groups[engine.active_isolate_group_index];
+}
+inline const RuntimeIsolateGroupState& RuntimeIsolateGroup(const DartPlantRuntime* runtime) {
+    const auto& engine = RuntimeEngine(runtime);
+    return *engine.isolate_groups[engine.active_isolate_group_index];
+}
+
+inline void ProjectActiveGeneration(DartPlantRuntime* runtime) {
+    runtime->generation = RuntimeIsolateGroup(runtime).generation;
+}
+
+inline void ProjectActiveRuntimeState(DartPlantRuntime* runtime) {
+    const auto& group = RuntimeIsolateGroup(runtime);
+    runtime->state = group.runtime_state;
+    runtime->profile_matched = group.profile_matched;
+    runtime->diagnostics = group.diagnostics;
+}
+
+inline void SetActiveRuntimeState(DartPlantRuntime* runtime, DartPlantRuntimeState state) {
+    RuntimeIsolateGroup(runtime).runtime_state = state;
+    runtime->state = state;
+}
+
+inline void SetActiveProfileMatched(DartPlantRuntime* runtime, bool matched) {
+    RuntimeIsolateGroup(runtime).profile_matched = matched;
+    runtime->profile_matched = matched;
+}
+
+inline DartPlantResolutionDiagnostics& RuntimeDiagnostics(DartPlantRuntime* runtime) {
+    return RuntimeIsolateGroup(runtime).diagnostics;
+}
+
+inline const DartPlantResolutionDiagnostics& RuntimeDiagnostics(const DartPlantRuntime* runtime) {
+    return RuntimeIsolateGroup(runtime).diagnostics;
+}
+
+inline void ProjectActiveDiagnostics(DartPlantRuntime* runtime) {
+    runtime->diagnostics = RuntimeDiagnostics(runtime);
+}
+
+inline vm_abi::CapabilityOwnerStamp RuntimeCapabilityOwner(const DartPlantRuntime* runtime) {
+    if (runtime == nullptr) return {};
+    return {
+        .runtime_generation = runtime->generation->load(std::memory_order_acquire),
+        .engine_incarnation_epoch = RuntimeEngine(runtime).incarnation_epoch,
+        .isolate_group_incarnation_epoch = RuntimeIsolateGroup(runtime).incarnation_epoch,
+    };
+}
 
 inline bool IsArtifactRuntimeMethod(const DartPlantMethod* method) {
     return method != nullptr && method->function != nullptr &&

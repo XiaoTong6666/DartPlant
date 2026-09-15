@@ -222,9 +222,10 @@ DartPlantStatus InvalidateRuntimeHooks(
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation);
 DartPlantStatus InvalidateRuntimeImageHooks(
-    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id);
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation, uint64_t image_id,
+    uint64_t image_incarnation_epoch = 0);
 void RetireRuntimeImageHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
-                             uint64_t image_id);
+                             uint64_t image_id, uint64_t image_incarnation_epoch = 0);
 DartPlantStatus QuiesceVmAdapterHooks(DartPlantVmAdapter* adapter);
 
 DartPlantStatus InstallHook(const std::shared_ptr<DartEntryTarget>& code_target, void* replacement,

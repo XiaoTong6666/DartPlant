@@ -238,6 +238,14 @@ typedef struct DartPlantLiveVmFunctionInfo {
     uint64_t runtime_image_id;
     uint32_t loading_unit_id;
     uint32_t reserved_image;
+
+    // V4 append-only ownership receipt. image_id/loading_unit_id name the
+    // logical namespace; these epochs bind the record to the physical image,
+    // Flutter engine and isolate-group incarnations that produced it.
+    uint64_t runtime_image_incarnation_epoch;
+    uint64_t engine_incarnation_epoch;
+    uint64_t isolate_group_incarnation_epoch;
+    uint64_t runtime_generation;
 } DartPlantLiveVmFunctionInfo;
 
 typedef struct DartPlantLiveVmFunctionIndexInfo {

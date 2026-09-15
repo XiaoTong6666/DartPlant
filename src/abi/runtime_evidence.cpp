@@ -49,7 +49,7 @@ bool SameEvidenceTarget(const RuntimeAbiEvidenceEntry& entry, const DartPlantMet
                         uint64_t generation) {
     return method != nullptr && method->function != nullptr &&
            entry.identity == method->function->identity &&
-           entry.image_id == method->function->image_id &&
+           entry.image_id == method->function->image_id && entry.owner == method->function->owner &&
            entry.code_target == MethodTarget(method) && entry.generation == generation;
 }
 
@@ -78,11 +78,15 @@ DartPlantMethodAbiState PublicAbiState(const RuntimeAbiEvidenceEntry& entry) {
 
 }  // namespace
 
-void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id) {
+void EraseRuntimeAbiEvidenceForImage(DartPlantRuntime* runtime, uint64_t image_id,
+                                     uint64_t image_incarnation_epoch) {
     if (runtime == nullptr || image_id == 0) return;
-    std::erase_if(runtime->abi_evidence, [image_id](const RuntimeAbiEvidenceEntry& entry) {
-        return entry.image_id == image_id;
-    });
+    std::erase_if(dartplant::RuntimeIsolateGroup(runtime).abi_evidence,
+                  [image_id, image_incarnation_epoch](const RuntimeAbiEvidenceEntry& entry) {
+                      return entry.image_id == image_id &&
+                             (image_incarnation_epoch == 0 ||
+                              entry.owner.image_incarnation_epoch == image_incarnation_epoch);
+                  });
 }
 
 std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
@@ -93,11 +97,13 @@ std::shared_ptr<const abi::DartCallLayout> FindRuntimeCallLayoutLocked(
         return nullptr;
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
-    const auto found = std::find_if(runtime->abi_evidence.begin(), runtime->abi_evidence.end(),
+    const auto found = std::find_if(dartplant::RuntimeIsolateGroup(runtime).abi_evidence.begin(),
+                                    dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end(),
                                     [method, generation](const auto& entry) {
                                         return SameEvidenceTarget(entry, method, generation);
                                     });
-    return found == runtime->abi_evidence.end() ? nullptr : found->call_layout;
+    return found == dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end() ? nullptr
+                                                                               : found->call_layout;
 }
 
 }  // namespace dartplant
@@ -152,16 +158,18 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             DARTPLANT_SHARED_CODE_ENTRY, DARTPLANT_REJECT_CODE_TARGET_AMBIGUOUS,
             "compiler ABI evidence cannot create a typed frame for an identity-ambiguous shared entry target");
     }
-    if (!runtime->snapshot.has_value() || !runtime->selected_app_module.has_value()) {
+    if (!dartplant::RuntimeIsolateGroup(runtime).snapshot.has_value() ||
+        !dartplant::RuntimeIsolateGroup(runtime).app_module.has_value()) {
         return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_SNAPSHOT_UNAVAILABLE,
                       "compiler ABI evidence cannot bind without the current AOT image");
     }
-    if (runtime->snapshot->snapshot_hash != evidence->snapshot_hash) {
+    if (dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash !=
+        evidence->snapshot_hash) {
         return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_SNAPSHOT_MISMATCH,
                       "compiler ABI evidence snapshot hash does not match the live runtime");
     }
-    if (!dartplant::EqualsIgnoreCaseAscii(runtime->selected_app_module->build_id,
-                                          evidence->app_build_id)) {
+    if (!dartplant::EqualsIgnoreCaseAscii(
+            dartplant::RuntimeIsolateGroup(runtime).app_module->build_id, evidence->app_build_id)) {
         return reject(DARTPLANT_BUILD_ID_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
                       "compiler ABI evidence app build-id does not match the live module");
     }
@@ -198,8 +206,9 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
                 DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
                 "compiler ABI evidence Function identity does not match the runtime method");
         }
-        const auto evidence_target = runtime->snapshot->ResolveInstructionVa(
-            *runtime->selected_app_module, evidence->entry_va);
+        const auto evidence_target =
+            dartplant::RuntimeIsolateGroup(runtime).snapshot->ResolveInstructionVa(
+                *dartplant::RuntimeIsolateGroup(runtime).app_module, evidence->entry_va);
         if (!evidence_target.has_value() || *evidence_target != target) {
             return reject(
                 DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ARTIFACT_MISMATCH,
@@ -275,15 +284,17 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         function_type_object = method->function->function_object;
     } else if (method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
                method->function->closure_call_entry_only &&
-               evidence->has_optional_parameters != 0 && runtime->live_snapshot_index.has_value()) {
+               evidence->has_optional_parameters != 0 &&
+               dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value()) {
         constexpr std::string_view kTearOffPrefix = "[tear-off] ";
         const std::string_view closure_name = method->record.function_name;
         if (closure_name.starts_with(kTearOffPrefix)) {
             const std::string_view parent_name = closure_name.substr(kTearOffPrefix.size());
             bool ambiguous = false;
-            const auto* parent = runtime->live_snapshot_index->FindSnapshotFunction(
-                method->record.library_uri, method->record.class_name, parent_name,
-                method->record.signature, DARTPLANT_ENTRY_DEFAULT, &ambiguous);
+            const auto* parent =
+                dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index->FindSnapshotFunction(
+                    method->record.library_uri, method->record.class_name, parent_name,
+                    method->record.signature, DARTPLANT_ENTRY_DEFAULT, &ambiguous);
             if (!ambiguous && parent != nullptr && parent->live && parent->function_object != 0 &&
                 !parent->closure_call_entry_only) {
                 function_type_object = parent->function_object;
@@ -293,26 +304,32 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     }
 
     if (function_type_object != 0) {
-        if (!runtime->live_vm_context.has_value() || !runtime->snapshot.has_value()) {
+        if (!dartplant::RuntimeIsolateGroup(runtime).live_vm_context.has_value() ||
+            !dartplant::RuntimeIsolateGroup(runtime).snapshot.has_value()) {
             return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
                           "live FunctionType is unavailable for ABI evidence validation");
         }
         dartplant::VmRuntimeFacts facts{};
-        facts.snapshot_hash = runtime->snapshot->snapshot_hash;
-        facts.snapshot_features = runtime->snapshot->snapshot_features;
-        facts.compressed_pointers = runtime->snapshot->compressed_pointers;
+        facts.snapshot_hash = dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash;
+        facts.snapshot_features =
+            dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_features;
+        facts.compressed_pointers =
+            dartplant::RuntimeIsolateGroup(runtime).snapshot->compressed_pointers;
         dartplant::vm_abi::AbiCandidateSet candidates{};
         candidates.profiles = dartplant::ResolveRuntimeProfileCandidates(facts);
+        const auto capability_owner = dartplant::RuntimeCapabilityOwner(runtime);
+        const auto* live_index_binding =
+            dartplant::RuntimeIsolateGroup(runtime).capability_bindings.FindForOwner(
+                dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, capability_owner);
         std::vector<bool> compatible;
         compatible.reserve(candidates.profiles.size());
         for (const auto* candidate : candidates.profiles) {
             compatible.push_back(
-                candidate != nullptr &&
-                std::find(runtime->live_vm_core_candidates.begin(),
-                          runtime->live_vm_core_candidates.end(),
-                          candidate) != runtime->live_vm_core_candidates.end() &&
+                candidate != nullptr && live_index_binding != nullptr &&
+                live_index_binding->Contains(candidate) &&
                 dartplant::vm_abi::ProveFunctionTypeLayout(
-                    *candidate, runtime->live_vm_context->heap_base, function_type_object)
+                    *candidate, dartplant::RuntimeIsolateGroup(runtime).live_vm_context->heap_base,
+                    function_type_object)
                     .passed);
         }
         const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
@@ -324,10 +341,13 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
                               : "live FunctionType capability proof rejected every candidate");
         }
         vm_profile = selection.representative;
+        (void) dartplant::RuntimeIsolateGroup(runtime).capability_bindings.Bind(
+            dartplant::vm_abi::kCapabilityFunctionTypeLayout, selection);
         DartPlantDartFunctionSignatureInfo signature{};
         signature.struct_size = sizeof(signature);
         const DartPlantStatus signature_status = dartplant::ReadLiveVmFunctionSignatureForProfile(
-            *runtime->live_vm_context, *vm_profile, function_type_object, &signature);
+            *dartplant::RuntimeIsolateGroup(runtime).live_vm_context, *vm_profile,
+            function_type_object, &signature);
         if (signature_status != DARTPLANT_OK) {
             return reject(signature_status, DARTPLANT_REJECT_ABI_INCOMPLETE,
                           "live FunctionType could not validate compiler ABI evidence");
@@ -411,19 +431,21 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
 
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     auto existing =
-        std::find_if(runtime->abi_evidence.begin(), runtime->abi_evidence.end(),
+        std::find_if(dartplant::RuntimeIsolateGroup(runtime).abi_evidence.begin(),
+                     dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end(),
                      [method, generation](const auto& candidate) {
                          return dartplant::SameEvidenceTarget(candidate, method, generation);
                      });
-    if (existing == runtime->abi_evidence.end()) {
+    if (existing == dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end()) {
         dartplant::RuntimeAbiEvidenceEntry entry;
         entry.identity = method->function->identity;
         entry.image_id = method->function->image_id;
+        entry.owner = method->function->owner;
         entry.code_target = dartplant::MethodTarget(method);
         entry.generation = generation;
         entry.formal_parameter_count = layout_parameter_count;
-        runtime->abi_evidence.push_back(std::move(entry));
-        existing = std::prev(runtime->abi_evidence.end());
+        dartplant::RuntimeIsolateGroup(runtime).abi_evidence.push_back(std::move(entry));
+        existing = std::prev(dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end());
     } else if (existing->formal_parameter_count != layout_parameter_count) {
         existing->resolution.conflicting = true;
         existing->layout_status = dartplant::abi::DartCallLayoutStatus::kConflictingEvidence;
@@ -461,9 +483,9 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             DartPlantDartParameterInfo parameter{};
             parameter.struct_size = sizeof(parameter);
             const DartPlantStatus parameter_status =
-                dartplant::ReadLiveVmFunctionParameterForProfile(*runtime->live_vm_context,
-                                                                 *vm_profile, function_type_object,
-                                                                 index, &parameter);
+                dartplant::ReadLiveVmFunctionParameterForProfile(
+                    *dartplant::RuntimeIsolateGroup(runtime).live_vm_context, *vm_profile,
+                    function_type_object, index, &parameter);
             if (parameter_status != DARTPLANT_OK) {
                 existing->layout_status = dartplant::abi::DartCallLayoutStatus::kIncompleteEvidence;
                 break;
@@ -520,12 +542,16 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             DARTPLANT_UNSUPPORTED_ABI, DARTPLANT_REJECT_ABI_INCOMPLETE,
             "compiler ABI evidence was retained but is insufficient for a verified DartCallLayout");
     }
-    runtime->diagnostics.abi_provider_count = static_cast<uint32_t>(existing->providers.size());
+    dartplant::RuntimeDiagnostics(runtime).abi_provider_count =
+        static_cast<uint32_t>(existing->providers.size());
+    dartplant::ProjectActiveDiagnostics(runtime);
     dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_ABI_EVIDENCE,
                                      DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
     if (has_structural_summary) {
-        runtime->diagnostics.structural_candidate_count = 1;
-        runtime->diagnostics.structural_relation_count = evidence->structural_relation_count;
+        auto& diagnostics = dartplant::RuntimeDiagnostics(runtime);
+        diagnostics.structural_candidate_count = 1;
+        diagnostics.structural_relation_count = evidence->structural_relation_count;
+        dartplant::ProjectActiveDiagnostics(runtime);
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_STRUCTURAL_EVIDENCE,
                                          DARTPLANT_RESOLVE_RESOLVED, DARTPLANT_OK);
     }
@@ -557,11 +583,12 @@ extern "C" DartPlantStatus dartplant_runtime_get_method_abi_info(const DartPlant
     info.struct_size = sizeof(info);
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
     const auto found =
-        std::find_if(runtime->abi_evidence.begin(), runtime->abi_evidence.end(),
+        std::find_if(dartplant::RuntimeIsolateGroup(runtime).abi_evidence.begin(),
+                     dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end(),
                      [method, generation](const auto& entry) {
                          return dartplant::SameEvidenceTarget(entry, method, generation);
                      });
-    if (found == runtime->abi_evidence.end()) {
+    if (found == dartplant::RuntimeIsolateGroup(runtime).abi_evidence.end()) {
         info.state = DARTPLANT_METHOD_ABI_NONE;
     } else {
         info.parameter_count = static_cast<uint32_t>(found->resolution.parameters.size());

@@ -45,6 +45,14 @@ struct VmTypeArgumentsLayout {
     uint32_t types_offset;
 };
 
+// Private Closure object layout used to recover the Function owned by a
+// retained Dart closure. This is emitted by Dart's AOT runtime-offset table
+// and is source-verified per supported SDK/profile; callers must not infer it
+// by scanning adjacent compressed-pointer fields.
+struct VmClosureLayout {
+    uint32_t function_offset;
+};
+
 // Private LoadingUnit object layout used to traverse Dart's source-defined
 // deferred AOT base-object relation. The values are generated from the exact
 // SDK revision for each supported profile and are never inferred from a live
@@ -157,6 +165,7 @@ struct RuntimeProfileRecord {
     FunctionKindLayout function_kind;
     VmThreadBridgeLayout thread_bridge;
     VmTypeArgumentsLayout type_arguments;
+    VmClosureLayout closure;
     VmLoadingUnitLayout loading_unit;
     VmTransitionLayout transition;
 };

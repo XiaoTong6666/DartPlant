@@ -213,6 +213,15 @@ def test_host(ctx: BuildContext, *, force: bool = False) -> None:
     run(["python3", str(ROOT_DIR / "tests" / "loader_compat_test.py")], cwd=ROOT_DIR)
     run(["python3", str(ROOT_DIR / "tests" / "vm_profiles_generator_test.py")], cwd=ROOT_DIR)
     run(["python3", str(ROOT_DIR / "tests" / "flutter_cold_bootstrap_test.py")], cwd=ROOT_DIR)
+    run(
+        [
+            "python3",
+            str(ROOT_DIR / "tests" / "flutter_elf_contract_test.py"),
+            "--probe",
+            str(ctx.host_build_dir / "dartplant_elf_contract_probe"),
+        ],
+        cwd=ROOT_DIR,
+    )
     run(["python3", str(ROOT_DIR / "scripts" / "generate_vm_profiles.py"), "--check"], cwd=ROOT_DIR)
     run(["dart", "pub", "get"], cwd=ROOT_DIR / "tests" / "dart")
     run(["dart", "test"], cwd=ROOT_DIR / "tests" / "dart")

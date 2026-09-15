@@ -57,6 +57,28 @@ enum class DartFunctionSource {
     kSynthetic,
 };
 
+// Immutable ownership receipt carried from runtime image selection into every
+// Function/EntryTarget/CodePayload created from that image. image_id is a
+// logical namespace; image_incarnation_epoch distinguishes the current
+// physical mapping. Engine/isolate-group epochs prevent address reuse across
+// higher-level VM owner replacement, while runtime_generation remains the
+// coarse public invalidation barrier.
+struct DartRuntimeOwnerIdentity {
+    uint64_t runtime_generation = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+    uint64_t image_id = 0;
+    uint64_t image_incarnation_epoch = 0;
+
+    bool operator==(const DartRuntimeOwnerIdentity& other) const {
+        return runtime_generation == other.runtime_generation &&
+               engine_incarnation_epoch == other.engine_incarnation_epoch &&
+               isolate_group_incarnation_epoch == other.isolate_group_incarnation_epoch &&
+               image_id == other.image_id &&
+               image_incarnation_epoch == other.image_incarnation_epoch;
+    }
+};
+
 // One Dart Code object/payload can expose multiple physical entry points
 // (normal, unchecked, monomorphic and monomorphic-unchecked). Patch ownership
 // that affects the shared body therefore belongs here rather than to an
@@ -67,6 +89,7 @@ struct DartCodePayload {
     mutable std::mutex mutex;
     Id id = 0;
     uint64_t image_id = 0;
+    DartRuntimeOwnerIdentity owner{};
     uintptr_t start = 0;
     uint32_t instructions_length = 0;
     uint64_t code_object = 0;
@@ -114,6 +137,7 @@ struct DartEntryTarget {
     mutable std::mutex mutex;
     Id id = 0;
     uint64_t image_id = 0;
+    DartRuntimeOwnerIdentity owner{};
     uintptr_t entry = 0;
     uint32_t code_size = 0;
     uint64_t code_object = 0;
@@ -251,6 +275,7 @@ private:
 struct DartFunctionHandle {
     DartMethodIdentity identity;
     uint64_t image_id = 0;
+    DartRuntimeOwnerIdentity owner{};
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     DartFunctionSource source = DartFunctionSource::kLegacyMetadata;
@@ -271,8 +296,12 @@ public:
         uintptr_t entry, uint32_t code_size, uint64_t code_object = 0,
         uint32_t reported_alias_count = 1,
         DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN,
-        uintptr_t payload_start = 0, uint32_t instructions_length = 0, uint64_t image_id = 0) {
+        uintptr_t payload_start = 0, uint32_t instructions_length = 0, uint64_t image_id = 0,
+        DartRuntimeOwnerIdentity owner = {}) {
         if (entry == 0) return nullptr;
+        if (owner.image_id == 0) owner.image_id = image_id;
+        if (image_id == 0) image_id = owner.image_id;
+        if (owner.image_id != image_id) return nullptr;
         const bool explicit_payload_identity = payload_start != 0 || instructions_length != 0;
         if (payload_start == 0) payload_start = entry;
         if (payload_start > entry) return nullptr;
@@ -290,7 +319,7 @@ public:
             return nullptr;
         }
         std::lock_guard lock(mutex_);
-        const ImageAddressKey target_key{.image_id = image_id, .address = entry};
+        const ImageAddressKey target_key{.owner = owner, .address = entry};
         auto target_found = targets_.find(target_key);
         if (target_found != targets_.end()) {
             if (auto existing = target_found->second.lock(); existing != nullptr) {
@@ -308,7 +337,7 @@ public:
                         return nullptr;
                     }
                     auto replacement = FindOrCreatePayloadLocked(
-                        image_id, payload_start, instructions_length, code_object, true);
+                        owner, payload_start, instructions_length, code_object, true);
                     if (replacement == nullptr ||
                         !existing->MergeEvidenceAndUpgradePayload(
                             code_size, code_object, reported_alias_count, identity_proof,
@@ -329,13 +358,14 @@ public:
             }
         }
 
-        auto payload = FindOrCreatePayloadLocked(image_id, payload_start, instructions_length,
+        auto payload = FindOrCreatePayloadLocked(owner, payload_start, instructions_length,
                                                  code_object, explicit_payload_identity);
         if (payload == nullptr) return nullptr;
 
         auto target = std::make_shared<DartEntryTarget>();
         target->id = entry;
         target->image_id = image_id;
+        target->owner = owner;
         target->entry = entry;
         target->code_size = code_size;
         target->code_object = code_object;
@@ -353,46 +383,55 @@ public:
         payloads_.clear();
     }
 
-    void EraseImage(uint64_t image_id) {
+    void EraseImage(uint64_t image_id, uint64_t image_incarnation_epoch = 0) {
         std::lock_guard lock(mutex_);
-        std::erase_if(targets_,
-                      [image_id](const auto& item) { return item.first.image_id == image_id; });
-        std::erase_if(payloads_,
-                      [image_id](const auto& item) { return item.first.image_id == image_id; });
+        const auto matches = [image_id, image_incarnation_epoch](const auto& item) {
+            return item.first.owner.image_id == image_id &&
+                   (image_incarnation_epoch == 0 ||
+                    item.first.owner.image_incarnation_epoch == image_incarnation_epoch);
+        };
+        std::erase_if(targets_, matches);
+        std::erase_if(payloads_, matches);
     }
 
 private:
     struct ImageAddressKey {
-        uint64_t image_id = 0;
+        DartRuntimeOwnerIdentity owner{};
         uintptr_t address = 0;
 
         bool operator==(const ImageAddressKey& other) const {
-            return image_id == other.image_id && address == other.address;
+            return owner == other.owner && address == other.address;
         }
     };
 
     struct ImageAddressKeyHash {
         size_t operator()(const ImageAddressKey& key) const {
             const size_t address_hash = std::hash<uintptr_t>{}(key.address);
-            const size_t image_hash = std::hash<uint64_t>{}(key.image_id);
-            return address_hash ^
-                   (image_hash + 0x9e3779b97f4a7c15ULL + (address_hash << 6) + (address_hash >> 2));
+            size_t hash = address_hash;
+            for (const uint64_t value :
+                 {key.owner.runtime_generation, key.owner.engine_incarnation_epoch,
+                  key.owner.isolate_group_incarnation_epoch, key.owner.image_id,
+                  key.owner.image_incarnation_epoch}) {
+                const size_t value_hash = std::hash<uint64_t>{}(value);
+                hash ^= value_hash + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+            }
+            return hash;
         }
     };
 
-    std::shared_ptr<DartCodePayload> FindOrCreatePayloadLocked(uint64_t image_id,
+    std::shared_ptr<DartCodePayload> FindOrCreatePayloadLocked(DartRuntimeOwnerIdentity owner,
                                                                uintptr_t payload_start,
                                                                uint32_t instructions_length,
                                                                uint64_t code_object,
                                                                bool exact_identity) {
-        const ImageAddressKey payload_key{.image_id = image_id, .address = payload_start};
+        const ImageAddressKey payload_key{.owner = owner, .address = payload_start};
         for (auto payload_it = payloads_.begin(); payload_it != payloads_.end();) {
             auto payload = payload_it->second.lock();
             if (payload == nullptr) {
                 payload_it = payloads_.erase(payload_it);
                 continue;
             }
-            if (payload->image_id == image_id && payload->start == payload_start) {
+            if (payload->owner == owner && payload->start == payload_start) {
                 if (payload->instructions_length != instructions_length) return nullptr;
                 std::lock_guard payload_lock(payload->mutex);
                 if (payload->code_object != 0 && code_object != 0 &&
@@ -407,7 +446,8 @@ private:
         }
         auto payload = std::make_shared<DartCodePayload>();
         payload->id = payload_start;
-        payload->image_id = image_id;
+        payload->image_id = owner.image_id;
+        payload->owner = owner;
         payload->start = payload_start;
         payload->instructions_length = instructions_length;
         payload->code_object = code_object;

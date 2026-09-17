@@ -20,6 +20,21 @@ RUNTIME_SCENARIOS = (
     "transition",
     "artifact_revalidate",
     "deferred_lifecycle",
+    "multi_engine",
+)
+COMMON_RUNTIME_SCENARIOS = (
+    "initialization",
+    "local_gate",
+    "simple_facade",
+    "p6_abi",
+    "exception_bridge",
+    "closure_receiver",
+    "advanced_ordinary",
+    "null_semantics",
+    "bool_semantics",
+    "live_vm_startup",
+    "ordinary_aot",
+    "late_shared",
 )
 APK_NATIVE_ENTRIES = (
     "lib/arm64-v8a/libapp.so",

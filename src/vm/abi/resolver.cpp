@@ -24,8 +24,9 @@ ArtifactIncarnation CaptureIncarnation(const ModuleImage& module) {
     };
 }
 
-uint64_t CapabilitiesFor(const RuntimeProfileRecord& profile, const CandidateProbe& probe,
-                         const RegisterEvidence& registers, const ArtifactSet& artifacts) {
+uint64_t CandidateCapabilitiesImpl(const RuntimeProfileRecord& profile, const CandidateProbe& probe,
+                                   const RegisterEvidence& registers,
+                                   const ArtifactSet& artifacts) {
     if (!probe.passed) return kCapabilityNone;
     uint64_t capabilities = kCapabilityRuntimeRoots | kCapabilitySafepointStubs;
     if (probe.roots.owner_match) capabilities |= kCapabilityOwnerIdentity;
@@ -99,6 +100,11 @@ uint64_t CapabilitiesFor(const RuntimeProfileRecord& profile, const CandidatePro
 
 }  // namespace
 
+uint64_t CandidateCapabilities(const RuntimeProfileRecord& profile, const CandidateProbe& probe,
+                               const RegisterEvidence& registers, const ArtifactSet& artifacts) {
+    return CandidateCapabilitiesImpl(profile, probe, registers, artifacts);
+}
+
 const CapabilityDescriptor* CapabilityRegistry() { return generated::kCapabilityRegistry; }
 
 size_t CapabilityRegistrySize() { return std::size(generated::kCapabilityRegistry); }
@@ -116,6 +122,15 @@ uint64_t ColdRequiredCapabilityMask() { return generated::kColdRequiredCapabilit
 
 uint64_t VerifiedAfterCreateCapabilityMask() {
     return generated::kVerifiedAfterCreateCapabilityMask;
+}
+
+uint64_t ProfileAbiSelectableCapabilityMask(uint64_t capabilities) {
+    uint64_t result = kCapabilityNone;
+    for (uint64_t bit = 1; bit != 0 && bit <= capabilities; bit <<= 1) {
+        if ((capabilities & bit) == 0 || CapabilityDomains(bit) == 0) continue;
+        result |= bit;
+    }
+    return result;
 }
 
 AbiDomainMask CapabilityDomains(uint64_t capability) {
@@ -540,8 +555,8 @@ ResolverResult ResolveVerifiedBinding(const ResolverInput& input) {
             const uint64_t available =
                 diagnostic == result.candidates.end() || candidate == nullptr
                     ? kCapabilityNone
-                    : CapabilitiesFor(*candidate, diagnostic->probe, input.registers,
-                                      result.binding.artifacts);
+                    : CandidateCapabilities(*candidate, diagnostic->probe, input.registers,
+                                            result.binding.artifacts);
             compatible.push_back((available & descriptor->capability) != 0);
         }
         const DomainSetSelection capability_selection = SelectCapabilityAbiSet(

@@ -5,13 +5,13 @@ namespace dartplant {
 
 inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-2432db822658411fcc790446",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
+            .full = "dart-vm-arm64-product-compressed/abi-2432db822658411fcc790446",
             .core = "dart-vm-arm64-product-compressed/abi-core-e1061561f58d7c038f469012",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
-            .transition = "dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-13e6a36c40f82036520fe423",
             .exception = "dart-vm-arm64-product-compressed/abi-exception-8dfdfa0cfa1b4e788769f837",
         },
         .machine = {
@@ -151,6 +151,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x748u,
             .active_stacktrace_offset = 0x750u,
             .execution_state_offset = 0x770u,
+            .safepoint_state_offset = 0x778u,
             .exit_through_ffi_offset = 0x780u,
         },
         .type_arguments = {
@@ -180,13 +181,13 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-3f13b69db97aa2cb5a3de306",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-7d36d6624557ab83dda75594",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-3f13b69db97aa2cb5a3de306",
+            .full = "dart-vm-arm64-product-compressed/abi-7d36d6624557ab83dda75594",
             .core = "dart-vm-arm64-product-compressed/abi-core-74cbbf9ab54b6ae8aa33a065",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-46872db6f99fcbf3e15995eb",
-            .transition = "dart-vm-arm64-product-compressed/abi-transition-16277c21148bf7ba2a41fca9",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-37d77a6c49a514672a95f1a7",
             .exception = "dart-vm-arm64-product-compressed/abi-exception-f458cbc09509db7e9046a128",
         },
         .machine = {
@@ -326,6 +327,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x768u,
             .active_stacktrace_offset = 0x770u,
             .execution_state_offset = 0x790u,
+            .safepoint_state_offset = 0x798u,
             .exit_through_ffi_offset = 0x7a0u,
         },
         .type_arguments = {
@@ -355,13 +357,13 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-product-compressed/abi-c27b22695a443c9104275a3d",
+        .abi_id = "dart-vm-arm64-product-compressed/abi-de575d97ed5c6d420af88bec",
         .abi_identity = {
-            .full = "dart-vm-arm64-product-compressed/abi-c27b22695a443c9104275a3d",
+            .full = "dart-vm-arm64-product-compressed/abi-de575d97ed5c6d420af88bec",
             .core = "dart-vm-arm64-product-compressed/abi-core-bc6b59e7b5831ae761fbdc1b",
             .call = "dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
             .object = "dart-vm-arm64-product-compressed/abi-object-237770f1261bebf48864be03",
-            .transition = "dart-vm-arm64-product-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
+            .transition = "dart-vm-arm64-product-compressed/abi-transition-6b8ea454fa127df4e127d71b",
             .exception = "dart-vm-arm64-product-compressed/abi-exception-36b6aa25e8ddf9ce95925268",
         },
         .machine = {
@@ -501,6 +503,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x6d0u,
             .active_stacktrace_offset = 0x6d8u,
             .execution_state_offset = 0x6f8u,
+            .safepoint_state_offset = 0x700u,
             .exit_through_ffi_offset = 0x708u,
         },
         .type_arguments = {
@@ -530,13 +533,13 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-3711845109817a7cca664ead",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-e67ab7c4e3b97564422e699c",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-3711845109817a7cca664ead",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-e67ab7c4e3b97564422e699c",
             .core = "dart-vm-arm64-nonproduct-compressed/abi-core-db1d640d9b121f8cfe7d67e4",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
-            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
+            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-13e6a36c40f82036520fe423",
             .exception = "dart-vm-arm64-nonproduct-compressed/abi-exception-8dfdfa0cfa1b4e788769f837",
         },
         .machine = {
@@ -676,6 +679,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x748u,
             .active_stacktrace_offset = 0x750u,
             .execution_state_offset = 0x770u,
+            .safepoint_state_offset = 0x778u,
             .exit_through_ffi_offset = 0x780u,
         },
         .type_arguments = {
@@ -705,13 +709,13 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-6996dc6e32dec3eb67bf6cbb",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-2114d63262e1e9fa6a467e51",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-6996dc6e32dec3eb67bf6cbb",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-2114d63262e1e9fa6a467e51",
             .core = "dart-vm-arm64-nonproduct-compressed/abi-core-3948b87f17c744121b9a9d24",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-46872db6f99fcbf3e15995eb",
-            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-16277c21148bf7ba2a41fca9",
+            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-37d77a6c49a514672a95f1a7",
             .exception = "dart-vm-arm64-nonproduct-compressed/abi-exception-f458cbc09509db7e9046a128",
         },
         .machine = {
@@ -851,6 +855,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x768u,
             .active_stacktrace_offset = 0x770u,
             .execution_state_offset = 0x790u,
+            .safepoint_state_offset = 0x798u,
             .exit_through_ffi_offset = 0x7a0u,
         },
         .type_arguments = {
@@ -880,13 +885,13 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
         },
     },
     RuntimeProfileRecord{
-        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-5d734370885acbff761d0a9b",
+        .abi_id = "dart-vm-arm64-nonproduct-compressed/abi-226281c09bf8cde7be57e6de",
         .abi_identity = {
-            .full = "dart-vm-arm64-nonproduct-compressed/abi-5d734370885acbff761d0a9b",
+            .full = "dart-vm-arm64-nonproduct-compressed/abi-226281c09bf8cde7be57e6de",
             .core = "dart-vm-arm64-nonproduct-compressed/abi-core-8a4f6459376d7e69bed0a194",
             .call = "dart-vm-arm64-nonproduct-compressed/abi-call-efc67d0750a7c885c66ea5ff",
             .object = "dart-vm-arm64-nonproduct-compressed/abi-object-237770f1261bebf48864be03",
-            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-bd84c15f0db9ba342bafc8ab",
+            .transition = "dart-vm-arm64-nonproduct-compressed/abi-transition-6b8ea454fa127df4e127d71b",
             .exception = "dart-vm-arm64-nonproduct-compressed/abi-exception-36b6aa25e8ddf9ce95925268",
         },
         .machine = {
@@ -1026,6 +1031,7 @@ inline constexpr RuntimeProfileRecord kGeneratedRuntimeProfiles[] = {
             .active_exception_offset = 0x6d0u,
             .active_stacktrace_offset = 0x6d8u,
             .execution_state_offset = 0x6f8u,
+            .safepoint_state_offset = 0x700u,
             .exit_through_ffi_offset = 0x708u,
         },
         .type_arguments = {

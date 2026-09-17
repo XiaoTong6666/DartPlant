@@ -36,6 +36,7 @@ struct VmThreadBridgeLayout {
     uint32_t active_exception_offset;
     uint32_t active_stacktrace_offset;
     uint32_t execution_state_offset;
+    uint32_t safepoint_state_offset;
     uint32_t exit_through_ffi_offset;
 };
 

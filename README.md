@@ -136,7 +136,14 @@ call `dartplant_runtime_on_module_unloading()` before `dlclose`, then
 `dartplant_runtime_refresh_modules()` after loader changes. Arbitrary concurrent
 `dlclose` without that ordering remains unsupported. Deferred loading units and
 multiple independent Flutter engine image sets are refreshed conservatively but
-are not exposed as separate public snapshot-index namespaces.
+are not exposed as separate public snapshot-index namespaces. Internally the
+runtime retains image/index state per Engine/IsolateGroup owner, but the public
+resolver still projects one active semantic namespace at a time. Physical AOT
+entry hooks are process-wide: callbacks are admitted only for the listener's
+durable owner receipt, and execution from a foreign live Engine must bypass the
+listener without entering that hook owner's VM adapter/capability bridge.
+Independent per-Engine callback adapters/layouts on one shared physical hook are
+not yet a supported public model.
 
 Normal consumers use DartPlant's high-level public API. DartPlant owns runtime
 creation, module refresh, Live VM bootstrap, entry/payload target sharing, and matching
@@ -230,7 +237,7 @@ Functions can still be resolved metadata-free and raw instrumentation remains
 available without typed ABI evidence. Retained closure Functions map supplied
 optional positional/named formals through the live ArgumentsDescriptor and expose
 the verified generic TypeArguments vector as one opaque tagged object. With an
-exact VM V3 adapter, individual TypeArguments elements are captured before the
+exact VM V5 adapter, individual TypeArguments elements are captured before the
 Generated->Native safepoint and placed in the same VM-visible root lease, so
 element reads remain valid across moving GC without exposing arbitrary VM
 memory. Dropped optional closures still require richer artifact evidence;
@@ -362,18 +369,23 @@ The exposed invocation frame always preserves raw ARM64 machine truth. When
 exact compiler evidence and Code identity prove a `DartCallLayout`, the same
 frame additionally exposes semantic argument/result values. Unknown layouts
 remain raw rather than being guessed. Object retention still requires an
-attached VM adapter and the correct isolate scope. The exact Flutter VM V3
+attached VM adapter and the correct isolate scope. The exact Flutter VM V5
 adapter publishes VM-visible persistent roots, performs generated/native
 safepoint transitions, and keeps the root lease authoritative while moving GC
 can make saved registers stale. A verified closure receiver and generic
 TypeArguments vector can be inspected during enter; generic TypeArguments
 elements are read only from pre-safepoint rooted slots, never by dereferencing a
-possibly relocated TypeArguments object from native state.
+possibly relocated TypeArguments object from native state. Semantic Function
+index construction uses a separate owner-thread observation lease: source-proven
+Thread/Code layouts resolve current app snapshot-owned safepoint stubs, the exact adapter
+temporarily returns the current FFI thread to VM execution, and the lease is
+released before native execution resumes. Process-sampled movable roots are not
+published by the production runtime path.
 
 Exception handling is intentionally asymmetric: `on_leave` remains normal-return
 only, while `dartplant_hook_handle_set_exception_callback()` provides a read-only
 notification when JumpToFrame proves that an exception unwound out of the hooked
-frame. During that callback, exact VM V3 adapters expose the current exception and
+frame. During that callback, exact VM V5 adapters expose the current exception and
 stacktrace as raw tagged values through `dartplant_invocation_get_exception()` and
 `dartplant_invocation_get_stacktrace()`. Retention, suppression and replacement
 are not exposed.
@@ -382,8 +394,13 @@ Runtime refresh is incarnation-aware. Hosts can call
 `dartplant_runtime_on_module_unloading()` before `dlclose` to invalidate hooks
 while code is mapped, then `dartplant_runtime_refresh_modules()` after loader
 changes. A changed app/runtime/snapshot identity advances generation and requires
-fresh bootstrap. Deferred loading units and simultaneous independent Flutter
-engine instances remain outside the current single-app-image resolver model.
+fresh bootstrap. Deferred loading units are retained as owner-scoped runtime
+images internally, and simultaneous Engine/IsolateGroup owners keep independent
+live/artifact indexes internally, but public lookup/registration still addresses
+only the currently projected owner. A shared physical callback hook therefore
+supports one logical callback-resource owner at a time; foreign Engine execution
+is fail-closed passthrough rather than an implicit cross-Engine adapter/snapshot
+namespace switch.
 
 ## Host tests
 

@@ -36,6 +36,17 @@ def run_lint(*, build_type: str, ndk: str | None) -> None:
                     clang_tidy,
                     "-p",
                     str(context.host_build_dir),
+                    # clang-analyzer-optin.performance.Padding reports struct
+                    # layout suggestions from shared project headers once for
+                    # every translation unit that includes them. Those are
+                    # advisory ABI/layout micro-optimizations rather than
+                    # correctness findings, and Clang prints a cumulative
+                    # "N warnings generated" line even when clang-tidy then
+                    # suppresses the header diagnostic as non-user code. Keep
+                    # all normal compiler diagnostics and analyzer checks, but
+                    # disable only this opt-in padding checker so CI output
+                    # reflects actionable warnings instead of repeated noise.
+                    "--checks=-clang-analyzer-optin.performance.Padding",
                     # GCC may omit an explicit -std flag from compile_commands.json
                     # when its default already satisfies CMake's cxx_std_20 feature.
                     # clang-tidy can use a different frontend/default, so keep the

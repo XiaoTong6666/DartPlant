@@ -729,6 +729,25 @@ def _structured_events(logs: str, event_name: str) -> list[dict[str, object]]:
     return events
 
 
+def _log_line_contains_markers(logs: str, prefix: str, markers: tuple[str, ...]) -> bool:
+    for line in logs.splitlines():
+        if prefix in line:
+            return all(marker in line for marker in markers)
+    return False
+
+
+def _live_index_uses_observation_direct_reader(logs: str) -> bool:
+    return _log_line_contains_markers(
+        logs,
+        "[LiveIndex] enumeration ",
+        ("mode=observation_direct", "safe_reads=0"),
+    ) and _log_line_contains_markers(
+        logs,
+        "[LiveIndex] semantics progress=",
+        ("safe_reads=0",),
+    )
+
+
 def _required_ordinary_source_markers(build_mode: str) -> tuple[str, ...]:
     build_mode = _normalize_flutter_mode(build_mode)
     if build_mode == "profile":
@@ -974,10 +993,23 @@ def _validate_round(
         )
     if "P6 ABI install ready=1 status=0" not in logs:
         raise RuntimeError(f"cold start {round_index}: P6 artifact hook install failed\n{logs}")
-    if (
-        "P6 ABI probe int64=1 entry_stack=1 odd_stack=1 throw=1 forced_stack=1 pair=1 failures=0 "
-        "cleanup=1 shutdown=1 passed=1"
-        not in logs
+    if not _log_line_contains_markers(
+        logs,
+        "P6 ABI probe ",
+        (
+            "int64=1",
+            "entry_stack=1",
+            "odd_stack=1",
+            "throw=1",
+            "throw_counts=2/1/1",
+            "exception_object=1",
+            "forced_stack=1",
+            "pair=1",
+            "failures=0",
+            "cleanup=1",
+            "shutdown=1",
+            "passed=1",
+        ),
     ):
         raise RuntimeError(f"cold start {round_index}: P6 native ABI probe failed\n{logs}")
     if "DartPlant P6 throw path: 2 normal=108.0/125.0" not in logs:
@@ -1009,6 +1041,11 @@ def _validate_round(
         )
     if "DartPlant live VM startup probe: 115" not in logs:
         raise RuntimeError(f"cold start {round_index}: hook probe did not return 115\n{logs}")
+    if not _live_index_uses_observation_direct_reader(logs):
+        raise RuntimeError(
+            f"cold start {round_index}: live Function index did not use the exact-observation "
+            f"direct reader for both enumeration and FunctionType semantics\n{logs}"
+        )
     if "DartPlant null semantic probe: 1 values=null/null" not in logs:
         raise RuntimeError(f"cold start {round_index}: null semantic probe failed\n{logs}")
     if "DartPlant FunctionType semantic probe: 1" not in logs:

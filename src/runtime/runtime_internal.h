@@ -128,7 +128,10 @@ struct RuntimeOperationLease {
 };
 
 bool EqualsIgnoreCaseAscii(const std::string& left, const std::string& right);
+bool SameRuntimeIsolateGroupSemanticContext(const DartPlantLiveVmContext& left,
+                                            const DartPlantLiveVmContext& right);
 bool IsCurrentRuntimeMethod(const DartPlantRuntime* runtime, const DartPlantMethod* method);
+bool IsRuntimeMethodOwnerAlive(const DartPlantRuntime* runtime, const DartPlantMethod* method);
 RuntimeOperationLease AcquireRuntimeOperation(const DartPlantRuntime* runtime);
 // Internal host-test observation for deterministic close/drain regressions.
 size_t RuntimeActiveOperationCountForTesting(const DartPlantRuntime* runtime);

@@ -246,7 +246,7 @@ bool WriteExecutableInstruction(uintptr_t address, uint32_t instruction) {
         return false;
     }
     auto* slot = reinterpret_cast<uint32_t*>(address);
-    std::atomic_ref<uint32_t>(*slot).store(instruction, std::memory_order_release);
+    __atomic_store_n(slot, instruction, __ATOMIC_RELEASE);
     __builtin___clear_cache(reinterpret_cast<char*>(address),
                             reinterpret_cast<char*>(address + sizeof(uint32_t)));
     return mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ | PROT_EXEC) == 0;

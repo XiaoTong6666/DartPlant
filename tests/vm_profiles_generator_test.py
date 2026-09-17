@@ -580,6 +580,101 @@ DART_EXPORT void Dart_EnterScope() {
                 "test",
             )
 
+    def test_live_heap_observation_verifier_requires_atomic_and_no_callback_contract(self) -> None:
+        thread_h = """
+class Thread {
+  int32_t no_callback_scope_depth() const { return no_callback_scope_depth_; }
+  class AtSafepointField : public BitField<uword, bool, 0, 1> {};
+  std::atomic<uword> safepoint_state_ = 0;
+};
+"""
+        bitfield_h = """
+template <typename S, typename T, int position = 0, int requested_size = 1>
+class BitField {};
+"""
+        safepoint_h = """
+class TransitionNativeToVM {
+ public:
+  explicit TransitionNativeToVM(Thread* T) {
+    ASSERT(T->execution_state() == Thread::kThreadInNative);
+    if (T->no_callback_scope_depth() == 0) {
+      T->ExitSafepointFromNative();
+    }
+    T->set_execution_state(Thread::kThreadInVM);
+  }
+  ~TransitionNativeToVM() {
+    thread()->set_execution_state(Thread::kThreadInNative);
+    if (thread()->no_callback_scope_depth() == 0) {
+      thread()->EnterSafepointToNative();
+    }
+  }
+};
+"""
+        dart_api_impl = """
+DART_EXPORT Dart_Handle Dart_TypedDataAcquireData(Dart_Handle object) {
+  START_NO_CALLBACK_SCOPE(T);
+  return Api::Success();
+}
+DART_EXPORT Dart_Handle Dart_TypedDataReleaseData(Dart_Handle object) {
+  END_NO_CALLBACK_SCOPE(T);
+  return Api::Success();
+}
+"""
+        generate_vm_profiles._verify_live_heap_observation_contract(
+            thread_h, bitfield_h, safepoint_h, dart_api_impl, "test"
+        )
+        with self.assertRaisesRegex(ValueError, "std::atomic"):
+            generate_vm_profiles._verify_live_heap_observation_contract(
+                thread_h.replace("std::atomic<uword>", "uword"),
+                bitfield_h,
+                safepoint_h,
+                dart_api_impl,
+                "test",
+            )
+        with self.assertRaisesRegex(ValueError, "AtSafepointField"):
+            generate_vm_profiles._verify_live_heap_observation_contract(
+                thread_h.replace(
+                    "BitField<uword, bool, 0, 1>", "BitField<uword, bool, 2, 1>"
+                ),
+                bitfield_h,
+                safepoint_h,
+                dart_api_impl,
+                "test",
+            )
+        default_thread_h = thread_h.replace(
+            "class AtSafepointField : public BitField<uword, bool, 0, 1> {};",
+            "using AtSafepointField = BitField<uword, bool>;",
+        )
+        generate_vm_profiles._verify_live_heap_observation_contract(
+            default_thread_h, bitfield_h, safepoint_h, dart_api_impl, "test"
+        )
+        with self.assertRaisesRegex(ValueError, "AtSafepointField"):
+            generate_vm_profiles._verify_live_heap_observation_contract(
+                default_thread_h,
+                bitfield_h.replace("int position = 0", "int position = 2"),
+                safepoint_h,
+                dart_api_impl,
+                "test",
+            )
+        with self.assertRaisesRegex(ValueError, "Native<->VM"):
+            generate_vm_profiles._verify_live_heap_observation_contract(
+                thread_h,
+                bitfield_h,
+                safepoint_h.replace(
+                    "if (T->no_callback_scope_depth() == 0)", "if (true)"
+                ),
+                dart_api_impl,
+                "test",
+            )
+        with self.assertRaisesRegex(ValueError, "TypedData acquire"):
+            generate_vm_profiles._verify_live_heap_observation_contract(
+                thread_h,
+                bitfield_h,
+                safepoint_h,
+                dart_api_impl.replace("START_NO_CALLBACK_SCOPE(T);", ""),
+                "test",
+            )
+
     def test_arm64_return_frame_verifier_requires_exact_caller_identity_restore(self) -> None:
         assembler = """
 void Assembler::EnterFrame(intptr_t frame_size) {

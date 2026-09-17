@@ -339,16 +339,31 @@ TEST_CASE(EntryTargetsShareExactCodePayloadOwnership) {
     EXPECT_TRUE(normal->payload->Contains(normal->entry, normal->code_size));
     EXPECT_TRUE(unchecked->payload->Contains(unchecked->entry, unchecked->code_size));
 
+    auto relocated_sibling =
+        registry.GetOrCreate(0x1060, 0x20, 0xdef, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000, 0x80);
+    EXPECT_TRUE(relocated_sibling != nullptr);
+    EXPECT_TRUE(relocated_sibling->payload == normal->payload);
+    EXPECT_EQ(0xdefULL, static_cast<unsigned long long>(relocated_sibling->payload->code_object));
+
     EXPECT_TRUE(registry.GetOrCreate(0x1060, 0x20, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
                                      0x90) == nullptr);
 
-    // Once a physical entry is bound, later producers may add a previously
-    // unknown Code* but must not rewrite its exact entry-to-payload range or
-    // contradict an already-known Code identity.
+    // Once a physical entry is bound, later producers must not rewrite its
+    // exact entry-to-payload range. Dart Code* itself is movable GC evidence:
+    // the same owner + payload range + entry + size with a relocated CodePtr
+    // refreshes the observation rather than contradicting physical identity.
     EXPECT_TRUE(registry.GetOrCreate(0x1020, 0x50, 0xabc, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
                                      0x80) == nullptr);
-    EXPECT_TRUE(registry.GetOrCreate(0x1020, 0x60, 0xdef, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
-                                     0x80) == nullptr);
+    auto relocated =
+        registry.GetOrCreate(0x1020, 0x60, 0xdef, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000, 0x80);
+    EXPECT_TRUE(relocated == normal);
+    EXPECT_EQ(0xdefULL, static_cast<unsigned long long>(relocated->code_object));
+    EXPECT_TRUE(relocated->payload == normal->payload);
+
+    // Payload identity still fails closed when immutable image geometry
+    // changes, even if the newest CodePtr observation is otherwise valid.
+    EXPECT_TRUE(registry.GetOrCreate(0x1020, 0x61, 0xdef, 1, DARTPLANT_CODE_IDENTITY_UNIQUE, 0x1000,
+                                     0x81) == nullptr);
 
     dartplant::DartEntryTargetRegistry artifact_first_registry;
     auto artifact = artifact_first_registry.GetOrCreate(

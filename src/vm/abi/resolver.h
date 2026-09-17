@@ -72,6 +72,7 @@ size_t CapabilityRegistrySize();
 const CapabilityDescriptor* FindCapabilityDescriptor(uint64_t capability);
 uint64_t ColdRequiredCapabilityMask();
 uint64_t VerifiedAfterCreateCapabilityMask();
+uint64_t ProfileAbiSelectableCapabilityMask(uint64_t capabilities);
 
 struct ArtifactIncarnation {
     std::string name;
@@ -85,6 +86,9 @@ struct ArtifactSet {
     ArtifactIncarnation app;
     std::vector<ArtifactIncarnation> engines;
 };
+
+uint64_t CandidateCapabilities(const RuntimeProfileRecord& profile, const CandidateProbe& probe,
+                               const RegisterEvidence& registers, const ArtifactSet& artifacts);
 
 struct CandidateDiagnostic {
     const RuntimeProfileRecord* profile = nullptr;

@@ -10,6 +10,7 @@
 
 #include "test_runner.h"
 #include "vm/abi/candidate_set.h"
+#include "vm/abi/probe.h"
 #include "vm/abi/proof.h"
 #include "vm/abi/resolver.h"
 
@@ -62,6 +63,54 @@ TEST_CASE(RuntimeProfilesMatchDartArm64CallingConvention) {
                       ->live_vm.profile_version);
         EXPECT_TRUE(profile.thread_jump_to_frame_entry_point_offset != 0);
     }
+}
+
+TEST_CASE(SafepointProbeAcceptsFullVmIsolateCodePointers) {
+    const auto& profile = dartplant::RuntimeProfiles()[2];
+    alignas(8) std::array<uint8_t, 64> enter_code{};
+    alignas(8) std::array<uint8_t, 64> exit_code{};
+    alignas(8) std::array<uint8_t, 4096> thread{};
+    constexpr uintptr_t kEnterEntry = 0x100100;
+    constexpr uintptr_t kExitEntry = 0x100200;
+    const uint64_t tags = static_cast<uint64_t>(profile.live_vm.cid_code)
+                          << profile.raw_object.class_id_tag_shift;
+    std::memcpy(enter_code.data(), &tags, sizeof(tags));
+    std::memcpy(exit_code.data(), &tags, sizeof(tags));
+    std::memcpy(enter_code.data() + profile.live_vm.code_entry_point_offset, &kEnterEntry,
+                sizeof(kEnterEntry));
+    std::memcpy(exit_code.data() + profile.live_vm.code_entry_point_offset, &kExitEntry,
+                sizeof(kExitEntry));
+    const uint64_t enter_tagged =
+        reinterpret_cast<uintptr_t>(enter_code.data()) + profile.raw_object.heap_object_tag;
+    const uint64_t exit_tagged =
+        reinterpret_cast<uintptr_t>(exit_code.data()) + profile.raw_object.heap_object_tag;
+    std::memcpy(thread.data() + profile.thread_bridge.enter_safepoint_stub_offset, &enter_tagged,
+                sizeof(enter_tagged));
+    std::memcpy(thread.data() + profile.thread_bridge.exit_safepoint_stub_offset, &exit_tagged,
+                sizeof(exit_tagged));
+
+    dartplant::ModuleImage app{};
+    app.name = "libapp.so";
+    app.path = "/data/app/libapp.so";
+    app.build_id = "source-proven-build-id";
+    app.executable_ranges.push_back({.start = 0x100000, .end = 0x101000});
+    const std::vector<dartplant::ModuleImage> modules = {app};
+
+    const auto probe = dartplant::vm_abi::ProbeSafepoints(
+        profile, reinterpret_cast<uintptr_t>(thread.data()), modules);
+    EXPECT_TRUE(probe.passed);
+    EXPECT_EQ(static_cast<unsigned>(dartplant::vm_abi::CandidateProbeStage::kComplete),
+              static_cast<unsigned>(probe.stage));
+    EXPECT_EQ(enter_tagged, probe.enter_code);
+    EXPECT_EQ(exit_tagged, probe.exit_code);
+    EXPECT_EQ(kEnterEntry, probe.enter_entry);
+    EXPECT_EQ(kExitEntry, probe.exit_entry);
+    EXPECT_TRUE(probe.code_module == &modules[0]);
+
+    const std::vector<dartplant::ModuleImage> ambiguous_modules = {app, app};
+    const auto ambiguous = dartplant::vm_abi::ProbeSafepoints(
+        profile, reinterpret_cast<uintptr_t>(thread.data()), ambiguous_modules);
+    EXPECT_TRUE(!ambiguous.passed);
 }
 
 TEST_CASE(RuntimeProfileCandidatesUseSnapshotAsHintNotArtifactGate) {
@@ -123,7 +172,7 @@ TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapsho
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     const auto* profiles = dartplant::RuntimeProfiles();
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-7cb8c74dd6dcbe15d47a7e92",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-2432db822658411fcc790446",
               std::string_view(profiles[0].abi_identity.full));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[1].abi_id));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[2].abi_id));
@@ -134,7 +183,7 @@ TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
               std::string_view(profiles[0].abi_identity.call));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
               std::string_view(profiles[0].abi_identity.object));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-transition-c7f4d6187f5f3a3fe8a521c7",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-transition-13e6a36c40f82036520fe423",
               std::string_view(profiles[0].abi_identity.transition));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-exception-8dfdfa0cfa1b4e788769f837",
               std::string_view(profiles[0].abi_identity.exception));
@@ -278,6 +327,10 @@ TEST_CASE(VmCapabilityRegistryDefinesColdAndEagerMasks) {
     EXPECT_EQ(UINT64_C(0x7ffff), all);
     EXPECT_EQ(UINT64_C(0xfff7), dartplant::vm_abi::ColdRequiredCapabilityMask());
     EXPECT_EQ(UINT64_C(0x237), dartplant::vm_abi::VerifiedAfterCreateCapabilityMask());
+    EXPECT_EQ(UINT64_C(0x37), dartplant::vm_abi::ProfileAbiSelectableCapabilityMask(
+                                  dartplant::vm_abi::VerifiedAfterCreateCapabilityMask()));
+    EXPECT_EQ(UINT64_C(0), dartplant::vm_abi::CapabilityDomains(
+                               dartplant::vm_abi::kCapabilityArtifactLifecycle));
 }
 
 TEST_CASE(CapabilityBindingsKeepCrossRowWinnersIndependent) {

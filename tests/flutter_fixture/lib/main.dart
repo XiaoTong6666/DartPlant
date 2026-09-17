@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 
 const fixture = DartPlantFixture();
 const _launchChannel = MethodChannel('dev.dartplant.fixture/launch');
+const _secondaryChannel = MethodChannel('dev.dartplant.fixture/secondary');
 const _ciFlutterVersion = String.fromEnvironment(
   'DARTPLANT_CI_FLUTTER_VERSION',
   defaultValue: 'unknown',
@@ -33,6 +34,21 @@ const _ciRuntimeTests = <String>{
   'transition',
   'artifact_revalidate',
   'deferred_lifecycle',
+  'multi_engine',
+};
+const _ciCommonScenarios = <String>{
+  'initialization',
+  'local_gate',
+  'simple_facade',
+  'p6_abi',
+  'exception_bridge',
+  'closure_receiver',
+  'advanced_ordinary',
+  'null_semantics',
+  'bool_semantics',
+  'live_vm_startup',
+  'ordinary_aot',
+  'late_shared',
 };
 final _ciScenarioResults = <String, bool>{};
 
@@ -59,6 +75,67 @@ void movingGcPressure(SendPort port) {
     if (retained.length == 128) retained.clear();
   }
   port.send(2);
+}
+
+Future<void> _multiOwnerGcPressure() async {
+  // Keep enough survivors around for promotion while repeatedly churning
+  // young-space. Non-product Dart 3.12.x is expected to compact old space
+  // opportunistically; the native re-bootstrap afterwards must tolerate every
+  // heap-root relocation without changing the IsolateGroup incarnation.
+  final retained = <List<Object?>>[];
+  for (var round = 0; round < 24; ++round) {
+    for (var index = 0; index < 4096; ++index) {
+      retained.add(
+          List<Object?>.filled(64, _GcPressureMarker((round << 12) | index)));
+      if (retained.length > 512) retained.removeRange(0, 256);
+    }
+    await Future<void>.delayed(Duration.zero);
+  }
+  retained.clear();
+}
+
+@pragma('vm:entry-point')
+Future<void> secondaryEngineMain() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  _bootstrapRetainedGenericClosure = retainedGenericClosure;
+  _secondaryChannel.setMethodCallHandler((call) async {
+    final arguments = call.arguments;
+    final label = arguments is Map && arguments['label'] is int
+        ? arguments['label'] as int
+        : 2;
+    switch (call.method) {
+      case 'activate':
+        return <String, Object?>{
+          'epoch': DartPlantNative.multiOwnerActivate(label),
+        };
+      case 'hookTarget':
+        return instrumentedAdd(2, 3);
+      case 'gc':
+        final before = DartPlantNative.multiOwnerActivate(label);
+        await _multiOwnerGcPressure();
+        final after = DartPlantNative.multiOwnerActivate(label);
+        return <String, Object?>{
+          'before': before,
+          'after': after,
+        };
+      case 'deferred':
+        final before = DartPlantNative.multiOwnerActivate(label);
+        await deferred_probe.loadLibrary();
+        final after = DartPlantNative.multiOwnerDeferred(label);
+        final value = deferred_probe.deferredAdd(1);
+        return <String, Object?>{
+          'before': before,
+          'after': after,
+          'value': value,
+        };
+      default:
+        throw PlatformException(
+          code: 'unknown-secondary-command',
+          message: 'Unknown secondary-engine command: ${call.method}',
+        );
+    }
+  });
+  await _secondaryChannel.invokeMethod<void>('ready');
 }
 
 @pragma('vm:entry-point')
@@ -198,6 +275,179 @@ String _runTypeArgumentsProof(
   }
 }
 
+int _mapInt(Map<Object?, Object?> value, String key) {
+  final result = value[key];
+  return result is int ? result : 0;
+}
+
+Future<Map<Object?, Object?>> _multiOwnerCommand(
+  String command,
+  int label,
+) async {
+  final result = await _launchChannel.invokeMethod<Object?>(
+    'multiOwnerCommand',
+    <String, Object?>{'command': command, 'label': label},
+  );
+  return result is Map ? Map<Object?, Object?>.from(result) : const {};
+}
+
+Future<bool> _runMultiEngineLifecycleProof() async {
+  var aEpoch = 0;
+  var aReturnEpoch = 0;
+  var aPostDeferredEpoch = 0;
+  var aPostDestroyEpoch = 0;
+  var aFinalEpoch = 0;
+  var bEpoch = 0;
+  var b2Epoch = 0;
+  var bGcBefore = 0;
+  var bGcAfter = 0;
+  var bDeferredBefore = 0;
+  var bDeferredAfter = 0;
+  var bDeferredValue = 0;
+  var aHookBefore = 0;
+  var aHookWhileBActive = 0;
+  var aHookAfterB = 0;
+  var aHookWhileBAfterDeferred = 0;
+  var aHookAfterDeferred = 0;
+  var aHookFinal = 0;
+  var aHookWhileB2Active = 0;
+  var bHookValue = -1;
+  var b2HookValue = -1;
+  var engineIncarnation1 = 0;
+  var engineIncarnation2 = 0;
+  String? failure;
+
+  try {
+    DartPlantNative.resetInstrumentedAddProbe();
+    aEpoch = DartPlantNative.multiOwnerActivate(1);
+    aHookBefore = instrumentedAdd(2, 3);
+
+    final start = await _launchChannel.invokeMethod<Object?>('multiOwnerStart');
+    if (start is Map) {
+      engineIncarnation1 =
+          start['incarnation'] is int ? start['incarnation'] as int : 0;
+    }
+
+    final bActivate = await _multiOwnerCommand('activate', 2);
+    bEpoch = _mapInt(bActivate, 'epoch');
+    final bHook = await _launchChannel.invokeMethod<Object?>(
+      'multiOwnerCommand',
+      <String, Object?>{'command': 'hookTarget', 'label': 2},
+    );
+    bHookValue = bHook is int ? bHook : -1;
+    // Keep B as the runtime's active owner, then exercise the interactive
+    // rebind path from A. A's method/listener belongs to another still-live
+    // owner and must not be torn down merely because the active projection is B.
+    DartPlantNative.resetInstrumentedAddProbe();
+    aHookWhileBActive = instrumentedAdd(2, 3);
+
+    aReturnEpoch = DartPlantNative.multiOwnerActivate(1);
+    aHookAfterB = instrumentedAdd(2, 3);
+
+    final bGc = await _multiOwnerCommand('gc', 2);
+    bGcBefore = _mapInt(bGc, 'before');
+    bGcAfter = _mapInt(bGc, 'after');
+
+    final bDeferred = await _multiOwnerCommand('deferred', 2);
+    bDeferredBefore = _mapInt(bDeferred, 'before');
+    bDeferredAfter = _mapInt(bDeferred, 'after');
+    bDeferredValue = _mapInt(bDeferred, 'value');
+    DartPlantNative.resetInstrumentedAddProbe();
+    aHookWhileBAfterDeferred = instrumentedAdd(2, 3);
+
+    aPostDeferredEpoch = DartPlantNative.multiOwnerActivate(1);
+    aHookAfterDeferred = instrumentedAdd(2, 3);
+
+    await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+    aPostDestroyEpoch = DartPlantNative.multiOwnerActivate(1);
+
+    final recreate =
+        await _launchChannel.invokeMethod<Object?>('multiOwnerRecreate');
+    if (recreate is Map) {
+      engineIncarnation2 =
+          recreate['incarnation'] is int ? recreate['incarnation'] as int : 0;
+    }
+    final b2Activate = await _multiOwnerCommand('activate', 3);
+    b2Epoch = _mapInt(b2Activate, 'epoch');
+    final b2Hook = await _launchChannel.invokeMethod<Object?>(
+      'multiOwnerCommand',
+      <String, Object?>{'command': 'hookTarget', 'label': 3},
+    );
+    b2HookValue = b2Hook is int ? b2Hook : -1;
+    DartPlantNative.resetInstrumentedAddProbe();
+    aHookWhileB2Active = instrumentedAdd(2, 3);
+
+    await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+    aFinalEpoch = DartPlantNative.multiOwnerActivate(1);
+    aHookFinal = instrumentedAdd(2, 3);
+  } catch (error, stackTrace) {
+    failure = '$error';
+    debugPrint(
+        'DartPlant multi-engine lifecycle exception: $error\n$stackTrace');
+  } finally {
+    try {
+      await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+    } catch (_) {
+      // The engine may already be gone after a successful lifecycle run.
+    }
+  }
+
+  final passed = failure == null &&
+      aEpoch != 0 &&
+      bEpoch != 0 &&
+      b2Epoch != 0 &&
+      aEpoch != bEpoch &&
+      bEpoch != b2Epoch &&
+      aEpoch != b2Epoch &&
+      aReturnEpoch == aEpoch &&
+      aPostDeferredEpoch == aEpoch &&
+      aPostDestroyEpoch == aEpoch &&
+      aFinalEpoch == aEpoch &&
+      bGcBefore == bEpoch &&
+      bGcAfter == bEpoch &&
+      bDeferredBefore == bEpoch &&
+      bDeferredAfter == bEpoch &&
+      bDeferredValue == 42 &&
+      engineIncarnation1 != 0 &&
+      engineIncarnation2 > engineIncarnation1 &&
+      aHookBefore == 115 &&
+      aHookWhileBActive == 115 &&
+      aHookAfterB == 115 &&
+      aHookWhileBAfterDeferred == 115 &&
+      aHookAfterDeferred == 115 &&
+      aHookWhileB2Active == 115 &&
+      aHookFinal == 115 &&
+      bHookValue == 5 &&
+      b2HookValue == 5;
+  _ciScenario('multi_engine', passed, <String, Object?>{
+    'a_epoch': aEpoch,
+    'b_epoch': bEpoch,
+    'b2_epoch': b2Epoch,
+    'a_return_epoch': aReturnEpoch,
+    'a_post_deferred_epoch': aPostDeferredEpoch,
+    'a_post_destroy_epoch': aPostDestroyEpoch,
+    'a_final_epoch': aFinalEpoch,
+    'b_gc_before': bGcBefore,
+    'b_gc_after': bGcAfter,
+    'b_deferred_before': bDeferredBefore,
+    'b_deferred_after': bDeferredAfter,
+    'b_deferred_value': bDeferredValue,
+    'engine_incarnation_1': engineIncarnation1,
+    'engine_incarnation_2': engineIncarnation2,
+    'a_hook_before': aHookBefore,
+    'a_hook_while_b_active': aHookWhileBActive,
+    'a_hook_after_b': aHookAfterB,
+    'a_hook_while_b_after_deferred': aHookWhileBAfterDeferred,
+    'a_hook_after_deferred': aHookAfterDeferred,
+    'a_hook_while_b2_active': aHookWhileB2Active,
+    'a_hook_final': aHookFinal,
+    'b_hook_value': bHookValue,
+    'b2_hook_value': b2HookValue,
+    if (failure != null) 'error': failure,
+  });
+  return passed;
+}
+
 // Keep this as an ordinary direct-call-only optimized AOT body. Without a
 // tear-off the compiler is free to use the unboxed double Dart calling
 // convention; the native fixture proves V0/V1 argument access from evidence.
@@ -311,7 +561,6 @@ Future<void> main() async {
     'DartPlant app retained generic closure bootstrap: ${_bootstrapRetainedGenericClosure != null ? 1 : 0}',
   );
 
-  final initializeStartStatus = DartPlantNative.startInitialize();
   runApp(const DartPlantFixtureApp());
 
   // Do not stall the UI isolate before runApp while the live-VM sampler is
@@ -320,6 +569,12 @@ Future<void> main() async {
   // bootstrap under the same workload instead of an artificial await-only
   // event loop.
   WidgetsBinding.instance.addPostFrameCallback((_) async {
+    // Start native bootstrap only after this FlutterEngine has rendered its
+    // first frame. Android may create and discard an earlier root engine in the
+    // same process during startup; installing a process-wide AOT patch from
+    // that short-lived IsolateGroup would bind every logical listener to a
+    // stale owner receipt before the durable UI engine begins the test.
+    final initializeStartStatus = DartPlantNative.startInitialize();
     final initializeStatus = initializeStartStatus == 0
         ? await DartPlantNative.waitForInitialization()
         : initializeStartStatus;
@@ -705,9 +960,16 @@ Future<void> main() async {
       );
     }
 
-    final selectedNativeProofPassed = requestedTest == 'all'
-        ? _ciRuntimeTests.every((name) => _ciScenarioResults[name] == true)
-        : _ciScenarioResults[requestedTest] == true;
+    if (wants('multi_engine')) {
+      await _runMultiEngineLifecycleProof();
+    }
+
+    final commonNativeProofPassed =
+        _ciCommonScenarios.every((name) => _ciScenarioResults[name] == true);
+    final selectedNativeProofPassed = commonNativeProofPassed &&
+        (requestedTest == 'all'
+            ? _ciRuntimeTests.every((name) => _ciScenarioResults[name] == true)
+            : _ciScenarioResults[requestedTest] == true);
     _ciEvent('suite', <String, Object?>{
       'state': selectedNativeProofPassed ? 'pass' : 'fail',
       'test': requestedTest,

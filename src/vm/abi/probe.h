@@ -39,6 +39,18 @@ struct CandidateProbe {
     bool passed = false;
 };
 
+struct SafepointProbe {
+    CandidateProbeStage stage = CandidateProbeStage::kNotStarted;
+    uint64_t enter_code = 0;
+    uint64_t exit_code = 0;
+    uint64_t enter_entry = 0;
+    uint64_t exit_entry = 0;
+    const ModuleImage* code_module = nullptr;
+    bool passed = false;
+};
+
+SafepointProbe ProbeSafepoints(const RuntimeProfileRecord& profile, uint64_t thread,
+                               const std::vector<ModuleImage>& modules);
 CandidateProbe ProbeCandidate(const CandidateProbeInput& input);
 
 }  // namespace dartplant::vm_abi

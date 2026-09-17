@@ -111,6 +111,9 @@ target_include_directories(
 )
 target_link_libraries(dartplant_core PUBLIC ${CMAKE_DL_LIBS})
 target_link_libraries(dartplant_core PRIVATE dartplant_abi)
+if(ANDROID)
+    target_link_libraries(dartplant_core PRIVATE log)
+endif()
 
 if(DARTPLANT_BUILD_DOBBY_ADAPTER)
     if(NOT TARGET dobby)

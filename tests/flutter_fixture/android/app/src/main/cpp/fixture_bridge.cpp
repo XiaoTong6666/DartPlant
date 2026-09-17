@@ -1,9 +1,11 @@
 #include <android/log.h>
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -41,6 +43,14 @@ DartPlantFlutterVmAdapter* g_flutter_vm_adapter = nullptr;
 
 constexpr char kTag[] = "DartPlantFixture";
 
+uint64_t CanonicalFixtureNativePointer(uint64_t value) {
+#if defined(__aarch64__)
+    return value & 0x00ffffffffffffffULL;
+#else
+    return value;
+#endif
+}
+
 DartPlantRuntime* g_runtime = nullptr;
 DartPlantMethod* g_instrumented_add = nullptr;
 DartPlantMethod* g_add_int = nullptr;
@@ -59,6 +69,7 @@ DartPlantHookHandle* g_verified_abi_double_hook = nullptr;
 DartPlantHookHandle* g_verified_abi_double_observer_hook = nullptr;
 DartPlantListener* g_add_int_listener = nullptr;
 DartPlantFlutterSnapshotInfo g_snapshot_info{};
+void* g_api_dl_data = nullptr;
 std::string g_snapshot_module_name;
 std::string g_snapshot_module_path;
 std::string g_snapshot_module_build_id;
@@ -113,6 +124,17 @@ std::atomic<uint64_t> g_snapshot_offset_proof{0};
 std::atomic<uint64_t> g_deferred_root_generation{0};
 std::atomic<int32_t> g_cold_bootstrap_status{-1};
 std::thread g_cold_bootstrap_thread;
+
+struct MultiOwnerObservation {
+    uint64_t isolate_group = 0;
+    uint64_t group_epoch = 0;
+    uint64_t generation = 0;
+    uint32_t image_count = 0;
+};
+
+std::mutex g_multi_owner_mutex;
+std::array<MultiOwnerObservation, 4> g_multi_owner_observations{};
+DartPlantMethod* g_multi_owner_retained_b_method = nullptr;
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
@@ -401,101 +423,73 @@ void OnInstrumentedAddEnter(DartPlantInvocation* invocation, void*) {
     if (identity_ambiguous) {
         g_shared_identity_ambiguous_seen.store(true, std::memory_order_release);
     }
-    DartPlantLiveVmProbeInfo live{};
-    live.struct_size = sizeof(live);
-    // TODO(runtime): This is intentionally still the full diagnostic probe. On
-    // a real Flutter UI thread it currently costs about 60 ms per invocation
-    // because it refreshes /proc/self/maps and rescans the ClassTable plus
-    // top-level libraries/functions to recover the same Function identity.
-    // Replace this hot-path use with a generation-bound fast invocation proof
-    // that reuses the already verified live index, while keeping the full probe
-    // for bootstrap/admission diagnostics and explicit regression coverage.
-    const DartPlantStatus live_status =
-        dartplant_live_vm_probe_invocation(invocation, &g_snapshot_info, &live);
     const uintptr_t expected_entry =
         g_instrumented_add == nullptr ? 0 : dartplant_method_runtime_address(g_instrumented_add);
-    bool live_ok = live_status == DARTPLANT_OK && live.heap_bits_match &&
-                   live.null_register_match && live.thread_pool_match && live.code_pool_match &&
-                   live.code_pool_is_null && live.code_owner_is_function &&
-                   (live.function_code_match || live.code_owner_mismatch_allowed) &&
-                   live.function_in_class_functions && live.owner_is_toplevel_class &&
-                   live.function_found_from_vm_index && live.entry_alias_count != 0 &&
-                   std::strcmp(live.function_name, "instrumentedAdd") == 0 &&
-                   std::strcmp(live.class_name, "Global") == 0 &&
-                   std::strcmp(live.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
-                   live.function_entry_point == expected_entry &&
-                   (live.code_entry_matches_function || live.entry_is_shared);
-    if (live_ok && !g_runtime_live_vm_ready.load(std::memory_order_acquire)) {
+    bool live_ok = g_runtime_live_vm_ready.load(std::memory_order_acquire);
+    if (!live_ok) {
         const DartPlantStatus capture_status =
             dartplant_runtime_capture_live_vm(g_runtime, invocation);
         if (capture_status == DARTPLANT_OK) {
             g_runtime_live_vm_ready.store(true, std::memory_order_release);
+            live_ok = true;
         } else {
-            live_ok = false;
             __android_log_print(ANDROID_LOG_ERROR, kTag, "runtime live-vm capture failed: %s",
                                 dartplant_last_error());
         }
+    }
+
+    // Never rescan movable VM heap objects from the native/safepoint callback
+    // state. capture_live_vm() now acquires an exact V5 observation lease and
+    // publishes an immutable function-family snapshot; repeated callback
+    // validation consumes only that cached receipt.
+    DartPlantLiveVmFunctionInfo live{};
+    live.struct_size = sizeof(live);
+    if (live_ok) {
+        DartPlantLiveVmFunctionIndexInfo index_info{};
+        index_info.struct_size = sizeof(index_info);
+        live_ok = dartplant_runtime_get_function_index_info(g_runtime, &index_info) == DARTPLANT_OK;
+        bool found = false;
+        for (uint32_t index = 0; live_ok && index < index_info.function_count; ++index) {
+            DartPlantLiveVmFunctionInfo candidate{};
+            candidate.struct_size = sizeof(candidate);
+            if (dartplant_runtime_get_function_info(g_runtime, index, &candidate) != DARTPLANT_OK) {
+                live_ok = false;
+                break;
+            }
+            if (std::strcmp(candidate.function_name, "instrumentedAdd") != 0 ||
+                std::strcmp(candidate.class_name, "Global") != 0 ||
+                std::strcmp(candidate.library_uri, "package:dartplant_fixture/main.dart") != 0) {
+                continue;
+            }
+            live = candidate;
+            found = true;
+            break;
+        }
+        live_ok = live_ok && found && live.entry_alias_count != 0 &&
+                  live.function_entry_point == expected_entry;
     }
     if (live_ok) {
         g_live_vm_probe_ok.fetch_add(1, std::memory_order_relaxed);
         __android_log_print(
             ANDROID_LOG_INFO, kTag,
-            "live-vm ok profile=%s thr=0x%llx group=0x%llx heap=0x%llx pp=0x%llx pool=0x%llx pool_len=%llu code_reg=0x%llx code=0x%llx code_owner=0x%llx code_entry=0x%llx fn_entry=0x%llx function=0x%llx code_pool_null=%u owner_match=%u dedup_owner=%u code_entry_match=%u aliases=%u shared=%u ambiguous=%u invocation_aliases=%u %s/%s/%s",
-            live.profile_name, static_cast<unsigned long long>(live.thread),
-            static_cast<unsigned long long>(live.isolate_group),
-            static_cast<unsigned long long>(live.heap_base),
-            static_cast<unsigned long long>(live.pp),
-            static_cast<unsigned long long>(live.global_object_pool),
-            static_cast<unsigned long long>(live.object_pool_length),
-            static_cast<unsigned long long>(live.code_register),
+            "live-vm cached receipt ok code=0x%llx code_entry=0x%llx fn_entry=0x%llx function=0x%llx aliases=%u shared=%u ambiguous=%u invocation_aliases=%u image=%llu image_epoch=%llu engine_epoch=%llu group_epoch=%llu generation=%llu %s/%s/%s",
             static_cast<unsigned long long>(live.code),
-            static_cast<unsigned long long>(live.code_owner),
             static_cast<unsigned long long>(live.code_entry_point),
             static_cast<unsigned long long>(live.function_entry_point),
             static_cast<unsigned long long>(live.function),
-            static_cast<unsigned>(live.code_pool_is_null),
-            static_cast<unsigned>(live.function_code_match),
-            static_cast<unsigned>(live.code_owner_mismatch_allowed),
-            static_cast<unsigned>(live.code_entry_matches_function),
             static_cast<unsigned>(live.entry_alias_count),
             static_cast<unsigned>(live.entry_is_shared), static_cast<unsigned>(identity_ambiguous),
-            invocation_alias_count, live.library_uri, live.class_name, live.function_name);
+            invocation_alias_count, static_cast<unsigned long long>(live.runtime_image_id),
+            static_cast<unsigned long long>(live.runtime_image_incarnation_epoch),
+            static_cast<unsigned long long>(live.engine_incarnation_epoch),
+            static_cast<unsigned long long>(live.isolate_group_incarnation_epoch),
+            static_cast<unsigned long long>(live.runtime_generation), live.library_uri,
+            live.class_name, live.function_name);
     } else {
         g_live_vm_probe_failed.fetch_add(1, std::memory_order_relaxed);
-        uint64_t x22 = 0;
-        uint64_t x24 = 0;
-        uint64_t x26 = 0;
-        uint64_t x27 = 0;
-        uint64_t x28 = 0;
-        (void) dartplant_invocation_get_gp_register(invocation, 22, &x22);
-        (void) dartplant_invocation_get_gp_register(invocation, 24, &x24);
-        (void) dartplant_invocation_get_gp_register(invocation, 26, &x26);
-        (void) dartplant_invocation_get_gp_register(invocation, 27, &x27);
-        (void) dartplant_invocation_get_gp_register(invocation, 28, &x28);
         __android_log_print(
-            ANDROID_LOG_ERROR, kTag,
-            "live-vm failed status=%d error=%s expected_entry=0x%llx x22=0x%llx x24=0x%llx x26=0x%llx x27=0x%llx x28=0x%llx actual_entry=0x%llx fn_entry=0x%llx code_owner=0x%llx aliases=%u shared=%u uri=%s class=%s fn=%s flags=%u%u%u%u%u%u%u%u%u%u%u%u",
-            live_status, dartplant_last_error(), static_cast<unsigned long long>(expected_entry),
-            static_cast<unsigned long long>(x22), static_cast<unsigned long long>(x24),
-            static_cast<unsigned long long>(x26), static_cast<unsigned long long>(x27),
-            static_cast<unsigned long long>(x28),
-            static_cast<unsigned long long>(live.code_entry_point),
-            static_cast<unsigned long long>(live.function_entry_point),
-            static_cast<unsigned long long>(live.code_owner),
-            static_cast<unsigned>(live.entry_alias_count),
-            static_cast<unsigned>(live.entry_is_shared), live.library_uri, live.class_name,
-            live.function_name, static_cast<unsigned>(live.heap_bits_match),
-            static_cast<unsigned>(live.null_register_match),
-            static_cast<unsigned>(live.thread_pool_match),
-            static_cast<unsigned>(live.code_pool_match),
-            static_cast<unsigned>(live.code_pool_is_null),
-            static_cast<unsigned>(live.function_code_match),
-            static_cast<unsigned>(live.code_owner_is_function),
-            static_cast<unsigned>(live.code_owner_mismatch_allowed),
-            static_cast<unsigned>(live.code_entry_matches_function),
-            static_cast<unsigned>(live.function_in_class_functions),
-            static_cast<unsigned>(live.owner_is_toplevel_class),
-            static_cast<unsigned>(live.function_found_from_vm_index));
+            ANDROID_LOG_ERROR, kTag, "live-vm cached receipt failed error=%s expected_entry=0x%llx",
+            dartplant_last_error(), static_cast<unsigned long long>(expected_entry));
     }
 
     DartPlantValue left{};
@@ -1034,7 +1028,7 @@ void ReleaseMethodBinding(DartPlantMethod** method) {
 void ReleaseStaleFixtureGenerationBindings() {
     const DartPlantMethod* probe =
         g_instrumented_add != nullptr ? g_instrumented_add : g_signature_probe;
-    if (probe == nullptr || dartplant::IsCurrentRuntimeMethod(g_runtime, probe)) return;
+    if (probe == nullptr || dartplant::IsRuntimeMethodOwnerAlive(g_runtime, probe)) return;
 
     ReleaseInstrumentedAddBindings();
     ReleaseHookBinding(&g_echo_object_hook);
@@ -1065,8 +1059,8 @@ DartPlantStatus EnsureInstrumentedAddBindingsCurrent() {
         SnapshotHasExactFeature(g_snapshot_info.snapshot_features, "dedup_instructions");
     const bool current =
         g_instrumented_add != nullptr && g_add_int != nullptr &&
-        dartplant::IsCurrentRuntimeMethod(g_runtime, g_instrumented_add) &&
-        dartplant::IsCurrentRuntimeMethod(g_runtime, g_add_int) &&
+        dartplant::IsRuntimeMethodOwnerAlive(g_runtime, g_instrumented_add) &&
+        dartplant::IsRuntimeMethodOwnerAlive(g_runtime, g_add_int) &&
         g_instrumented_add_hook != nullptr &&
         g_instrumented_add_hook->active.load(std::memory_order_acquire) &&
         (!dedup_instructions ||
@@ -1202,7 +1196,7 @@ DartPlantStatus InstallTypeArgumentsProofHook(Dart_Handle retained_closure) {
     if (g_type_arguments_closure_hook != nullptr &&
         g_type_arguments_closure_hook->active.load(std::memory_order_acquire) &&
         g_type_arguments_closure != nullptr &&
-        dartplant::IsCurrentRuntimeMethod(g_runtime, g_type_arguments_closure)) {
+        dartplant::IsRuntimeMethodOwnerAlive(g_runtime, g_type_arguments_closure)) {
         return DARTPLANT_OK;
     }
     if (g_type_arguments_closure_hook != nullptr) {
@@ -1278,15 +1272,12 @@ DartPlantStatus InstallTypeArgumentsProofHook(Dart_Handle retained_closure) {
         static_cast<unsigned long long>(
             dartplant_method_runtime_address(g_type_arguments_closure)));
 
-    // The artifact supplies the exact physical entry certificate, but optional
-    // closure argument mapping deliberately requires a retained live FunctionType.
-    // Promote this test method only after the retained Closure's Function has
-    // independently parsed as the expected generic/named FunctionType and its
-    // Function.entry_point exactly matches the artifact target above. This keeps
-    // the production fail-closed rule intact while giving the proof hook the live
-    // Function object needed to derive ArgumentsDescriptor/type-argument mapping.
-    g_type_arguments_closure->function->function_object = retained_function_raw;
-    g_type_arguments_closure->function->source = dartplant::DartFunctionSource::kLiveVm;
+    // The retained Closure relation above is an observation-time cross-check
+    // only. Function* is a compacting-GC object, so never promote the artifact
+    // method by caching retained_function_raw into the long-lived method model.
+    // Compiler ABI validation consumes the parent signatureProbe semantic
+    // snapshot captured inside the V5 heap-observation lease, while the
+    // artifact keeps owning the exact implicit-closure entry certificate.
 
 #if defined(DARTPLANT_DART_PLANT_TYPE_ARGUMENTS_CLOSURE_ABI_EVIDENCE_AVAILABLE)
     const DartPlantStatus evidence_status = dartplant_runtime_register_compiler_abi_evidence(
@@ -1637,20 +1628,38 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
             indexed_closure_entry_proof = true;
         }
     }
+    DartPlantObjectPoolEntryInfo unsafe_pool_entry{};
+    unsafe_pool_entry.struct_size = sizeof(unsafe_pool_entry);
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const DartPlantStatus unsafe_pool_status =
+        dartplant_runtime_read_global_object_pool_entry(g_runtime, 0, &unsafe_pool_entry);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+    const bool pool_live_read_fail_closed = unsafe_pool_status == DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    if (!pool_live_read_fail_closed) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "ObjectPool lease boundary violated status=%d expected=%d",
+                            unsafe_pool_status, DARTPLANT_VM_BRIDGE_UNAVAILABLE);
+        LogFailure("ObjectPool observation lease boundary");
+        g_cold_bootstrap_status.store(DARTPLANT_PROFILE_MISMATCH, std::memory_order_release);
+        return;
+    }
+
+    // ObjectPool entries may contain tagged heap objects, so their values must
+    // never escape a moving-GC observation lease. CompleteBootstrap runs on an
+    // ordinary native worker after that lease has ended. Keep the public
+    // runtime API fail-closed here and test only the immutable index-space
+    // arithmetic that does not dereference ObjectPool/heap memory.
     uint32_t decoded_pool_entries = 0;
     for (uint32_t index = 0; index < 32; ++index) {
-        DartPlantObjectPoolEntryInfo entry{};
-        entry.struct_size = sizeof(entry);
         uint64_t offset = 0;
         uint32_t round_trip_index = UINT32_MAX;
-        if (dartplant_runtime_read_global_object_pool_entry(g_runtime, index, &entry) !=
+        if (dartplant_live_vm_object_pool_offset_from_index(&g_snapshot_info, index, &offset) !=
                 DARTPLANT_OK ||
-            entry.type == DARTPLANT_OBJECT_POOL_UNKNOWN ||
-            entry.patchable != static_cast<uint8_t>(((entry.entry_bits >> 4) & 0x1) == 0) ||
-            entry.snapshot_behavior != static_cast<uint8_t>((entry.entry_bits >> 5) & 0x7) ||
-            dartplant_live_vm_object_pool_offset_from_index(&g_snapshot_info, index, &offset) !=
-                DARTPLANT_OK ||
-            offset != entry.byte_offset ||
             dartplant_live_vm_object_pool_index_from_offset(&g_snapshot_info, offset,
                                                             &round_trip_index) != DARTPLANT_OK ||
             round_trip_index != index) {
@@ -1685,10 +1694,11 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     }
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "live-index functions=%u entry_targets=%u shared_payloads=%u skipped=%u instrumented_entry_va=0x%llx pool_decoded=%u retained_closure_proof=%u dedup=%u producer_identity=%u",
+        "live-index functions=%u entry_targets=%u shared_payloads=%u skipped=%u instrumented_entry_va=0x%llx pool_index_space=%u pool_live_fail_closed=%u retained_closure_proof=%u dedup=%u producer_identity=%u",
         function_index.function_count, function_index.code_target_count,
         function_index.shared_code_target_count, function_index.skipped_function_count,
         static_cast<unsigned long long>(indexed_entry_va), decoded_pool_entries,
+        static_cast<unsigned>(pool_live_read_fail_closed),
         static_cast<unsigned>(indexed_closure_entry_proof),
         static_cast<unsigned>(dedup_instructions), static_cast<unsigned>(producer_identity_ok));
 
@@ -2019,12 +2029,146 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     g_cold_bootstrap_status.store(DARTPLANT_OK, std::memory_order_release);
 }
 
-void RunColdBootstrap() {
+uint64_t ActivateMultiOwnerForRegisters(uint32_t label, uint64_t null_value, uint64_t thr,
+                                        uint64_t pp, uint64_t heap_bits, bool refresh_modules,
+                                        bool require_deferred) {
+    if (g_runtime == nullptr || label == 0 || label >= g_multi_owner_observations.size()) return 0;
+
+    const DartPlantStatus refresh_status =
+        refresh_modules ? dartplant_runtime_refresh_modules(g_runtime) : DARTPLANT_OK;
+    if (refresh_status != DARTPLANT_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "multi-owner module refresh failed label=%u status=%d error=%s", label,
+                            refresh_status, dartplant_last_error());
+        return 0;
+    }
+
+    DartPlantLiveVmArm64Registers registers{};
+    registers.struct_size = sizeof(registers);
+    registers.thr = thr;
+    registers.pp = pp;
+    registers.heap_bits = heap_bits;
+    registers.null_value = null_value;
     DartPlantLiveVmBootstrapInfo bootstrap{};
     bootstrap.struct_size = sizeof(bootstrap);
-    const DartPlantStatus status =
-        dartplant_runtime_bootstrap_live_vm(g_runtime, nullptr, &bootstrap);
-    CompleteBootstrap(status, bootstrap, "sampler");
+    const DartPlantFlutterVmAdapterOptions adapter_options = {
+        .struct_size = sizeof(DartPlantFlutterVmAdapterOptions),
+        .api_version = DARTPLANT_FLUTTER_VM_ADAPTER_API_VERSION,
+        .api_dl_data = g_api_dl_data,
+        .thread = thr,
+        .isolate_generation = label,
+        .snapshot_hash = g_snapshot_info.snapshot_hash,
+        .snapshot_features = g_snapshot_info.snapshot_features,
+    };
+    DartPlantFlutterVmAdapter* owner_adapter = nullptr;
+    const DartPlantStatus adapter_status =
+        dartplant_flutter_vm_adapter_create(&adapter_options, &owner_adapter);
+    const DartPlantStatus bootstrap_status =
+        adapter_status == DARTPLANT_OK
+            ? dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter(
+                  g_runtime, &registers, dartplant_flutter_vm_adapter_get(owner_adapter),
+                  &bootstrap)
+            : adapter_status;
+    const DartPlantStatus adapter_destroy_status =
+        dartplant_flutter_vm_adapter_destroy(owner_adapter);
+    if (bootstrap_status != DARTPLANT_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "multi-owner bootstrap failed label=%u create=%d bootstrap=%d "
+                            "destroy=%d error=%s",
+                            label, adapter_status, bootstrap_status, adapter_destroy_status,
+                            dartplant_last_error());
+        return 0;
+    }
+    if (adapter_destroy_status != DARTPLANT_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "multi-owner adapter destroy failed label=%u status=%d error=%s", label,
+                            adapter_destroy_status, dartplant_last_error());
+        return 0;
+    }
+
+    MultiOwnerObservation observation{};
+    {
+        std::lock_guard runtime_lock(g_runtime->mutex);
+        const auto& group = dartplant::RuntimeIsolateGroup(g_runtime);
+        observation.isolate_group = group.isolate_group_identity;
+        observation.group_epoch = group.incarnation_epoch;
+        observation.generation =
+            group.generation == nullptr ? 0 : group.generation->load(std::memory_order_acquire);
+        observation.image_count = static_cast<uint32_t>(group.image_set.size());
+    }
+
+    DartPlantMethod* proof_method = nullptr;
+    const bool proof_found = FindLiveTopLevelMethod("instrumentedAdd", &proof_method);
+    const bool proof_owner_ok =
+        proof_found && proof_method != nullptr && proof_method->function != nullptr &&
+        proof_method->function->owner.isolate_group_incarnation_epoch == observation.group_epoch;
+    bool stale_handle_ok = true;
+    if (label == 2 && proof_method != nullptr) {
+        std::lock_guard lock(g_multi_owner_mutex);
+        if (g_multi_owner_retained_b_method == nullptr) {
+            // Hold one real B-generation Function handle through engine
+            // destruction/recreation. B2 must never make this owner receipt
+            // current again, even if the VM allocator reuses the same native
+            // IsolateGroup address.
+            g_multi_owner_retained_b_method = proof_method;
+            proof_method = nullptr;
+        } else {
+            stale_handle_ok =
+                dartplant::IsCurrentRuntimeMethod(g_runtime, g_multi_owner_retained_b_method);
+        }
+    } else if (label == 3) {
+        std::lock_guard lock(g_multi_owner_mutex);
+        stale_handle_ok =
+            g_multi_owner_retained_b_method != nullptr &&
+            !dartplant::IsCurrentRuntimeMethod(g_runtime, g_multi_owner_retained_b_method);
+    }
+    if (proof_method != nullptr) dartplant_release_method(proof_method);
+
+    bool deferred_ok = !require_deferred;
+    if (require_deferred) {
+        const DartPlantMethodQuery deferred_query = {
+            .struct_size = sizeof(DartPlantMethodQuery),
+            .library_uri = "package:dartplant_fixture/deferred_probe.dart",
+            .class_name = "Global",
+            .function_name = "deferredAdd",
+            .signature = "",
+            .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+        };
+        DartPlantMethod* deferred_method = nullptr;
+        const DartPlantStatus deferred_status =
+            dartplant_runtime_find_method(g_runtime, &deferred_query, &deferred_method);
+        deferred_ok = deferred_status == DARTPLANT_OK && deferred_method != nullptr &&
+                      deferred_method->function != nullptr &&
+                      deferred_method->function->owner.isolate_group_incarnation_epoch ==
+                          observation.group_epoch;
+        if (deferred_method != nullptr) dartplant_release_method(deferred_method);
+    }
+
+    MultiOwnerObservation previous{};
+    {
+        std::lock_guard lock(g_multi_owner_mutex);
+        previous = g_multi_owner_observations[label];
+        g_multi_owner_observations[label] = observation;
+    }
+    const bool stable_reactivation =
+        previous.group_epoch == 0 || (previous.group_epoch == observation.group_epoch &&
+                                      previous.isolate_group == observation.isolate_group &&
+                                      previous.generation == observation.generation);
+    const bool passed = observation.isolate_group != 0 && observation.group_epoch != 0 &&
+                        observation.generation != 0 && proof_owner_ok && deferred_ok &&
+                        stable_reactivation && stale_handle_ok;
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DARTPLANT_CI {\"event\":\"multi_owner_activate\",\"state\":\"%s\","
+        "\"label\":%u,\"group\":\"0x%llx\",\"epoch\":%llu,"
+        "\"generation\":%llu,\"images\":%u,\"proof_owner\":%u,"
+        "\"deferred\":%u,\"stable_reactivation\":%u,\"stale_handle\":%u}",
+        passed ? "pass" : "fail", label, static_cast<unsigned long long>(observation.isolate_group),
+        static_cast<unsigned long long>(observation.group_epoch),
+        static_cast<unsigned long long>(observation.generation), observation.image_count,
+        static_cast<unsigned>(proof_owner_ok), static_cast<unsigned>(deferred_ok),
+        static_cast<unsigned>(stable_reactivation), static_cast<unsigned>(stale_handle_ok));
+    return passed ? observation.group_epoch : 0;
 }
 
 }  // namespace
@@ -2398,26 +2542,36 @@ dartplant_fixture_type_arguments_proof() {
         dartplant_flutter_vm_adapter_failed_capabilities(g_flutter_vm_adapter);
     const uint64_t capability_verified =
         dartplant_flutter_vm_adapter_verified_capabilities(g_flutter_vm_adapter);
-    constexpr uint64_t kExpectedInvocationCapabilities =
+    // FunctionCode/AOTEntry are certified by the exact artifact sidecar and
+    // DartEntryTarget identity for this AOT-dropped implicit closure. Do not
+    // force the VM adapter to re-prove those physical facts through a movable
+    // Function*/Code*. The adapter is responsible for the live call/object
+    // domains that remain generation-sensitive.
+    constexpr uint64_t kExpectedVmInvocationCapabilities =
         DARTPLANT_FLUTTER_VM_CAP_ARGUMENTS_DESCRIPTOR_LAYOUT_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_INVOCATION_CALL_ABI_VERIFIED |
-        DARTPLANT_FLUTTER_VM_CAP_FUNCTION_CODE_LAYOUT_VERIFIED |
-        DARTPLANT_FLUTTER_VM_CAP_AOT_ENTRY_LAYOUT_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_FUNCTION_TYPE_LAYOUT_VERIFIED |
         DARTPLANT_FLUTTER_VM_CAP_CLOSURE_CALL_LAYOUT_VERIFIED;
+    const bool artifact_entry_proven =
+        g_type_arguments_closure != nullptr && g_type_arguments_closure->function != nullptr &&
+        g_type_arguments_closure->function->source ==
+            dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
+        g_type_arguments_closure->function->code_target != nullptr &&
+        g_type_arguments_closure->function->code_target->HasProvenUniqueIdentity();
     const bool active =
         g_type_arguments_closure_hook != nullptr && g_type_arguments_closure_hook->active;
     const bool passed =
         enter == 1 && failures == 0 && (!require_relocation || calls >= 1) && vector_before != 0 &&
         vector_after != 0 && element_before != 0 && element_after != 0 && callback_passed &&
-        active && type_arguments_state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
-        (capability_verified & kExpectedInvocationCapabilities) ==
-            kExpectedInvocationCapabilities &&
+        active && artifact_entry_proven &&
+        type_arguments_state == DARTPLANT_FLUTTER_VM_PROOF_VERIFIED &&
+        (capability_verified & kExpectedVmInvocationCapabilities) ==
+            kExpectedVmInvocationCapabilities &&
         (capability_failed & (DARTPLANT_FLUTTER_VM_CAP_TYPE_ARGUMENTS_SOURCE_VERIFIED |
-                              kExpectedInvocationCapabilities)) == 0;
+                              kExpectedVmInvocationCapabilities)) == 0;
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu require_relocation=%u vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u capability_state=%u capability_verified=0x%llx capability_required=0x%llx capability_failed=0x%llx passed=%u",
+        "TypeArguments proof native summary enter=%llu failures=%llu dart_api_calls=%llu require_relocation=%u vector_before=0x%llx vector_after=0x%llx element_before=0x%llx element_after=0x%llx vector_relocated=%u element_relocated=%u active=%u artifact_entry=%u capability_state=%u capability_verified=0x%llx capability_required=0x%llx capability_failed=0x%llx passed=%u",
         static_cast<unsigned long long>(enter), static_cast<unsigned long long>(failures),
         static_cast<unsigned long long>(calls), static_cast<unsigned>(require_relocation),
         static_cast<unsigned long long>(vector_before),
@@ -2425,9 +2579,9 @@ dartplant_fixture_type_arguments_proof() {
         static_cast<unsigned long long>(element_before),
         static_cast<unsigned long long>(element_after), static_cast<unsigned>(vector_relocated),
         static_cast<unsigned>(element_relocated), static_cast<unsigned>(active),
-        static_cast<unsigned>(type_arguments_state),
+        static_cast<unsigned>(artifact_entry_proven), static_cast<unsigned>(type_arguments_state),
         static_cast<unsigned long long>(capability_verified),
-        static_cast<unsigned long long>(kExpectedInvocationCapabilities),
+        static_cast<unsigned long long>(kExpectedVmInvocationCapabilities),
         static_cast<unsigned long long>(capability_failed), static_cast<unsigned>(passed));
     __android_log_print(
         passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
@@ -2828,9 +2982,11 @@ dartplant_fixture_deferred_after_load_with_registers(uint64_t null_value, uint64
     DartPlantLiveVmBootstrapInfo bootstrap{};
     bootstrap.struct_size = sizeof(bootstrap);
     const DartPlantStatus bootstrap_status =
-        refresh_status == DARTPLANT_OK ? dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
-                                             g_runtime, &registers, &bootstrap)
-                                       : refresh_status;
+        refresh_status == DARTPLANT_OK
+            ? dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter(
+                  g_runtime, &registers, dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter),
+                  &bootstrap)
+            : refresh_status;
     const std::string bootstrap_error =
         bootstrap_status == DARTPLANT_OK ? std::string() : std::string(dartplant_last_error());
 
@@ -2916,6 +3072,24 @@ dartplant_fixture_deferred_after_load_with_registers(uint64_t null_value, uint64
     return passed ? 1 : 0;
 }
 
+extern "C" __attribute__((visibility("hidden"))) uint64_t
+dartplant_fixture_multi_owner_activate_with_registers(uint32_t label, uint64_t null_value,
+                                                      uint64_t thr, uint64_t pp,
+                                                      uint64_t heap_bits) {
+    return ActivateMultiOwnerForRegisters(label, null_value, thr, pp, heap_bits,
+                                          /*refresh_modules=*/false,
+                                          /*require_deferred=*/false);
+}
+
+extern "C" __attribute__((visibility("hidden"))) uint64_t
+dartplant_fixture_multi_owner_deferred_with_registers(uint32_t label, uint64_t null_value,
+                                                      uint64_t thr, uint64_t pp,
+                                                      uint64_t heap_bits) {
+    return ActivateMultiOwnerForRegisters(label, null_value, thr, pp, heap_bits,
+                                          /*refresh_modules=*/true,
+                                          /*require_deferred=*/true);
+}
+
 extern "C" __attribute__((visibility("default"))) int32_t
 dartplant_fixture_enable_advanced_ordinary_hook() {
     // The independent simple-facade consumer intentionally owns and clears its
@@ -2928,10 +3102,45 @@ dartplant_fixture_enable_advanced_ordinary_hook() {
     return InstallAdvancedOrdinaryAotHooks();
 }
 
+extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdown();
+
 extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initialize_with_registers(
     void* api_dl_data, uint64_t null_value, uint64_t thr, uint64_t pp, uint64_t heap_bits) {
     if (api_dl_data == nullptr) return DARTPLANT_INVALID_ARGUMENT;
-    if (g_runtime != nullptr) return DARTPLANT_OK;
+    if (g_runtime != nullptr) {
+        uint64_t active_group = 0;
+        {
+            std::lock_guard runtime_lock(g_runtime->mutex);
+            active_group = dartplant::RuntimeIsolateGroup(g_runtime).isolate_group_identity;
+        }
+        uint64_t current_group = 0;
+        if (thr != 0 && g_snapshot_info.snapshot_hash != nullptr &&
+            g_snapshot_info.profile_name != nullptr) {
+            const dartplant::RuntimeProfileRecord* profile =
+                dartplant::FindRuntimeProfileBySnapshot(g_snapshot_info.snapshot_hash,
+                                                        g_snapshot_info.profile_name);
+            if (profile != nullptr) {
+                std::memcpy(
+                    &current_group,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(thr) +
+                                                  profile->live_vm.thread_isolate_group_offset),
+                    sizeof(current_group));
+            }
+        }
+        active_group = CanonicalFixtureNativePointer(active_group);
+        current_group = CanonicalFixtureNativePointer(current_group);
+        if (active_group != 0 && current_group != 0 && active_group == current_group) {
+            return DARTPLANT_OK;
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, kTag,
+            "root FlutterEngine owner changed; rebuilding fixture runtime old_group=0x%llx "
+            "new_group=0x%llx",
+            static_cast<unsigned long long>(active_group),
+            static_cast<unsigned long long>(current_group));
+        dartplant_fixture_shutdown();
+    }
+    g_api_dl_data = api_dl_data;
     // Exercise the exact LSPosed/Vector compatibility architecture before any
     // strict consumer can install the process-global JumpToFrame bridge. The
     // physical backend exposes only DobbyHook/DobbyDestroy, matching the
@@ -3013,7 +3222,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     DartPlantVmAdapter* vm_adapter = dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter);
     if (adapter_status != DARTPLANT_OK || vm_adapter == nullptr) {
         __android_log_print(ANDROID_LOG_ERROR, kTag,
-                            "exact V4 VM adapter initialization failed status=%d error=%s",
+                            "exact V5 VM adapter initialization failed status=%d error=%s",
                             adapter_status, dartplant_last_error());
         g_cold_bootstrap_status.store(adapter_status, std::memory_order_release);
         return adapter_status;
@@ -3149,6 +3358,14 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
     g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_multi_owner_mutex);
+        g_multi_owner_observations = {};
+        if (g_multi_owner_retained_b_method != nullptr) {
+            dartplant_release_method(g_multi_owner_retained_b_method);
+            g_multi_owner_retained_b_method = nullptr;
+        }
+    }
     dartplant_fixture_reset_null_semantic_probe();
     dartplant_fixture_reset_bool_semantic_probe();
 
@@ -3160,18 +3377,12 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     entry_registers.null_value = null_value;
     DartPlantLiveVmBootstrapInfo entry_bootstrap{};
     entry_bootstrap.struct_size = sizeof(entry_bootstrap);
-    const DartPlantStatus entry_status = dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
-        g_runtime, &entry_registers, &entry_bootstrap);
-    if (entry_status == DARTPLANT_OK) {
-        g_cold_bootstrap_thread =
-            std::thread(CompleteBootstrap, entry_status, entry_bootstrap, "ffi-entry");
-    } else {
-        __android_log_print(ANDROID_LOG_WARN, kTag,
-                            "FFI-entry LiveVmContext validation failed status=%d error=%s; "
-                            "falling back to sampler",
-                            entry_status, dartplant_last_error());
-        g_cold_bootstrap_thread = std::thread(RunColdBootstrap);
-    }
+    const DartPlantStatus entry_status =
+        dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter(
+            g_runtime, &entry_registers, dartplant_flutter_vm_adapter_get(g_flutter_vm_adapter),
+            &entry_bootstrap);
+    g_cold_bootstrap_thread =
+        std::thread(CompleteBootstrap, entry_status, entry_bootstrap, "ffi-entry");
     return DARTPLANT_OK;
 }
 
@@ -3190,6 +3401,26 @@ extern "C"
         "b dartplant_fixture_deferred_after_load_with_registers\n");
 }
 
+extern "C" __attribute__((naked, visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_activate(uint32_t) {
+    __asm__ volatile(
+        "mov x1, x22\n"
+        "mov x2, x26\n"
+        "mov x3, x27\n"
+        "mov x4, x28\n"
+        "b dartplant_fixture_multi_owner_activate_with_registers\n");
+}
+
+extern "C" __attribute__((naked, visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_deferred(uint32_t) {
+    __asm__ volatile(
+        "mov x1, x22\n"
+        "mov x2, x26\n"
+        "mov x3, x27\n"
+        "mov x4, x28\n"
+        "b dartplant_fixture_multi_owner_deferred_with_registers\n");
+}
+
 extern "C" __attribute__((naked, visibility("default"))) int dartplant_fixture_initialize(void*) {
     __asm__ volatile(
         "mov x1, x22\n"
@@ -3200,6 +3431,16 @@ extern "C" __attribute__((naked, visibility("default"))) int dartplant_fixture_i
 }
 #else
 extern "C" __attribute__((visibility("default"))) uint64_t dartplant_fixture_deferred_after_load() {
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_activate(uint32_t) {
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_deferred(uint32_t) {
     return 0;
 }
 
@@ -3260,6 +3501,14 @@ extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdow
     if (g_verified_abi_double != nullptr) dartplant_release_method(g_verified_abi_double);
     if (g_forced_stack_closure != nullptr) dartplant_release_method(g_forced_stack_closure);
     if (g_type_arguments_closure != nullptr) dartplant_release_method(g_type_arguments_closure);
+    {
+        std::lock_guard lock(g_multi_owner_mutex);
+        if (g_multi_owner_retained_b_method != nullptr) {
+            dartplant_release_method(g_multi_owner_retained_b_method);
+            g_multi_owner_retained_b_method = nullptr;
+        }
+        g_multi_owner_observations = {};
+    }
     if (g_runtime != nullptr) dartplant_runtime_destroy(g_runtime);
     if (g_flutter_vm_adapter != nullptr) {
         dartplant_flutter_vm_adapter_destroy(g_flutter_vm_adapter);

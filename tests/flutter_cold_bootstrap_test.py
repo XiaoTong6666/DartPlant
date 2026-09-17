@@ -54,6 +54,55 @@ class FlutterColdBootstrapModeTest(unittest.TestCase):
             flutter_cold_bootstrap._required_ordinary_source_markers("release"),
         )
 
+
+    def test_log_line_marker_match_tolerates_extra_fields_and_order(self) -> None:
+        logs = (
+            "I/DartPlantP6: P6 ABI probe int64=1 throw_counts=2/1/1 odd_stack=1 "
+            "exception_object=1 entry_stack=1 throw=1 forced_stack=1 pair=1 "
+            "failures=0 cleanup=1 shutdown=1 passed=1\n"
+        )
+        markers = (
+            "int64=1",
+            "entry_stack=1",
+            "odd_stack=1",
+            "throw=1",
+            "throw_counts=2/1/1",
+            "exception_object=1",
+            "forced_stack=1",
+            "pair=1",
+            "failures=0",
+            "cleanup=1",
+            "shutdown=1",
+            "passed=1",
+        )
+        self.assertTrue(
+            flutter_cold_bootstrap._log_line_contains_markers(logs, "P6 ABI probe ", markers)
+        )
+        self.assertFalse(
+            flutter_cold_bootstrap._log_line_contains_markers(
+                logs, "P6 ABI probe ", markers + ("missing=1",)
+            )
+        )
+
+    def test_live_index_requires_observation_direct_reader_for_both_phases(self) -> None:
+        logs = (
+            "I/DartPlant: [LiveIndex] enumeration elapsed_ms=395 functions=8406 "
+            "read_calls=610991 safe_reads=0 bytes=2048522 mode=observation_direct\n"
+            "I/DartPlant: [LiveIndex] semantics progress=8406/8406 success=727 "
+            "elapsed_ms=29 read_calls=36342 safe_reads=0 bytes=224625\n"
+        )
+        self.assertTrue(flutter_cold_bootstrap._live_index_uses_observation_direct_reader(logs))
+        self.assertFalse(
+            flutter_cold_bootstrap._live_index_uses_observation_direct_reader(
+                logs.replace("safe_reads=0", "safe_reads=1", 1)
+            )
+        )
+        self.assertFalse(
+            flutter_cold_bootstrap._live_index_uses_observation_direct_reader(
+                logs.replace("mode=observation_direct", "mode=volatile_safe")
+            )
+        )
+
     def test_unknown_flutter_mode_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported Flutter AOT mode"):
             flutter_cold_bootstrap.flutter_fixture_apk_path("debug")

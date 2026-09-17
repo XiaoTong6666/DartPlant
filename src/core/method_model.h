@@ -92,6 +92,10 @@ struct DartCodePayload {
     DartRuntimeOwnerIdentity owner{};
     uintptr_t start = 0;
     uint32_t instructions_length = 0;
+    // Latest observed Dart CodePtr for diagnostics/capability proof refresh.
+    // Code is a GC-managed heap object and its address is therefore not part
+    // of the stable payload identity. Owner receipt + image incarnation +
+    // payload range are the durable identity.
     uint64_t code_object = 0;
     // Legacy metadata only knows the entry and code size. A live VM or exact
     // artifact range can promote that provisional identity before a hook is
@@ -140,6 +144,8 @@ struct DartEntryTarget {
     DartRuntimeOwnerIdentity owner{};
     uintptr_t entry = 0;
     uint32_t code_size = 0;
+    // Latest observed movable Dart CodePtr. Do not compare this raw heap
+    // address as physical-entry identity across observation windows.
     uint64_t code_object = 0;
     uint32_t reported_alias_count = 1;
     DartPlantCodeIdentityProof identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN;
@@ -151,12 +157,17 @@ struct DartEntryTarget {
         uint32_t new_code_size, uint64_t new_code_object, uint32_t alias_count,
         DartPlantCodeIdentityProof new_identity_proof = DARTPLANT_CODE_IDENTITY_UNKNOWN) {
         std::lock_guard lock(mutex);
-        if ((code_size != 0 && new_code_size != 0 && code_size != new_code_size) ||
-            (code_object != 0 && new_code_object != 0 && code_object != new_code_object)) {
+        if (code_size != 0 && new_code_size != 0 && code_size != new_code_size) {
             return false;
         }
         if (code_size == 0) code_size = new_code_size;
-        if (code_object == 0) code_object = new_code_object;
+        if (new_code_object != 0) {
+            code_object = new_code_object;
+            if (payload != nullptr) {
+                std::lock_guard payload_lock(payload->mutex);
+                payload->code_object = new_code_object;
+            }
+        }
         if (alias_count > reported_alias_count) reported_alias_count = alias_count;
         if (new_identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1) {
             identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
@@ -226,12 +237,11 @@ struct DartEntryTarget {
         if (expected_payload == nullptr || replacement == nullptr) return false;
         std::lock_guard lock(mutex);
         if (payload != expected_payload || hook_record != nullptr ||
-            (code_size != 0 && new_code_size != 0 && code_size != new_code_size) ||
-            (code_object != 0 && new_code_object != 0 && code_object != new_code_object)) {
+            (code_size != 0 && new_code_size != 0 && code_size != new_code_size)) {
             return false;
         }
         if (code_size == 0) code_size = new_code_size;
-        if (code_object == 0) code_object = new_code_object;
+        if (new_code_object != 0) code_object = new_code_object;
         if (alias_count > reported_alias_count) reported_alias_count = alias_count;
         if (new_identity_proof == DARTPLANT_CODE_IDENTITY_SHARED || reported_alias_count > 1) {
             identity_proof = DARTPLANT_CODE_IDENTITY_SHARED;
@@ -240,6 +250,10 @@ struct DartEntryTarget {
             identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
         }
         payload = replacement;
+        if (new_code_object != 0) {
+            std::lock_guard payload_lock(payload->mutex);
+            payload->code_object = new_code_object;
+        }
         return true;
     }
 
@@ -276,11 +290,22 @@ struct DartFunctionHandle {
     DartMethodIdentity identity;
     uint64_t image_id = 0;
     DartRuntimeOwnerIdentity owner{};
+    // Native Dart_IsolateGroup* observed when this handle was resolved. The
+    // incarnation epoch remains the durable owner receipt; this raw identity
+    // is carried only so a physical AOT hook shared by multiple live root
+    // IsolateGroups can cheaply fail closed when execution arrives from a
+    // different group.
+    uint64_t isolate_group_identity = 0;
     uint64_t function_object = 0;
     uint64_t code_object = 0;
     DartFunctionSource source = DartFunctionSource::kLegacyMetadata;
     uint32_t function_kind = 0;
     uint32_t runtime_profile_version = 0;
+    // True only for methods published from a live Function index that was
+    // built while the mutator was inside an exact V5 heap-observation lease.
+    // The receipt makes the semantic Function->Code relation durable without
+    // making the movable FunctionPtr/CodePtr themselves durable identities.
+    bool live_observation_receipt = false;
     bool closure_call_entry_only = false;
     uint32_t thread_jump_to_frame_entry_point_offset = 0;
     std::shared_ptr<DartEntryTarget> code_target;
@@ -434,11 +459,11 @@ private:
             if (payload->owner == owner && payload->start == payload_start) {
                 if (payload->instructions_length != instructions_length) return nullptr;
                 std::lock_guard payload_lock(payload->mutex);
-                if (payload->code_object != 0 && code_object != 0 &&
-                    payload->code_object != code_object) {
-                    return nullptr;
-                }
-                if (payload->code_object == 0) payload->code_object = code_object;
+                // A compacting GC may move the Code heap object while the
+                // AOT payload range remains the same physical image bytes.
+                // Keep the newest observation but never use CodePtr equality
+                // as payload identity.
+                if (code_object != 0) payload->code_object = code_object;
                 if (exact_identity) payload->exact_identity = true;
                 return payload;
             }

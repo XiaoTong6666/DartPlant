@@ -139,21 +139,30 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_flutter_snapshot(
 DARTPLANT_EXPORT DartPlantStatus
 dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime, const DartPlantInvocation* invocation);
 
-// Performs process-wide discovery of an active Dart mutator context without
-// external metadata or a precomputed function index. This is valid once the
-// Flutter app/runtime images and snapshot are discovered; a successful
-// bootstrap promotes IMAGES_READY to READY.
-DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_bootstrap_live_vm(
-    DartPlantRuntime* runtime, const DartPlantLiveVmBootstrapOptions* options,
-    DartPlantLiveVmBootstrapInfo* out_info);
+// Legacy ABI entry retained for binary compatibility. Process-sampled
+// bootstrap cannot establish a moving-GC observation lease and therefore
+// always fails closed with DARTPLANT_VM_BRIDGE_UNAVAILABLE. New code must use
+// an exact adapter-backed bootstrap path.
+DARTPLANT_EXPORT DARTPLANT_DEPRECATED(
+    "unsafe process-sampled bootstrap is unavailable; use the exact adapter-backed bootstrap")
+    DartPlantStatus
+    dartplant_runtime_bootstrap_live_vm(DartPlantRuntime* runtime,
+                                        const DartPlantLiveVmBootstrapOptions* options,
+                                        DartPlantLiveVmBootstrapInfo* out_info);
 
-// Fast path for hosts that already execute on a Dart mutator thread (for
-// example a Dart FFI entry). The supplied ARM64 Dart-reserved registers still
-// pass the same full semantic validation as sampled contexts. No metadata is
-// consulted. A successful call promotes IMAGES_READY to READY.
-DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
+// Legacy ABI entry retained for binary compatibility. Raw register bootstrap
+// without an exact adapter has no moving-GC observation lease and therefore
+// always fails closed with DARTPLANT_VM_BRIDGE_UNAVAILABLE.
+DARTPLANT_EXPORT DARTPLANT_DEPRECATED(
+    "register bootstrap requires an exact VM adapter; use "
+    "dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter") DartPlantStatus
+    dartplant_runtime_bootstrap_live_vm_from_arm64_registers(
+        DartPlantRuntime* runtime, const DartPlantLiveVmArm64Registers* registers,
+        DartPlantLiveVmBootstrapInfo* out_info);
+DARTPLANT_EXPORT DartPlantStatus
+dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter(
     DartPlantRuntime* runtime, const DartPlantLiveVmArm64Registers* registers,
-    DartPlantLiveVmBootstrapInfo* out_info);
+    DartPlantVmAdapter* adapter, DartPlantLiveVmBootstrapInfo* out_info);
 
 // Returns the automatically generated runtime Function index. The index is
 // rebuilt from live Class.functions/Library.toplevel_class when a LiveVmContext
@@ -181,8 +190,13 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_method_parameter(
     const DartPlantRuntime* runtime, const DartPlantMethod* method, uint32_t index,
     DartPlantDartParameterInfo* out_parameter);
 
-DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_read_global_object_pool_entry(
-    const DartPlantRuntime* runtime, uint32_t index, DartPlantObjectPoolEntryInfo* out_entry);
+// Legacy ABI entry retained for binary compatibility. A cached global
+// ObjectPoolPtr is movable GC state, so this API intentionally fails closed
+// until the caller can supply an exact live-heap observation adapter.
+DARTPLANT_EXPORT DARTPLANT_DEPRECATED(
+    "global ObjectPool reads require an exact moving-GC observation window") DartPlantStatus
+    dartplant_runtime_read_global_object_pool_entry(const DartPlantRuntime* runtime, uint32_t index,
+                                                    DartPlantObjectPoolEntryInfo* out_entry);
 
 // Resolves supported runtime identities only from the automatically built live
 // Function index first. If an exact snapshot index was explicitly registered,

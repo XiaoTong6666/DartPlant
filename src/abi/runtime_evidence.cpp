@@ -10,6 +10,7 @@
 #include "abi/calling_convention.h"
 #include "abi/evidence_solver.h"
 #include "runtime/runtime_internal.h"
+#include "runtime/snapshot_index.h"
 #include "vm/abi/proof.h"
 #include "vm/abi/resolver.h"
 #include "vm/live_vm_internal.h"
@@ -268,7 +269,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
 
     uint32_t layout_parameter_count = evidence->parameter_count;
     std::optional<DartPlantDartFunctionSignatureInfo> live_signature;
-    uint64_t function_type_object = 0;
+    const dartplant::LiveFunctionSemanticSnapshot* function_semantics = nullptr;
     bool synthesize_implicit_closure_receiver = false;
 
     // A retained live Function gives us an independent FunctionType source for
@@ -281,7 +282,12 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
     // the physical closure target.
     if (method->function->source == dartplant::DartFunctionSource::kLiveVm &&
         method->function->closure_call_entry_only) {
-        function_type_object = method->function->function_object;
+        if (dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index.has_value()) {
+            function_semantics = dartplant::RuntimeIsolateGroup(runtime)
+                                     .live_snapshot_index->FindLiveFunctionSemanticSnapshot(
+                                         method->function->image_id, method->record.library_uri,
+                                         method->record.class_name, method->record.function_name);
+        }
     } else if (method->function->source == dartplant::DartFunctionSource::kOfflineSnapshotIndex &&
                method->function->closure_call_entry_only &&
                evidence->has_optional_parameters != 0 &&
@@ -295,63 +301,36 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
                 dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index->FindSnapshotFunction(
                     method->record.library_uri, method->record.class_name, parent_name,
                     method->record.signature, DARTPLANT_ENTRY_DEFAULT, &ambiguous);
-            if (!ambiguous && parent != nullptr && parent->live && parent->function_object != 0 &&
+            if (!ambiguous && parent != nullptr && parent->live &&
                 !parent->closure_call_entry_only) {
-                function_type_object = parent->function_object;
+                function_semantics = dartplant::RuntimeIsolateGroup(runtime)
+                                         .live_snapshot_index->FindLiveFunctionSemanticSnapshot(
+                                             parent->runtime_image_id, parent->library_uri,
+                                             parent->class_name, parent->function_name);
                 synthesize_implicit_closure_receiver = true;
             }
         }
     }
 
-    if (function_type_object != 0) {
-        if (!dartplant::RuntimeIsolateGroup(runtime).live_vm_context.has_value() ||
-            !dartplant::RuntimeIsolateGroup(runtime).snapshot.has_value()) {
-            return reject(DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE,
-                          "live FunctionType is unavailable for ABI evidence validation");
+    if (function_semantics != nullptr) {
+        // Function and FunctionType are compacting-GC objects. The live index
+        // captures their semantic value while the mutator is inside the V5
+        // observation lease; compiler-evidence validation must consume that
+        // immutable snapshot instead of re-dereferencing a cached FunctionPtr
+        // on an ordinary native worker later.
+        vm_profile = dartplant::ResolveLiveFunctionSemanticProfile(*function_semantics);
+        if (!dartplant::LiveFunctionSemanticMatchesOwner(*function_semantics,
+                                                         method->function->owner)) {
+            return reject(
+                DARTPLANT_RUNTIME_NOT_READY, DARTPLANT_REJECT_STALE_GENERATION,
+                "observation-scoped FunctionType semantics belong to a stale runtime owner");
         }
-        dartplant::VmRuntimeFacts facts{};
-        facts.snapshot_hash = dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_hash;
-        facts.snapshot_features =
-            dartplant::RuntimeIsolateGroup(runtime).snapshot->snapshot_features;
-        facts.compressed_pointers =
-            dartplant::RuntimeIsolateGroup(runtime).snapshot->compressed_pointers;
-        dartplant::vm_abi::AbiCandidateSet candidates{};
-        candidates.profiles = dartplant::ResolveRuntimeProfileCandidates(facts);
-        const auto capability_owner = dartplant::RuntimeCapabilityOwner(runtime);
-        const auto* live_index_binding =
-            dartplant::RuntimeIsolateGroup(runtime).capability_bindings.FindForOwner(
-                dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout, capability_owner);
-        std::vector<bool> compatible;
-        compatible.reserve(candidates.profiles.size());
-        for (const auto* candidate : candidates.profiles) {
-            compatible.push_back(
-                candidate != nullptr && live_index_binding != nullptr &&
-                live_index_binding->Contains(candidate) &&
-                dartplant::vm_abi::ProveFunctionTypeLayout(
-                    *candidate, dartplant::RuntimeIsolateGroup(runtime).live_vm_context->heap_base,
-                    function_type_object)
-                    .passed);
-        }
-        const auto selection = dartplant::vm_abi::SelectCapabilityAbiSet(
-            candidates, dartplant::vm_abi::kCapabilityFunctionTypeLayout, compatible);
-        if (!selection.passed()) {
+        if (vm_profile == nullptr || function_semantics->signature.struct_size <
+                                         sizeof(DartPlantDartFunctionSignatureInfo)) {
             return reject(DARTPLANT_PROFILE_MISMATCH, DARTPLANT_REJECT_ABI_INCOMPLETE,
-                          selection.ambiguous()
-                              ? "live FunctionType capability proof is ambiguous"
-                              : "live FunctionType capability proof rejected every candidate");
+                          "observation-scoped FunctionType semantics have no source profile");
         }
-        vm_profile = selection.representative;
-        (void) dartplant::RuntimeIsolateGroup(runtime).capability_bindings.Bind(
-            dartplant::vm_abi::kCapabilityFunctionTypeLayout, selection);
-        DartPlantDartFunctionSignatureInfo signature{};
-        signature.struct_size = sizeof(signature);
-        const DartPlantStatus signature_status = dartplant::ReadLiveVmFunctionSignatureForProfile(
-            *dartplant::RuntimeIsolateGroup(runtime).live_vm_context, *vm_profile,
-            function_type_object, &signature);
-        if (signature_status != DARTPLANT_OK) {
-            return reject(signature_status, DARTPLANT_REJECT_ABI_INCOMPLETE,
-                          "live FunctionType could not validate compiler ABI evidence");
-        }
+        const DartPlantDartFunctionSignatureInfo& signature = function_semantics->signature;
         if (method->function->closure_call_entry_only) {
             if (synthesize_implicit_closure_receiver) {
                 if (signature.implicit_parameter_count != 0 ||
@@ -480,16 +459,11 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
             synthesize_implicit_closure_receiver ? 0 : live_signature->implicit_parameter_count;
         for (uint32_t index = first_user_parameter; index < live_signature->parameter_count;
              ++index) {
-            DartPlantDartParameterInfo parameter{};
-            parameter.struct_size = sizeof(parameter);
-            const DartPlantStatus parameter_status =
-                dartplant::ReadLiveVmFunctionParameterForProfile(
-                    *dartplant::RuntimeIsolateGroup(runtime).live_vm_context, *vm_profile,
-                    function_type_object, index, &parameter);
-            if (parameter_status != DARTPLANT_OK) {
+            if (function_semantics == nullptr || index >= function_semantics->parameters.size()) {
                 existing->layout_status = dartplant::abi::DartCallLayoutStatus::kIncompleteEvidence;
                 break;
             }
+            const DartPlantDartParameterInfo& parameter = function_semantics->parameters[index];
             closure_signature.formals.push_back({
                 .signature_index = parameter.index,
                 .kind = static_cast<dartplant::abi::DartClosureFormalKind>(parameter.kind),
@@ -526,6 +500,7 @@ extern "C" DartPlantStatus dartplant_runtime_register_compiler_abi_evidence(
         // adapter's generation-scoped FunctionType binding at admission.
         layout->vm_call_profile = defer_live_profile_binding ? nullptr : vm_profile;
         layout->vm_object_profile = vm_profile;
+        layout->vm_semantic_observation_receipt = function_semantics != nullptr;
     }
     existing->call_layout = existing->layout_status == dartplant::abi::DartCallLayoutStatus::kOk &&
                                     method->function->code_target->HasProvenUniqueIdentity()

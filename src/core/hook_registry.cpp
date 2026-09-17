@@ -66,9 +66,10 @@ struct VmMethodBinding {
     const RuntimeProfileRecord* exception_profile = nullptr;
 };
 
-DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlantVmAdapter* adapter,
-                                         uintptr_t expected_entry, bool allow_shared,
-                                         VmMethodBinding* out_binding) {
+DartPlantStatus ProveLiveFunctionBinding(
+    const DartPlantMethod& method, DartPlantVmAdapter* adapter,
+    const std::shared_ptr<const abi::DartCallLayout>& call_layout, uintptr_t expected_entry,
+    bool allow_shared, VmMethodBinding* out_binding) {
     if (adapter == nullptr || method.function == nullptr ||
         method.function->source == DartFunctionSource::kSynthetic) {
         return DARTPLANT_OK;
@@ -76,8 +77,15 @@ DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlan
     if (!VmAdapterSupportsCapabilityProof(adapter)) return DARTPLANT_OK;
     if (out_binding == nullptr) return DARTPLANT_INVALID_ARGUMENT;
     const bool live_vm = method.function->source == DartFunctionSource::kLiveVm;
-    if (live_vm && method.function->function_object == 0) {
-        SetLastError("live Dart hook requires the exact VM capability proof bridge");
+    const bool semantic_receipt =
+        method.function->source == DartFunctionSource::kOfflineSnapshotIndex &&
+        method.function->closure_call_entry_only && method.function->code_target != nullptr &&
+        method.function->code_target->HasProvenUniqueIdentity() && call_layout != nullptr &&
+        call_layout->vm_semantic_observation_receipt;
+    if (live_vm &&
+        (!method.function->live_observation_receipt || method.function->code_target == nullptr ||
+         method.function->code_target->Payload() == nullptr)) {
+        SetLastError("live Dart hook has no observation-scoped physical entry receipt");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
     uint64_t artifact_generation = 0;
@@ -86,13 +94,24 @@ DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlan
         DartPlantVmCapabilityEvidence evidence{};
         evidence.struct_size = sizeof(evidence);
         evidence.kind = kind;
-        evidence.function = method.function->function_object;
-        evidence.code = method.function->code_object;
+        const bool observation_receipt = live_vm && kind != DARTPLANT_VM_EVIDENCE_EXCEPTION_BRIDGE;
+        const bool semantic_capability =
+            semantic_receipt && (kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI ||
+                                 kind == DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE);
+        evidence.function =
+            (observation_receipt || semantic_capability) ? 0 : method.function->function_object;
+        evidence.code =
+            (observation_receipt || semantic_capability) ? 0 : method.function->code_object;
         evidence.expected_entry = expected_entry;
         evidence.entry_kind = method.record.entry_kind;
         evidence.flags = allow_shared && HasSharedCodeEvidence(method)
                              ? DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER
                              : 0;
+        if (observation_receipt) {
+            evidence.flags |= DARTPLANT_VM_EVIDENCE_OBSERVATION_RECEIPT;
+        } else if (semantic_capability) {
+            evidence.flags |= DARTPLANT_VM_EVIDENCE_SEMANTIC_RECEIPT;
+        }
         DartPlantVmCapabilityProof proof{};
         proof.struct_size = sizeof(proof);
         const DartPlantStatus status = VmAdapterProveCapability(adapter, evidence, &proof);
@@ -134,17 +153,22 @@ DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlan
             const DartPlantStatus status = prove(DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE);
             if (status != DARTPLANT_OK) return status;
         }
+    } else if (semantic_receipt) {
+        const DartPlantStatus call_status = prove(DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI);
+        if (call_status != DARTPLANT_OK) return call_status;
+        const DartPlantStatus object_status = prove(DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE);
+        if (object_status != DARTPLANT_OK) return object_status;
     }
     const DartPlantStatus exception_status = prove(DARTPLANT_VM_EVIDENCE_EXCEPTION_BRIDGE);
     if (exception_status != DARTPLANT_OK) return exception_status;
-    if (live_vm) {
+    if (live_vm || semantic_receipt) {
         out_binding->call.struct_size = sizeof(out_binding->call);
         const DartPlantStatus call_status =
             VmAdapterGetCapabilityBinding(adapter, DARTPLANT_VM_CAP_INVOCATION_CALL_ABI,
                                           &out_binding->call, &out_binding->call_profile);
         if (call_status != DARTPLANT_OK) return call_status;
     }
-    if (live_vm && method.function->closure_call_entry_only) {
+    if ((live_vm || semantic_receipt) && method.function->closure_call_entry_only) {
         out_binding->object.struct_size = sizeof(out_binding->object);
         const DartPlantStatus object_status =
             VmAdapterGetCapabilityBinding(adapter, DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
@@ -162,10 +186,10 @@ DartPlantStatus ProveLiveFunctionBinding(const DartPlantMethod& method, DartPlan
         &out_binding->exception_profile);
     if (exception_binding_status != DARTPLANT_OK ||
         out_binding->exception_bridge.resolved_target == 0 ||
-        (live_vm && (out_binding->exception_bridge.artifact_generation !=
-                         out_binding->call.artifact_generation ||
-                     out_binding->exception_bridge.isolate_generation !=
-                         out_binding->call.isolate_generation))) {
+        ((live_vm || semantic_receipt) && (out_binding->exception_bridge.artifact_generation !=
+                                               out_binding->call.artifact_generation ||
+                                           out_binding->exception_bridge.isolate_generation !=
+                                               out_binding->call.isolate_generation))) {
         SetLastError("VM JumpToFrame capability binding is incomplete or stale");
         return DARTPLANT_PROFILE_MISMATCH;
     }
@@ -188,10 +212,10 @@ DartPlantStatus BindCallLayoutProfile(const DartPlantMethod& method, DartPlantVm
     }
     const RuntimeProfileRecord* call_profile = nullptr;
     const RuntimeProfileRecord* object_profile = nullptr;
-    if (method.function->source == DartFunctionSource::kLiveVm &&
-        VmAdapterSupportsCapabilityProof(adapter)) {
+    if (binding.call.profile_version != 0 && VmAdapterSupportsCapabilityProof(adapter)) {
         call_profile = binding.call_profile;
-        object_profile = binding.object_profile;
+        object_profile =
+            binding.object_profile == nullptr ? signature_profile : binding.object_profile;
     } else if ((*call_layout)->vm_call_profile != nullptr &&
                (*call_layout)->vm_object_profile != nullptr) {
         call_profile = (*call_layout)->vm_call_profile;
@@ -204,8 +228,7 @@ DartPlantStatus BindCallLayoutProfile(const DartPlantMethod& method, DartPlantVm
         SetLastError("DartCallLayout has no compatible call/object-domain binding");
         return DARTPLANT_PROFILE_MISMATCH;
     }
-    if (method.function->source == DartFunctionSource::kLiveVm &&
-        (*call_layout)->closure_signature.has_value()) {
+    if (binding.call.profile_version != 0 && (*call_layout)->closure_signature.has_value()) {
         if (object_profile == nullptr || signature_profile == nullptr ||
             vm_abi::BuildCapabilityAbiKey(*signature_profile,
                                           vm_abi::kCapabilityFunctionTypeLayout) !=
@@ -1039,7 +1062,7 @@ DartPlantStatus InstallCallbackHook(
             return DARTPLANT_UNSUPPORTED_ABI;
         }
         const DartPlantStatus proof_status = ProveLiveFunctionBinding(
-            *method, options.vm_adapter, target, AllowsSharedCode(options), &binding);
+            *method, options.vm_adapter, call_layout, target, AllowsSharedCode(options), &binding);
         if (proof_status != DARTPLANT_OK) return proof_status;
         const DartPlantStatus layout_status =
             BindCallLayoutProfile(*method, options.vm_adapter, binding, &call_layout);

@@ -29,11 +29,12 @@ bool IsHeapObject(const RuntimeProfileRecord& profile, uint64_t tagged) {
            tagged >= profile.raw_object.heap_object_tag;
 }
 
-bool TaggedInHeapWindow(const RuntimeProfileRecord& profile, uint64_t heap_base, uint64_t tagged) {
-    return heap_base != 0 && IsHeapObject(profile, tagged) &&
-           heap_base <= UINT64_MAX - profile.raw_object.heap_object_tag &&
-           tagged >= heap_base + profile.raw_object.heap_object_tag &&
-           tagged - heap_base <= UINT32_MAX;
+uintptr_t CanonicalNativePointer(uint64_t pointer) {
+#if defined(__aarch64__)
+    return static_cast<uintptr_t>(pointer & 0x00ffffffffffffffULL);
+#else
+    return static_cast<uintptr_t>(pointer);
+#endif
 }
 
 bool ReadCid(const RuntimeProfileRecord& profile, uint64_t tagged, uint32_t* output) {
@@ -60,16 +61,19 @@ const ModuleImage* FindUniqueExecutableModule(const std::vector<ModuleImage>& mo
     return match;
 }
 
-bool ProbeSafepoint(const RuntimeProfileRecord& profile, uint64_t thread, uint64_t heap_base,
-                    uint32_t thread_offset, const std::vector<ModuleImage>& modules,
-                    uint64_t* output_code, uint64_t* output_entry,
-                    const ModuleImage** output_module) {
+bool ProbeSafepoint(const RuntimeProfileRecord& profile, uint64_t thread, uint32_t thread_offset,
+                    const std::vector<ModuleImage>& modules, uint64_t* output_code,
+                    uint64_t* output_entry, const ModuleImage** output_module) {
     if (output_code == nullptr || output_entry == nullptr || output_module == nullptr) {
         return false;
     }
     uint64_t tagged_code = 0;
-    if (!ReadSelf(static_cast<uintptr_t>(thread) + thread_offset, &tagged_code) ||
-        !TaggedInHeapWindow(profile, heap_base, tagged_code)) {
+    if (!ReadSelf(static_cast<uintptr_t>(thread) + thread_offset, &tagged_code)) {
+        return false;
+    }
+    tagged_code = CanonicalNativePointer(tagged_code);
+    if (!IsHeapObject(profile, tagged_code) ||
+        (tagged_code - profile.raw_object.heap_object_tag) % profile.machine.pointer_size != 0) {
         return false;
     }
     uint32_t cid = 0;
@@ -79,6 +83,7 @@ bool ProbeSafepoint(const RuntimeProfileRecord& profile, uint64_t thread, uint64
     if (!ReadSelf(code + profile.live_vm.code_entry_point_offset, &entry) || entry == 0) {
         return false;
     }
+    entry = CanonicalNativePointer(entry);
     const ModuleImage* module = FindUniqueExecutableModule(modules, static_cast<uintptr_t>(entry));
     if (module == nullptr) return false;
     *output_code = tagged_code;
@@ -88,6 +93,31 @@ bool ProbeSafepoint(const RuntimeProfileRecord& profile, uint64_t thread, uint64
 }
 
 }  // namespace
+
+SafepointProbe ProbeSafepoints(const RuntimeProfileRecord& profile, uint64_t thread,
+                               const std::vector<ModuleImage>& modules) {
+    SafepointProbe probe{};
+    const ModuleImage* enter_module = nullptr;
+    probe.stage = CandidateProbeStage::kEnterSafepoint;
+    if (!ProbeSafepoint(profile, thread, profile.thread_bridge.enter_safepoint_stub_offset, modules,
+                        &probe.enter_code, &probe.enter_entry, &enter_module)) {
+        return probe;
+    }
+    const ModuleImage* exit_module = nullptr;
+    probe.stage = CandidateProbeStage::kExitSafepoint;
+    if (!ProbeSafepoint(profile, thread, profile.thread_bridge.exit_safepoint_stub_offset, modules,
+                        &probe.exit_code, &probe.exit_entry, &exit_module)) {
+        return probe;
+    }
+    probe.stage = CandidateProbeStage::kSafepointModuleRelation;
+    if (enter_module != exit_module || enter_module == nullptr || enter_module->build_id.empty()) {
+        return probe;
+    }
+    probe.stage = CandidateProbeStage::kComplete;
+    probe.code_module = enter_module;
+    probe.passed = true;
+    return probe;
+}
 
 const char* CandidateProbeStageName(const CandidateProbeStage& stage, const RootProof& roots) {
     if (stage == CandidateProbeStage::kRuntimeRoots && !roots.passed) {
@@ -119,27 +149,16 @@ CandidateProbe ProbeCandidate(const CandidateProbeInput& input) {
     probe.roots = ProveRuntimeRoots(input.roots);
     if (!probe.roots.passed) return probe;
 
-    const ModuleImage* enter_module = nullptr;
-    probe.stage = CandidateProbeStage::kEnterSafepoint;
-    if (!ProbeSafepoint(profile, input.roots.thread, probe.roots.heap_base,
-                        profile.thread_bridge.enter_safepoint_stub_offset, *input.modules,
-                        &probe.enter_code, &probe.enter_entry, &enter_module)) {
-        return probe;
-    }
-
-    const ModuleImage* exit_module = nullptr;
-    probe.stage = CandidateProbeStage::kExitSafepoint;
-    if (!ProbeSafepoint(profile, input.roots.thread, probe.roots.heap_base,
-                        profile.thread_bridge.exit_safepoint_stub_offset, *input.modules,
-                        &probe.exit_code, &probe.exit_entry, &exit_module)) {
-        return probe;
-    }
-
-    probe.stage = CandidateProbeStage::kSafepointModuleRelation;
-    if (enter_module != exit_module) return probe;
+    const SafepointProbe safepoints = ProbeSafepoints(profile, input.roots.thread, *input.modules);
+    probe.stage = safepoints.stage;
+    if (!safepoints.passed) return probe;
+    probe.enter_code = safepoints.enter_code;
+    probe.exit_code = safepoints.exit_code;
+    probe.enter_entry = safepoints.enter_entry;
+    probe.exit_entry = safepoints.exit_entry;
+    probe.code_module = safepoints.code_module;
 
     probe.stage = CandidateProbeStage::kComplete;
-    probe.code_module = enter_module;
     probe.passed = true;
     return probe;
 }

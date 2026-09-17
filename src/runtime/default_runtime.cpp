@@ -609,10 +609,9 @@ DartPlantStatus FindDefaultRuntimeMethod(const DartPlantMethodQuery* query,
     if (status == DARTPLANT_RUNTIME_NOT_READY) {
         // Exact artifact methods (including PRODUCT-dropped Functions) resolve
         // directly from IMAGES_READY. Only a miss needs semantic VM roots and
-        // the live Function index, so ordinary artifact consumers never depend
-        // on sampler timing.
-        status = dartplant_runtime_bootstrap_live_vm(state.runtime, nullptr, nullptr);
-        if (status != DARTPLANT_OK) return status;
+        // the live Function index. The default C ABI has no owner-thread-bound
+        // moving-GC observation lease, so it must fail closed instead of
+        // falling back to process-sampled heap reads.
         status = BindRegisteredArtifactIndexIfReady(state.runtime);
         if (status != DARTPLANT_OK) return status;
         status = dartplant_runtime_find_method(state.runtime, query, out_method);

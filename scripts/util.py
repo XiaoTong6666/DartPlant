@@ -232,6 +232,24 @@ def test_host(ctx: BuildContext, *, force: bool = False) -> None:
     run(["python3", str(ROOT_DIR / "tests" / "cmake_parent_smoke.py")], cwd=ROOT_DIR)
     run(
         [
+            "python3",
+            str(ROOT_DIR / "tests" / "dobby_android_config_test.py"),
+            "--ndk",
+            str(ctx.ndk_home),
+        ],
+        cwd=ROOT_DIR,
+    )
+    run(
+        [
+            "python3",
+            str(ROOT_DIR / "tests" / "android_core_link_test.py"),
+            "--ndk",
+            str(ctx.ndk_home),
+        ],
+        cwd=ROOT_DIR,
+    )
+    run(
+        [
             "cargo",
             "test",
             "--manifest-path",

@@ -36,6 +36,8 @@ typedef _SnapshotOffsetProofNative = Uint64 Function();
 typedef _SnapshotOffsetProofDart = int Function();
 typedef _DeferredLifecycleProofNative = Uint64 Function();
 typedef _DeferredLifecycleProofDart = int Function();
+typedef _MultiOwnerNative = Uint64 Function(Uint32);
+typedef _MultiOwnerDart = int Function(int);
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -162,6 +164,16 @@ final class DartPlantNative {
   static final _DeferredLifecycleProofDart _deferredAfterLoad = _library
       .lookup<NativeFunction<_DeferredLifecycleProofNative>>(
         'dartplant_fixture_deferred_after_load',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerActivate = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_activate',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerDeferred = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_deferred',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -327,6 +339,10 @@ final class DartPlantNative {
   static int deferredBeforeLoad() => _deferredBeforeLoad();
 
   static int deferredAfterLoad() => _deferredAfterLoad();
+
+  static int multiOwnerActivate(int label) => _multiOwnerActivate(label);
+
+  static int multiOwnerDeferred(int label) => _multiOwnerDeferred(label);
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

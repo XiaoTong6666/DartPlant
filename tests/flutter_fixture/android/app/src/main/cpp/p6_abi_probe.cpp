@@ -206,7 +206,10 @@ void ThrowingStackEnter(DartPlantInvocation* invocation, void*) {
         Fail("throwing stack enter decode");
         return;
     }
-    State().throwing_stack_enter.fetch_add(1, std::memory_order_relaxed);
+    const double first_value = std::bit_cast<double>(first.raw);
+    const uint32_t enter = State().throwing_stack_enter.fetch_add(1, std::memory_order_relaxed) + 1;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "throwing stack enter count=%u a0=%.17g raw=0x%llx",
+                        enter, first_value, static_cast<unsigned long long>(first.raw));
 }
 
 void ThrowingStackLeave(DartPlantInvocation* invocation, void*) {
@@ -216,7 +219,9 @@ void ThrowingStackLeave(DartPlantInvocation* invocation, void*) {
         Fail("throwing stack leave decode");
         return;
     }
-    State().throwing_stack_leave.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t leave = State().throwing_stack_leave.fetch_add(1, std::memory_order_relaxed) + 1;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "throwing stack leave count=%u result=%.17g", leave,
+                        std::bit_cast<double>(result.raw));
 }
 
 void ThrowingStackException(DartPlantInvocation* invocation, void*) {
@@ -248,7 +253,10 @@ void ThrowingStackException(DartPlantInvocation* invocation, void*) {
                         "exception callback phase-safe access exception=1 stacktrace=1 "
                         "argument_rejected=1 raw_gp_rejected=1");
     State().exception_object_observed.fetch_add(1, std::memory_order_relaxed);
-    State().throwing_stack_exception.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t exception_count =
+        State().throwing_stack_exception.fetch_add(1, std::memory_order_relaxed) + 1;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "throwing stack exception count=%u",
+                        exception_count);
 }
 
 void ExceptionLifetimeEnter(DartPlantInvocation* invocation, void*) {
@@ -490,14 +498,16 @@ extern "C" uint64_t dartplant_fixture_p6_abi_probe() {
     const bool shutdown = dartplant_is_initialized() == 0;
     const bool passed = int64_ok && entry_ok && odd_ok && throw_ok && forced_ok && pair_ok &&
                         failures == 0 && cleanup && shutdown;
-    __android_log_print(
-        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
-        "P6 ABI probe int64=%u entry_stack=%u odd_stack=%u throw=%u forced_stack=%u pair=%u failures=%u cleanup=%u shutdown=%u passed=%u",
-        static_cast<unsigned>(int64_ok), static_cast<unsigned>(entry_ok),
-        static_cast<unsigned>(odd_ok), static_cast<unsigned>(throw_ok),
-        static_cast<unsigned>(forced_ok), static_cast<unsigned>(pair_ok), failures,
-        static_cast<unsigned>(cleanup), static_cast<unsigned>(shutdown),
-        static_cast<unsigned>(passed));
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "P6 ABI probe int64=%u entry_stack=%u odd_stack=%u throw=%u "
+                        "throw_counts=%u/%u/%u exception_object=%u forced_stack=%u pair=%u "
+                        "failures=%u cleanup=%u shutdown=%u passed=%u",
+                        static_cast<unsigned>(int64_ok), static_cast<unsigned>(entry_ok),
+                        static_cast<unsigned>(odd_ok), static_cast<unsigned>(throw_ok),
+                        throwing_enter, throwing_leave, throwing_exception,
+                        exception_object_observed, static_cast<unsigned>(forced_ok),
+                        static_cast<unsigned>(pair_ok), failures, static_cast<unsigned>(cleanup),
+                        static_cast<unsigned>(shutdown), static_cast<unsigned>(passed));
     return passed ? 1 : 0;
 }
 

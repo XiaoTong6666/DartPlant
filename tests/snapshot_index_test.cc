@@ -4,6 +4,7 @@
 
 #include "core/internal.h"
 #include "test_runner.h"
+#include "vm/abi/resolver.h"
 
 namespace {
 
@@ -115,6 +116,55 @@ TEST_CASE(SnapshotIndexRejectsAmbiguousLiveIdentity) {
     EXPECT_TRUE(index.FindSnapshotFunction("package:app/main.dart", "Fixture", "add", "",
                                            DARTPLANT_ENTRY_DEFAULT, &ambiguous) == nullptr);
     EXPECT_TRUE(ambiguous);
+}
+
+TEST_CASE(LiveFunctionSemanticProfileIsIndependentFromLiveIndexProfile) {
+    const auto* live_index_profile = dartplant::FindRuntimeProfileByVersion(1);
+    const auto* function_type_profile = dartplant::FindRuntimeProfileByVersion(3);
+    EXPECT_TRUE(live_index_profile != nullptr);
+    EXPECT_TRUE(function_type_profile != nullptr);
+    EXPECT_TRUE(dartplant::vm_abi::BuildCapabilityAbiKey(
+                    *live_index_profile, dartplant::vm_abi::kCapabilityFunctionTypeLayout) !=
+                dartplant::vm_abi::BuildCapabilityAbiKey(
+                    *function_type_profile, dartplant::vm_abi::kCapabilityFunctionTypeLayout));
+
+    dartplant::SnapshotIndex index;
+    index.vm_profile_version = live_index_profile->live_vm.profile_version;
+    dartplant::LiveFunctionSemanticSnapshot semantic;
+    semantic.runtime_image_id = 7;
+    semantic.runtime_image_incarnation_epoch = 11;
+    semantic.engine_incarnation_epoch = 12;
+    semantic.isolate_group_incarnation_epoch = 13;
+    semantic.runtime_generation = 14;
+    semantic.library_uri = "package:app/main.dart";
+    semantic.class_name = "Global";
+    semantic.function_name = "target";
+    semantic.function_type_profile_version = function_type_profile->live_vm.profile_version;
+    semantic.function_type_abi_key = dartplant::vm_abi::BuildCapabilityAbiKey(
+        *function_type_profile, dartplant::vm_abi::kCapabilityFunctionTypeLayout);
+    index.live_function_semantics.push_back(semantic);
+
+    const auto* found =
+        index.FindLiveFunctionSemanticSnapshot(7, "package:app/main.dart", "Global", "target");
+    EXPECT_TRUE(found != nullptr);
+    const auto* resolved = dartplant::ResolveLiveFunctionSemanticProfile(*found);
+    EXPECT_TRUE(resolved == function_type_profile);
+    EXPECT_TRUE(resolved != live_index_profile);
+    const dartplant::DartRuntimeOwnerIdentity owner = {
+        .runtime_generation = 14,
+        .engine_incarnation_epoch = 12,
+        .isolate_group_incarnation_epoch = 13,
+        .image_id = 7,
+        .image_incarnation_epoch = 11,
+    };
+    EXPECT_TRUE(dartplant::LiveFunctionSemanticMatchesOwner(*found, owner));
+    auto stale_owner = owner;
+    stale_owner.image_incarnation_epoch++;
+    EXPECT_FALSE(dartplant::LiveFunctionSemanticMatchesOwner(*found, stale_owner));
+
+    index.live_function_semantics[0].function_type_abi_key += "-corrupt";
+    EXPECT_TRUE(dartplant::ResolveLiveFunctionSemanticProfile(index.live_function_semantics[0]) ==
+                nullptr);
 }
 
 TEST_CASE(SnapshotIndexRequiresAllQueryFields) {

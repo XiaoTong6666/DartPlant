@@ -85,6 +85,11 @@ struct DartCallLayout {
     const RuntimeProfileRecord *vm_object_profile = nullptr;
     uint64_t vm_artifact_generation = 0;
     uint64_t vm_isolate_generation = 0;
+    // FunctionType/call semantics were frozen while a V5 live-heap
+    // observation lease was active. This is provenance, not a heap pointer:
+    // later hook/invocation code may bind the corresponding VM ABI domains to
+    // the current generation without dereferencing the old Function object.
+    bool vm_semantic_observation_receipt = false;
     std::vector<DartParameterLayout> parameters;
     DartParameterLayout result{};
     uint32_t stack_words = 0;

@@ -15,6 +15,14 @@
 
 namespace {
 
+uint64_t CanonicalObservationThread(uint64_t thread) {
+#if defined(__aarch64__)
+    return thread & UINT64_C(0x00ffffffffffffff);
+#else
+    return thread;
+#endif
+}
+
 constexpr size_t kVmAdapterCallbacksV1Size =
     offsetof(DartPlantVmAdapterCallbacks, pin_generated_roots);
 constexpr size_t kVmAdapterCallbacksV2Size =
@@ -72,6 +80,14 @@ bool CapabilityProofCallbackAvailable(const DartPlantVmAdapterCallbacks& callbac
            callbacks.prove_capability != nullptr;
 }
 
+bool LiveHeapObservationCallbacksAvailable(const DartPlantVmAdapterCallbacks& callbacks) {
+    return callbacks.struct_size >=
+               offsetof(DartPlantVmAdapterCallbacks, end_live_heap_observation) +
+                   sizeof(DartPlantEndLiveHeapObservationCallback) &&
+           callbacks.begin_live_heap_observation != nullptr &&
+           callbacks.end_live_heap_observation != nullptr;
+}
+
 uint64_t CapabilityForEvidence(DartPlantVmCapabilityEvidenceKind kind) {
     switch (kind) {
     case DARTPLANT_VM_EVIDENCE_FUNCTION_CODE:
@@ -113,7 +129,8 @@ DartPlantStatus CheckAttachedOwnerLocked(DartPlantVmAdapter* adapter) {
         dartplant::SetLastError("VM adapter has no attached isolate");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    if (adapter->owner_thread != std::thread::id{} && !SameOwner(*adapter)) {
+    const bool transient_owner = adapter->owner_thread == std::thread::id{};
+    if (!transient_owner && !SameOwner(*adapter)) {
         dartplant::SetLastError("VM adapter is owned by another thread");
         return DARTPLANT_VM_THREAD_MISMATCH;
     }
@@ -171,7 +188,8 @@ DartPlantStatus VmAdapterCheckQuiescent(DartPlantVmAdapter* adapter) {
     std::lock_guard lock(adapter->mutex);
     if (adapter->hook_refs != 0 || adapter->generated_root_leases != 0 ||
         adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
-        adapter->isolate_entered || adapter->live_handles != 0) {
+        adapter->isolate_entered || adapter->live_handles != 0 ||
+        adapter->live_heap_observations != 0) {
         SetLastError("VM adapter still has active hooks, callbacks, scopes, or object handles");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -222,6 +240,10 @@ DartPlantStatus VmAdapterProveCapability(DartPlantVmAdapter* adapter,
     const bool transient_owner = adapter->owner_thread == std::thread::id{};
     const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
     if (owner != DARTPLANT_OK) return owner;
+    if (adapter->live_heap_observations != 0) {
+        SetLastError("VM adapter has an active live heap observation");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
     const DartPlantStatus status = adapter->callbacks.prove_capability(
         adapter->user_data, &adapter->isolate, &evidence, out_proof);
     if (transient_owner && !adapter->isolate_entered && adapter->entered == 0 &&
@@ -305,6 +327,97 @@ void VmAdapterInvalidateAbiBinding(DartPlantVmAdapter* adapter) {
     ResetAbiBindingLocked(adapter);
 }
 
+DartPlantStatus VmAdapterBeginLiveHeapObservation(DartPlantVmAdapter* adapter, uint64_t thread,
+                                                  void** out_lease) {
+    if (adapter == nullptr || thread == 0 || out_lease == nullptr) {
+        SetLastError("live heap observation arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    *out_lease = nullptr;
+    std::lock_guard lock(adapter->mutex);
+    if (!adapter->attached || !adapter->admission_open.load(std::memory_order_acquire)) {
+        SetLastError("VM adapter is unavailable for live heap observation");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    if (!LiveHeapObservationCallbacksAvailable(adapter->callbacks)) {
+        SetLastError("VM adapter has no moving-GC observation bridge");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    const bool nested_generated_callback = adapter->generated_native_transitions == 1 &&
+                                           adapter->generated_root_leases != 0 &&
+                                           adapter->entered != 0 && !adapter->isolate_entered;
+    const bool standalone_native = adapter->generated_native_transitions == 0 &&
+                                   adapter->entered == 0 && !adapter->isolate_entered;
+    if ((!nested_generated_callback && !standalone_native) ||
+        adapter->live_heap_observations != 0) {
+        SetLastError("VM adapter state is busy for live heap observation");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const bool transient_owner = adapter->owner_thread == std::thread::id{};
+    if (!transient_owner && !SameOwner(*adapter)) {
+        SetLastError("VM adapter is owned by another thread");
+        return DARTPLANT_VM_THREAD_MISMATCH;
+    }
+    adapter->owner_thread = std::this_thread::get_id();
+    void* lease = nullptr;
+    const DartPlantStatus status = adapter->callbacks.begin_live_heap_observation(
+        adapter->user_data, &adapter->isolate, thread, &lease);
+    if (status != DARTPLANT_OK) {
+        if (transient_owner) adapter->owner_thread = {};
+        return status;
+    }
+    if (lease == nullptr) {
+        if (transient_owner) adapter->owner_thread = {};
+        SetLastError("VM adapter returned a null live heap observation lease");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    adapter->live_heap_observations = 1;
+    adapter->live_heap_observation_thread = std::this_thread::get_id();
+    adapter->live_heap_observation_vm_thread = CanonicalObservationThread(thread);
+    adapter->live_heap_observation_lease = lease;
+    *out_lease = lease;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus VmAdapterEndLiveHeapObservation(DartPlantVmAdapter* adapter, void* lease) {
+    if (adapter == nullptr || lease == nullptr) {
+        SetLastError("live heap observation release arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    std::lock_guard lock(adapter->mutex);
+    if (adapter->live_heap_observations != 1 ||
+        adapter->live_heap_observation_thread != std::this_thread::get_id() ||
+        adapter->live_heap_observation_lease != lease ||
+        !LiveHeapObservationCallbacksAvailable(adapter->callbacks)) {
+        SetLastError("live heap observation is unavailable on this thread");
+        return DARTPLANT_VM_ADAPTER_BUSY;
+    }
+    const DartPlantStatus status =
+        adapter->callbacks.end_live_heap_observation(adapter->user_data, &adapter->isolate, lease);
+    if (status == DARTPLANT_OK) {
+        adapter->live_heap_observations = 0;
+        adapter->live_heap_observation_thread = {};
+        adapter->live_heap_observation_vm_thread = 0;
+        adapter->live_heap_observation_lease = nullptr;
+        if (!adapter->isolate_entered && adapter->entered == 0 &&
+            adapter->generated_root_leases == 0 && adapter->generated_native_transitions == 0) {
+            adapter->owner_thread = {};
+        }
+    }
+    return status;
+}
+
+bool VmAdapterOwnsLiveHeapObservation(const DartPlantVmAdapter* adapter, uint64_t thread,
+                                      const void* lease) {
+    if (adapter == nullptr || thread == 0 || lease == nullptr) return false;
+    std::lock_guard lock(adapter->mutex);
+    return adapter->attached && adapter->admission_open.load(std::memory_order_acquire) &&
+           adapter->live_heap_observations == 1 &&
+           adapter->live_heap_observation_thread == std::this_thread::get_id() &&
+           adapter->live_heap_observation_vm_thread == CanonicalObservationThread(thread) &&
+           adapter->live_heap_observation_lease == lease && SameOwner(*adapter);
+}
+
 void VmAdapterRetainHook(DartPlantVmAdapter* adapter) {
     if (adapter == nullptr) return;
     std::lock_guard lock(adapter->mutex);
@@ -336,7 +449,8 @@ DartPlantStatus VmAdapterPinGeneratedRoots(DartPlantVmAdapter* adapter, const ui
     }
     const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
     if (owner != DARTPLANT_OK) return owner;
-    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
+        adapter->live_heap_observations != 0) {
         SetLastError("generated roots must be pinned while the mutator is in generated state");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -408,7 +522,8 @@ DartPlantStatus VmAdapterUnpinGeneratedRoots(DartPlantVmAdapter* adapter, void* 
     }
     const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
     if (owner != DARTPLANT_OK) return owner;
-    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
+        adapter->live_heap_observations != 0) {
         SetLastError("generated roots can only be unpinned after returning to generated state");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -442,7 +557,8 @@ DartPlantStatus VmAdapterEnterGeneratedToNative(DartPlantVmAdapter* adapter,
     }
     const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
     if (owner != DARTPLANT_OK) return owner;
-    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
+        adapter->live_heap_observations != 0) {
         SetLastError("VM adapter already has a generated/native transition or scope");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -466,6 +582,11 @@ DartPlantStatus VmAdapterLeaveNativeToGenerated(DartPlantVmAdapter* adapter,
         adapter->generated_native_transitions == 0 || adapter->generated_root_leases == 0) {
         SetLastError("VM adapter generated/native transition is not active");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (adapter->live_heap_observations != 0) {
+        SetLastError(
+            "generated/native transition cannot leave while live heap observation is active");
+        return DARTPLANT_VM_ADAPTER_BUSY;
     }
     if (!SameOwner(*adapter)) {
         SetLastError("VM adapter is owned by another thread");
@@ -501,7 +622,7 @@ DartPlantStatus ReadActiveObject(DartPlantVmAdapter* adapter,
         SetLastError("VM adapter is owned by another thread");
         return DARTPLANT_VM_THREAD_MISMATCH;
     }
-    if (adapter->generated_native_transitions != 0 ||
+    if (adapter->generated_native_transitions != 0 || adapter->live_heap_observations != 0 ||
         (GeneratedTransitionCallbacksAvailable(adapter->callbacks) && adapter->entered != 0)) {
         SetLastError("active exception objects can only be read in generated state");
         return DARTPLANT_VM_ADAPTER_BUSY;
@@ -537,7 +658,8 @@ DartPlantStatus VmAdapterReadTypeArgumentsElementGenerated(DartPlantVmAdapter* a
     }
     const DartPlantStatus owner = CheckAttachedOwnerLocked(adapter);
     if (owner != DARTPLANT_OK) return owner;
-    if (adapter->generated_native_transitions != 0 || adapter->entered != 0) {
+    if (adapter->generated_native_transitions != 0 || adapter->entered != 0 ||
+        adapter->live_heap_observations != 0) {
         SetLastError("TypeArguments elements must be captured while Dart is still generated");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -631,7 +753,8 @@ DARTPLANT_EXPORT DartPlantStatus
 dartplant_vm_adapter_create(const DartPlantVmAdapterCallbacks* callbacks, void* user_data,
                             DartPlantVmAdapter** out_adapter) {
     if (callbacks == nullptr || out_adapter == nullptr || !ValidAdapterCallbacks(*callbacks) ||
-        (callbacks->adapter_version >= 4 && !CapabilityProofCallbackAvailable(*callbacks))) {
+        (callbacks->adapter_version >= 4 && !CapabilityProofCallbackAvailable(*callbacks)) ||
+        (callbacks->adapter_version >= 5 && !LiveHeapObservationCallbacksAvailable(*callbacks))) {
         dartplant::SetLastError("VM adapter callbacks are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
@@ -653,7 +776,8 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_destroy(DartPlantVmAdapter
     std::unique_lock lock(adapter->mutex);
     if (adapter->attached || adapter->entered != 0 || adapter->isolate_entered ||
         adapter->live_handles != 0 || adapter->hook_refs != 0 ||
-        adapter->generated_root_leases != 0 || adapter->generated_native_transitions != 0) {
+        adapter->generated_root_leases != 0 || adapter->generated_native_transitions != 0 ||
+        adapter->live_heap_observations != 0) {
         dartplant::SetLastError("VM adapter still owns an isolate, scope, or object handle");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -697,7 +821,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_adapter_detach_isolate(
     }
     if (adapter->entered != 0 || adapter->isolate_entered || adapter->live_handles != 0 ||
         adapter->hook_refs != 0 || adapter->generated_root_leases != 0 ||
-        adapter->generated_native_transitions != 0) {
+        adapter->generated_native_transitions != 0 || adapter->live_heap_observations != 0) {
         dartplant::SetLastError("VM adapter isolate still has active scopes, handles, or hooks");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -722,7 +846,7 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_enter_isolate(DartPlantVmAdapter* 
         dartplant::SetLastError("VM adapter has no attached isolate");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
-    if (adapter->entered != 0 || adapter->isolate_entered) {
+    if (adapter->entered != 0 || adapter->isolate_entered || adapter->live_heap_observations != 0) {
         dartplant::SetLastError("VM adapter already has an entered isolate or scope");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
@@ -770,6 +894,10 @@ DARTPLANT_EXPORT DartPlantStatus dartplant_vm_enter_scope(DartPlantVmAdapter* ad
     if (!adapter->attached) {
         dartplant::SetLastError("VM adapter has no attached isolate");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (adapter->live_heap_observations != 0) {
+        dartplant::SetLastError("VM adapter has an active live heap observation");
+        return DARTPLANT_VM_ADAPTER_BUSY;
     }
     if (adapter->entered != 0 && !SameOwner(*adapter)) {
         dartplant::SetLastError("VM adapter is owned by another thread");

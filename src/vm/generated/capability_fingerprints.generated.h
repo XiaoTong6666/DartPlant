@@ -159,6 +159,7 @@ inline void AppendGeneratedTransitionLayoutFields(std::string& key, const Runtim
     AppendCapabilityValue(key, profile.thread_bridge.top_exit_frame_offset);  // thread.top_exit_frame
     AppendCapabilityValue(key, profile.thread_bridge.vm_tag_offset);  // thread.vm_tag
     AppendCapabilityValue(key, profile.thread_bridge.execution_state_offset);  // thread.execution_state
+    AppendCapabilityValue(key, profile.thread_bridge.safepoint_state_offset);  // thread.safepoint_state
     AppendCapabilityValue(key, profile.thread_bridge.exit_through_ffi_offset);  // thread.exit_through_ffi
     AppendCapabilityValue(key, profile.transition.vm_tag_dart);  // transition.vm_tag_dart
     AppendCapabilityValue(key, profile.transition.execution_vm);  // transition.execution_vm

@@ -14,11 +14,11 @@ from typing import Iterable
 try:
     from .capability_registry import mask as capability_mask
     from .capability_registry import required_event_capabilities
-    from .common import RUNTIME_SCENARIOS
+    from .common import COMMON_RUNTIME_SCENARIOS, RUNTIME_SCENARIOS
 except ImportError:
     from capability_registry import mask as capability_mask
     from capability_registry import required_event_capabilities
-    from common import RUNTIME_SCENARIOS
+    from common import COMMON_RUNTIME_SCENARIOS, RUNTIME_SCENARIOS
 
 
 CI_PREFIX = "DARTPLANT_CI "
@@ -137,10 +137,11 @@ def _check_runtime(
         and event.get("abi") == "arm64-v8a"
         and event.get("dart_ffi_abi") == "android_arm64"
     ]
+    mismatching = [event for event in runtime if event not in matching]
     return Check(
         "Runtime provenance",
-        bool(matching),
-        f"events={len(runtime)} matching={len(matching)} "
+        bool(runtime) and len(matching) == len(runtime),
+        f"events={len(runtime)} matching={len(matching)} mismatching={len(mismatching)} "
         f"expected={expected_flutter}/{expected_dart}/arm64-v8a/android_arm64",
     )
 
@@ -283,6 +284,11 @@ def _check_capabilities(
         )
     ]
     for capability in required_event_capabilities():
+        if capability.diagnostic_name == "ActiveException" and expected_test not in {
+            "all",
+            "exception",
+        }:
+            continue
         if capability.diagnostic_name == "TypeArguments" and expected_test not in {
             "all",
             "generic_closure",
@@ -333,7 +339,10 @@ def _check_scenarios(
 ) -> list[Check]:
     scenarios = _event_group(events, "scenario")
     checks: list[Check] = []
-    required = RUNTIME_SCENARIOS if expected_test == "all" else (expected_test,)
+    requested = RUNTIME_SCENARIOS if expected_test == "all" else (expected_test,)
+    required = COMMON_RUNTIME_SCENARIOS + tuple(
+        name for name in requested if name not in COMMON_RUNTIME_SCENARIOS
+    )
     for name in required:
         named = [event for event in scenarios if event.get("name") == name]
         checks.append(
@@ -390,6 +399,8 @@ def _check_legacy_proofs(log_text: str, expected_test: str) -> list[Check]:
     for name, markers in LEGACY_PROOFS.items():
         if name == "TypeArguments moving GC" and expected_test not in {"all", "generic_gc"}:
             continue
+        if name == "Exception unwind lifetime" and expected_test not in {"all", "exception"}:
+            continue
         missing = [marker for marker in markers if marker not in log_text]
         checks.append(
             Check(
@@ -402,13 +413,22 @@ def _check_legacy_proofs(log_text: str, expected_test: str) -> list[Check]:
 
 
 def _check_code_identity_semantics(log_text: str) -> Check:
+    # The public resolver intentionally projects the currently active runtime
+    # owner. Once the multi-engine proof activates a foreign Engine, a later
+    # instrumentedAdd probe may resolve that foreign owner's Method/Code while
+    # the original A physical hook and listener remain valid. Code-identity
+    # semantics for the root producer must therefore be gated on evidence from
+    # before the first multi-owner activation, not on the last probe globally.
+    multi_owner_marker = '"event":"multi_owner_activate"'
+    marker_offset = log_text.find(multi_owner_marker)
+    identity_scope = log_text if marker_offset < 0 else log_text[:marker_offset]
     producer_lines = [
         line
-        for line in log_text.splitlines()
+        for line in identity_scope.splitlines()
         if "producer code-identity policy verified mode=" in line
     ]
     probe_lines = [
-        line for line in log_text.splitlines() if "instrumentedAdd probe mode=" in line
+        line for line in identity_scope.splitlines() if "instrumentedAdd probe mode=" in line
     ]
     if not producer_lines or not probe_lines:
         return Check(

@@ -18,6 +18,22 @@ namespace dartplant {
 
 struct MetadataIndex;
 struct LiveVmInstructionImage;
+struct DartRuntimeOwnerIdentity;
+
+struct LiveFunctionSemanticSnapshot {
+    uint64_t runtime_image_id = 0;
+    uint64_t runtime_image_incarnation_epoch = 0;
+    uint64_t engine_incarnation_epoch = 0;
+    uint64_t isolate_group_incarnation_epoch = 0;
+    uint64_t runtime_generation = 0;
+    std::string library_uri;
+    std::string class_name;
+    std::string function_name;
+    uint32_t function_type_profile_version = 0;
+    std::string function_type_abi_key;
+    DartPlantDartFunctionSignatureInfo signature{};
+    std::vector<DartPlantDartParameterInfo> parameters;
+};
 
 struct SnapshotFunction {
     uint64_t runtime_image_id = 0;
@@ -69,6 +85,11 @@ struct SnapshotIndex {
     // queries do not need to reconstruct it by rescanning the flattened
     // SnapshotFunction list for every position.
     std::vector<DartPlantLiveVmFunctionInfo> live_function_infos;
+    // FunctionType is a GC-managed heap object. Capture its semantic value
+    // while the live index is built inside a moving-GC observation lease;
+    // later runtime APIs must consume this immutable copy rather than
+    // dereference a cached movable FunctionPtr.
+    std::vector<LiveFunctionSemanticSnapshot> live_function_semantics;
 
     const SnapshotFunction* FindSnapshotFunction(std::string_view library_uri,
                                                  std::string_view class_name,
@@ -76,7 +97,15 @@ struct SnapshotIndex {
                                                  std::string_view signature,
                                                  DartPlantEntryKind entry_kind,
                                                  bool* out_ambiguous = nullptr) const;
+    const LiveFunctionSemanticSnapshot* FindLiveFunctionSemanticSnapshot(
+        uint64_t runtime_image_id, std::string_view library_uri, std::string_view class_name,
+        std::string_view function_name) const;
 };
+
+const RuntimeProfileRecord* ResolveLiveFunctionSemanticProfile(
+    const LiveFunctionSemanticSnapshot& semantic);
+bool LiveFunctionSemanticMatchesOwner(const LiveFunctionSemanticSnapshot& semantic,
+                                      const DartRuntimeOwnerIdentity& owner);
 
 // Compatibility cache only. A runtime snapshot parser must populate the same
 // model without calling this function. The runtime marks this source so callers
@@ -84,14 +113,15 @@ struct SnapshotIndex {
 SnapshotIndex BuildOfflineSnapshotIndexFromMetadata(const MetadataIndex& metadata);
 std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo& source,
                                                 std::string* error);
-std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext& context,
-                                                    const DartPlantFlutterSnapshotInfo& snapshot,
-                                                    const RuntimeProfileRecord& profile,
-                                                    DartPlantLiveVmFunctionIndexInfo* out_info,
-                                                    std::string* error);
+std::optional<SnapshotIndex> BuildLiveSnapshotIndex(
+    const DartPlantLiveVmContext& context, const DartPlantFlutterSnapshotInfo& snapshot,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, DartPlantLiveVmFunctionIndexInfo* out_info,
+    std::string* error);
 std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
-    const RuntimeProfileRecord& live_index_profile, const RuntimeProfileRecord* deferred_profile,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, const RuntimeProfileRecord* deferred_profile,
     DartPlantLiveVmFunctionIndexInfo* out_info, std::string* error);
 
 // Internal record adapter shared by the live-VM visitor and host regression

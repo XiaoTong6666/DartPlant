@@ -40,6 +40,10 @@ struct DartPlantVmAdapter {
     uint64_t hook_refs = 0;
     uint64_t generated_root_leases = 0;
     uint32_t generated_native_transitions = 0;
+    uint32_t live_heap_observations = 0;
+    std::thread::id live_heap_observation_thread;
+    uint64_t live_heap_observation_vm_thread = 0;
+    void* live_heap_observation_lease = nullptr;
     std::atomic_bool admission_open{true};
     VmAbiBindingState abi_binding;
     std::vector<DartPlantObjectHandle*> released_handles;
@@ -89,6 +93,11 @@ DartPlantStatus VmAdapterReadTypeArgumentsElementGenerated(DartPlantVmAdapter* a
                                                            uint64_t type_arguments_raw,
                                                            uint32_t index, uint64_t* out_raw);
 bool VmAdapterSupportsCapabilityProof(const DartPlantVmAdapter* adapter);
+DartPlantStatus VmAdapterBeginLiveHeapObservation(DartPlantVmAdapter* adapter, uint64_t thread,
+                                                  void** out_lease);
+DartPlantStatus VmAdapterEndLiveHeapObservation(DartPlantVmAdapter* adapter, void* lease);
+bool VmAdapterOwnsLiveHeapObservation(const DartPlantVmAdapter* adapter, uint64_t thread,
+                                      const void* lease);
 DartPlantStatus VmAdapterProveCapability(DartPlantVmAdapter* adapter,
                                          const DartPlantVmCapabilityEvidence& evidence,
                                          DartPlantVmCapabilityProof* out_proof);

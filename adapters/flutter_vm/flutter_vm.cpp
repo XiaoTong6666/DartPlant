@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -83,6 +85,12 @@ struct State {
         std::vector<dartplant::vm_abi::CapabilityProofRecord>(
             dartplant::vm_abi::CapabilityRegistrySize());
     bool isolate_detached = false;
+    bool live_heap_observation_active = false;
+    uint64_t live_heap_observation_thread = 0;
+    const dartplant::RuntimeProfileRecord* live_heap_observation_profile = nullptr;
+    uintptr_t live_heap_enter_runtime_entry = 0;
+    uintptr_t live_heap_exit_runtime_entry = 0;
+    bool live_heap_observation_owns_transition = false;
 };
 
 struct DescriptorMetadata {
@@ -109,10 +117,18 @@ static_assert(std::size(kDescriptorMetadata) == 1,
 #endif
 
 constexpr char kTag[] = "DartPlantFlutterVm";
-constexpr uint64_t kEagerRuntimeProofMask =
-    dartplant::vm_abi::kCapabilityRuntimeRoots | dartplant::vm_abi::kCapabilityOwnerIdentity |
-    dartplant::vm_abi::kCapabilityCanonicalNull | dartplant::vm_abi::kCapabilityRegisterSemantics |
-    dartplant::vm_abi::kCapabilityDartCore | dartplant::vm_abi::kCapabilitySafepointStubs;
+std::mutex g_api_dl_mutex;
+bool g_api_dl_initialized = false;
+
+bool EnsureDartApiDlInitialized(void* api_dl_data) {
+    std::lock_guard lock(g_api_dl_mutex);
+    if (g_api_dl_initialized) return true;
+    if (Dart_InitializeApiDL(api_dl_data) != 0) return false;
+    g_api_dl_initialized = true;
+    return true;
+}
+const uint64_t kEagerRuntimeProofMask = dartplant::vm_abi::ProfileAbiSelectableCapabilityMask(
+    dartplant::vm_abi::VerifiedAfterCreateCapabilityMask());
 static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_RUNTIME_ROOTS_PROVEN) ==
               static_cast<uint64_t>(dartplant::vm_abi::kCapabilityRuntimeRoots));
 static_assert(static_cast<uint64_t>(DARTPLANT_FLUTTER_VM_CAP_OWNER_IDENTITY_PROVEN) ==
@@ -181,6 +197,242 @@ uintptr_t CanonicalNativePointer(uint64_t pointer) {
 #else
     return static_cast<uintptr_t>(pointer);
 #endif
+}
+
+struct LiveHeapObservation {
+    uint64_t thread = 0;
+    const dartplant::RuntimeProfileRecord* profile = nullptr;
+    uintptr_t enter_runtime_entry = 0;
+    uintptr_t exit_runtime_entry = 0;
+    bool owns_transition = false;
+    bool active = false;
+};
+
+static_assert(std::atomic<uintptr_t>::is_always_lock_free,
+              "Flutter VM Thread::safepoint_state_ requires lock-free native-word atomics");
+
+const std::atomic<uintptr_t>* ThreadSafepointState(uint64_t thread, uint32_t offset) {
+    return reinterpret_cast<const std::atomic<uintptr_t>*>(static_cast<uintptr_t>(thread) + offset);
+}
+
+uintptr_t LoadThreadSafepointState(uint64_t thread, uint32_t offset) {
+    // Dart 3.4/3.5/3.12 declare Thread::safepoint_state_ as
+    // std::atomic<uword>. Reading the object through an ordinary uint64_t*
+    // races with safepoint requests/active-mutator stealing even when the
+    // target CPU provides naturally atomic aligned 64-bit loads.
+    return ThreadSafepointState(thread, offset)->load(std::memory_order_acquire);
+}
+
+bool IsExecutableInRanges(std::span<const dartplant::ExecutableRange> ranges, uintptr_t address) {
+    return std::any_of(ranges.begin(), ranges.end(), [address](const auto& range) {
+        return address >= range.start && address < range.end;
+    });
+}
+
+bool ResolveSafepointEntry(const dartplant::RuntimeProfileRecord& profile, uint64_t thread,
+                           uint32_t stub_offset, std::span<const dartplant::ExecutableRange> ranges,
+                           uintptr_t* out_entry) {
+    if (out_entry == nullptr) return false;
+    const uint64_t tagged_code =
+        CanonicalNativePointer(*reinterpret_cast<const uint64_t*>(thread + stub_offset));
+    if ((tagged_code & profile.raw_object.smi_tag_mask) != profile.raw_object.heap_object_tag ||
+        tagged_code < profile.raw_object.heap_object_tag ||
+        (tagged_code - profile.raw_object.heap_object_tag) % profile.machine.pointer_size != 0) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "safepoint Code slot rejected offset=0x%x tagged=0x%llx tag=0x%x mask=0x%x",
+            stub_offset, static_cast<unsigned long long>(tagged_code),
+            profile.raw_object.heap_object_tag, profile.raw_object.smi_tag_mask);
+        return false;
+    }
+    const uintptr_t code = static_cast<uintptr_t>(tagged_code - profile.raw_object.heap_object_tag);
+    const uint64_t tags = *reinterpret_cast<const uint64_t*>(code);
+    const uint64_t cid_mask = (uint64_t{1} << profile.raw_object.class_id_tag_bits) - uint64_t{1};
+    const uint32_t cid =
+        static_cast<uint32_t>((tags >> profile.raw_object.class_id_tag_shift) & cid_mask);
+    if (cid != profile.live_vm.cid_code) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "safepoint Code CID rejected offset=0x%x code=0x%llx tags=0x%llx "
+                            "cid=%u expected=%u",
+                            stub_offset, static_cast<unsigned long long>(code),
+                            static_cast<unsigned long long>(tags), cid, profile.live_vm.cid_code);
+        return false;
+    }
+    const uintptr_t entry = CanonicalNativePointer(
+        *reinterpret_cast<const uint64_t*>(code + profile.live_vm.code_entry_point_offset));
+    if (!IsExecutableInRanges(ranges, entry)) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "safepoint entry rejected offset=0x%x code=0x%llx entry=0x%llx ranges=%zu", stub_offset,
+            static_cast<unsigned long long>(code), static_cast<unsigned long long>(entry),
+            ranges.size());
+        return false;
+    }
+    *out_entry = entry;
+    return true;
+}
+
+bool BeginLiveHeapObservationForProfile(uint64_t thread, uint64_t current_isolate,
+                                        const dartplant::RuntimeProfileRecord& profile,
+                                        std::span<const dartplant::ExecutableRange> code_ranges,
+                                        LiveHeapObservation* out) {
+    if (thread == 0 || current_isolate == 0 || out == nullptr) return false;
+    const auto& bridge = profile.thread_bridge;
+    const auto& transition = profile.transition;
+    const uint64_t observed_isolate = CanonicalNativePointer(
+        *reinterpret_cast<const uint64_t*>(thread + profile.live_vm.thread_isolate_offset));
+    const uint64_t execution_state =
+        *reinterpret_cast<const uint64_t*>(thread + bridge.execution_state_offset);
+    const uint64_t top_exit_frame =
+        *reinterpret_cast<const uint64_t*>(thread + bridge.top_exit_frame_offset);
+    const uint64_t exit_marker =
+        *reinterpret_cast<const uint64_t*>(thread + bridge.exit_through_ffi_offset);
+    const uintptr_t safepoint_state =
+        LoadThreadSafepointState(thread, bridge.safepoint_state_offset);
+    if (observed_isolate != current_isolate || top_exit_frame == transition.exit_none ||
+        exit_marker != transition.exit_through_ffi) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "live heap observation rejected profile=%s thread=0x%llx isolate=0x%llx/0x%llx "
+            "exec=0x%llx expected_native=0x%llx top_exit=0x%llx exit_ffi=0x%llx "
+            "expected_exit_ffi=0x%llx safepoint=0x%llx",
+            profile.live_vm.name, static_cast<unsigned long long>(thread),
+            static_cast<unsigned long long>(observed_isolate),
+            static_cast<unsigned long long>(current_isolate),
+            static_cast<unsigned long long>(execution_state),
+            static_cast<unsigned long long>(transition.execution_native),
+            static_cast<unsigned long long>(top_exit_frame),
+            static_cast<unsigned long long>(exit_marker),
+            static_cast<unsigned long long>(transition.exit_through_ffi),
+            static_cast<unsigned long long>(safepoint_state));
+        return false;
+    }
+
+    // Two exact states are admissible:
+    //
+    //  * Native FFI state at a safepoint. This is the state produced by
+    //    TransitionGeneratedToNative and requires us to perform the
+    //    Native->VM transition below.
+    //
+    //  * VM state outside a safepoint. This occurs when callback_dispatch has
+    //    already entered a Dart API scope via Dart_EnterScope. In that case
+    //    Dart itself already executed TransitionNativeToVM, including the
+    //    no_callback_scope_depth() branch, so the observation lease must borrow
+    //    that state instead of attempting a second transition.
+    //
+    // Dart_TypedDataAcquireData proves the remaining native edge case: it
+    // increments no_callback_scope_depth() before its TransitionNativeToVM
+    // destructor returns to native, and that destructor deliberately skips
+    // EnterSafepointToNative(). Therefore native+AtSafepoint is an observable
+    // proof that no_callback_scope_depth()==0 without inventing a private
+    // offset that Dart's runtime offset table does not expose.
+    const bool native_at_safepoint =
+        execution_state == transition.execution_native && (safepoint_state & uintptr_t{1}) != 0;
+    const bool vm_outside_safepoint =
+        execution_state == transition.execution_vm && (safepoint_state & uintptr_t{1}) == 0;
+    if (!native_at_safepoint && !vm_outside_safepoint) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "live heap observation rejected transition state profile=%s exec=0x%llx "
+            "safepoint=0x%llx",
+            profile.live_vm.name, static_cast<unsigned long long>(execution_state),
+            static_cast<unsigned long long>(safepoint_state));
+        return false;
+    }
+
+    if (vm_outside_safepoint) {
+        *out = {
+            .thread = thread,
+            .profile = &profile,
+            .owns_transition = false,
+            .active = true,
+        };
+        return true;
+    }
+
+    uintptr_t enter_safepoint = 0;
+    uintptr_t exit_safepoint = 0;
+    if (!ResolveSafepointEntry(profile, thread, bridge.enter_safepoint_stub_offset, code_ranges,
+                               &enter_safepoint) ||
+        !ResolveSafepointEntry(profile, thread, bridge.exit_safepoint_stub_offset, code_ranges,
+                               &exit_safepoint)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "live heap observation could not resolve app-owned safepoint stubs");
+        return false;
+    }
+
+    dartplant_flutter_vm_call_safepoint_stub(thread, exit_safepoint);
+    *reinterpret_cast<uint64_t*>(thread + bridge.execution_state_offset) = transition.execution_vm;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if ((LoadThreadSafepointState(thread, bridge.safepoint_state_offset) & uintptr_t{1}) != 0 ||
+        *reinterpret_cast<const uint64_t*>(thread + bridge.execution_state_offset) !=
+            transition.execution_vm) {
+        std::abort();
+    }
+    *out = {
+        .thread = thread,
+        .profile = &profile,
+        .enter_runtime_entry = enter_safepoint,
+        .exit_runtime_entry = exit_safepoint,
+        .owns_transition = true,
+        .active = true,
+    };
+    return true;
+}
+
+void EndLiveHeapObservationForProfile(LiveHeapObservation* observation) {
+    if (observation == nullptr || !observation->active || observation->profile == nullptr) {
+        std::abort();
+    }
+    const auto& bridge = observation->profile->thread_bridge;
+    const auto& transition = observation->profile->transition;
+    auto* execution_state =
+        reinterpret_cast<uint64_t*>(observation->thread + bridge.execution_state_offset);
+    if (*execution_state != transition.execution_vm) std::abort();
+    if (!observation->owns_transition) {
+        if ((LoadThreadSafepointState(observation->thread, bridge.safepoint_state_offset) &
+             uintptr_t{1}) != 0) {
+            std::abort();
+        }
+        observation->active = false;
+        return;
+    }
+    *execution_state = transition.execution_native;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    dartplant_flutter_vm_call_safepoint_stub(observation->thread, observation->enter_runtime_entry);
+    if ((LoadThreadSafepointState(observation->thread, bridge.safepoint_state_offset) &
+         uintptr_t{1}) == 0 ||
+        *execution_state != transition.execution_native) {
+        std::abort();
+    }
+    observation->active = false;
+}
+
+bool BeginSourceVerifiedLiveHeapObservation(const dartplant::VmRuntimeFacts& facts,
+                                            uint32_t only_profile_version,
+                                            const std::vector<dartplant::ModuleImage>& modules,
+                                            uint64_t thread, uint64_t current_isolate,
+                                            LiveHeapObservation* out) {
+    const dartplant::RuntimeProfileRecord* selected = nullptr;
+    for (const auto* candidate : dartplant::ResolveRuntimeProfileCandidates(facts)) {
+        if (facts.snapshot_hash.empty() || candidate->live_vm.snapshot_hash == nullptr ||
+            facts.snapshot_hash != candidate->live_vm.snapshot_hash) {
+            continue;
+        }
+        if (only_profile_version == 0 ||
+            candidate->live_vm.profile_version == only_profile_version) {
+            if (selected != nullptr && std::strcmp(selected->abi_identity.transition,
+                                                   candidate->abi_identity.transition) != 0) {
+                return false;
+            }
+            selected = candidate;
+        }
+    }
+    if (selected == nullptr) return false;
+    const auto safepoints = dartplant::vm_abi::ProbeSafepoints(*selected, thread, modules);
+    return safepoints.passed && safepoints.code_module != nullptr &&
+           BeginLiveHeapObservationForProfile(thread, current_isolate, *selected,
+                                              safepoints.code_module->executable_ranges, out);
 }
 
 bool ReadNativePointer(uintptr_t address, uint64_t* out_pointer) {
@@ -551,6 +803,12 @@ bool EstablishEagerCapabilityProofs(State& state,
     state.root_compatible_candidates = compatible;
     for (uint64_t bit = 1; bit != 0 && bit <= kEagerRuntimeProofMask; bit <<= 1) {
         if ((state.capabilities & kEagerRuntimeProofMask & bit) == 0) continue;
+        if (compatible_rows == nullptr) {
+            const auto* existing = state.capability_bindings.Find(bit);
+            if (existing == nullptr || !existing->bound()) return false;
+            SetProofRecordDomains(state, bit, *existing->representative, existing->abi_domain_key);
+            continue;
+        }
         const auto selection =
             dartplant::vm_abi::SelectCapabilityAbiSet(state.abi_candidates, bit, compatible);
         if (!selection.passed()) {
@@ -617,6 +875,40 @@ bool ReproveCoreBinding(State& state) {
             .enter = probes[index].enter_entry,
             .exit = probes[index].exit_entry,
         });
+    }
+
+    // Artifact retirement clears every capability binding, not only proof
+    // state. Rebuild the structural bindings for the new artifact incarnation
+    // before restoring eager verification. Non-eager capabilities such as
+    // GeneratedTransition remain UNVERIFIED here, but their source-row/domain
+    // selection must still exist so the first runtime proof can consume it.
+    for (const auto* descriptor = dartplant::vm_abi::CapabilityRegistry();
+         descriptor !=
+         dartplant::vm_abi::CapabilityRegistry() + dartplant::vm_abi::CapabilityRegistrySize();
+         ++descriptor) {
+        const uint64_t capability = descriptor->capability;
+        if ((state.capabilities & capability) == 0 ||
+            capability == dartplant::vm_abi::kCapabilityArtifactLifecycle ||
+            capability == dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout) {
+            continue;
+        }
+        std::vector<bool> capability_compatible;
+        capability_compatible.reserve(state.abi_candidates.profiles.size());
+        for (size_t index = 0; index < state.abi_candidates.profiles.size(); ++index) {
+            const auto* candidate = state.abi_candidates.profiles[index];
+            const uint64_t available =
+                candidate == nullptr ? dartplant::vm_abi::kCapabilityNone
+                                     : dartplant::vm_abi::CandidateCapabilities(
+                                           *candidate, probes[index],
+                                           dartplant::vm_abi::RegisterEvidence{}, state.artifacts);
+            capability_compatible.push_back((available & capability) != 0);
+        }
+        const auto capability_selection = dartplant::vm_abi::SelectCapabilityAbiSet(
+            state.abi_candidates, capability, capability_compatible);
+        if (!capability_selection.passed() ||
+            !state.capability_bindings.Bind(capability, capability_selection)) {
+            return false;
+        }
     }
     return EstablishEagerCapabilityProofs(state, &compatible);
 }
@@ -766,9 +1058,58 @@ DartPlantStatus ProveCapability(void* user_data, const DartPlantIsolateIdentity*
     const auto exception_bridge = dartplant::vm_abi::kCapabilityExceptionBridgeLayout;
     const dartplant::RuntimeProfileRecord* selected = nullptr;
     dartplant::vm_abi::DomainSetSelection proof_selection{};
-    if (evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ||
-        evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY ||
-        evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI) {
+    const bool observation_receipt =
+        (evidence->flags & DARTPLANT_VM_EVIDENCE_OBSERVATION_RECEIPT) != 0;
+    const bool semantic_receipt = (evidence->flags & DARTPLANT_VM_EVIDENCE_SEMANTIC_RECEIPT) != 0;
+    if (observation_receipt || semantic_receipt) {
+        const bool observation_kind = evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ||
+                                      evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY ||
+                                      evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI ||
+                                      evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE;
+        const bool semantic_kind = evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI ||
+                                   evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_TYPE ||
+                                   evidence->kind == DARTPLANT_VM_EVIDENCE_CLOSURE_CALL;
+        if (observation_receipt == semantic_receipt || (observation_receipt && !observation_kind) ||
+            (semantic_receipt && !semantic_kind) || evidence->function != 0 ||
+            evidence->code != 0 || evidence->expected_entry == 0 ||
+            !HasCapability(*state, requested_capability) ||
+            HasFailedCapability(*state, requested_capability) ||
+            !CapabilityDependenciesVerified(*state, requested_capability) ||
+            (semantic_receipt && evidence->kind == DARTPLANT_VM_EVIDENCE_CLOSURE_CALL &&
+             evidence->descriptor == 0)) {
+            LogCapabilityDiagnostic(*state, requested_capability, "unavailable");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+
+        // Observation receipts preserve a Function -> Code -> entry relation
+        // captured under the V5 lease. Semantic receipts preserve immutable
+        // FunctionType/call semantics captured under that lease and matched to
+        // an exact artifact entry. Neither form may replay movable heap
+        // pointers after the lease ends. Re-publish only the already selected
+        // capability domain for the current artifact/isolate generation.
+        const auto modules = dartplant::EnumerateModules();
+        const size_t entry_owners = static_cast<size_t>(
+            std::count_if(modules.begin(), modules.end(), [evidence](const auto& module) {
+                return module.ContainsExecutable(static_cast<uintptr_t>(evidence->expected_entry),
+                                                 sizeof(uint32_t));
+            }));
+        const auto* binding = state->capability_bindings.Find(requested_capability);
+        if (entry_owners != 1 || binding == nullptr || !binding->bound() ||
+            binding->selected_rows.empty()) {
+            LogCapabilityDiagnostic(*state, requested_capability, "predicate_failed");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        selected = binding->representative;
+        proof_selection.representative = binding->representative;
+        proof_selection.abi_domain_key = binding->abi_domain_key;
+        proof_selection.compatible_rows = binding->selected_rows.size();
+        proof_selection.distinct_domain_sets = 1;
+        proof_selection.selected_rows = binding->selected_rows;
+        SetProofRecordDomains(*state, requested_capability, *selected, binding->abi_domain_key);
+        MarkCapabilityVerified(*state, requested_capability);
+    } else if (evidence->kind == DARTPLANT_VM_EVIDENCE_FUNCTION_CODE ||
+               evidence->kind == DARTPLANT_VM_EVIDENCE_AOT_ENTRY ||
+               evidence->kind == DARTPLANT_VM_EVIDENCE_INVOCATION_CALL_ABI) {
         const bool allow_shared =
             (evidence->flags & DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER) != 0;
         const uint64_t selected_capability =
@@ -1792,9 +2133,88 @@ DartPlantStatus ReadTypeArgumentsElement(void* user_data, const DartPlantIsolate
     return DARTPLANT_OK;
 }
 
+DartPlantStatus BeginLiveHeapObservation(void* user_data, const DartPlantIsolateIdentity* identity,
+                                         uint64_t thread, void** out_lease) {
+    auto* state = static_cast<State*>(user_data);
+    if (state == nullptr || identity == nullptr || out_lease == nullptr || thread == 0 ||
+        identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group ||
+        identity->generation != state->identity.generation || state->live_heap_observation_active) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (CanonicalNativePointer(thread) != CanonicalNativePointer(state->thread)) {
+        return DARTPLANT_VM_THREAD_MISMATCH;
+    }
+    state->artifact_mutex.lock();
+    if (!ValidateHotArtifactBinding(*state) || state->artifacts.app.executable_ranges.empty()) {
+        state->artifact_mutex.unlock();
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    constexpr std::array<uint64_t, 2> kCapabilities = {
+        dartplant::vm_abi::kCapabilitySafepointStubs,
+        dartplant::vm_abi::kCapabilityGeneratedTransitionLayout,
+    };
+    const auto* profile = dartplant::vm_abi::ResolveCapabilityConsumerProfile(
+        state->capability_bindings, kCapabilities);
+    LiveHeapObservation observation{};
+    const uint64_t current_isolate =
+        CanonicalNativePointer(reinterpret_cast<uint64_t>(Dart_CurrentIsolate_DL()));
+    if (current_isolate != state->identity.isolate) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "live heap observation isolate mismatch current=0x%llx expected=0x%llx",
+                            static_cast<unsigned long long>(current_isolate),
+                            static_cast<unsigned long long>(state->identity.isolate));
+        state->artifact_mutex.unlock();
+        return DARTPLANT_VM_ISOLATE_MISMATCH;
+    }
+    if (profile == nullptr ||
+        !BeginLiveHeapObservationForProfile(thread, current_isolate, *profile,
+                                            state->artifacts.app.executable_ranges, &observation)) {
+        state->artifact_mutex.unlock();
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    state->live_heap_observation_active = true;
+    state->live_heap_observation_thread = observation.thread;
+    state->live_heap_observation_profile = observation.profile;
+    state->live_heap_enter_runtime_entry = observation.enter_runtime_entry;
+    state->live_heap_exit_runtime_entry = observation.exit_runtime_entry;
+    state->live_heap_observation_owns_transition = observation.owns_transition;
+    *out_lease = state;
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus EndLiveHeapObservation(void* user_data, const DartPlantIsolateIdentity* identity,
+                                       void* lease) {
+    auto* state = static_cast<State*>(user_data);
+    if (state == nullptr || identity == nullptr || lease != state ||
+        !state->live_heap_observation_active || identity->isolate != state->identity.isolate ||
+        identity->isolate_group != state->identity.isolate_group ||
+        identity->generation != state->identity.generation) {
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (state->live_heap_observation_profile == nullptr) std::abort();
+    LiveHeapObservation observation = {
+        .thread = state->live_heap_observation_thread,
+        .profile = state->live_heap_observation_profile,
+        .enter_runtime_entry = state->live_heap_enter_runtime_entry,
+        .exit_runtime_entry = state->live_heap_exit_runtime_entry,
+        .owns_transition = state->live_heap_observation_owns_transition,
+        .active = true,
+    };
+    EndLiveHeapObservationForProfile(&observation);
+    state->live_heap_observation_active = false;
+    state->live_heap_observation_thread = 0;
+    state->live_heap_observation_profile = nullptr;
+    state->live_heap_observation_owns_transition = false;
+    state->live_heap_enter_runtime_entry = 0;
+    state->live_heap_exit_runtime_entry = 0;
+    state->artifact_mutex.unlock();
+    return DARTPLANT_OK;
+}
+
 const DartPlantVmAdapterCallbacks kCallbacks = {
     .struct_size = sizeof(DartPlantVmAdapterCallbacks),
-    .adapter_version = 4,
+    .adapter_version = 5,
     .enter_isolate = EnterIsolate,
     .leave_isolate = LeaveIsolate,
     .enter_scope = EnterScope,
@@ -1814,6 +2234,8 @@ const DartPlantVmAdapterCallbacks kCallbacks = {
     .read_active_stacktrace = ReadActiveStacktrace,
     .read_type_arguments_element = ReadTypeArgumentsElement,
     .prove_capability = ProveCapability,
+    .begin_live_heap_observation = BeginLiveHeapObservation,
+    .end_live_heap_observation = EndLiveHeapObservation,
 };
 
 }  // namespace
@@ -1838,7 +2260,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     facts.snapshot_features =
         options->snapshot_features == nullptr ? "" : options->snapshot_features;
 
-    if (Dart_InitializeApiDL(api_dl_data) != 0) {
+    if (!EnsureDartApiDlInitialized(api_dl_data)) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "Dart_InitializeApiDL failed");
         return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
     }
@@ -1887,8 +2309,25 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
 #if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
     resolver_input.only_profile_version = 1;
 #endif
+    LiveHeapObservation startup_observation{};
+    if (!BeginSourceVerifiedLiveHeapObservation(facts, resolver_input.only_profile_version, modules,
+                                                thread, current_isolate, &startup_observation)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "source-verified live heap observation bootstrap failed");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
     const dartplant::vm_abi::ResolverResult resolution =
         dartplant::vm_abi::ResolveVerifiedBinding(resolver_input);
+    const auto* transition_binding = resolution.binding.capability_bindings.Find(
+        dartplant::vm_abi::kCapabilityGeneratedTransitionLayout);
+    const bool observation_profile_retained =
+        transition_binding != nullptr && transition_binding->Contains(startup_observation.profile);
+    EndLiveHeapObservationForProfile(&startup_observation);
+    if (!observation_profile_retained) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "startup observation profile was not retained by structural proof");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
         "ABI resolver snapshot=%s features=%s source_candidates=%zu snapshot_identity_is_hint=1",
@@ -2091,7 +2530,7 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     *out_instance = reinterpret_cast<DartPlantFlutterVmAdapter*>(instance);
     __android_log_print(
         ANDROID_LOG_INFO, kTag,
-        "source-verified Dart %s V4 adapter initialized abi=%s snapshot=%s thread=0x%llx",
+        "source-verified Dart %s V5 adapter initialized abi=%s snapshot=%s thread=0x%llx",
         profile->live_vm.dart_version, profile->abi_id, snapshot_hash,
         static_cast<unsigned long long>(thread));
     __android_log_print(ANDROID_LOG_INFO, kTag,
@@ -2299,7 +2738,7 @@ const DartPlantFlutterVmDescriptor* DescriptorAt(uint32_t index) {
             result[cursor] = {
                 .struct_size = sizeof(DartPlantFlutterVmDescriptor),
                 .descriptor_version = 1,
-                .vm_adapter_version = 4,
+                .vm_adapter_version = 5,
                 .descriptor_id = metadata.descriptor_id,
                 .dart_version = profile->live_vm.dart_version,
                 .flutter_version = metadata.flutter_version,

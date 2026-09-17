@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "dartplant/advanced/live_vm.h"
 #include "dartplant/invocation.h"
@@ -24,6 +25,13 @@ struct LiveVmInstructionImage {
     uint64_t runtime_generation = 0;
     uint32_t loading_unit_id = 0;
     DartPlantFlutterSnapshotInfo snapshot{};
+};
+
+struct LiveVmFunctionSnapshotRecord {
+    DartPlantLiveVmFunctionInfo function{};
+    bool has_semantics = false;
+    DartPlantDartFunctionSignatureInfo signature{};
+    std::vector<DartPlantDartParameterInfo> parameters;
 };
 
 DartPlantStatus ResolveLiveVmCandidateForArm64Context(const DartPlantFlutterSnapshotInfo& snapshot,
@@ -50,6 +58,19 @@ DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& cont
                                               void* user_data,
                                               DartPlantLiveVmFunctionIndexInfo* out_info);
 
+// Observation-window collector used by runtime bootstrap. Function
+// enumeration and FunctionType semantic capture share one ProcessMemoryReader
+// and one /proc/self/maps snapshot so non-PRODUCT heaps with thousands of
+// retained Functions do not reopen and reparsed /proc/self/maps once per
+// Function. The caller must already hold the exact moving-GC observation
+// lease for context.thread.
+DartPlantStatus CollectLiveVmFunctionSnapshotRecordsForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, const RuntimeProfileRecord* deferred_profile,
+    std::vector<LiveVmFunctionSnapshotRecord>* out_records,
+    DartPlantLiveVmFunctionIndexInfo* out_info);
+
 // Candidate-scoped canonical Bool proof used before capability selection has
 // chosen a whole source row. Unlike ResolveLiveVmCanonicalBoolRoots(), this
 // deliberately does not compare context.profile_version; the candidate's own
@@ -65,6 +86,14 @@ DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmConte
                                                       const RuntimeProfileRecord& profile,
                                                       uint64_t function, uint32_t index,
                                                       DartPlantDartParameterInfo* out_parameter);
+// Observation-window batch reader. FunctionType and its parameter arrays are
+// movable heap objects, so snapshot capture must copy the complete semantic
+// value without repeatedly reopening /proc/self/maps or reparsing the same
+// FunctionType for every parameter.
+DartPlantStatus ReadLiveVmFunctionSemanticsForProfile(
+    const DartPlantLiveVmContext& context, const RuntimeProfileRecord& profile, uint64_t function,
+    DartPlantDartFunctionSignatureInfo* out_signature,
+    std::vector<DartPlantDartParameterInfo>* out_parameters);
 
 // Reads ObjectStore.loading_units[0], the root ProgramVisitor::Hash() Smi used
 // by Dart's deferred snapshot loader to reject units from another program.

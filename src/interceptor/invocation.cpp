@@ -12,11 +12,8 @@
 #include <utility>
 #include <vector>
 
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-#include <android/log.h>
-#endif
-
 #include "abi/value_codec.h"
+#include "android_logging.h"
 #include "runtime/runtime_internal.h"
 #include "vm/abi/resolver.h"
 #include "vm/dart_string.h"
@@ -461,8 +458,8 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
     const DartPlantStatus descriptor_status =
         dartplant_invocation_get_arguments_descriptor(invocation, &info);
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-    __android_log_print(
-        ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
+    dartplant::AndroidLogPrint(
+        ANDROID_LOG_DEBUG, "TypeArgs",
         "ArgumentsDescriptor status=%d type_args=%u count=%u size=%u positional=%u named=%u",
         descriptor_status, info.type_args_len, info.count, info.size, info.positional_count,
         info.named_count);
@@ -558,17 +555,24 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
             return false;
         }
     }
-    if (invocation->vm_adapter != nullptr &&
-        dartplant::VmAdapterSupportsCapabilityProof(invocation->vm_adapter) &&
-        invocation->requested_method->function != nullptr &&
-        invocation->requested_method->function->source == dartplant::DartFunctionSource::kLiveVm) {
+    // dartplant_invocation_get_arguments_descriptor() already proves the
+    // current descriptor against the adapter generation, and the checks above
+    // compare that live call shape against the immutable FunctionType semantic
+    // snapshot captured during the V5 heap-observation lease. Publish the
+    // composite ClosureCall domain from that semantic receipt; never replay
+    // requested_method->FunctionPtr/CodePtr because those heap objects may have
+    // relocated since bootstrap.
+    if (invocation->vm_adapter != nullptr && layout.vm_semantic_observation_receipt &&
+        dartplant::VmAdapterSupportsCapabilityProof(invocation->vm_adapter)) {
         DartPlantVmCapabilityEvidence evidence{};
         evidence.struct_size = sizeof(evidence);
         evidence.kind = DARTPLANT_VM_EVIDENCE_CLOSURE_CALL;
-        evidence.function = invocation->requested_method->function->function_object;
-        evidence.code = invocation->requested_method->function->code_object;
+        evidence.flags = DARTPLANT_VM_EVIDENCE_SEMANTIC_RECEIPT;
         evidence.expected_entry =
             invocation->code_target == nullptr ? 0 : invocation->code_target->entry;
+        evidence.entry_kind = invocation->requested_method == nullptr
+                                  ? DARTPLANT_ENTRY_DEFAULT
+                                  : invocation->requested_method->record.entry_kind;
         evidence.descriptor = info.raw_descriptor;
         evidence.type_arguments = type_arguments;
         DartPlantVmCapabilityProof proof{};
@@ -577,7 +581,7 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
             dartplant::VmAdapterProveCapability(invocation->vm_adapter, evidence, &proof);
         if (proof_status != DARTPLANT_OK ||
             proof.capability != dartplant::vm_abi::kCapabilityClosureCallLayout) {
-            dartplant::SetLastError("closure call composite proof was rejected");
+            dartplant::SetLastError("closure semantic receipt proof was rejected");
             return false;
         }
         DartPlantVmCapabilityProof bound{};
@@ -588,9 +592,10 @@ bool EnsureClosureArgumentMapping(const DartPlantInvocation* invocation) {
             bound.profile_version != proof.profile_version ||
             bound.artifact_generation != proof.artifact_generation ||
             bound.isolate_generation != proof.isolate_generation ||
-            bound.artifact_generation != invocation->call_layout->vm_artifact_generation ||
-            bound.isolate_generation != invocation->call_layout->vm_isolate_generation) {
-            dartplant::SetLastError("closure call proof was not published to the VM ABI binding");
+            bound.artifact_generation != layout.vm_artifact_generation ||
+            bound.isolate_generation != layout.vm_isolate_generation) {
+            dartplant::SetLastError(
+                "closure semantic receipt was not published to the current VM generation");
             return false;
         }
     }
@@ -963,7 +968,8 @@ DartPlantStatus dartplant_invocation_get_arguments_descriptor(
     }
     if (invocation->vm_adapter != nullptr &&
         dartplant::VmAdapterSupportsCapabilityProof(invocation->vm_adapter) &&
-        invocation->requested_method->function->source == dartplant::DartFunctionSource::kLiveVm) {
+        (invocation->requested_method->function->source == dartplant::DartFunctionSource::kLiveVm ||
+         invocation->call_layout->vm_semantic_observation_receipt)) {
         DartPlantVmCapabilityEvidence evidence{};
         evidence.struct_size = sizeof(evidence);
         evidence.kind = DARTPLANT_VM_EVIDENCE_ARGUMENTS_DESCRIPTOR;
@@ -1135,9 +1141,9 @@ DartPlantStatus dartplant_invocation_get_closure_type_argument(
         invocation->vm_adapter, invocation->generated_root_lease, root_index, &raw);
     if (status != DARTPLANT_OK) return status;
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-    __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-                        "root_get element[%u] root_index=%u raw=0x%llx", index, root_index,
-                        static_cast<unsigned long long>(raw));
+    dartplant::AndroidLogPrint(ANDROID_LOG_DEBUG, "TypeArgs",
+                               "root_get element[%u] root_index=%u raw=0x%llx", index, root_index,
+                               static_cast<unsigned long long>(raw));
 #endif
     *out_value =
         RefineTaggedSemanticValue(invocation, dartplant::dartplant_vm_abi_decode_gp_word(

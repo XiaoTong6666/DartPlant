@@ -109,6 +109,7 @@ AOT_OFFSET_BINDINGS = {
     ("thread", "active_exception"): "AOT_Thread_active_exception_offset",
     ("thread", "active_stacktrace"): "AOT_Thread_active_stacktrace_offset",
     ("thread", "execution_state"): "AOT_Thread_execution_state_offset",
+    ("thread", "safepoint_state"): "AOT_Thread_safepoint_state_offset",
     ("thread", "exit_through_ffi"): "AOT_Thread_exit_through_ffi_offset",
     ("thread", "jump_to_frame_entry_point"): "AOT_Thread_jump_to_frame_entry_point_offset",
     ("isolate_group", "class_table"): "AOT_IsolateGroup_class_table_offset",
@@ -335,7 +336,6 @@ def _verify_class_table_num_cids_contract(
             f"{profile['name']}: manifest class_table.num_cids=0x{actual:x} "
             f"disagrees with source-proven {source_name} layout=0x{expected:x}"
         )
-
 
 
 def _verify_object_store_offsets_contract(
@@ -784,7 +784,8 @@ ABI_DOMAIN_FIELDS = {
     "transition": (
         "thread.enter_safepoint_stub", "thread.exit_safepoint_stub",
         "thread.top_exit_frame", "thread.vm_tag", "thread.execution_state",
-        "thread.exit_through_ffi", "transition.vm_tag_dart", "transition.execution_vm",
+        "thread.safepoint_state", "thread.exit_through_ffi",
+        "transition.vm_tag_dart", "transition.execution_vm",
         "transition.execution_generated", "transition.execution_native",
         "transition.exit_none", "transition.exit_through_ffi",
         "transition.exit_through_runtime_call",
@@ -895,6 +896,7 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("thread.top_exit_frame", "profile.thread_bridge.top_exit_frame_offset"),
         ("thread.vm_tag", "profile.thread_bridge.vm_tag_offset"),
         ("thread.execution_state", "profile.thread_bridge.execution_state_offset"),
+        ("thread.safepoint_state", "profile.thread_bridge.safepoint_state_offset"),
         ("thread.exit_through_ffi", "profile.thread_bridge.exit_through_ffi_offset"),
         ("transition.vm_tag_dart", "profile.transition.vm_tag_dart"),
         ("transition.execution_vm", "profile.transition.execution_vm"),
@@ -1499,6 +1501,78 @@ def _verify_generated_native_transition_contract(
         raise ValueError(f"{source_name}: Dart_EnterScope no longer requires Native->VM transition")
 
 
+def _verify_live_heap_observation_contract(
+    thread_h: str,
+    bitfield_h: str,
+    safepoint_h: str,
+    dart_api_impl: str,
+    source_name: str,
+) -> None:
+    thread_text = " ".join(thread_h.split())
+    if re.search(r"std::atomic<uword> safepoint_state_(?: = 0)?;", thread_text) is None:
+        raise ValueError(
+            f"{source_name}: Thread::safepoint_state_ is no longer std::atomic<uword>"
+        )
+    explicit_at_safepoint_bit_zero = re.search(
+        r"(?:class|using) AtSafepointField .*?BitField<uword, bool, 0, 1>",
+        thread_text,
+    )
+    default_at_safepoint_bit = re.search(
+        r"using AtSafepointField = BitField<uword, bool>;", thread_text
+    )
+    bitfield_text = " ".join(bitfield_h.split())
+    default_bitfield_position_zero = re.search(
+        r"template <typename S, typename T, int position = 0,", bitfield_text
+    )
+    if explicit_at_safepoint_bit_zero is None and (
+        default_at_safepoint_bit is None or default_bitfield_position_zero is None
+    ):
+        raise ValueError(
+            f"{source_name}: Thread::AtSafepointField is no longer source-proven as bit 0"
+        )
+
+    safepoint_text = " ".join(safepoint_h.split())
+    start = safepoint_text.find("class TransitionNativeToVM")
+    transition = safepoint_text[start : start + 1800] if start >= 0 else ""
+    for evidence in (
+        "ASSERT(T->execution_state() == Thread::kThreadInNative);",
+        "T->set_execution_state(Thread::kThreadInVM);",
+        "thread()->set_execution_state(Thread::kThreadInNative);",
+    ):
+        if evidence not in transition:
+            raise ValueError(
+                f"{source_name}: Native<->VM observation transition contract changed: {evidence}"
+            )
+    exit_contract = (
+        "if (T->no_callback_scope_depth() == 0) { T->ExitSafepointFromNative(); }",
+        "if (T->no_callback_scope_depth() == 0) { T->ExitSafepoint(); }",
+    )
+    enter_contract = (
+        "if (thread()->no_callback_scope_depth() == 0) { thread()->EnterSafepointToNative(); }",
+        "if (thread()->no_callback_scope_depth() == 0) { thread()->EnterSafepoint(); }",
+    )
+    if not any(evidence in transition for evidence in exit_contract) or not any(
+        evidence in transition for evidence in enter_contract
+    ):
+        raise ValueError(
+            f"{source_name}: Native<->VM no-callback safepoint condition changed"
+        )
+
+    api = " ".join(dart_api_impl.split())
+    acquire_start = api.find("DART_EXPORT Dart_Handle Dart_TypedDataAcquireData")
+    release_start = api.find("DART_EXPORT Dart_Handle Dart_TypedDataReleaseData")
+    acquire = api[acquire_start : acquire_start + 5000] if acquire_start >= 0 else ""
+    release = api[release_start : release_start + 2600] if release_start >= 0 else ""
+    if "START_NO_CALLBACK_SCOPE(T);" not in acquire:
+        raise ValueError(
+            f"{source_name}: TypedData acquire no longer establishes no-callback scope"
+        )
+    if "END_NO_CALLBACK_SCOPE(T);" not in release:
+        raise ValueError(
+            f"{source_name}: TypedData release no longer closes no-callback scope"
+        )
+
+
 def _verify_arm64_return_frame_identity(
     assembler_arm64: str, il_arm64: str, source_name: str
 ) -> None:
@@ -1820,6 +1894,7 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
         stack_frame_arm64 = _git_show(sdk_root, version, "runtime/vm/stack_frame_arm64.h")
         stack_frame = _git_show(sdk_root, version, "runtime/vm/stack_frame.cc")
         dart_api_impl = _git_show(sdk_root, version, "runtime/vm/dart_api_impl.cc")
+        safepoint = _git_show(sdk_root, version, "runtime/vm/heap/safepoint.h")
         snapshot_header = _git_show(sdk_root, version, "runtime/vm/snapshot.h")
         dart_api = _git_show(sdk_root, version, "runtime/include/dart_api.h")
         dart_source = _git_show(sdk_root, version, "runtime/vm/dart.cc")
@@ -1868,6 +1943,10 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
             stack_frame,
             dart_api_impl,
             source_name=f"Dart SDK {version}",
+        )
+        bitfield = _git_show(sdk_root, version, "runtime/vm/bitfield.h")
+        _verify_live_heap_observation_contract(
+            thread, bitfield, safepoint, dart_api_impl, source_name=f"Dart SDK {version}"
         )
         _verify_arm64_return_frame_identity(
             assembler_arm64, il_arm64, source_name=f"Dart SDK {version}"
@@ -2069,6 +2148,8 @@ def verify_sdk_contract(sdk_root: Path) -> None:
     stack_frame_arm64 = sdk_root / "runtime" / "vm" / "stack_frame_arm64.h"
     stack_frame = sdk_root / "runtime" / "vm" / "stack_frame.cc"
     dart_api_impl = sdk_root / "runtime" / "vm" / "dart_api_impl.cc"
+    safepoint = sdk_root / "runtime" / "vm" / "heap" / "safepoint.h"
+    bitfield = sdk_root / "runtime" / "vm" / "bitfield.h"
     il_arm64 = sdk_root / "runtime" / "vm" / "compiler" / "backend" / "il_arm64.cc"
     il_header = sdk_root / "runtime" / "vm" / "compiler" / "backend" / "il.h"
     kernel_flowgraph = (
@@ -2102,6 +2183,7 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         stack_frame_arm64,
         stack_frame,
         dart_api_impl,
+        safepoint,
         il_arm64,
         il_header,
         kernel_flowgraph,
@@ -2142,6 +2224,13 @@ def verify_sdk_contract(sdk_root: Path) -> None:
         assembler_arm64.read_text(),
         stack_frame_arm64.read_text(),
         stack_frame.read_text(),
+        dart_api_impl.read_text(),
+        source_name="current Dart SDK",
+    )
+    _verify_live_heap_observation_contract(
+        thread.read_text(),
+        bitfield.read_text(),
+        safepoint.read_text(),
         dart_api_impl.read_text(),
         source_name="current Dart SDK",
     )
@@ -2422,6 +2511,7 @@ def _render_profile(profile: dict[str, object]) -> str:
             .active_exception_offset = {_u(int(thread['active_exception']))},
             .active_stacktrace_offset = {_u(int(thread['active_stacktrace']))},
             .execution_state_offset = {_u(int(thread['execution_state']))},
+            .safepoint_state_offset = {_u(int(thread['safepoint_state']))},
             .exit_through_ffi_offset = {_u(int(thread['exit_through_ffi']))},
         }},
         .type_arguments = {{

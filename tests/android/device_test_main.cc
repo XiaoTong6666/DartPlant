@@ -24,8 +24,10 @@ int RunDeviceFlutterSnapshotDiscoveryTests();
 namespace {
 
 using Add = int (*)(int, int);
+using UnaryWord = uint64_t (*)(uint64_t);
 
 Add g_original_add = nullptr;
+UnaryWord g_dobby_x17_original = nullptr;
 int g_enter_calls = 0;
 int g_leave_calls = 0;
 int g_listener_calls = 0;
@@ -98,9 +100,135 @@ extern "C" uint64_t DartPlantDeviceInvokeDartCallbackWithOddSp(DartPlantHook* ho
                                                                uint64_t argument);
 extern "C" int DartPlantDeviceInvokeGeneratedGate(void* target, uintptr_t dart_spreg, int left,
                                                   int right);
+extern "C" uint64_t DartPlantDeviceDobbyX17Target(uint64_t argument);
 extern "C" int DartPlantFixtureAdd(int left, int right);
 
 int Fail(const char* message);
+
+uint64_t DobbyX17Replacement(uint64_t argument) {
+    return g_dobby_x17_original == nullptr ? UINT64_MAX : g_dobby_x17_original(argument) + 1000;
+}
+
+int DobbyFailClosedReplacement() { return 99; }
+
+void DobbyFailClosedInstrument(void*, DobbyRegisterContext*) {}
+
+int ExerciseDobbyX17OriginalTrampoline() {
+    g_dobby_x17_original = nullptr;
+    const uint64_t before = DartPlantDeviceDobbyX17Target(5);
+    const int hook_status = DobbyHook(reinterpret_cast<void*>(DartPlantDeviceDobbyX17Target),
+                                      reinterpret_cast<dobby_dummy_func_t>(DobbyX17Replacement),
+                                      reinterpret_cast<dobby_dummy_func_t*>(&g_dobby_x17_original));
+    if (hook_status != RS_SUCCESS || g_dobby_x17_original == nullptr) {
+        return Fail("Dobby x17 original trampoline install");
+    }
+    const uint64_t hooked = DartPlantDeviceDobbyX17Target(5);
+    const uint64_t original = g_dobby_x17_original(5);
+    const int destroy_status = DobbyDestroy(reinterpret_cast<void*>(DartPlantDeviceDobbyX17Target));
+    const uint64_t restored = DartPlantDeviceDobbyX17Target(5);
+    g_dobby_x17_original = nullptr;
+    if (before != 12 || hooked != 1012 || original != 12 || destroy_status != RT_SUCCESS ||
+        restored != 12) {
+        return Fail("Dobby x17 original trampoline transparency");
+    }
+    std::puts("[PASS] ARM64 Dobby x17 original trampoline transparency");
+    return 0;
+}
+
+int ExerciseDobbyRelocationFailClosed() {
+    constexpr size_t kReserveSize = 320ULL << 20;
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    if (page_size_raw <= 0) return Fail("Dobby fail-closed page size");
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    void* reservation = mmap(nullptr, kReserveSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) return Fail("Dobby fail-closed reserve range");
+
+    uintptr_t target_address = reinterpret_cast<uintptr_t>(reservation) + kReserveSize / 2;
+    target_address &= ~(static_cast<uintptr_t>(page_size) - 1);
+    auto* target_page = reinterpret_cast<uint32_t*>(target_address);
+    if (mprotect(target_page, page_size, PROT_READ | PROT_WRITE) != 0) {
+        munmap(reservation, kReserveSize);
+        return Fail("Dobby fail-closed target write permission");
+    }
+    const uint32_t target_code[] = {
+        0xd2800540U,  // mov x0, #42
+        0xd65f03c0U,  // ret
+        0xd503201fU,  // nop
+        0xd503201fU,  // nop
+    };
+    std::memcpy(target_page, target_code, sizeof(target_code));
+    __builtin___clear_cache(reinterpret_cast<char*>(target_page),
+                            reinterpret_cast<char*>(target_page) + sizeof(target_code));
+    if (mprotect(target_page, page_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(reservation, kReserveSize);
+        return Fail("Dobby fail-closed target execute permission");
+    }
+
+    using Target = int (*)();
+    auto target = reinterpret_cast<Target>(target_page);
+    uint8_t pristine[sizeof(target_code)]{};
+    std::memcpy(pristine, target_page, sizeof(pristine));
+    const int before = target();
+    dobby_dummy_func_t backup = reinterpret_cast<dobby_dummy_func_t>(uintptr_t{0x1234});
+    const int hook_status =
+        DobbyHook(reinterpret_cast<void*>(target),
+                  reinterpret_cast<dobby_dummy_func_t>(DobbyFailClosedReplacement), &backup);
+    const int after = target();
+    const bool unchanged = std::memcmp(pristine, target_page, sizeof(pristine)) == 0;
+    munmap(reservation, kReserveSize);
+    if (before != 42 || hook_status == RS_SUCCESS || backup != nullptr || after != 42 ||
+        !unchanged) {
+        return Fail("Dobby relocation failure atomicity");
+    }
+    std::puts("[PASS] ARM64 Dobby relocation failure atomicity");
+    return 0;
+}
+
+int ExerciseDobbyInstrumentRelocationFailClosed() {
+    constexpr size_t kReserveSize = 320ULL << 20;
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    if (page_size_raw <= 0) return Fail("Dobby instrument fail-closed page size");
+    const size_t page_size = static_cast<size_t>(page_size_raw);
+    void* reservation = mmap(nullptr, kReserveSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) return Fail("Dobby instrument fail-closed reserve range");
+
+    uintptr_t target_address = reinterpret_cast<uintptr_t>(reservation) + kReserveSize / 2;
+    target_address &= ~(static_cast<uintptr_t>(page_size) - 1);
+    auto* target_page = reinterpret_cast<uint32_t*>(target_address);
+    if (mprotect(target_page, page_size, PROT_READ | PROT_WRITE) != 0) {
+        munmap(reservation, kReserveSize);
+        return Fail("Dobby instrument fail-closed target write permission");
+    }
+    const uint32_t target_code[] = {
+        0xd2800540U,  // mov x0, #42
+        0xd65f03c0U,  // ret
+        0xd503201fU,  // nop
+        0xd503201fU,  // nop
+    };
+    std::memcpy(target_page, target_code, sizeof(target_code));
+    __builtin___clear_cache(reinterpret_cast<char*>(target_page),
+                            reinterpret_cast<char*>(target_page) + sizeof(target_code));
+    if (mprotect(target_page, page_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(reservation, kReserveSize);
+        return Fail("Dobby instrument fail-closed target execute permission");
+    }
+
+    using Target = int (*)();
+    auto target = reinterpret_cast<Target>(target_page);
+    uint8_t pristine[sizeof(target_code)]{};
+    std::memcpy(pristine, target_page, sizeof(pristine));
+    const int before = target();
+    const int instrument_status =
+        DobbyInstrument(reinterpret_cast<void*>(target), DobbyFailClosedInstrument);
+    const bool unchanged = std::memcmp(pristine, target_page, sizeof(pristine)) == 0;
+    const int after = instrument_status == RS_SUCCESS ? -1 : target();
+    munmap(reservation, kReserveSize);
+    if (before != 42 || instrument_status == RS_SUCCESS || after != 42 || !unchanged) {
+        return Fail("Dobby instrument relocation failure atomicity");
+    }
+    std::puts("[PASS] ARM64 Dobby instrument relocation failure atomicity");
+    return 0;
+}
 
 int ExerciseDartPadBranch() {
     constexpr size_t kFakeStackSize = 1U << 20;
@@ -678,6 +806,10 @@ int main() {
     std::fprintf(stderr, "[FAIL] device test requires ARM64\n");
     return 1;
 #endif
+
+    if (ExerciseDobbyInstrumentRelocationFailClosed() != 0) return 1;
+    if (ExerciseDobbyRelocationFailClosed() != 0) return 1;
+    if (ExerciseDobbyX17OriginalTrampoline() != 0) return 1;
 
     const DartPlantHostApi legacy_dobby_host = {
         .struct_size = sizeof(DartPlantHostApi),

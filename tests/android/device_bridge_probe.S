@@ -3,6 +3,17 @@
 
 #if defined(__aarch64__)
 .text
+
+.p2align 2
+.global DartPlantDeviceDobbyX17Target
+.type DartPlantDeviceDobbyX17Target, %function
+DartPlantDeviceDobbyX17Target:
+  mov x17, x0
+  nop
+  nop
+  add x0, x17, #7
+  ret
+.size DartPlantDeviceDobbyX17Target, .-DartPlantDeviceDobbyX17Target
 .align 2
 .global DartPlantDeviceInvokeDartCallbackWithOddSp
 .type DartPlantDeviceInvokeDartCallbackWithOddSp, %function

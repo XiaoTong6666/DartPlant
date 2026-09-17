@@ -155,6 +155,22 @@ typedef enum DartPlantVmCapabilityEvidenceKind {
 
 typedef enum DartPlantVmCapabilityEvidenceFlags {
     DARTPLANT_VM_EVIDENCE_ALLOW_SHARED_CODE_OWNER = 1u << 0,
+    // The runtime already proved Function -> Code -> executable-entry
+    // semantics while holding an exact V5 live-heap observation lease. The
+    // movable FunctionPtr/CodePtr must not be replayed after that lease ends;
+    // this flag asks the adapter to publish the already source-selected
+    // capability domain for the current artifact/isolate generation instead.
+    // Callers must pair this with their own immutable entry/payload owner
+    // receipt. It is valid only for FunctionCode, AotEntry,
+    // InvocationCallAbi, and FunctionType evidence.
+    DARTPLANT_VM_EVIDENCE_OBSERVATION_RECEIPT = 1u << 1,
+    // FunctionType/call semantics were copied while a V5 live-heap
+    // observation lease was active and were then matched to an immutable
+    // compiler/artifact entry receipt. No movable FunctionPtr/CodePtr is
+    // replayed. This receipt is valid only for InvocationCallAbi,
+    // FunctionType, and ClosureCall; ClosureCall additionally requires a
+    // freshly proven ArgumentsDescriptor from the current invocation.
+    DARTPLANT_VM_EVIDENCE_SEMANTIC_RECEIPT = 1u << 2,
 } DartPlantVmCapabilityEvidenceFlags;
 
 typedef struct DartPlantVmCapabilityEvidence {
@@ -181,6 +197,16 @@ typedef struct DartPlantVmCapabilityProof {
 typedef DartPlantStatus (*DartPlantProveCapabilityCallback)(
     void* user_data, const DartPlantIsolateIdentity* isolate,
     const DartPlantVmCapabilityEvidence* evidence, DartPlantVmCapabilityProof* out_proof);
+
+// V5 exact-adapter lease for reading movable VM heap metadata. The begin
+// callback must prove that the owner thread is already in the VM's native FFI
+// exit state with its safepoint state acquired, and retain that state until
+// end returns. The lease is owner-thread-bound and does not permit Dart API
+// allocation.
+typedef DartPlantStatus (*DartPlantBeginLiveHeapObservationCallback)(
+    void* user_data, const DartPlantIsolateIdentity* isolate, uint64_t thread, void** out_lease);
+typedef DartPlantStatus (*DartPlantEndLiveHeapObservationCallback)(
+    void* user_data, const DartPlantIsolateIdentity* isolate, void* lease);
 
 typedef struct DartPlantVmAdapterCallbacks {
     uint32_t struct_size;
@@ -230,6 +256,10 @@ typedef struct DartPlantVmAdapterCallbacks {
     // required for V4+. The exact VM adapter resolves evidence against its
     // retained source-verified candidates and publishes only owning domains.
     DartPlantProveCapabilityCallback prove_capability;
+    // V5 append-only moving-GC exclusion contract. Both callbacks are required
+    // for V5+ adapters and are intentionally separate from API scopes.
+    DartPlantBeginLiveHeapObservationCallback begin_live_heap_observation;
+    DartPlantEndLiveHeapObservationCallback end_live_heap_observation;
 } DartPlantVmAdapterCallbacks;
 
 DARTPLANT_EXPORT DartPlantStatus

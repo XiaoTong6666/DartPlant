@@ -7,7 +7,7 @@ import unittest
 import analyze_logcat
 from capability_registry import mask as capability_mask
 from capability_registry import required_event_capabilities
-from common import RUNTIME_SCENARIOS
+from common import COMMON_RUNTIME_SCENARIOS, RUNTIME_SCENARIOS
 
 
 def _event(**fields: object) -> str:
@@ -85,7 +85,7 @@ def _passing_lines() -> list[str]:
                 isolate_generation=1,
             )
         )
-    for name in RUNTIME_SCENARIOS:
+    for name in COMMON_RUNTIME_SCENARIOS + RUNTIME_SCENARIOS:
         lines.append(_event(event="scenario", name=name, state="pass"))
     lines.append(
         _event(
@@ -124,18 +124,45 @@ def _passing_lines() -> list[str]:
 
 class AnalyzeLogcatTest(unittest.TestCase):
     def _analyze(
-        self, lines: list[str], metadata: dict[str, object] | None = None
+        self,
+        lines: list[str],
+        metadata: dict[str, object] | None = None,
+        *,
+        expected_test: str = "all",
     ) -> analyze_logcat.Analysis:
         return analyze_logcat.analyze(
             "\n".join(lines) + "\n",
             metadata or _metadata(),
             expected_flutter="3.22.3",
             expected_dart="3.4.4",
+            expected_test=expected_test,
         )
 
     def test_passing_log(self) -> None:
         analysis = self._analyze(_passing_lines())
         self.assertTrue(analysis.passed, [check for check in analysis.checks if not check.passed])
+
+    def test_mixed_runtime_provenance_fails(self) -> None:
+        lines = _passing_lines()
+        lines.insert(
+            1,
+            _event(
+                event="runtime",
+                flutter="3.44.1",
+                dart="3.12.1",
+                dart_runtime="3.12.1",
+                abi="arm64-v8a",
+                dart_ffi_abi="android_arm64",
+            ),
+        )
+        analysis = self._analyze(lines)
+        self.assertFalse(analysis.passed)
+        runtime = next(
+            check for check in analysis.checks if check.name == "Runtime provenance"
+        )
+        self.assertIn("events=2", runtime.detail)
+        self.assertIn("matching=1", runtime.detail)
+        self.assertIn("mismatching=1", runtime.detail)
 
     def test_stale_capability_generation_fails(self) -> None:
         lines = _passing_lines()
@@ -173,6 +200,59 @@ class AnalyzeLogcatTest(unittest.TestCase):
         analysis = self._analyze(_passing_lines())
         lifecycle = next(check for check in analysis.checks if check.name == "Artifact lifecycle")
         self.assertTrue(lifecycle.passed, lifecycle.detail)
+
+    def test_multi_engine_does_not_require_exception_or_type_arguments_proofs(self) -> None:
+        lines = [
+            line
+            for line in _passing_lines()
+            if "ActiveException" not in line
+            and "TypeArguments" not in line
+            and "exception callback phase-safe access" not in line
+            and "exception bridge lifetime probe" not in line
+            and "parameter_relocated=1" not in line
+            and "TypeArguments proof native summary" not in line
+            and "DartPlant app TypeArguments proof" not in line
+            and "require_relocation=1" not in line
+            and "result_ok=1" not in line
+            and '"event":"type_arguments"' not in line
+        ]
+        lines = [
+            line
+            for line in lines
+            if '"event":"scenario"' not in line and '"event":"suite"' not in line
+        ]
+        lines.extend(
+            [
+                *[
+                    _event(event="scenario", name=name, state="pass")
+                    for name in COMMON_RUNTIME_SCENARIOS
+                ],
+                _event(event="scenario", name="multi_engine", state="pass"),
+                _event(event="suite", state="pass", test="multi_engine"),
+            ]
+        )
+        analysis = self._analyze(lines, expected_test="multi_engine")
+        self.assertTrue(analysis.passed, [check for check in analysis.checks if not check.passed])
+
+    def test_selected_scenario_still_requires_common_runtime_corpus(self) -> None:
+        lines = [
+            line
+            for line in _passing_lines()
+            if not (
+                '"event":"scenario"' in line and '"name":"p6_abi"' in line
+            )
+            and '"event":"suite"' not in line
+        ]
+        lines.extend(
+            [
+                _event(event="scenario", name="p6_abi", state="fail"),
+                _event(event="suite", state="pass", test="multi_engine"),
+            ]
+        )
+        analysis = self._analyze(lines, expected_test="multi_engine")
+        self.assertFalse(analysis.passed)
+        failed = {check.name for check in analysis.checks if not check.passed}
+        self.assertIn("Scenario p6_abi", failed)
 
     def test_capability_ambiguity_is_distinguished(self) -> None:
         lines = _passing_lines()
@@ -332,6 +412,27 @@ class AnalyzeLogcatTest(unittest.TestCase):
             check for check in analysis.checks if check.name == "Code identity semantics"
         )
         self.assertIn("instrumented_aliases=1", failure.detail)
+
+    def test_code_identity_ignores_foreign_owner_probe_after_multi_owner_switch(self) -> None:
+        check = analyze_logcat._check_code_identity_semantics(
+            "\n".join(
+                [
+                    "producer code-identity policy verified mode=dedup-shared "
+                    "instrumented_aliases=2 add_int_aliases=2",
+                    "instrumentedAdd probe mode=dedup-shared enter=5 leave=5 "
+                    "second_listener_enter=5 live_ok=5 live_failed=0 lookup_ok=1 model_ok=1 "
+                    "policy_ok=1 ambiguous_identity=1 second_listener_identity=1 "
+                    "result=115 expected=115",
+                    'DARTPLANT_CI {"event":"multi_owner_activate","state":"pass","label":2}',
+                    "instrumentedAdd probe mode=dedup-shared enter=5 leave=5 "
+                    "second_listener_enter=5 live_ok=5 live_failed=0 lookup_ok=1 model_ok=0 "
+                    "policy_ok=1 ambiguous_identity=1 second_listener_identity=1 "
+                    "result=115 expected=115",
+                ]
+            )
+            + "\n"
+        )
+        self.assertTrue(check.passed, check.detail)
 
     def test_prelaunch_runner_error_without_pid_fails_without_crashing(self) -> None:
         metadata = copy.deepcopy(_metadata())

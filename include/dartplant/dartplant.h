@@ -13,8 +13,13 @@ extern "C" {
 
 #if defined(__GNUC__)
 #define DARTPLANT_EXPORT __attribute__((visibility("default")))
+#define DARTPLANT_DEPRECATED(message) __attribute__((deprecated(message)))
+#elif defined(_MSC_VER)
+#define DARTPLANT_EXPORT
+#define DARTPLANT_DEPRECATED(message) __declspec(deprecated(message))
 #else
 #define DARTPLANT_EXPORT
+#define DARTPLANT_DEPRECATED(message)
 #endif
 
 typedef struct DartPlantMethod DartPlantMethod;

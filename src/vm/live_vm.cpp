@@ -22,10 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
-#if defined(__ANDROID__)
-#include <android/log.h>
-#endif
-
+#include "android_logging.h"
 #include "runtime/runtime_internal.h"
 #include "vm/abi/probe.h"
 #include "vm/abi/proof.h"
@@ -48,7 +45,7 @@ void LogLiveIndex(const char* format, ...) {
 #if defined(__ANDROID__)
     va_list args;
     va_start(args, format);
-    __android_log_vprint(ANDROID_LOG_INFO, "DartPlantLiveIndex", format, args);
+    AndroidLogVPrint(ANDROID_LOG_INFO, "LiveIndex", format, args);
     va_end(args);
 #else
     (void) format;
@@ -1172,6 +1169,27 @@ bool CollectDeferredLoadingUnitFunctions(
                          static_cast<unsigned long long>(unit));
             return false;
         }
+
+        // A deferred ELF is process-global, while LoadingUnit load state is
+        // IsolateGroup-local. Multiple FlutterEngine instances can therefore
+        // see the same mapped secondary image even though this particular
+        // group has not completed Dart_DeferredLoadComplete() for it yet. Dart
+        // represents that state with LoadingUnit.base_objects == null. This is
+        // not a malformed VM graph and must not make the root live index fail;
+        // keep the physical RuntimeImage unbound (live_entry_count == 0) until
+        // a later bootstrap observes the unit loaded in this group.
+        uint64_t canonical_null = 0;
+        if (profile.thread_object_null_offset == 0 || context.thread == 0 ||
+            !reader.Read(static_cast<uintptr_t>(context.thread) + profile.thread_object_null_offset,
+                         &canonical_null)) {
+            LogLiveIndex("deferred canonical null unavailable id=%u", image.loading_unit_id);
+            return false;
+        }
+        if (base_objects == canonical_null) {
+            LogLiveIndex("deferred unit not loaded in current IsolateGroup id=%u",
+                         image.loading_unit_id);
+            continue;
+        }
         uint32_t base_objects_cid = 0;
         uint64_t base_object_count = 0;
         if (!ReadCid(reader, profile, base_objects, &base_objects_cid) ||
@@ -1730,7 +1748,7 @@ DartPlantStatus ProbeLiveVmCanonicalBoolRootsForCandidate(const DartPlantLiveVmC
         SetLastError("live VM Bool root arguments/profile are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    ProcessMemoryReader reader;
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
     if (!reader.Refresh()) {
         SetLastError("failed to inspect process mappings for Dart Bool roots");
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -1769,7 +1787,7 @@ DartPlantStatus ProbeLiveVmRootProgramHashForCandidate(const DartPlantLiveVmCont
         SetLastError("live VM deferred program-hash candidate arguments/profile are invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    ProcessMemoryReader reader;
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
     if (!reader.Refresh()) {
         SetLastError("cannot inspect process mappings for deferred program hash");
         return DARTPLANT_RUNTIME_NOT_READY;
@@ -1848,32 +1866,25 @@ DartPlantStatus ReadLiveVmFunctionSignatureForProfile(
     return DARTPLANT_OK;
 }
 
-DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmContext& context,
-                                                      const RuntimeProfileRecord& profile,
-                                                      uint64_t function, uint32_t index,
-                                                      DartPlantDartParameterInfo* out_parameter) {
+namespace {
+
+DartPlantStatus DecodeLiveVmFunctionParameter(const ProcessMemoryReader& reader,
+                                              const RuntimeProfileRecord& profile,
+                                              uint64_t heap_base,
+                                              const ParsedFunctionSignature& parsed, uint32_t index,
+                                              DartPlantDartParameterInfo* out_parameter) {
     if (out_parameter == nullptr ||
-        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo) || context.heap_base == 0 ||
-        function == 0) {
-        SetLastError("live VM FunctionType parameter profile parser arguments are invalid");
+        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo)) {
+        SetLastError("live VM FunctionType parameter output is invalid");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    ProcessMemoryReader reader(/*volatile_reads=*/true);
-    if (!reader.Refresh()) {
-        SetLastError("cannot inspect process mappings for FunctionType parsing");
-        return DARTPLANT_RUNTIME_NOT_READY;
-    }
-    ParsedFunctionSignature parsed{};
-    DartPlantStatus status = ParseRetainedFunctionSignatureWithRetry(
-        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
-    if (status != DARTPLANT_OK) return status;
     if (index >= parsed.parameter_count) {
         SetLastError("FunctionType parameter index is out of range");
         return DARTPLANT_INVALID_ARGUMENT;
     }
 
     uint64_t tagged_type = 0;
-    if (!ReadArrayElement(reader, profile.live_vm, context.heap_base, parsed.parameter_types, index,
+    if (!ReadArrayElement(reader, profile.live_vm, heap_base, parsed.parameter_types, index,
                           &tagged_type)) {
         return FailProbe("FunctionType parameter type is unreadable");
     }
@@ -1895,8 +1906,8 @@ DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmConte
         parameter.kind = DARTPLANT_DART_PARAMETER_NAMED;
         const uint32_t named_index = index - parsed.fixed_parameter_count;
         uint64_t tagged_name = 0;
-        if (!ReadArrayElement(reader, profile.live_vm, context.heap_base,
-                              parsed.named_parameter_names, named_index, &tagged_name) ||
+        if (!ReadArrayElement(reader, profile.live_vm, heap_base, parsed.named_parameter_names,
+                              named_index, &tagged_name) ||
             !ReadDartString(reader, profile.live_vm, tagged_name, parameter.name,
                             sizeof(parameter.name))) {
             return FailProbe("FunctionType named parameter name is invalid");
@@ -1922,9 +1933,117 @@ DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmConte
             (flags & (1U << (named_index % kNamedParameterFlagsPerSmi))) != 0 ? 1 : 0;
     }
     *out_parameter = parameter;
+    return DARTPLANT_OK;
+}
+
+void CopyParsedFunctionSignature(const ParsedFunctionSignature& parsed,
+                                 DartPlantDartFunctionSignatureInfo* out_signature) {
+    DartPlantDartFunctionSignatureInfo signature{};
+    signature.struct_size = sizeof(signature);
+    signature.parameter_count = parsed.parameter_count;
+    signature.implicit_parameter_count = parsed.implicit_parameter_count;
+    signature.fixed_parameter_count = parsed.fixed_parameter_count;
+    signature.optional_parameter_count = parsed.optional_parameter_count;
+    signature.type_parameter_count = parsed.type_parameter_count;
+    signature.parent_type_argument_count = parsed.parent_type_argument_count;
+    signature.has_named_optional_parameters = parsed.has_named_optional_parameters ? 1 : 0;
+    signature.result_type = parsed.result_type;
+    *out_signature = signature;
+}
+
+}  // namespace
+
+DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmContext& context,
+                                                      const RuntimeProfileRecord& profile,
+                                                      uint64_t function, uint32_t index,
+                                                      DartPlantDartParameterInfo* out_parameter) {
+    if (out_parameter == nullptr ||
+        out_parameter->struct_size < sizeof(DartPlantDartParameterInfo) || context.heap_base == 0 ||
+        function == 0) {
+        SetLastError("live VM FunctionType parameter profile parser arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
+    if (!reader.Refresh()) {
+        SetLastError("cannot inspect process mappings for FunctionType parsing");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    ParsedFunctionSignature parsed{};
+    DartPlantStatus status = ParseRetainedFunctionSignatureWithRetry(
+        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+    status = DecodeLiveVmFunctionParameter(reader, profile, context.heap_base, parsed, index,
+                                           out_parameter);
+    if (status != DARTPLANT_OK) return status;
     ClearLastError();
     return DARTPLANT_OK;
 }
+
+DartPlantStatus ReadLiveVmFunctionSemanticsForProfile(
+    const DartPlantLiveVmContext& context, const RuntimeProfileRecord& profile, uint64_t function,
+    DartPlantDartFunctionSignatureInfo* out_signature,
+    std::vector<DartPlantDartParameterInfo>* out_parameters) {
+    if (out_signature == nullptr ||
+        out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo) ||
+        out_parameters == nullptr || context.heap_base == 0 || function == 0) {
+        SetLastError("live VM FunctionType semantic snapshot arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
+    if (!reader.Refresh()) {
+        SetLastError("cannot inspect process mappings for FunctionType semantic snapshot");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    ParsedFunctionSignature parsed{};
+    DartPlantStatus status = ParseRetainedFunctionSignatureWithRetry(
+        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+
+    std::vector<DartPlantDartParameterInfo> parameters(parsed.parameter_count);
+    for (uint32_t index = 0; index < parsed.parameter_count; ++index) {
+        parameters[index].struct_size = sizeof(DartPlantDartParameterInfo);
+        status = DecodeLiveVmFunctionParameter(reader, profile, context.heap_base, parsed, index,
+                                               &parameters[index]);
+        if (status != DARTPLANT_OK) return status;
+    }
+    CopyParsedFunctionSignature(parsed, out_signature);
+    *out_parameters = std::move(parameters);
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+namespace {
+
+DartPlantStatus ReadLiveVmFunctionSemanticsWithReader(
+    const ProcessMemoryReader& reader, const DartPlantLiveVmContext& context,
+    const RuntimeProfileRecord& profile, uint64_t function,
+    DartPlantDartFunctionSignatureInfo* out_signature,
+    std::vector<DartPlantDartParameterInfo>* out_parameters) {
+    if (out_signature == nullptr ||
+        out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo) ||
+        out_parameters == nullptr || context.heap_base == 0 || function == 0) {
+        SetLastError("live VM FunctionType semantic snapshot arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    ParsedFunctionSignature parsed{};
+    DartPlantStatus status = ParseRetainedFunctionSignatureWithRetry(
+        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    if (status != DARTPLANT_OK) return status;
+
+    std::vector<DartPlantDartParameterInfo> parameters(parsed.parameter_count);
+    for (uint32_t index = 0; index < parsed.parameter_count; ++index) {
+        parameters[index].struct_size = sizeof(DartPlantDartParameterInfo);
+        status = DecodeLiveVmFunctionParameter(reader, profile, context.heap_base, parsed, index,
+                                               &parameters[index]);
+        if (status != DARTPLANT_OK) return status;
+    }
+    CopyParsedFunctionSignature(parsed, out_signature);
+    *out_parameters = std::move(parameters);
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+}  // namespace
 
 LiveVmCandidateResolution ResolveLiveVmCandidateForArm64ContextInternal(
     const DartPlantFlutterSnapshotInfo& snapshot, const DartPlantArm64Context& context) {
@@ -2074,7 +2193,7 @@ DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& cont
         SetLastError("live VM instruction image set has no root loading unit");
         return DARTPLANT_INVALID_ARGUMENT;
     }
-    ProcessMemoryReader reader;
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
     if (!reader.Refresh()) {
         return FailProbe("cannot read /proc/self/maps for live Function index");
     }
@@ -2088,6 +2207,79 @@ DartPlantStatus VisitLiveVmFunctionsForImages(const DartPlantLiveVmContext& cont
     for (const auto& function : functions) {
         if (!visitor(&function.info, user_data)) break;
     }
+    *out_info = info;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus CollectLiveVmFunctionSnapshotRecordsForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile,
+    const RuntimeProfileRecord* deferred_profile_record,
+    std::vector<LiveVmFunctionSnapshotRecord>* out_records,
+    DartPlantLiveVmFunctionIndexInfo* out_info) {
+    if (out_records == nullptr || out_info == nullptr) {
+        SetLastError("live VM semantic snapshot collector arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (images.empty()) {
+        SetLastError("live VM semantic snapshot collector has no instruction images");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    const LiveVmInstructionImage* root_image = nullptr;
+    for (const auto& image : images) {
+        if (image.snapshot.struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
+            image.snapshot.isolate_instructions_runtime == 0 ||
+            image.snapshot.isolate_instructions_size == 0) {
+            SetLastError("live VM instruction image descriptor is invalid");
+            return DARTPLANT_INVALID_ARGUMENT;
+        }
+        if (image.loading_unit_id == 1) {
+            if (root_image != nullptr) {
+                SetLastError("live VM instruction image set has multiple root loading units");
+                return DARTPLANT_INVALID_ARGUMENT;
+            }
+            root_image = &image;
+        }
+    }
+    if (root_image == nullptr) {
+        SetLastError("live VM instruction image set has no root loading unit");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    ProcessMemoryReader reader(/*volatile_reads=*/true);
+    if (!reader.Refresh()) {
+        return FailProbe("cannot read /proc/self/maps for live Function semantic snapshot");
+    }
+    std::vector<CollectedLiveFunction> functions;
+    DartPlantLiveVmFunctionIndexInfo info{};
+    info.struct_size = sizeof(info);
+    if (!CollectAllLiveFunctions(reader, live_index_profile, deferred_profile_record, context,
+                                 root_image->snapshot, images, &functions, &info)) {
+        return FailProbe("failed to enumerate live Dart Function graph");
+    }
+
+    std::vector<LiveVmFunctionSnapshotRecord> records;
+    records.reserve(functions.size());
+    for (const auto& collected : functions) {
+        LiveVmFunctionSnapshotRecord record{};
+        record.function = collected.info;
+        record.signature.struct_size = sizeof(record.signature);
+        if (ReadLiveVmFunctionSemanticsWithReader(reader, context, function_type_profile,
+                                                  collected.info.function, &record.signature,
+                                                  &record.parameters) == DARTPLANT_OK) {
+            record.has_semantics = true;
+        } else {
+            // Not every retained Function exposes a source-readable
+            // FunctionType. Function enumeration remains valid; consumers
+            // requiring semantics fail closed when this flag is false.
+            ClearLastError();
+        }
+        records.push_back(std::move(record));
+    }
+
+    *out_records = std::move(records);
     *out_info = info;
     ClearLastError();
     return DARTPLANT_OK;
@@ -2149,7 +2341,7 @@ extern "C" DartPlantStatus dartplant_live_vm_probe_invocation(
     DartPlantLiveVmProfile profile = record->live_vm;
     const dartplant::RawObjectLayout* raw = &record->raw_object;
 
-    dartplant::ProcessMemoryReader reader;
+    dartplant::ProcessMemoryReader reader(/*volatile_reads=*/true);
     if (!reader.Refresh()) {
         return dartplant::FailProbe("cannot read /proc/self/maps for live VM probe");
     }
@@ -2389,7 +2581,7 @@ extern "C" DartPlantStatus dartplant_live_vm_find_method(
         return dartplant::FailProbe("live VM method has no source-verified ABI record");
     }
 
-    dartplant::ProcessMemoryReader reader;
+    dartplant::ProcessMemoryReader reader(/*volatile_reads=*/true);
     if (!reader.Refresh()) {
         return dartplant::FailProbe("cannot read /proc/self/maps for live VM method lookup");
     }
@@ -2738,7 +2930,7 @@ extern "C" DartPlantStatus dartplant_live_vm_read_object_pool_entry(
         return DARTPLANT_PROFILE_MISMATCH;
     }
 
-    dartplant::ProcessMemoryReader reader;
+    dartplant::ProcessMemoryReader reader(/*volatile_reads=*/true);
     uint32_t pool_cid = 0;
     if (!reader.Refresh() ||
         !dartplant::ReadCidSafely(reader, profile, tagged_object_pool, &pool_cid) ||

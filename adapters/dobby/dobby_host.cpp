@@ -43,8 +43,9 @@ int HookWithPublication(void* user_data, void* target, void* replacement,
     auto* routing =
         new FunctionInlineHookRouting(entry, reinterpret_cast<dobby_dummy_func_t>(replacement));
     routing->Prepare();
-    routing->DispatchRouting();
-    if (entry->relocated_addr == 0) return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    if (!routing->DispatchRouting() || entry->relocated_addr == 0) {
+        return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    }
 
     // Dobby's public DobbyHook writes origin_func before Commit(). This strict
     // adapter preserves that ordering and lets DartPlant publish backup to the

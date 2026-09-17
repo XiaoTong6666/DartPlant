@@ -5,14 +5,11 @@
 #include <cstring>
 #include <new>
 
-#if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-#include <android/log.h>
-#endif
-
 #if defined(DARTPLANT_USE_PTHREAD_TLS)
 #include <pthread.h>
 #endif
 
+#include "android_logging.h"
 #include "runtime/runtime_internal.h"
 
 namespace {
@@ -24,6 +21,76 @@ namespace {
 
 constexpr uint32_t kMaxInvocationDepth = 64;
 constexpr uint32_t kMaxGeneratedRootBindings = 96;
+
+uint64_t CanonicalNativePointer(uint64_t value) {
+#if defined(__aarch64__)
+    return value & 0x00ffffffffffffffULL;
+#else
+    return value;
+#endif
+}
+
+bool MethodOwnerMatchesCurrentIsolateGroup(const DartPlantMethod* method,
+                                           const DartPlantArm64Context& context) {
+    if (method == nullptr || method->function == nullptr) {
+        return true;
+    }
+    const auto& function = *method->function;
+    if (function.source == dartplant::DartFunctionSource::kSynthetic) {
+        return true;
+    }
+    if (method->runtime_generation == nullptr || method->expected_runtime_generation == 0 ||
+        method->runtime_generation->load(std::memory_order_acquire) !=
+            method->expected_runtime_generation) {
+        return false;
+    }
+    if (function.owner.runtime_generation != 0 &&
+        function.owner.runtime_generation != method->expected_runtime_generation) {
+        return false;
+    }
+    if (function.isolate_group_identity == 0) return true;
+    const dartplant::RuntimeProfileRecord* profile =
+        dartplant::FindRuntimeProfileByVersion(function.runtime_profile_version);
+    if (profile == nullptr || profile->live_vm.thr_register >= 31 ||
+        profile->live_vm.thread_isolate_group_offset == 0) {
+        return false;
+    }
+    const uint64_t thread = CanonicalNativePointer(context.x[profile->live_vm.thr_register]);
+    if (thread == 0) return false;
+    uint64_t current_group = 0;
+    // THR belongs to the currently executing generated Dart frame. The
+    // IsolateGroup field itself is native VM state (not a movable Dart heap
+    // object), so a single aligned load is sufficient here and avoids making
+    // every callback pay for a process_vm_readv syscall.
+    std::memcpy(&current_group,
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(thread) +
+                                              profile->live_vm.thread_isolate_group_offset),
+                sizeof(current_group));
+    return CanonicalNativePointer(current_group) ==
+           CanonicalNativePointer(function.isolate_group_identity);
+}
+
+void FilterListenersForCurrentIsolateGroup(DartPlantInvocation* invocation,
+                                           const DartPlantArm64Context& context) {
+    if (invocation == nullptr) return;
+    auto& listeners = invocation->entered_listeners;
+    auto out = listeners.begin();
+    for (auto it = listeners.begin(); it != listeners.end(); ++it) {
+        const auto& listener = *it;
+        const DartPlantMethod* method = listener == nullptr || listener->requested_method == nullptr
+                                            ? nullptr
+                                            : listener->requested_method.get();
+        if (MethodOwnerMatchesCurrentIsolateGroup(method, context)) {
+            *out++ = listener;
+            continue;
+        }
+        if (listener != nullptr) {
+            listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+    listeners.erase(out, listeners.end());
+}
+
 enum class GeneratedRootRole : uint8_t {
     kPadding = 0,
     kInput,
@@ -212,9 +279,9 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
     const auto* parameters = InvocationParameters(&frame->invocation);
     if (parameters == nullptr) {
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-        __android_log_print(ANDROID_LOG_ERROR, "DartPlantTypeArgs",
-                            "bridge build failed stage=parameters error=%s",
-                            dartplant_last_error());
+        dartplant::AndroidLogPrint(ANDROID_LOG_ERROR, "TypeArgs",
+                                   "bridge build failed stage=parameters error=%s",
+                                   dartplant_last_error());
 #endif
         return false;
     }
@@ -263,18 +330,18 @@ bool BuildGeneratedRootBindings(DispatchFrame* frame) {
                     frame->invocation.vm_adapter, vector_raw, index, &elements[index]) !=
                 DARTPLANT_OK) {
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-                __android_log_print(
-                    ANDROID_LOG_ERROR, "DartPlantTypeArgs",
+                dartplant::AndroidLogPrint(
+                    ANDROID_LOG_ERROR, "TypeArgs",
                     "bridge build failed stage=read_element index=%u vector=0x%llx error=%s", index,
                     static_cast<unsigned long long>(vector_raw), dartplant_last_error());
 #endif
                 return false;
             }
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-            __android_log_print(ANDROID_LOG_DEBUG, "DartPlantTypeArgs",
-                                "capture vector=0x%llx element[%u]=0x%llx generated_state=1",
-                                static_cast<unsigned long long>(vector_raw), index,
-                                static_cast<unsigned long long>(elements[index]));
+            dartplant::AndroidLogPrint(ANDROID_LOG_DEBUG, "TypeArgs",
+                                       "capture vector=0x%llx element[%u]=0x%llx generated_state=1",
+                                       static_cast<unsigned long long>(vector_raw), index,
+                                       static_cast<unsigned long long>(elements[index]));
 #endif
         }
         frame->invocation.closure_type_argument_root_base = frame->generated_root_count;
@@ -797,6 +864,15 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     // BeginInvocation is the entry-stub quiescence pin. Reset cannot detach
     // this hook or its VM adapter after this point until FinishFrame retires it.
     frame.invocation.vm_adapter = hook->vm_adapter;
+    const size_t listener_count_before_owner_filter = frame.invocation.entered_listeners.size();
+    FilterListenersForCurrentIsolateGroup(&frame.invocation, frame.context);
+    if (listener_count_before_owner_filter != 0 && frame.invocation.entered_listeners.empty()) {
+        // Direct FlutterEngine instances share the process-wide AOT text
+        // mapping. Keep the physical hook/return bookkeeping process-wide, but
+        // admit each logical listener only for the IsolateGroup receipt carried
+        // by that listener's requested method.
+        dartplant::SetLastError("callback hook owner does not match the current Dart IsolateGroup");
+    }
     const bool late_shared_fail_closed =
         frame.invocation.identity_ambiguous && !hook->shared_code_opt_in;
     const bool has_callbacks = !frame.invocation.entered_listeners.empty();
@@ -810,8 +886,8 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         const bool bridge_ok = pin_ok && EnterGeneratedVmBridge(&frame, false);
         if (!bridge_ok) {
 #if defined(__ANDROID__) && defined(DARTPLANT_TYPE_ARGUMENTS_PROOF_LOGGING)
-            __android_log_print(
-                ANDROID_LOG_ERROR, "DartPlantTypeArgs",
+            dartplant::AndroidLogPrint(
+                ANDROID_LOG_ERROR, "TypeArgs",
                 "generated bridge setup failed bindings=%u pin=%u enter=%u error=%s",
                 static_cast<unsigned>(bindings_ok), static_cast<unsigned>(pin_ok),
                 static_cast<unsigned>(bridge_ok), dartplant_last_error());
@@ -984,6 +1060,17 @@ extern "C" void dartplant_arm64_dispatch_exception_unwind(uintptr_t target_spreg
             frame.entry_caller_fp != 0 && target_fp != 0 && target_fp >= frame.entry_caller_fp;
         const bool unwound_by_sp =
             frame.entry_spreg != 0 && target_spreg != 0 && target_spreg > frame.entry_spreg;
+#if defined(__ANDROID__)
+        dartplant::AndroidLogPrint(
+            ANDROID_LOG_INFO, "ExceptionUnwind",
+            "depth=%u entry_sp=0x%llx entry_fp=0x%llx target_sp=0x%llx target_fp=0x%llx "
+            "by_fp=%u by_sp=%u",
+            stack->depth, static_cast<unsigned long long>(frame.entry_spreg),
+            static_cast<unsigned long long>(frame.entry_caller_fp),
+            static_cast<unsigned long long>(target_spreg),
+            static_cast<unsigned long long>(target_fp), static_cast<unsigned>(unwound_by_fp),
+            static_cast<unsigned>(unwound_by_sp));
+#endif
         if (!unwound_by_fp && !unwound_by_sp) break;
         frame.invocation.phase = DARTPLANT_INVOCATION_EXCEPTION;
         for (auto it = frame.invocation.entered_listeners.rbegin();

@@ -6,17 +6,13 @@
 #include <unordered_map>
 
 #include "core/internal.h"
+#include "core/method_model.h"
+#include "vm/abi/resolver.h"
 #include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
 namespace {
-
-struct LiveSnapshotBuildState {
-    SnapshotIndex* index = nullptr;
-    const RuntimeProfileRecord* profile = nullptr;
-    bool failed = false;
-};
 
 uint64_t RuntimeEntryForKind(const DartPlantLiveVmFunctionInfo& function, DartPlantEntryKind kind) {
     switch (kind) {
@@ -46,16 +42,32 @@ uint64_t EntryVaForKind(const DartPlantLiveVmFunctionInfo& function, DartPlantEn
     return 0;
 }
 
-uint8_t AppendLiveSnapshotFunction(const DartPlantLiveVmFunctionInfo* function, void* user_data) {
-    auto* state = static_cast<LiveSnapshotBuildState*>(user_data);
-    if (function == nullptr || state == nullptr || state->index == nullptr) return 0;
-    if (state->profile == nullptr ||
-        !AppendLiveSnapshotFunctionRecord(*function, state->profile->live_vm.profile_version,
-                                          state->index)) {
-        state->failed = true;
-        return 0;
+bool AppendLiveSnapshotRecord(const LiveVmFunctionSnapshotRecord& record,
+                              const RuntimeProfileRecord& live_index_profile,
+                              const RuntimeProfileRecord& function_type_profile,
+                              SnapshotIndex* index) {
+    if (index == nullptr ||
+        !AppendLiveSnapshotFunctionRecord(record.function,
+                                          live_index_profile.live_vm.profile_version, index)) {
+        return false;
     }
-    return 1;
+    if (!record.has_semantics) return true;
+    index->live_function_semantics.push_back({
+        .runtime_image_id = record.function.runtime_image_id,
+        .runtime_image_incarnation_epoch = record.function.runtime_image_incarnation_epoch,
+        .engine_incarnation_epoch = record.function.engine_incarnation_epoch,
+        .isolate_group_incarnation_epoch = record.function.isolate_group_incarnation_epoch,
+        .runtime_generation = record.function.runtime_generation,
+        .library_uri = record.function.library_uri,
+        .class_name = record.function.class_name,
+        .function_name = record.function.function_name,
+        .function_type_profile_version = function_type_profile.live_vm.profile_version,
+        .function_type_abi_key = vm_abi::BuildCapabilityAbiKey(
+            function_type_profile, vm_abi::kCapabilityFunctionTypeLayout),
+        .signature = record.signature,
+        .parameters = record.parameters,
+    });
+    return true;
 }
 
 }  // namespace
@@ -256,6 +268,43 @@ const SnapshotFunction* SnapshotIndex::FindSnapshotFunction(
     return match;
 }
 
+const LiveFunctionSemanticSnapshot* SnapshotIndex::FindLiveFunctionSemanticSnapshot(
+    uint64_t runtime_image_id, std::string_view library_uri, std::string_view class_name,
+    std::string_view function_name) const {
+    const LiveFunctionSemanticSnapshot* match = nullptr;
+    for (const auto& candidate : live_function_semantics) {
+        if ((runtime_image_id != 0 && candidate.runtime_image_id != runtime_image_id) ||
+            candidate.library_uri != library_uri || candidate.class_name != class_name ||
+            candidate.function_name != function_name) {
+            continue;
+        }
+        if (match != nullptr) return nullptr;
+        match = &candidate;
+    }
+    return match;
+}
+
+const RuntimeProfileRecord* ResolveLiveFunctionSemanticProfile(
+    const LiveFunctionSemanticSnapshot& semantic) {
+    const RuntimeProfileRecord* profile =
+        FindRuntimeProfileByVersion(semantic.function_type_profile_version);
+    if (profile == nullptr || semantic.function_type_abi_key.empty() ||
+        semantic.function_type_abi_key !=
+            vm_abi::BuildCapabilityAbiKey(*profile, vm_abi::kCapabilityFunctionTypeLayout)) {
+        return nullptr;
+    }
+    return profile;
+}
+
+bool LiveFunctionSemanticMatchesOwner(const LiveFunctionSemanticSnapshot& semantic,
+                                      const DartRuntimeOwnerIdentity& owner) {
+    return semantic.runtime_generation == owner.runtime_generation &&
+           semantic.engine_incarnation_epoch == owner.engine_incarnation_epoch &&
+           semantic.isolate_group_incarnation_epoch == owner.isolate_group_incarnation_epoch &&
+           semantic.runtime_image_id == owner.image_id &&
+           semantic.runtime_image_incarnation_epoch == owner.image_incarnation_epoch;
+}
+
 SnapshotIndex BuildOfflineSnapshotIndexFromMetadata(const MetadataIndex& metadata) {
     SnapshotIndex index;
     index.module_name = metadata.module_name;
@@ -371,23 +420,25 @@ std::optional<SnapshotIndex> BuildSnapshotIndex(const DartPlantSnapshotIndexInfo
     return index;
 }
 
-std::optional<SnapshotIndex> BuildLiveSnapshotIndex(const DartPlantLiveVmContext& context,
-                                                    const DartPlantFlutterSnapshotInfo& snapshot,
-                                                    const RuntimeProfileRecord& profile,
-                                                    DartPlantLiveVmFunctionIndexInfo* out_info,
-                                                    std::string* error) {
+std::optional<SnapshotIndex> BuildLiveSnapshotIndex(
+    const DartPlantLiveVmContext& context, const DartPlantFlutterSnapshotInfo& snapshot,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, DartPlantLiveVmFunctionIndexInfo* out_info,
+    std::string* error) {
     LiveVmInstructionImage image{};
     image.runtime_image_id = 0;
     image.loading_unit_id = 1;
     image.snapshot = snapshot;
     const std::array<LiveVmInstructionImage, 1> images = {image};
-    return BuildLiveSnapshotIndexForImages(context, images, profile, nullptr, out_info, error);
+    return BuildLiveSnapshotIndexForImages(context, images, live_index_profile,
+                                           function_type_profile, nullptr, out_info, error);
 }
 
 std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
-    const RuntimeProfileRecord& profile, const RuntimeProfileRecord* deferred_profile,
-    DartPlantLiveVmFunctionIndexInfo* out_info, std::string* error) {
+    const RuntimeProfileRecord& profile, const RuntimeProfileRecord& function_type_profile,
+    const RuntimeProfileRecord* deferred_profile, DartPlantLiveVmFunctionIndexInfo* out_info,
+    std::string* error) {
     if (images.empty()) {
         if (error != nullptr) *error = "live snapshot index has no runtime images";
         return std::nullopt;
@@ -416,17 +467,25 @@ std::optional<SnapshotIndex> BuildLiveSnapshotIndexForImages(
     index.profile_version = profile.live_vm.name == nullptr ? "" : profile.live_vm.name;
     index.vm_profile_version = profile.live_vm.profile_version;
 
-    LiveSnapshotBuildState state{.index = &index, .profile = &profile};
     DartPlantLiveVmFunctionIndexInfo local_info{};
     local_info.struct_size = sizeof(local_info);
-    const DartPlantStatus status =
-        VisitLiveVmFunctionsForImages(context, images, profile, deferred_profile,
-                                      AppendLiveSnapshotFunction, &state, &local_info);
-    if (status != DARTPLANT_OK || state.failed || index.functions.empty()) {
+    std::vector<LiveVmFunctionSnapshotRecord> records;
+    const DartPlantStatus status = CollectLiveVmFunctionSnapshotRecordsForImages(
+        context, images, profile, function_type_profile, deferred_profile, &records, &local_info);
+    bool append_failed = false;
+    if (status == DARTPLANT_OK) {
+        for (const auto& record : records) {
+            if (!AppendLiveSnapshotRecord(record, profile, function_type_profile, &index)) {
+                append_failed = true;
+                break;
+            }
+        }
+    }
+    if (status != DARTPLANT_OK || append_failed || index.functions.empty()) {
         if (error != nullptr) {
             *error = status != DARTPLANT_OK ? dartplant_last_error()
-                     : state.failed ? "live VM Function index visitor rejected an entry family"
-                                    : "live VM Function index is empty";
+                     : append_failed ? "live VM Function index visitor rejected an entry family"
+                                     : "live VM Function index is empty";
         }
         return std::nullopt;
     }

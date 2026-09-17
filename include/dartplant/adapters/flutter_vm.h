@@ -130,9 +130,9 @@ dartplant_flutter_vm_adapter_destroy(DartPlantFlutterVmAdapter* instance);
 // Source-verified ABI descriptors compiled into this adapter. Snapshot identity
 // ranks a finite candidate set; read-only structural and relational proofs
 // select ABI domains. Artifact Build IDs never select private VM layouts. The
-// implementation remains process-global because dart_api_dl itself is
-// process-global; create returns VM_ADAPTER_BUSY while another instance is
-// attached.
+// dart_api_dl initialization is process-global, while adapter instances and
+// their roots/proofs remain isolate-owner scoped. Multiple instances may be
+// attached concurrently to distinct live isolate owners.
 DARTPLANT_EXPORT uint32_t dartplant_flutter_vm_descriptor_count(void);
 DARTPLANT_EXPORT const DartPlantFlutterVmDescriptor* dartplant_flutter_vm_descriptor_at(
     uint32_t index);

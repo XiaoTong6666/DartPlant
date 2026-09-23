@@ -4,12 +4,14 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #include "dartplant/advanced/live_vm.h"
 #include "test_runner.h"
 #include "vm/abi/proof.h"
 #include "vm/abi/resolver.h"
+#include "vm/dart_string.h"
 #include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
@@ -191,6 +193,40 @@ SyntheticSignatureFixture BuildSignatureFixture(const SignatureProfileCase& item
 }
 
 }  // namespace
+
+TEST_CASE(DartOneByteStringReaderBatchesContiguousPayloadReads) {
+    EXPECT_TRUE(dartplant::RuntimeProfileCount() != 0);
+    const auto& profile = dartplant::RuntimeProfiles()[0];
+    const auto& raw = profile.raw_object;
+    const auto& vm = profile.live_vm;
+
+    alignas(16) std::array<uint8_t, 1024> storage{};
+    const uintptr_t object = reinterpret_cast<uintptr_t>(storage.data());
+    const uint64_t tagged = object + raw.heap_object_tag;
+    const uint64_t tags = static_cast<uint64_t>(vm.cid_one_byte_string) << raw.class_id_tag_shift;
+    std::memcpy(storage.data(), &tags, sizeof(tags));
+
+    const std::string input(600, 'x');
+    const uint32_t raw_length = static_cast<uint32_t>(input.size()) << raw.smi_tag_shift;
+    std::memcpy(storage.data() + vm.string_length_offset, &raw_length, sizeof(raw_length));
+    std::memcpy(storage.data() + vm.string_data_offset, input.data(), input.size());
+
+    uint32_t read_calls = 0;
+    const auto read = [&](uintptr_t address, void* output, size_t size) {
+        ++read_calls;
+        if (address < object || size > storage.size() || address - object > storage.size() - size) {
+            return false;
+        }
+        std::memcpy(output, reinterpret_cast<const void*>(address), size);
+        return true;
+    };
+    std::array<char, 700> output{};
+    EXPECT_TRUE(
+        dartplant::vm_abi::ReadDartStringUtf8(profile, tagged, read, output.data(), output.size()));
+    EXPECT_EQ(input, std::string(output.data()));
+    // tags + length + ceil(600 / 256) payload reads.
+    EXPECT_EQ(5U, read_calls);
+}
 
 TEST_CASE(LiveVmParsesRetainedFunctionTypeAcrossSupportedProfiles) {
     for (const auto& item : kSignatureProfiles) {

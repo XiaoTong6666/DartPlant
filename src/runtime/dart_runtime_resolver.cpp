@@ -9,8 +9,10 @@
 #include <deque>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "abi/value_codec.h"
+#include "android_logging.h"
 #include "runtime/default_runtime.h"
 #include "runtime/runtime_image_transition.h"
 #include "runtime/runtime_internal.h"
@@ -582,8 +584,7 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
         SetLastError("Dart method identity is ambiguous in the live Function index");
         return DARTPLANT_AMBIGUOUS_METHOD;
     }
-    if (record == nullptr || !record->live || record->runtime_entry == 0 ||
-        record->function_object == 0 || record->code_object == 0) {
+    if (record == nullptr || !record->live || record->runtime_entry == 0) {
         SetLastError("Dart method was not found in the live Function index");
         return DARTPLANT_METHOD_NOT_FOUND;
     }
@@ -641,11 +642,11 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
         owner.runtime_generation = expected_runtime_generation;
         owner.image_id = image_id;
     }
-    auto code_target = entry_targets.GetOrCreate(
-        record->runtime_entry, static_cast<uint32_t>(record->code_size), record->code_object,
-        record->entry_alias_count, DARTPLANT_CODE_IDENTITY_UNKNOWN,
-        static_cast<uintptr_t>(record->code_payload_start), record->code_instructions_length,
-        image_id, owner);
+    auto code_target =
+        entry_targets.GetOrCreate(record->runtime_entry, static_cast<uint32_t>(record->code_size),
+                                  0, record->entry_alias_count, DARTPLANT_CODE_IDENTITY_UNKNOWN,
+                                  static_cast<uintptr_t>(record->code_payload_start),
+                                  record->code_instructions_length, image_id, owner);
     if (code_target == nullptr) {
         SetLastError("live Function index produced an invalid entry target");
         return DARTPLANT_METHOD_NOT_FOUND;
@@ -659,8 +660,11 @@ DartPlantStatus ResolveLiveIndexedRuntimeMethod(
     function->identity = MethodIdentityFromRecord(method_record);
     function->image_id = image_id;
     function->owner = owner;
-    function->function_object = record->function_object;
-    function->code_object = record->code_object;
+    // The observation-time FunctionPtr/CodePtr are deliberately not retained.
+    // The durable live receipt is owner + immutable semantic directory +
+    // source-proven executable payload identity.
+    function->function_object = 0;
+    function->code_object = 0;
     function->source = DartFunctionSource::kLiveVm;
     function->function_kind = record->function_kind;
     function->runtime_profile_version = profile == nullptr ? 0 : profile->live_vm.profile_version;
@@ -972,6 +976,43 @@ DartPlantStatus BindArtifactSnapshotIndex(SnapshotIndex* index,
 }
 
 }  // namespace
+
+class LiveHeapObservationGuard {
+public:
+    explicit LiveHeapObservationGuard(DartPlantVmAdapter* adapter) : adapter_(adapter) {}
+    ~LiveHeapObservationGuard() {
+        if (lease_ != nullptr) {
+            (void) VmAdapterEndLiveHeapObservation(adapter_, std::exchange(lease_, nullptr));
+        }
+    }
+
+    LiveHeapObservationGuard(const LiveHeapObservationGuard&) = delete;
+    LiveHeapObservationGuard& operator=(const LiveHeapObservationGuard&) = delete;
+
+    DartPlantStatus Acquire(uint64_t thread) {
+        if (lease_ != nullptr) {
+            SetLastError("live heap observation guard is already active");
+            return DARTPLANT_VM_ADAPTER_BUSY;
+        }
+        return VmAdapterBeginLiveHeapObservation(adapter_, thread, &lease_);
+    }
+
+    void* lease() const { return lease_; }
+
+    DartPlantStatus Release() {
+        if (lease_ == nullptr) return DARTPLANT_OK;
+        return VmAdapterEndLiveHeapObservation(adapter_, std::exchange(lease_, nullptr));
+    }
+
+    DartPlantStatus ReleaseWithStatus(DartPlantStatus primary_status) {
+        const DartPlantStatus release_status = Release();
+        return release_status == DARTPLANT_OK ? primary_status : release_status;
+    }
+
+private:
+    DartPlantVmAdapter* adapter_ = nullptr;
+    void* lease_ = nullptr;
+};
 
 void ActivateRuntimeEngineOwnerForAnchorLocked(DartPlantRuntime* runtime,
                                                const std::vector<ModuleImage>& modules,
@@ -1836,14 +1877,10 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         group_state.live_vm_bool_false_value = 0;
     }
 
-    DartPlantLiveVmFunctionIndexInfo index_info{};
-    index_info.struct_size = sizeof(index_info);
-    std::string error;
-    std::optional<SnapshotIndex> index;
-    if (!dartplant::RuntimeIsolateGroup(runtime).image_set.empty()) {
-        std::vector<LiveVmInstructionImage> instruction_images;
-        instruction_images.reserve(dartplant::RuntimeIsolateGroup(runtime).image_set.size());
-        for (const auto& image : dartplant::RuntimeIsolateGroup(runtime).image_set.images()) {
+    std::vector<LiveVmInstructionImage> instruction_images;
+    if (!group_state.image_set.empty()) {
+        instruction_images.reserve(group_state.image_set.size());
+        for (const auto& image : group_state.image_set.images()) {
             LiveVmInstructionImage descriptor{};
             descriptor.runtime_image_id = image.id;
             descriptor.runtime_image_incarnation_epoch = image.incarnation_epoch;
@@ -1855,27 +1892,205 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
             FillSnapshotInfo(image.snapshot, &descriptor.snapshot);
             instruction_images.push_back(descriptor);
         }
-        index = BuildLiveSnapshotIndexForImages(
-            live_context, instruction_images, *live_index_profile, *function_type_profile,
-            deferred_profile, observation_adapter, observation_lease, &index_info, &error);
-    } else {
-        // Synthetic/legacy callers that seed runtime fields directly retain the
-        // single-image contract until they opt into RuntimeImageSet.
-        index = BuildLiveSnapshotIndex(live_context, snapshot_info, *live_index_profile,
-                                       *function_type_profile, observation_adapter,
-                                       observation_lease, &index_info, &error);
     }
-    if (!index.has_value()) {
-        SetLastError(error.empty() ? "failed to build live Function index" : error);
-        return DARTPLANT_RUNTIME_NOT_READY;
+
+    RuntimeImageSet observed_images = group_state.image_set;
+    std::vector<LiveVmDeferredLoadingUnitState> deferred_load_states;
+    if (deferred_profile != nullptr) {
+        const DartPlantStatus deferred_state_status = ProbeLiveVmDeferredLoadingUnitStatesForImages(
+            live_context, instruction_images, *deferred_profile, live_null_value,
+            observation_adapter, observation_lease, &deferred_load_states);
+        if (deferred_state_status != DARTPLANT_OK) return deferred_state_status;
+        for (const auto& state : deferred_load_states) {
+            if (!observed_images.BindDeferredLoadState(state.runtime_image_id,
+                                                       state.loading_unit_id, state.loaded)) {
+                SetLastError(
+                    "deferred LoadingUnit state does not match the current RuntimeImage owner");
+                return DARTPLANT_PROFILE_MISMATCH;
+            }
+        }
     }
+    const bool deferred_load_state_unchanged =
+        group_state.image_set.SameDeferredLoadStates(observed_images);
+    const bool stable_directory_reusable =
+        !semantic_context_changed && group_state.live_snapshot_index.has_value() &&
+        CanReuseLiveSnapshotIndex(*group_state.live_snapshot_index, group_state.image_set,
+                                  *live_index_profile, *function_type_profile,
+                                  group_state.live_function_index_info);
+    const bool stable_directory_extendable =
+        !semantic_context_changed && group_state.live_snapshot_index.has_value() &&
+        CanExtendLiveSnapshotIndex(*group_state.live_snapshot_index, group_state.image_set,
+                                   *live_index_profile, *function_type_profile,
+                                   group_state.live_function_index_info);
+
+#if defined(__ANDROID__)
+    AndroidLogPrint(
+        ANDROID_LOG_INFO, "LiveIndex",
+        "reuse-check semantic_changed=%u deferred_same=%u reusable=%u extendable=%u images=%zu "
+        "cached=%u",
+        semantic_context_changed ? 1u : 0u, deferred_load_state_unchanged ? 1u : 0u,
+        stable_directory_reusable ? 1u : 0u, stable_directory_extendable ? 1u : 0u,
+        group_state.image_set.size(),
+        group_state.live_snapshot_index.has_value()
+            ? group_state.live_function_index_info.function_count
+            : 0u);
+#endif
+
+    if (deferred_load_state_unchanged && stable_directory_reusable) {
+#if defined(__ANDROID__)
+        AndroidLogPrint(
+            ANDROID_LOG_INFO, "LiveIndex", "reuse stable directory functions=%u generation=%llu",
+            group_state.live_function_index_info.function_count,
+            static_cast<unsigned long long>(runtime->generation->load(std::memory_order_acquire)));
+#endif
+        capability_bindings.StampOwner(RuntimeCapabilityOwner(runtime));
+        if (!capability_bindings.owner.valid()) {
+            SetLastError("VM capability bindings have no current runtime owner epoch");
+            return DARTPLANT_RUNTIME_NOT_READY;
+        }
+        group_state.live_vm_context = live_context;
+        group_state.isolate_group_identity = live_context.isolate_group;
+        if (group_state.isolate_generation == 0) group_state.isolate_generation = 1;
+        group_state.capability_bindings = std::move(capability_bindings);
+        group_state.live_vm_null_value = live_null_value;
+        group_state.live_vm_bool_true_value = bool_true_value;
+        group_state.live_vm_bool_false_value = bool_false_value;
+        dartplant::SetActiveRuntimeState(runtime, DARTPLANT_RUNTIME_READY);
+        ClearLastError();
+        return DARTPLANT_OK;
+    }
+
+    DartPlantLiveVmFunctionIndexInfo index_info{};
+    index_info.struct_size = sizeof(index_info);
+    std::string error;
+    std::optional<SnapshotIndex> index;
     std::optional<RuntimeImageSet> semantically_bound_images;
-    if (!dartplant::RuntimeIsolateGroup(runtime).image_set.empty()) {
+
+    // LoadingUnit::ReadRoots updates Function entry-point caches in place and
+    // PostLoad publishes base_objects only after that update is complete. When
+    // the exact same RuntimeImage owner moves monotonically from NotLoaded to
+    // Loaded, refresh only Functions referenced by that unit's Code objects.
+    // Any other semantic transition fails out of this optimization and uses
+    // the complete live graph below.
+    if (!deferred_load_state_unchanged && stable_directory_extendable &&
+        deferred_profile != nullptr && !group_state.image_set.empty()) {
+        bool delta_eligible = true;
+        std::vector<uint64_t> newly_loaded_image_ids;
+        for (const auto& observed : observed_images.images()) {
+            if (observed.kind != RuntimeImageKind::kDeferred) continue;
+            const RuntimeImage* previous = group_state.image_set.FindById(observed.id);
+            if (previous == nullptr || previous->incarnation_epoch != observed.incarnation_epoch ||
+                previous->engine_incarnation_epoch != observed.engine_incarnation_epoch ||
+                previous->isolate_group_incarnation_epoch !=
+                    observed.isolate_group_incarnation_epoch ||
+                previous->runtime_generation != observed.runtime_generation ||
+                previous->loading_unit_id != observed.loading_unit_id) {
+                delta_eligible = false;
+                break;
+            }
+            if (previous->deferred_load_state == observed.deferred_load_state) continue;
+            const bool known_not_loaded_to_loaded =
+                previous->deferred_load_state == RuntimeDeferredLoadState::kNotLoaded &&
+                observed.deferred_load_state == RuntimeDeferredLoadState::kLoaded;
+            const bool pristine_new_image =
+                previous->deferred_load_state == RuntimeDeferredLoadState::kUnbound &&
+                !previous->deferred_program_hash_vm_bound && previous->live_entry_count == 0;
+            const bool pristine_to_observed =
+                pristine_new_image &&
+                (observed.deferred_load_state == RuntimeDeferredLoadState::kNotLoaded ||
+                 observed.deferred_load_state == RuntimeDeferredLoadState::kLoaded);
+            if (!known_not_loaded_to_loaded && !pristine_to_observed) {
+                delta_eligible = false;
+                break;
+            }
+            if (observed.deferred_load_state == RuntimeDeferredLoadState::kLoaded) {
+                newly_loaded_image_ids.push_back(observed.id);
+            }
+        }
+        if (delta_eligible) {
+            if (newly_loaded_image_ids.empty()) {
+                index = *group_state.live_snapshot_index;
+                index_info = group_state.live_function_index_info;
+            } else {
+                index = BuildDeferredLiveSnapshotIndexIncrement(
+                    *group_state.live_snapshot_index, live_context, instruction_images,
+                    newly_loaded_image_ids, *live_index_profile, *function_type_profile,
+                    *deferred_profile, observation_adapter, observation_lease,
+                    group_state.live_function_index_info, &index_info, &error);
+            }
+#if defined(__ANDROID__)
+            if (!index.has_value()) {
+                AndroidLogPrint(ANDROID_LOG_INFO, "LiveIndex",
+                                "incremental deferred rejected images=%zu reason=%s",
+                                newly_loaded_image_ids.size(), error.c_str());
+            }
+#endif
+            if (index.has_value()) {
+                RuntimeImageSet rebound;
+                if (!BindStableLiveSnapshotImageSemantics(*index, observed_images, &rebound,
+                                                          &error)) {
+#if defined(__ANDROID__)
+                    AndroidLogPrint(ANDROID_LOG_INFO, "LiveIndex",
+                                    "incremental deferred bind rejected reason=%s", error.c_str());
+#endif
+                    index.reset();
+                } else if (root_program_hash.has_value() &&
+                           !rebound.BindDeferredProgramHash(*root_program_hash)) {
+                    error =
+                        "deferred runtime image program hash disagrees with the live isolate group";
+                    index.reset();
+                } else {
+                    semantically_bound_images = std::move(rebound);
+#if defined(__ANDROID__)
+                    AndroidLogPrint(
+                        ANDROID_LOG_INFO, "LiveIndex",
+                        "incremental deferred refresh images=%zu functions=%u generation=%llu",
+                        newly_loaded_image_ids.size(), index_info.function_count,
+                        static_cast<unsigned long long>(
+                            runtime->generation->load(std::memory_order_acquire)));
+#endif
+                }
+            }
+        }
+        // Delta refresh is an optimization only. Any incomplete owner-slot,
+        // FunctionType, or LoadingUnit proof falls through to a complete graph
+        // rebuild under the same exact observation receipt.
+        if (!index.has_value()) error.clear();
+    }
+
+    if (!index.has_value()) {
+        if (!dartplant::RuntimeIsolateGroup(runtime).image_set.empty()) {
+            index = BuildLiveSnapshotIndexForImages(
+                live_context, instruction_images, *live_index_profile, *function_type_profile,
+                deferred_profile, observation_adapter, observation_lease, &index_info, &error);
+        } else {
+            // Synthetic/legacy callers that seed runtime fields directly retain the
+            // single-image contract until they opt into RuntimeImageSet.
+            index = BuildLiveSnapshotIndex(live_context, snapshot_info, *live_index_profile,
+                                           *function_type_profile, observation_adapter,
+                                           observation_lease, &index_info, &error);
+        }
+        if (!index.has_value()) {
+            SetLastError(error.empty() ? "failed to build live Function index" : error);
+            return DARTPLANT_RUNTIME_NOT_READY;
+        }
+    }
+
+    if (!dartplant::RuntimeIsolateGroup(runtime).image_set.empty() &&
+        !semantically_bound_images.has_value()) {
         RuntimeImageSet rebound;
         if (!BindLiveSnapshotImageSemantics(
                 *index, dartplant::RuntimeIsolateGroup(runtime).image_set, &rebound, &error)) {
             SetLastError(error.empty() ? "live Function image semantics are inconsistent" : error);
             return DARTPLANT_PROFILE_MISMATCH;
+        }
+        for (const auto& state : deferred_load_states) {
+            if (!rebound.BindDeferredLoadState(state.runtime_image_id, state.loading_unit_id,
+                                               state.loaded)) {
+                SetLastError(
+                    "deferred LoadingUnit state does not match the rebound RuntimeImage owner");
+                return DARTPLANT_PROFILE_MISMATCH;
+            }
         }
         if (root_program_hash.has_value() && !rebound.BindDeferredProgramHash(*root_program_hash)) {
             char mismatch[192] = {};
@@ -1910,6 +2125,7 @@ DartPlantStatus BuildLiveIndexForContext(DartPlantRuntime* runtime,
         semantically_bound_images->ActivateAll();
         dartplant::RuntimeIsolateGroup(runtime).image_set = std::move(*semantically_bound_images);
     }
+    StabilizeLiveSnapshotIndexForPublication(&*index);
     capability_bindings.StampOwner(RuntimeCapabilityOwner(runtime));
     if (!capability_bindings.owner.valid()) {
         SetLastError("VM capability bindings have no current runtime owner epoch");
@@ -2296,9 +2512,8 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
     if (invocation->requested_method == nullptr ||
         invocation->requested_method->function == nullptr ||
         !dartplant::IsCurrentRuntimeMethod(runtime, invocation->requested_method) ||
-        invocation->hook == nullptr ||
-        invocation->hook->runtime_generation != runtime->generation ||
-        invocation->hook->expected_runtime_generation !=
+        invocation->hook == nullptr || invocation->runtime_generation != runtime->generation ||
+        invocation->expected_runtime_generation !=
             runtime->generation->load(std::memory_order_acquire) ||
         invocation->context == nullptr) {
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
@@ -2319,9 +2534,8 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
     }
     const uint64_t observation_thread =
         invocation->context->x[capture_profile->live_vm.thr_register];
-    void* observation_lease = nullptr;
-    DartPlantStatus status = dartplant::VmAdapterBeginLiveHeapObservation(
-        invocation->vm_adapter, observation_thread, &observation_lease);
+    dartplant::LiveHeapObservationGuard observation(invocation->vm_adapter);
+    DartPlantStatus status = observation.Acquire(observation_thread);
     if (status != DARTPLANT_OK) {
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
                                          DARTPLANT_RESOLVE_REJECTED, status,
@@ -2336,42 +2550,32 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
     probe.struct_size = sizeof(probe);
     status = dartplant_live_vm_probe_invocation(invocation, &snapshot_info, &probe);
     if (status != DARTPLANT_OK) {
-        const DartPlantStatus release_status =
-            dartplant::VmAdapterEndLiveHeapObservation(invocation->vm_adapter, observation_lease);
-        if (release_status != DARTPLANT_OK) return release_status;
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
                                          DARTPLANT_RESOLVE_REJECTED, status,
                                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
-        return status;
+        return observation.ReleaseWithStatus(status);
     }
 
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
     status = dartplant_live_vm_context_from_probe(&probe, &context);
     if (status != DARTPLANT_OK) {
-        const DartPlantStatus release_status =
-            dartplant::VmAdapterEndLiveHeapObservation(invocation->vm_adapter, observation_lease);
-        if (release_status != DARTPLANT_OK) return release_status;
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
                                          DARTPLANT_RESOLVE_REJECTED, status,
                                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
-        return status;
+        return observation.ReleaseWithStatus(status);
     }
     const dartplant::RuntimeProfileRecord* probe_profile =
         dartplant::FindRuntimeProfileByVersion(probe.profile_version);
     if (probe_profile == nullptr || probe_profile->live_vm.null_register >= 31) {
-        const DartPlantStatus release_status =
-            dartplant::VmAdapterEndLiveHeapObservation(invocation->vm_adapter, observation_lease);
-        if (release_status != DARTPLANT_OK) return release_status;
         dartplant::SetLastError("live VM probe selected an invalid candidate profile");
-        return DARTPLANT_PROFILE_MISMATCH;
+        return observation.ReleaseWithStatus(DARTPLANT_PROFILE_MISMATCH);
     }
     status = dartplant::BuildLiveIndexForContext(
         runtime, context, *dartplant::RuntimeIsolateGroup(runtime).snapshot,
         invocation->context->x[probe_profile->live_vm.null_register], invocation->vm_adapter,
-        observation_lease);
-    const DartPlantStatus release_status =
-        dartplant::VmAdapterEndLiveHeapObservation(invocation->vm_adapter, observation_lease);
+        observation.lease());
+    const DartPlantStatus release_status = observation.Release();
     if (release_status != DARTPLANT_OK) return release_status;
     if (status != DARTPLANT_OK) {
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
@@ -2385,7 +2589,7 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
         invocation->requested_method->function->code_target != nullptr) {
         auto& function = *invocation->requested_method->function;
         if (!function.code_target->MergeEvidence(
-                dartplant::MethodCodeSize(invocation->requested_method), probe.code,
+                dartplant::MethodCodeSize(invocation->requested_method), 0,
                 probe.entry_alias_count)) {
             dartplant::SetLastError(
                 "live VM Code identity contradicts the existing physical entry certificate");
@@ -2394,8 +2598,10 @@ DartPlantStatus dartplant_runtime_capture_live_vm(DartPlantRuntime* runtime,
                                              DARTPLANT_REJECT_ARTIFACT_MISMATCH);
             return DARTPLANT_PROFILE_MISMATCH;
         }
-        function.function_object = probe.function;
-        function.code_object = probe.code;
+        // probe.function/probe.code are valid only inside the exact moving-GC
+        // observation window above. The stable directory has already copied
+        // every durable semantic/code-range receipt we need, so do not leak
+        // either movable heap address back into a persistent method/target.
         dartplant::DartMethodIdentity live_identity = {
             .library_uri = probe.library_uri,
             .class_name = probe.class_name,
@@ -2490,9 +2696,8 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_ad
     dartplant::FillSnapshotInfo(snapshot, &snapshot_info);
     DartPlantLiveVmContext context{};
     context.struct_size = sizeof(context);
-    void* observation_lease = nullptr;
-    DartPlantStatus status =
-        dartplant::VmAdapterBeginLiveHeapObservation(adapter, registers->thr, &observation_lease);
+    dartplant::LiveHeapObservationGuard observation(adapter);
+    DartPlantStatus status = observation.Acquire(registers->thr);
     if (status != DARTPLANT_OK) {
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
                                          DARTPLANT_RESOLVE_REJECTED, status,
@@ -2501,13 +2706,10 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_ad
     }
     status = dartplant_live_vm_context_from_arm64_registers(&snapshot_info, registers, &context);
     if (status != DARTPLANT_OK) {
-        const DartPlantStatus release_status =
-            dartplant::VmAdapterEndLiveHeapObservation(adapter, observation_lease);
-        if (release_status != DARTPLANT_OK) return release_status;
         dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_LIVE_VM,
                                          DARTPLANT_RESOLVE_REJECTED, status,
                                          DARTPLANT_REJECT_LIVE_VM_UNAVAILABLE);
-        return status;
+        return observation.ReleaseWithStatus(status);
     }
 
     DartPlantStatus index_status = DARTPLANT_OK;
@@ -2525,7 +2727,7 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_ad
             index_status = DARTPLANT_RUNTIME_NOT_READY;
         } else {
             index_status = dartplant::BuildLiveIndexForContext(
-                runtime, context, snapshot, registers->null_value, adapter, observation_lease);
+                runtime, context, snapshot, registers->null_value, adapter, observation.lease());
         }
         if (index_status != DARTPLANT_OK) {
             dartplant::SetRuntimeDiagnostics(runtime, DARTPLANT_RESOLVE_FUNCTION_IDENTITY,
@@ -2533,8 +2735,7 @@ DartPlantStatus dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_ad
                                              DARTPLANT_REJECT_FUNCTION_AMBIGUOUS);
         }
     }
-    const DartPlantStatus release_status =
-        dartplant::VmAdapterEndLiveHeapObservation(adapter, observation_lease);
+    const DartPlantStatus release_status = observation.Release();
     if (release_status != DARTPLANT_OK) return release_status;
     if (index_status != DARTPLANT_OK) return index_status;
 

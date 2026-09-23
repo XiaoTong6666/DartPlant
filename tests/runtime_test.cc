@@ -22,6 +22,7 @@
 #include "runtime/runtime_image_transition.h"
 #include "runtime/runtime_internal.h"
 #include "test_runner.h"
+#include "vm/abi/resolver.h"
 #include "vm/live_vm_internal.h"
 #include "vm/runtime_profiles.h"
 
@@ -38,6 +39,12 @@ int ImageScopedRootTarget(int left, int right) { return left + right + 40; }
 int ImageScopedDeferredTarget(int left, int right) { return left + right + 50; }
 
 int DeferredLifecycleTarget(int left, int right) { return left + right + 60; }
+
+int MultiOwnerPublicTarget(int left, int right) { return left + right + 70; }
+
+int MultiOwnerInvalidationTarget(int left, int right) { return left + right + 80; }
+
+int MultiOwnerQuiesceTarget(int left, int right) { return left + right + 90; }
 
 int g_enter_calls = 0;
 int g_leave_calls = 0;
@@ -647,6 +654,8 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     function.isolate_group_incarnation_epoch = root_image->isolate_group_incarnation_epoch;
     function.runtime_generation = root_image->runtime_generation;
     function.loading_unit_id = 1;
+    function.owner_class_id = 42;
+    function.owner_function_index = 0;
     function.library_uri = "package:fixture/main.dart";
     function.class_name = "Fixture";
     function.function_name = "add";
@@ -678,6 +687,8 @@ void SeedSyntheticLiveFunctionIndex(DartPlantRuntime* runtime, const dartplant::
     live_info.isolate_group_incarnation_epoch = root_image->isolate_group_incarnation_epoch;
     live_info.runtime_generation = root_image->runtime_generation;
     live_info.loading_unit_id = 1;
+    live_info.owner_class_id = 42;
+    live_info.owner_function_index = 0;
     live_info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT] = 1;
     live_info.entry_kind_mask = 0x01;
     std::snprintf(live_info.library_uri, sizeof(live_info.library_uri), "%s",
@@ -1029,12 +1040,12 @@ TEST_CASE(VmAdapterOwnsOpaqueObjectLifetime) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
-        .pin_generated_roots = nullptr,
-        .generated_root_get = nullptr,
-        .generated_root_set = nullptr,
-        .unpin_generated_roots = nullptr,
-        .enter_generated_to_native = nullptr,
-        .leave_native_to_generated = nullptr,
+        .pin_generated_roots = FakePinGeneratedRoots,
+        .generated_root_get = FakeGeneratedRootGet,
+        .generated_root_set = FakeGeneratedRootSet,
+        .unpin_generated_roots = FakeUnpinGeneratedRoots,
+        .enter_generated_to_native = FakeEnterGeneratedToNative,
+        .leave_native_to_generated = FakeLeaveNativeToGenerated,
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
@@ -1575,6 +1586,135 @@ TEST_CASE(VmAdapterV5OwnsLiveHeapObservationLease) {
     EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
 }
 
+TEST_CASE(LiveVmDeferredLoadStateProbeTracksPostLoadPublication) {
+    const auto& profile = dartplant::RuntimeProfiles()[0];
+    EXPECT_TRUE(profile.live_vm.object_store_loading_units_offset != 0);
+    EXPECT_TRUE(profile.loading_unit.cid != 0);
+    EXPECT_TRUE(profile.loading_unit.base_objects_offset != 0);
+
+    alignas(16) std::array<uint8_t, 0x4000> arena{};
+    const uint64_t heap_base = reinterpret_cast<uintptr_t>(arena.data());
+    constexpr size_t kLoadingUnitsOffset = 0x200;
+    constexpr size_t kLoadingUnitOffset = 0x500;
+    constexpr size_t kNullOffset = 0x800;
+    constexpr size_t kBaseObjectsOffset = 0xa00;
+    constexpr size_t kObjectStoreOffset = 0x1800;
+    const auto tagged = [&](size_t offset) {
+        return heap_base + offset + profile.raw_object.heap_object_tag;
+    };
+    const auto write_word = [&](size_t offset, uint64_t value) {
+        std::memcpy(arena.data() + offset, &value, sizeof(value));
+    };
+    const auto write_compressed = [&](size_t offset, uint64_t value) {
+        const uint64_t delta = value - heap_base;
+        EXPECT_TRUE(delta <= UINT32_MAX);
+        const uint32_t compressed = static_cast<uint32_t>(delta);
+        std::memcpy(arena.data() + offset, &compressed, sizeof(compressed));
+    };
+    const auto write_tags = [&](size_t offset, uint32_t cid) {
+        const uint64_t tags = static_cast<uint64_t>(cid) << profile.raw_object.class_id_tag_shift;
+        write_word(offset, tags);
+    };
+    const auto write_array = [&](size_t offset, uint32_t cid, uint32_t length) {
+        write_tags(offset, cid);
+        const uint32_t smi = length << profile.raw_object.smi_tag_shift;
+        std::memcpy(arena.data() + offset + profile.live_vm.array_length_offset, &smi, sizeof(smi));
+    };
+    const auto write_array_pointer = [&](size_t array_offset, uint32_t index, uint64_t value) {
+        write_compressed(
+            array_offset + profile.live_vm.array_elements_offset + index * sizeof(uint32_t), value);
+    };
+
+    write_array(kLoadingUnitsOffset, profile.live_vm.cid_array, 3);
+    write_tags(kLoadingUnitOffset, profile.loading_unit.cid);
+    write_array(kBaseObjectsOffset, profile.live_vm.cid_array, 1);
+    write_array_pointer(kLoadingUnitsOffset, 2, tagged(kLoadingUnitOffset));
+    write_compressed(kLoadingUnitOffset + profile.loading_unit.base_objects_offset,
+                     tagged(kNullOffset));
+    write_word(kObjectStoreOffset + profile.live_vm.object_store_loading_units_offset,
+               tagged(kLoadingUnitsOffset));
+
+    FakeVmState state{};
+    DartPlantVmAdapterCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.adapter_version = 5;
+    callbacks.enter_isolate = FakeEnter;
+    callbacks.leave_isolate = FakeLeave;
+    callbacks.enter_scope = FakeEnterScope;
+    callbacks.leave_scope = FakeLeaveScope;
+    callbacks.retain_object = FakeRetain;
+    callbacks.release_object = FakeRelease;
+    callbacks.object_kind = FakeKind;
+    callbacks.object_to_raw = FakeRaw;
+    callbacks.object_is_alive = FakeAlive;
+    callbacks.prove_capability = FakeProveCapability;
+    callbacks.pin_generated_roots = FakePinGeneratedRoots;
+    callbacks.generated_root_get = FakeGeneratedRootGet;
+    callbacks.generated_root_set = FakeGeneratedRootSet;
+    callbacks.unpin_generated_roots = FakeUnpinGeneratedRoots;
+    callbacks.enter_generated_to_native = FakeEnterGeneratedToNative;
+    callbacks.leave_native_to_generated = FakeLeaveNativeToGenerated;
+    callbacks.begin_live_heap_observation = FakeBeginLiveHeapObservation;
+    callbacks.end_live_heap_observation = FakeEndLiveHeapObservation;
+
+    DartPlantVmAdapter* adapter = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state, &adapter));
+    const DartPlantIsolateIdentity isolate = {51, 52, 53};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter, &isolate));
+
+    DartPlantLiveVmContext context{};
+    context.struct_size = sizeof(context);
+    context.profile_version = profile.live_vm.profile_version;
+    context.thread = 0x1234;
+    context.heap_base = heap_base;
+    context.object_store = heap_base + kObjectStoreOffset;
+
+    DartPlantFlutterSnapshotInfo snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    snapshot.isolate_instructions_runtime = 0x100000;
+    snapshot.isolate_instructions_size = 0x1000;
+    const std::array<dartplant::LiveVmInstructionImage, 2> images = {{
+        {
+            .runtime_image_id = 1,
+            .loading_unit_id = 1,
+            .snapshot = snapshot,
+        },
+        {
+            .runtime_image_id = 2,
+            .loading_unit_id = 2,
+            .snapshot = snapshot,
+        },
+    }};
+
+    void* lease = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::VmAdapterBeginLiveHeapObservation(adapter, context.thread, &lease));
+
+    std::vector<dartplant::LiveVmDeferredLoadingUnitState> states;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::ProbeLiveVmDeferredLoadingUnitStatesForImages(
+                  context, images, profile, tagged(kNullOffset), adapter, lease, &states));
+    EXPECT_EQ(1U, states.size());
+    EXPECT_EQ(2ULL, states[0].runtime_image_id);
+    EXPECT_EQ(2U, states[0].loading_unit_id);
+    EXPECT_FALSE(states[0].loaded);
+
+    // UnitDeserializationRoots::PostLoad publishes base_objects only after
+    // deferred Function entry points have been updated.
+    write_compressed(kLoadingUnitOffset + profile.loading_unit.base_objects_offset,
+                     tagged(kBaseObjectsOffset));
+    states.clear();
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::ProbeLiveVmDeferredLoadingUnitStatesForImages(
+                  context, images, profile, tagged(kNullOffset), adapter, lease, &states));
+    EXPECT_EQ(1U, states.size());
+    EXPECT_TRUE(states[0].loaded);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterEndLiveHeapObservation(adapter, lease));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter, &isolate));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter));
+}
+
 TEST_CASE(LiveSemanticCollectorRequiresExactObservationReceipt) {
     const auto* profile = dartplant::FindRuntimeProfileByVersion(1);
     EXPECT_TRUE(profile != nullptr);
@@ -1610,12 +1750,12 @@ TEST_CASE(VmAdapterRejectsWrongThreadAndIsolateGeneration) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
-        .pin_generated_roots = nullptr,
-        .generated_root_get = nullptr,
-        .generated_root_set = nullptr,
-        .unpin_generated_roots = nullptr,
-        .enter_generated_to_native = nullptr,
-        .leave_native_to_generated = nullptr,
+        .pin_generated_roots = FakePinGeneratedRoots,
+        .generated_root_get = FakeGeneratedRootGet,
+        .generated_root_set = FakeGeneratedRootSet,
+        .unpin_generated_roots = FakeUnpinGeneratedRoots,
+        .enter_generated_to_native = FakeEnterGeneratedToNative,
+        .leave_native_to_generated = FakeLeaveNativeToGenerated,
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
@@ -1659,12 +1799,12 @@ TEST_CASE(InvocationObjectBridgeUsesActiveVmScope) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
-        .pin_generated_roots = nullptr,
-        .generated_root_get = nullptr,
-        .generated_root_set = nullptr,
-        .unpin_generated_roots = nullptr,
-        .enter_generated_to_native = nullptr,
-        .leave_native_to_generated = nullptr,
+        .pin_generated_roots = FakePinGeneratedRoots,
+        .generated_root_get = FakeGeneratedRootGet,
+        .generated_root_set = FakeGeneratedRootSet,
+        .unpin_generated_roots = FakeUnpinGeneratedRoots,
+        .enter_generated_to_native = FakeEnterGeneratedToNative,
+        .leave_native_to_generated = FakeLeaveNativeToGenerated,
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
@@ -1846,6 +1986,51 @@ TEST_CASE(DartCallbackHookRejectsVmAdapterWithoutGcSafeNativeTransition) {
     EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
               dartplant::InstallCallbackHook(&method, profile, options, 0, &hook, nullptr));
     EXPECT_EQ(nullptr, hook);
+}
+
+TEST_CASE(DartCallbackListenerRejectsVmAdapterWithoutGcSafeNativeTransition) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
+    target->id = reinterpret_cast<uintptr_t>(Replacement);
+    target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+
+    DartPlantMethod physical_method{};
+    physical_method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    physical_method.function->source = dartplant::DartFunctionSource::kSynthetic;
+    physical_method.function->code_target = target;
+
+    DartPlantMethod listener_method{};
+    listener_method.function = std::make_shared<dartplant::DartFunctionHandle>();
+    listener_method.function->source = dartplant::DartFunctionSource::kLiveVm;
+    listener_method.function->code_target = target;
+
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(physical_method);
+    hook.profile = profile;
+    hook.backup = reinterpret_cast<void*>(Replacement);
+
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        // call_layout is intentionally null, so admission must reject before
+        // this sentinel adapter can ever be dereferenced.
+        .vm_adapter = reinterpret_cast<DartPlantVmAdapter*>(uintptr_t{1}),
+    };
+    DartPlantListener* listener = nullptr;
+    EXPECT_EQ(DARTPLANT_UNSUPPORTED_ABI,
+              dartplant::AddCallbackListener(&hook, &listener_method, options, 0, &listener));
+    EXPECT_TRUE(listener == nullptr);
+    EXPECT_TRUE(hook.listeners.empty());
 }
 
 TEST_CASE(RealDartCallbackHookRejectsLegacyHostPublication) {
@@ -3498,6 +3683,238 @@ TEST_CASE(RuntimeImageTransitionDoesNotPublishReplacementWhenDrainFails) {
     dlclose(fixture);
 }
 
+TEST_CASE(RuntimeImageTransitionPreservesStableDirectoryAcrossAdditiveDeferredImage) {
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+    EXPECT_TRUE(dartplant::RuntimeProfileCount() != 0);
+    const auto& vm_profile = dartplant::RuntimeProfiles()[0];
+
+    auto& group = dartplant::RuntimeIsolateGroup(runtime);
+    group.live_snapshot_index->vm_profile_version = vm_profile.live_vm.profile_version;
+    group.live_snapshot_index->live_index_abi_key = dartplant::vm_abi::BuildCapabilityAbiKey(
+        vm_profile, dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout);
+    group.live_snapshot_index->function_type_abi_key = dartplant::vm_abi::BuildCapabilityAbiKey(
+        vm_profile, dartplant::vm_abi::kCapabilityFunctionTypeLayout);
+    dartplant::StabilizeLiveSnapshotIndexForPublication(&*group.live_snapshot_index);
+    const auto* old_root = group.image_set.Root();
+    EXPECT_TRUE(old_root != nullptr);
+    EXPECT_EQ(1U, old_root->live_entry_count);
+    const auto old_root_id = old_root->id;
+    const auto old_root_epoch = old_root->incarnation_epoch;
+
+    const DartPlantMethodQuery root_query = {
+        .struct_size = sizeof(root_query),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* retained_root_method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_find_method(runtime, &root_query, &retained_root_method));
+    EXPECT_TRUE(retained_root_method != nullptr);
+    EXPECT_TRUE(dartplant::IsCurrentRuntimeMethod(runtime, retained_root_method));
+
+    dartplant::ModuleImage deferred_module;
+    deferred_module.name = "libdartplant_fixture.so-2.part.so";
+    deferred_module.path = "/synthetic/libdartplant_fixture.so-2.part.so";
+    deferred_module.build_id = "synthetic-deferred";
+    deferred_module.load_bias = 0x500000;
+    deferred_module.executable_ranges.push_back({
+        .start = 0x501000,
+        .end = 0x501100,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x100,
+    });
+    dartplant::FlutterSnapshotSource deferred_snapshot = *group.snapshot;
+    deferred_snapshot.module_name = deferred_module.name;
+    deferred_snapshot.module_path = deferred_module.path;
+    deferred_snapshot.module_build_id = deferred_module.build_id;
+    deferred_snapshot.isolate_instructions_va = 0x1000;
+    deferred_snapshot.isolate_instructions_runtime = 0x501000;
+    deferred_snapshot.isolate_instructions_size = 0x100;
+    deferred_snapshot.deferred_program_hash = 0x12345678;
+
+    dartplant::RuntimeImageSet staged;
+    std::string error;
+    EXPECT_TRUE(staged.SetRoot(*module, *group.snapshot,
+                               runtime->generation->load(std::memory_order_acquire), &error));
+    EXPECT_TRUE(staged.AddDeferred(deferred_module, deferred_snapshot, 2,
+                                   runtime->generation->load(std::memory_order_acquire), &error));
+    EXPECT_TRUE(staged.ReconcileOwnershipFrom(group.image_set));
+    staged.BindOwnerEpochs(dartplant::RuntimeEngine(runtime).incarnation_epoch,
+                           group.incarnation_epoch);
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::TransitionRuntimeImages(
+                  runtime, std::move(staged), dartplant::RuntimeProcess(runtime).modules, false));
+
+    const auto* root = group.image_set.Root();
+    EXPECT_TRUE(root != nullptr);
+    EXPECT_EQ(old_root_id, root->id);
+    EXPECT_EQ(old_root_epoch, root->incarnation_epoch);
+    EXPECT_EQ(1U, root->live_entry_count);
+    const auto* deferred = group.image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(deferred != nullptr);
+    EXPECT_EQ(0U, deferred->live_entry_count);
+    EXPECT_FALSE(deferred->deferred_program_hash_vm_bound);
+    EXPECT_EQ(static_cast<int>(dartplant::RuntimeDeferredLoadState::kUnbound),
+              static_cast<int>(deferred->deferred_load_state));
+    EXPECT_TRUE(group.live_snapshot_index.has_value());
+    EXPECT_TRUE(group.live_snapshot_index->stable_live_directory);
+    EXPECT_EQ(1U, group.live_function_index_info.function_count);
+    EXPECT_TRUE(dartplant::IsCurrentRuntimeMethod(runtime, retained_root_method));
+
+    // A mapped deferred image can disappear before it ever contributes a
+    // retained Function. Its exact live_entry_count==0 receipt is enough to
+    // prove that pruning zero records is intentional; the surviving root
+    // directory must not be thrown away and force a complete heap scan.
+    const auto first_deferred_id = deferred->id;
+    const auto first_deferred_epoch = deferred->incarnation_epoch;
+    {
+        auto inconsistent_index = *group.live_snapshot_index;
+        auto inconsistent_info = group.live_function_index_info;
+        dartplant::RuntimeImage inconsistent_owner = *deferred;
+        inconsistent_owner.live_entry_count = 1;
+        const std::array<dartplant::RuntimeImage, 1> inconsistent_retired = {inconsistent_owner};
+        std::string prune_error;
+        EXPECT_FALSE(dartplant::PruneStableLiveSnapshotIndexForImages(
+            &inconsistent_index, inconsistent_retired, &inconsistent_info, &prune_error));
+        EXPECT_EQ(1U, inconsistent_index.live_function_infos.size());
+        EXPECT_EQ(1U, inconsistent_info.function_count);
+    }
+    dartplant::RuntimeImageSet without_pristine_deferred = group.image_set;
+    EXPECT_TRUE(without_pristine_deferred.RemoveById(first_deferred_id));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::TransitionRuntimeImages(
+                                runtime, std::move(without_pristine_deferred),
+                                dartplant::RuntimeProcess(runtime).modules, false));
+    EXPECT_TRUE(group.live_snapshot_index.has_value());
+    EXPECT_TRUE(group.live_snapshot_index->stable_live_directory);
+    EXPECT_EQ(1U, group.live_function_index_info.function_count);
+
+    dartplant::RuntimeImageSet reloaded_images = group.image_set;
+    EXPECT_TRUE(reloaded_images.AddDeferred(deferred_module, deferred_snapshot, 2,
+                                            runtime->generation->load(std::memory_order_acquire),
+                                            &error));
+    reloaded_images.BindOwnerEpochs(dartplant::RuntimeEngine(runtime).incarnation_epoch,
+                                    group.incarnation_epoch);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::TransitionRuntimeImages(
+                                runtime, std::move(reloaded_images),
+                                dartplant::RuntimeProcess(runtime).modules, false));
+    deferred = group.image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(deferred != nullptr);
+    EXPECT_TRUE(deferred->id != first_deferred_id ||
+                deferred->incarnation_epoch != first_deferred_epoch);
+    EXPECT_TRUE(deferred->incarnation_epoch != first_deferred_epoch);
+    EXPECT_EQ(0U, deferred->live_entry_count);
+    EXPECT_EQ(static_cast<int>(dartplant::RuntimeDeferredLoadState::kUnbound),
+              static_cast<int>(deferred->deferred_load_state));
+    EXPECT_TRUE(dartplant::CanExtendLiveSnapshotIndex(*group.live_snapshot_index, group.image_set,
+                                                      vm_profile, vm_profile,
+                                                      group.live_function_index_info));
+    EXPECT_TRUE(dartplant::IsCurrentRuntimeMethod(runtime, retained_root_method));
+
+    // Simulate the stable directory after this deferred unit has been loaded:
+    // one root Function survives while one Function belongs exclusively to
+    // the secondary image. A pre-unload transition must prune only the latter
+    // instead of discarding the root directory and forcing a full VM scan on
+    // the subsequent re-add.
+    auto& stable_index = *group.live_snapshot_index;
+    auto deferred_function = stable_index.functions.front();
+    deferred_function.runtime_image_id = deferred->id;
+    deferred_function.runtime_image_incarnation_epoch = deferred->incarnation_epoch;
+    deferred_function.loading_unit_id = 2;
+    deferred_function.owner_class_id = 43;
+    deferred_function.owner_function_index = 0;
+    deferred_function.library_uri = "package:fixture/deferred.dart";
+    deferred_function.function_name = "deferredAdd";
+    deferred_function.runtime_entry = 0x501000;
+    deferred_function.code_entry = 0x501000;
+    deferred_function.code_payload_start = 0x501000;
+    deferred_function.code_instructions_length = 4;
+    deferred_function.code_size = 4;
+    stable_index.functions.push_back(deferred_function);
+
+    auto deferred_info = stable_index.live_function_infos.front();
+    deferred_info.runtime_image_id = deferred->id;
+    deferred_info.runtime_image_incarnation_epoch = deferred->incarnation_epoch;
+    deferred_info.loading_unit_id = 2;
+    deferred_info.owner_class_id = 43;
+    deferred_info.owner_function_index = 0;
+    deferred_info.code_entry_point = 0x501000;
+    deferred_info.function_entry_point = 0x501000;
+    deferred_info.code_size = 4;
+    deferred_info.entry_va = 0x1000;
+    deferred_info.code_section_va = 0x1000;
+    std::snprintf(deferred_info.library_uri, sizeof(deferred_info.library_uri), "%s",
+                  "package:fixture/deferred.dart");
+    std::snprintf(deferred_info.function_name, sizeof(deferred_info.function_name), "%s",
+                  "deferredAdd");
+    stable_index.live_function_infos.push_back(deferred_info);
+    group.live_function_index_info.function_count = 2;
+    group.live_function_index_info.code_target_count = 2;
+    const std::array<dartplant::RuntimeImageId, 2> loaded_bindings = {old_root_id, deferred->id};
+    EXPECT_TRUE(group.image_set.BindLiveEntries(loaded_bindings));
+    const auto loaded_deferred_id = deferred->id;
+    const auto loaded_deferred_epoch = deferred->incarnation_epoch;
+
+    dartplant::RuntimeImageSet without_deferred = group.image_set;
+    EXPECT_TRUE(without_deferred.RemoveById(loaded_deferred_id));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::TransitionRuntimeImages(
+                                runtime, std::move(without_deferred),
+                                dartplant::RuntimeProcess(runtime).modules, false));
+
+    EXPECT_TRUE(group.live_snapshot_index.has_value());
+    EXPECT_TRUE(group.live_snapshot_index->stable_live_directory);
+    EXPECT_EQ(1U, group.live_function_index_info.function_count);
+    EXPECT_EQ(1U, group.live_snapshot_index->live_function_infos.size());
+    EXPECT_EQ(old_root_id, group.live_snapshot_index->live_function_infos.front().runtime_image_id);
+    EXPECT_EQ(1U, group.image_set.Root()->live_entry_count);
+    EXPECT_TRUE(group.image_set.FindByLoadingUnitId(2) == nullptr);
+    EXPECT_TRUE(dartplant::IsCurrentRuntimeMethod(runtime, retained_root_method));
+
+    // Reload after pruning a previously loaded deferred image. The stable
+    // root directory must remain a valid delta base, while the retired
+    // deferred owner is absent and the new image starts unbound.
+    dartplant::RuntimeImageSet second_reload = group.image_set;
+    EXPECT_TRUE(second_reload.AddDeferred(deferred_module, deferred_snapshot, 2,
+                                          runtime->generation->load(std::memory_order_acquire),
+                                          &error));
+    second_reload.BindOwnerEpochs(dartplant::RuntimeEngine(runtime).incarnation_epoch,
+                                  group.incarnation_epoch);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::TransitionRuntimeImages(
+                                runtime, std::move(second_reload),
+                                dartplant::RuntimeProcess(runtime).modules, false));
+    const auto* second_deferred = group.image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(second_deferred != nullptr);
+    EXPECT_TRUE(second_deferred->incarnation_epoch != loaded_deferred_epoch);
+    EXPECT_EQ(0U, second_deferred->live_entry_count);
+    EXPECT_TRUE(dartplant::CanExtendLiveSnapshotIndex(*group.live_snapshot_index, group.image_set,
+                                                      vm_profile, vm_profile,
+                                                      group.live_function_index_info));
+
+    EXPECT_TRUE(dartplant::IsCurrentRuntimeMethod(runtime, retained_root_method));
+
+    dartplant_release_method(retained_root_method);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
 TEST_CASE(RuntimePreUnloadDoesNotRetireOwnerWhenHookDrainFails) {
     InstallTestHost(FakeHook, FakeFailUnhook);
     g_fake_unhook_calls = 0;
@@ -4104,6 +4521,276 @@ TEST_CASE(RuntimeLiveIndexResolvesExactEntryKindsWithoutSplittingLogicalFunction
     dartplant_release_method(unchecked);
     dartplant_release_method(monomorphic);
     dartplant_release_method(monomorphic_unchecked);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
+TEST_CASE(LiveSnapshotPublicationDropsMovableHeapReceipts) {
+    dartplant::SnapshotIndex index;
+    dartplant::SnapshotFunction flattened;
+    flattened.function_object = 0x1001;
+    flattened.code_object = 0x2001;
+    flattened.code_object_pool = 0x3001;
+    flattened.owner_class = 0x4001;
+    flattened.library = 0x5001;
+    flattened.runtime_entry = 0x70000000;
+    flattened.code_payload_start = 0x70000000;
+    flattened.code_instructions_length = 32;
+    index.functions.push_back(flattened);
+
+    DartPlantLiveVmFunctionInfo info{};
+    info.struct_size = sizeof(info);
+    info.function = 0x1001;
+    info.code = 0x2001;
+    info.code_object_pool = 0x3001;
+    info.owner_class = 0x4001;
+    info.library = 0x5001;
+    info.code_entry_point = 0x70000000;
+    info.code_size = 32;
+    info.entry_kind_mask = 0x01;
+    index.live_function_infos.push_back(info);
+
+    dartplant::StabilizeLiveSnapshotIndexForPublication(&index);
+    EXPECT_EQ(0U, index.functions[0].function_object);
+    EXPECT_EQ(0U, index.functions[0].code_object);
+    EXPECT_EQ(0U, index.functions[0].code_object_pool);
+    EXPECT_EQ(0U, index.functions[0].owner_class);
+    EXPECT_EQ(0U, index.functions[0].library);
+    EXPECT_EQ(0x70000000U, index.functions[0].runtime_entry);
+    EXPECT_EQ(0U, index.live_function_infos[0].function);
+    EXPECT_EQ(0U, index.live_function_infos[0].code);
+    EXPECT_EQ(0U, index.live_function_infos[0].code_object_pool);
+    EXPECT_EQ(0U, index.live_function_infos[0].owner_class);
+    EXPECT_EQ(0U, index.live_function_infos[0].library);
+    EXPECT_EQ(0x70000000U, index.live_function_infos[0].code_entry_point);
+}
+
+TEST_CASE(LiveSnapshotStableDirectoryResolvesWithoutMovableHeapReceipts) {
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+    dartplant::StabilizeLiveSnapshotIndexForPublication(
+        &*dartplant::RuntimeIsolateGroup(runtime).live_snapshot_index);
+
+    const DartPlantMethodQuery query = {
+        .struct_size = sizeof(DartPlantMethodQuery),
+        .library_uri = "package:fixture/main.dart",
+        .class_name = "Fixture",
+        .function_name = "add",
+        .signature = "",
+        .entry_kind = DARTPLANT_ENTRY_DEFAULT,
+    };
+    DartPlantMethod* method = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_find_method(runtime, &query, &method));
+    EXPECT_TRUE(method != nullptr);
+    EXPECT_EQ(0U, method->function->function_object);
+    EXPECT_EQ(0U, method->function->code_object);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(target), dartplant_method_runtime_address(method));
+
+    dartplant_release_method(method);
+    dartplant_runtime_destroy(runtime);
+    dlclose(fixture);
+}
+
+TEST_CASE(LiveSnapshotReuseRequiresExactOwnerImageAndCapabilityAbi) {
+    void* fixture = dlopen(DARTPLANT_FIXTURE_PATH, RTLD_NOW | RTLD_LOCAL);
+    EXPECT_TRUE(fixture != nullptr);
+    void* target = dlsym(fixture, "DartPlantFixtureAdd");
+    EXPECT_TRUE(target != nullptr);
+    dartplant::RefreshModules();
+    const auto module =
+        dartplant::FindModule(dartplant::EnumerateModules(), "libdartplant_fixture.so");
+    EXPECT_TRUE(module.has_value());
+    EXPECT_TRUE(dartplant::RuntimeProfileCount() != 0);
+    const auto& vm_profile = dartplant::RuntimeProfiles()[0];
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.app_module_name = "libdartplant_fixture.so";
+    profile.runtime_module_name = "libdartplant_fixture.so";
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    SeedSyntheticLiveFunctionIndex(runtime, *module, target);
+
+    auto& group = dartplant::RuntimeIsolateGroup(runtime);
+    auto& index = *group.live_snapshot_index;
+    index.vm_profile_version = vm_profile.live_vm.profile_version;
+    index.live_index_abi_key = dartplant::vm_abi::BuildCapabilityAbiKey(
+        vm_profile, dartplant::vm_abi::kCapabilityLiveFunctionIndexLayout);
+    index.function_type_abi_key = dartplant::vm_abi::BuildCapabilityAbiKey(
+        vm_profile, dartplant::vm_abi::kCapabilityFunctionTypeLayout);
+    dartplant::StabilizeLiveSnapshotIndexForPublication(&index);
+
+    EXPECT_TRUE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile, vm_profile,
+                                                     group.live_function_index_info));
+
+    // A full observation may legitimately publish implicit/synthetic live
+    // Functions that are not members of Class.functions. Their immutable
+    // semantic directory remains reusable while the exact owner/image state
+    // is unchanged. It is also a valid base for an additive deferred delta:
+    // unchanged slotless records are carried forward verbatim, while every
+    // changed deferred record must independently provide a stable owner slot.
+    const uint32_t saved_owner_class_id = index.live_function_infos.front().owner_class_id;
+    const uint32_t saved_owner_function_index =
+        index.live_function_infos.front().owner_function_index;
+    index.live_function_infos.front().owner_class_id = 0;
+    index.live_function_infos.front().owner_function_index = UINT32_MAX;
+    index.functions.front().owner_class_id = 0;
+    index.functions.front().owner_function_index = UINT32_MAX;
+    for (auto& semantic : index.live_function_semantics) {
+        semantic.owner_class_id = 0;
+        semantic.owner_function_index = UINT32_MAX;
+    }
+    EXPECT_TRUE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile, vm_profile,
+                                                     group.live_function_index_info));
+    EXPECT_TRUE(dartplant::CanExtendLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+    dartplant::RuntimeImageSet slotless_rebound;
+    std::string slotless_bind_error;
+    EXPECT_TRUE(dartplant::BindStableLiveSnapshotImageSemantics(
+        index, group.image_set, &slotless_rebound, &slotless_bind_error));
+    EXPECT_EQ(group.image_set.Root()->live_entry_count, slotless_rebound.Root()->live_entry_count);
+    index.live_function_infos.front().owner_class_id = saved_owner_class_id;
+    index.live_function_infos.front().owner_function_index = saved_owner_function_index;
+    index.functions.front().owner_class_id = saved_owner_class_id;
+    index.functions.front().owner_function_index = saved_owner_function_index;
+    for (auto& semantic : index.live_function_semantics) {
+        semantic.owner_class_id = saved_owner_class_id;
+        semantic.owner_function_index = saved_owner_function_index;
+    }
+
+    dartplant::RuntimeImageSet unbound_images = group.image_set;
+    unbound_images.ResetSemanticBindings();
+    unbound_images.ActivateAll();
+    EXPECT_FALSE(dartplant::CanReuseLiveSnapshotIndex(index, unbound_images, vm_profile, vm_profile,
+                                                      group.live_function_index_info));
+
+    dartplant::RuntimeImageSet wrong_generation = group.image_set;
+    wrong_generation.BindGeneration(runtime->generation->load(std::memory_order_acquire) + 1);
+    EXPECT_FALSE(dartplant::CanReuseLiveSnapshotIndex(index, wrong_generation, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+
+    const std::string saved_function_type_key = index.function_type_abi_key;
+    index.function_type_abi_key = "wrong-function-type-abi";
+    EXPECT_FALSE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+    index.function_type_abi_key = saved_function_type_key;
+
+    index.stable_live_directory = false;
+    EXPECT_FALSE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+    index.stable_live_directory = true;
+
+    dartplant::ModuleImage deferred_module;
+    deferred_module.name = "libdartplant_fixture.so-2.part.so";
+    deferred_module.path = "/synthetic/libdartplant_fixture.so-2.part.so";
+    deferred_module.build_id = "synthetic-deferred";
+    deferred_module.load_bias = 0x500000;
+    deferred_module.executable_ranges.push_back({
+        .start = 0x501000,
+        .end = 0x501100,
+        .file_offset = 0x1000,
+        .virtual_address = 0x1000,
+        .file_size = 0x100,
+    });
+    dartplant::FlutterSnapshotSource deferred_snapshot = *group.snapshot;
+    deferred_snapshot.module_name = deferred_module.name;
+    deferred_snapshot.module_path = deferred_module.path;
+    deferred_snapshot.module_build_id = deferred_module.build_id;
+    deferred_snapshot.isolate_instructions_va = 0x1000;
+    deferred_snapshot.isolate_instructions_runtime = 0x501000;
+    deferred_snapshot.isolate_instructions_size = 0x100;
+    deferred_snapshot.deferred_program_hash = 0x12345678;
+    std::string deferred_error;
+    EXPECT_TRUE(group.image_set.AddDeferred(deferred_module, deferred_snapshot, 2,
+                                            runtime->generation->load(std::memory_order_acquire),
+                                            &deferred_error));
+    group.image_set.BindOwnerEpochs(dartplant::RuntimeEngine(runtime).incarnation_epoch,
+                                    group.incarnation_epoch);
+    group.image_set.ActivateAll();
+
+    const auto* deferred_image = group.image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(deferred_image != nullptr);
+    EXPECT_EQ(static_cast<int>(dartplant::RuntimeDeferredLoadState::kUnbound),
+              static_cast<int>(deferred_image->deferred_load_state));
+
+    // Relaxing CanExtend() for unchanged slotless Functions must not permit a
+    // slotless record owned by the image being refreshed. The incremental
+    // merge has no durable identity with which to prove replacement of such a
+    // record, so it must reject before touching the live heap.
+    auto changed_slotless_base = index;
+    auto changed_slotless_info = changed_slotless_base.live_function_infos.front();
+    changed_slotless_info.runtime_image_id = deferred_image->id;
+    changed_slotless_info.runtime_image_incarnation_epoch = deferred_image->incarnation_epoch;
+    changed_slotless_info.engine_incarnation_epoch = deferred_image->engine_incarnation_epoch;
+    changed_slotless_info.isolate_group_incarnation_epoch =
+        deferred_image->isolate_group_incarnation_epoch;
+    changed_slotless_info.runtime_generation = deferred_image->runtime_generation;
+    changed_slotless_info.loading_unit_id = deferred_image->loading_unit_id;
+    changed_slotless_info.owner_class_id = 0;
+    changed_slotless_info.owner_function_index = UINT32_MAX;
+    changed_slotless_base.live_function_infos.push_back(changed_slotless_info);
+    DartPlantLiveVmFunctionIndexInfo changed_slotless_base_info = group.live_function_index_info;
+    changed_slotless_base_info.function_count =
+        static_cast<uint32_t>(changed_slotless_base.live_function_infos.size());
+    DartPlantLiveVmFunctionIndexInfo changed_slotless_out{};
+    changed_slotless_out.struct_size = sizeof(changed_slotless_out);
+    DartPlantLiveVmContext unused_context{};
+    unused_context.struct_size = sizeof(unused_context);
+    const std::array<uint64_t, 1> changed_images = {deferred_image->id};
+    std::string changed_slotless_error;
+    EXPECT_FALSE(dartplant::BuildDeferredLiveSnapshotIndexIncrement(
+                     changed_slotless_base, unused_context, {}, changed_images, vm_profile,
+                     vm_profile, vm_profile, nullptr, nullptr, changed_slotless_base_info,
+                     &changed_slotless_out, &changed_slotless_error)
+                     .has_value());
+    EXPECT_EQ(std::string("changed deferred image contains a slotless stable-directory record"),
+              changed_slotless_error);
+
+    EXPECT_FALSE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+    EXPECT_TRUE(dartplant::CanExtendLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+    EXPECT_TRUE(group.image_set.BindDeferredProgramHash(0x12345678));
+    EXPECT_FALSE(dartplant::CanExtendLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                       vm_profile, group.live_function_index_info));
+
+    EXPECT_TRUE(group.image_set.BindDeferredLoadState(deferred_image->id, 2, false));
+    deferred_image = group.image_set.FindByLoadingUnitId(2);
+    EXPECT_TRUE(deferred_image != nullptr);
+    EXPECT_EQ(static_cast<int>(dartplant::RuntimeDeferredLoadState::kNotLoaded),
+              static_cast<int>(deferred_image->deferred_load_state));
+    EXPECT_TRUE(dartplant::CanReuseLiveSnapshotIndex(index, group.image_set, vm_profile, vm_profile,
+                                                     group.live_function_index_info));
+    EXPECT_TRUE(dartplant::CanExtendLiveSnapshotIndex(index, group.image_set, vm_profile,
+                                                      vm_profile, group.live_function_index_info));
+
+    dartplant::RuntimeImageSet loaded_images = group.image_set;
+    EXPECT_TRUE(loaded_images.BindDeferredLoadState(deferred_image->id, 2, true));
+    EXPECT_FALSE(group.image_set.SameDeferredLoadStates(loaded_images));
+    EXPECT_TRUE(group.image_set.SameDeferredLoadStates(group.image_set));
+    EXPECT_FALSE(group.image_set.BindDeferredLoadState(deferred_image->id, 3, true));
+    EXPECT_FALSE(group.image_set.BindDeferredLoadState(deferred_image->id + 1000, 2, true));
+
+    loaded_images.ResetSemanticBindings();
+    const auto* reset_deferred = loaded_images.FindByLoadingUnitId(2);
+    EXPECT_TRUE(reset_deferred != nullptr);
+    EXPECT_EQ(static_cast<int>(dartplant::RuntimeDeferredLoadState::kUnbound),
+              static_cast<int>(reset_deferred->deferred_load_state));
+
     dartplant_runtime_destroy(runtime);
     dlclose(fixture);
 }
@@ -5056,6 +5743,12 @@ TEST_CASE(InvocationDecodesAndEncodesValidatedCanonicalDartBool) {
     hook.expected_runtime_generation = 7;
     invocation.profile = &profile;
     invocation.hook = &hook;
+    // Semantic roots are listener/invocation scoped. The physical HookRecord
+    // may continue to serve sibling owners after this listener generation
+    // retires, so staleness must be proven from the invocation receipt rather
+    // than the hook's historical first-owner fields.
+    invocation.runtime_generation = generation;
+    invocation.expected_runtime_generation = 7;
     context.x[1] = kCanonicalTrue;
     generation->store(8, std::memory_order_release);
     EXPECT_EQ(DARTPLANT_OK, dartplant_invocation_get_argument(&invocation, 0, &value));
@@ -5768,8 +6461,12 @@ TEST_CASE(ReturnDispatchRequiresMatchingDartCallerFrame) {
     hook.active = true;
     hook.has_method = true;
     hook.state = dartplant::HookRecordState::kInstalled;
+    auto physical_payload = std::make_shared<dartplant::DartCodePayload>();
+    physical_payload->start = reinterpret_cast<uintptr_t>(Replacement);
+    physical_payload->instructions_length = 4;
     hook.code_target = std::make_shared<dartplant::DartEntryTarget>();
     hook.code_target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    hook.code_target->payload = physical_payload;
     hook.method_storage = std::make_unique<DartPlantMethod>(method);
     hook.profile = profile;
     hook.backup = reinterpret_cast<void*>(Replacement);
@@ -5904,7 +6601,7 @@ TEST_CASE(PayloadReturnDispatchKeepsSiblingHookFramesIndependent) {
     dartplant_release_listener(first_listener);
 }
 
-TEST_CASE(RuntimeBoundCallbackHookFailsClosedAfterGenerationAdvance) {
+TEST_CASE(RuntimeBoundCallbackHookAdmitsFreshListenerAfterGenerationAdvance) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
     profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
@@ -5942,17 +6639,25 @@ TEST_CASE(RuntimeBoundCallbackHookFailsClosedAfterGenerationAdvance) {
     EXPECT_EQ(reinterpret_cast<void*>(Replacement), stale.original);
     EXPECT_EQ(0, g_enter_calls);
 
-    DartPlantListener* rejected = nullptr;
-    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
-              dartplant::AddCallbackListener(&hook, &method, options, 0, &rejected,
-                                             hook.runtime_generation, 8));
-    EXPECT_TRUE(rejected == nullptr);
+    DartPlantListener* fresh = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&hook, &method, options, 0, &fresh,
+                                                           hook.runtime_generation, 8));
+    EXPECT_TRUE(fresh != nullptr);
+
+    g_enter_calls = 0;
+    const auto current = dartplant_arm64_dispatch_enter(&context, &hook);
+    EXPECT_EQ(reinterpret_cast<void*>(Replacement), current.original);
+    EXPECT_EQ(1, g_enter_calls);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
     hook.state = dartplant::HookRecordState::kUnhooked;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(fresh));
+    dartplant_release_listener(fresh);
     EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
     dartplant_release_listener(listener);
 }
 
-TEST_CASE(PhysicalHookRejectsListenerFromDifferentOwnerGenerationToken) {
+TEST_CASE(PhysicalHookAcceptsListenerFromDifferentOwnerGenerationToken) {
     DartPlantRuntimeProfile profile{};
     dartplant_runtime_profile_init_arm64_aot(&profile);
     profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
@@ -5983,14 +6688,739 @@ TEST_CASE(PhysicalHookRejectsListenerFromDifferentOwnerGenerationToken) {
         .vm_adapter = nullptr,
     };
     DartPlantListener* listener = nullptr;
-    EXPECT_EQ(DARTPLANT_RUNTIME_NOT_READY,
-              dartplant::AddCallbackListener(&hook, &owner_b_method, options, 0, &listener,
-                                             owner_b_generation, 7));
-    EXPECT_TRUE(listener == nullptr);
-    EXPECT_TRUE(hook.listeners.empty());
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(&hook, &owner_b_method, options, 0,
+                                                           &listener, owner_b_generation, 7));
+    EXPECT_TRUE(listener != nullptr);
+    EXPECT_EQ(1U, hook.listeners.size());
+    EXPECT_TRUE(hook.listeners[0]->runtime_generation == owner_b_generation);
+    EXPECT_EQ(7U, hook.listeners[0]->expected_runtime_generation);
     EXPECT_TRUE(hook.runtime_generation == owner_a_generation);
     EXPECT_EQ(7U, owner_a_generation->load(std::memory_order_acquire));
     EXPECT_EQ(7U, owner_b_generation->load(std::memory_order_acquire));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener));
+    dartplant_release_listener(listener);
+}
+
+TEST_CASE(RuntimeAddListenerAcceptsSecondOwnerOnExistingPhysicalHook) {
+#if !defined(__aarch64__)
+    return;
+#endif
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    DartPlantRuntime* runtime = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant_runtime_create(&profile, &runtime));
+    EXPECT_TRUE(runtime != nullptr);
+
+    auto& engine = dartplant::RuntimeEngine(runtime);
+    engine.incarnation_epoch = 1;
+    auto& group_a = dartplant::RuntimeIsolateGroup(runtime);
+    group_a.incarnation_epoch = 1;
+    dartplant::SetActiveRuntimeState(runtime, DARTPLANT_RUNTIME_READY);
+    dartplant::SetActiveProfileMatched(runtime, true);
+
+    auto physical_target = std::make_shared<dartplant::DartEntryTarget>();
+    physical_target->id = reinterpret_cast<uintptr_t>(MultiOwnerPublicTarget);
+    physical_target->entry = reinterpret_cast<uintptr_t>(MultiOwnerPublicTarget);
+    physical_target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+
+    const auto make_method = [&](const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                 uint64_t expected_generation) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = physical_target;
+        return method;
+    };
+
+    DartPlantMethod method_a =
+        make_method(group_a.generation, group_a.generation->load(std::memory_order_acquire));
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OnEnter,
+        .on_leave = nullptr,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    DartPlantListener* listener_a = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_add_listener(runtime, &method_a, &options, 0, &listener_a));
+    EXPECT_TRUE(listener_a != nullptr);
+    DartPlantHook* hook = listener_a->hook;
+    EXPECT_TRUE(hook != nullptr);
+    EXPECT_EQ(1U, hook->listeners.size());
+
+    auto group_b = std::make_unique<dartplant::RuntimeIsolateGroupState>();
+    group_b->incarnation_epoch = 2;
+    group_b->runtime_state = DARTPLANT_RUNTIME_READY;
+    group_b->profile_matched = true;
+    auto generation_b = group_b->generation;
+    const uint64_t expected_b = generation_b->load(std::memory_order_acquire);
+    engine.isolate_groups.push_back(std::move(group_b));
+    engine.active_isolate_group_index = engine.isolate_groups.size() - 1;
+    dartplant::ProjectActiveGeneration(runtime);
+    dartplant::ProjectActiveRuntimeState(runtime);
+
+    DartPlantMethod method_b = make_method(generation_b, expected_b);
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant_runtime_add_listener(runtime, &method_b, &options, 0, &listener_b));
+    EXPECT_TRUE(listener_b != nullptr);
+    EXPECT_TRUE(listener_b->hook == hook);
+    EXPECT_EQ(2U, hook->listeners.size());
+    EXPECT_TRUE(hook->listeners[0]->runtime_generation == method_a.runtime_generation ||
+                hook->listeners[1]->runtime_generation == method_a.runtime_generation);
+    EXPECT_TRUE(hook->listeners[0]->runtime_generation == generation_b ||
+                hook->listeners[1]->runtime_generation == generation_b);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_a));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_b));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+    dartplant_runtime_destroy(runtime);
+    dartplant_reset();
+}
+
+TEST_CASE(RuntimeInvalidationRemovesOnlyMatchingOwnerListenerFromSharedPhysicalHook) {
+#if !defined(__aarch64__)
+    return;
+#endif
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
+    target->id = reinterpret_cast<uintptr_t>(MultiOwnerInvalidationTarget);
+    target->entry = reinterpret_cast<uintptr_t>(MultiOwnerInvalidationTarget);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    auto generation_a = std::make_shared<std::atomic_uint64_t>(11);
+    auto generation_b = std::make_shared<std::atomic_uint64_t>(17);
+
+    const auto make_method = [&](const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                 uint64_t expected_generation) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = target;
+        return method;
+    };
+    DartPlantMethod method_a = make_method(generation_a, 11);
+    DartPlantMethod method_b = make_method(generation_b, 17);
+
+    int callback_a = 1;
+    int callback_b = 2;
+    DartPlantHookOptions options_a = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OrderedEnter,
+        .on_leave = nullptr,
+        .user_data = &callback_a,
+        .vm_adapter = nullptr,
+    };
+    DartPlantHookOptions options_b = options_a;
+    options_b.user_data = &callback_b;
+
+    DartPlantHook* hook = nullptr;
+    DartPlantListener* listener_a = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallCallbackHook(&method_a, profile, options_a, 0, &hook,
+                                                           &listener_a, 0, generation_a, 11));
+    EXPECT_TRUE(hook != nullptr);
+    EXPECT_TRUE(listener_a != nullptr);
+
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(hook, &method_b, options_b, 0,
+                                                           &listener_b, generation_b, 17));
+    EXPECT_EQ(2U, hook->listeners.size());
+
+    // Retiring A's logical runtime generation must not tear down the process-
+    // wide entry patch while B still owns a listener on that same target.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InvalidateRuntimeHooks(generation_a));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(1U, hook->listeners.size());
+    EXPECT_FALSE(dartplant_listener_is_active(listener_a));
+    EXPECT_TRUE(dartplant_listener_is_active(listener_b));
+    EXPECT_TRUE(hook->listeners.front() == listener_b->record);
+
+    g_callback_order.clear();
+    DartPlantArm64Context context{};
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
+    // Once B retires too, the last logical user is gone and physical unhook is
+    // allowed to run exactly once.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InvalidateRuntimeHooks(generation_b));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->listeners.empty());
+
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+    dartplant_release_hook(hook);
+    dartplant_reset();
+}
+
+TEST_CASE(RuntimeRetirementRemovesOnlyMatchingOwnerListenerFromSharedPhysicalHook) {
+#if !defined(__aarch64__)
+    return;
+#endif
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
+    target->id = reinterpret_cast<uintptr_t>(MultiOwnerInvalidationTarget);
+    target->entry = reinterpret_cast<uintptr_t>(MultiOwnerInvalidationTarget);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    auto generation_a = std::make_shared<std::atomic_uint64_t>(21);
+    auto generation_b = std::make_shared<std::atomic_uint64_t>(29);
+
+    const auto make_method = [&](const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                 uint64_t expected_generation) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = target;
+        return method;
+    };
+    DartPlantMethod method_a = make_method(generation_a, 21);
+    DartPlantMethod method_b = make_method(generation_b, 29);
+
+    int callback_a = 1;
+    int callback_b = 2;
+    DartPlantHookOptions options_a = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OrderedEnter,
+        .on_leave = nullptr,
+        .user_data = &callback_a,
+        .vm_adapter = nullptr,
+    };
+    DartPlantHookOptions options_b = options_a;
+    options_b.user_data = &callback_b;
+
+    DartPlantHook* hook = nullptr;
+    DartPlantListener* listener_a = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallCallbackHook(&method_a, profile, options_a, 0, &hook,
+                                                           &listener_a, 0, generation_a, 21));
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(hook, &method_b, options_b, 0,
+                                                           &listener_b, generation_b, 29));
+    EXPECT_EQ(2U, hook->listeners.size());
+
+    dartplant::RetireRuntimeHooks(generation_a);
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(1U, hook->listeners.size());
+    EXPECT_FALSE(dartplant_listener_is_active(listener_a));
+    EXPECT_TRUE(dartplant_listener_is_active(listener_b));
+    EXPECT_TRUE(hook->listeners.front() == listener_b->record);
+
+    g_callback_order.clear();
+    DartPlantArm64Context context{};
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
+    dartplant::RetireRuntimeHooks(generation_b);
+    EXPECT_TRUE(!hook->active.load(std::memory_order_acquire));
+    EXPECT_TRUE(hook->state == dartplant::HookRecordState::kRetired);
+    EXPECT_TRUE(hook->listeners.empty());
+    EXPECT_EQ(0, g_fake_unhook_calls);
+
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+    dartplant_release_hook(hook);
+    dartplant_reset();
+}
+
+TEST_CASE(VmAdapterQuiesceRemovesOnlyItsListenerFromSharedPhysicalHook) {
+#if !defined(__aarch64__)
+    return;
+#endif
+    InstallTestHost(FakeHook, FakeUnhook);
+    g_fake_unhook_calls = 0;
+
+    FakeVmState state_a{};
+    FakeVmState state_b{};
+    const DartPlantVmAdapterCallbacks callbacks = {
+        .struct_size = sizeof(DartPlantVmAdapterCallbacks),
+        .adapter_version = 1,
+        .enter_isolate = FakeEnter,
+        .leave_isolate = FakeLeave,
+        .enter_scope = FakeEnterScope,
+        .leave_scope = FakeLeaveScope,
+        .retain_object = FakeRetain,
+        .release_object = FakeRelease,
+        .object_kind = FakeKind,
+        .object_to_raw = FakeRaw,
+        .object_is_alive = FakeAlive,
+        .pin_generated_roots = nullptr,
+        .generated_root_get = nullptr,
+        .generated_root_set = nullptr,
+        .unpin_generated_roots = nullptr,
+        .enter_generated_to_native = nullptr,
+        .leave_native_to_generated = nullptr,
+        .read_active_exception = nullptr,
+        .read_active_stacktrace = nullptr,
+        .read_type_arguments_element = nullptr,
+        .prove_capability = nullptr,
+        .begin_live_heap_observation = nullptr,
+        .end_live_heap_observation = nullptr,
+    };
+    DartPlantVmAdapter* adapter_a = nullptr;
+    DartPlantVmAdapter* adapter_b = nullptr;
+    const DartPlantIsolateIdentity isolate_a = {0x101, 0x201, 11};
+    const DartPlantIsolateIdentity isolate_b = {0x102, 0x202, 17};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state_a, &adapter_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state_b, &adapter_b));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter_a, &isolate_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter_b, &isolate_b));
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    auto target = std::make_shared<dartplant::DartEntryTarget>();
+    target->id = reinterpret_cast<uintptr_t>(MultiOwnerQuiesceTarget);
+    target->entry = reinterpret_cast<uintptr_t>(MultiOwnerQuiesceTarget);
+    target->identity_proof = DARTPLANT_CODE_IDENTITY_UNIQUE;
+    auto generation_a = std::make_shared<std::atomic_uint64_t>(11);
+    auto generation_b = std::make_shared<std::atomic_uint64_t>(17);
+
+    const auto make_method = [&](const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                 uint64_t expected_generation) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = target;
+        return method;
+    };
+    DartPlantMethod method_a = make_method(generation_a, 11);
+    DartPlantMethod method_b = make_method(generation_b, 17);
+
+    int callback_a = 1;
+    int callback_b = 2;
+    DartPlantHookOptions options_a = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OrderedEnter,
+        .on_leave = nullptr,
+        .user_data = &callback_a,
+        .vm_adapter = adapter_a,
+    };
+    DartPlantHookOptions options_b = options_a;
+    options_b.user_data = &callback_b;
+    options_b.vm_adapter = adapter_b;
+
+    DartPlantHook* hook = nullptr;
+    DartPlantListener* listener_a = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::InstallCallbackHook(&method_a, profile, options_a, 0, &hook,
+                                                           &listener_a, 0, generation_a, 11));
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK, dartplant::AddCallbackListener(hook, &method_b, options_b, 0,
+                                                           &listener_b, generation_b, 17));
+    EXPECT_EQ(2U, hook->listeners.size());
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant::QuiesceVmAdapterHooks(adapter_a));
+    EXPECT_EQ(0, g_fake_unhook_calls);
+    EXPECT_TRUE(hook->active.load(std::memory_order_acquire));
+    EXPECT_EQ(1U, hook->listeners.size());
+    EXPECT_FALSE(dartplant_listener_is_active(listener_a));
+    EXPECT_TRUE(dartplant_listener_is_active(listener_b));
+    EXPECT_EQ(DARTPLANT_OK, dartplant::VmAdapterCheckQuiescent(adapter_a));
+
+    g_callback_order.clear();
+    DartPlantArm64Context context{};
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    EXPECT_EQ(0, state_a.scope_enters);
+    EXPECT_EQ(1, state_b.scope_enters);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+    EXPECT_EQ(0, state_a.scope_leaves);
+    EXPECT_EQ(1, state_b.scope_leaves);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_b));
+    EXPECT_EQ(1, g_fake_unhook_calls);
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+    dartplant_release_hook(hook);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter_a, &isolate_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter_b, &isolate_b));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter_b));
+    dartplant_reset();
+}
+
+TEST_CASE(PhysicalReturnCookieRemainsPhysicalAcrossLogicalOwnerTargetSwitch) {
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    EXPECT_TRUE(dartplant::RuntimeProfileCount() != 0);
+    const auto& owner_profile = dartplant::RuntimeProfiles()[0];
+    EXPECT_TRUE(owner_profile.live_vm.thr_register < 31);
+    EXPECT_TRUE(owner_profile.live_vm.thread_isolate_group_offset != 0);
+
+    auto physical_payload = std::make_shared<dartplant::DartCodePayload>();
+    physical_payload->start = reinterpret_cast<uintptr_t>(Replacement);
+    physical_payload->instructions_length = 4;
+    auto physical_target = std::make_shared<dartplant::DartEntryTarget>();
+    physical_target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    physical_target->payload = physical_payload;
+    auto logical_payload_b = std::make_shared<dartplant::DartCodePayload>();
+    logical_payload_b->start = reinterpret_cast<uintptr_t>(Replacement);
+    logical_payload_b->instructions_length = 4;
+    auto logical_target_b = std::make_shared<dartplant::DartEntryTarget>();
+    logical_target_b->entry = physical_target->entry;
+    logical_target_b->payload = logical_payload_b;
+    auto generation_a = std::make_shared<std::atomic_uint64_t>(11);
+    auto generation_b = std::make_shared<std::atomic_uint64_t>(17);
+    constexpr uint64_t kGroupA = 0x11111000ULL;
+    constexpr uint64_t kGroupB = 0x22222000ULL;
+
+    const auto make_owner_method = [&](uint64_t group,
+                                       const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                       uint64_t expected_generation,
+                                       const std::shared_ptr<dartplant::DartEntryTarget>& target) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kLiveVm;
+        method.function->runtime_profile_version = owner_profile.live_vm.profile_version;
+        method.function->isolate_group_identity = group;
+        method.function->owner.runtime_generation = expected_generation;
+        method.function->thread_jump_to_frame_entry_point_offset = 8;
+        method.function->code_target = target;
+        return method;
+    };
+    DartPlantMethod method_a = make_owner_method(kGroupA, generation_a, 11, physical_target);
+    DartPlantMethod method_b = make_owner_method(kGroupB, generation_b, 17, logical_target_b);
+
+    // Keep the physical representative synthetic: this unit test is about
+    // listener-scoped owner selection and adapter routing, not the real-Dart
+    // generated/native bridge or JumpToFrame installation.
+    DartPlantMethod physical_method{};
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = physical_target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(physical_method);
+    hook.profile = profile;
+    hook.backup = reinterpret_cast<void*>(Replacement);
+    hook.runtime_generation = generation_a;
+    hook.expected_runtime_generation = 11;
+
+    int callback_a = 1;
+    int callback_b = 2;
+    DartPlantHookOptions options_a = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OrderedEnter,
+        .on_leave = OnLeave,
+        .user_data = &callback_a,
+        .vm_adapter = nullptr,
+    };
+    DartPlantHookOptions options_b = options_a;
+    options_b.user_data = &callback_b;
+    auto call_layout = std::make_shared<dartplant::abi::DartCallLayout>();
+    call_layout->dart_sp_register = 15;
+
+    DartPlantListener* listener_a = nullptr;
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::AddCallbackListener(&hook, &method_a, options_a, 0, &listener_a,
+                                             generation_a, 11, 0, 0, 0, call_layout));
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::AddCallbackListener(&hook, &method_b, options_b, 0, &listener_b,
+                                             generation_b, 17, 0, 0, 0, call_layout));
+    EXPECT_EQ(2U, hook.listeners.size());
+    EXPECT_EQ(kGroupA, listener_a->record->requested_method->function->isolate_group_identity);
+    EXPECT_EQ(kGroupB, listener_b->record->requested_method->function->isolate_group_identity);
+    EXPECT_TRUE(listener_a->record->requested_method->function->code_target == physical_target);
+    EXPECT_TRUE(listener_b->record->requested_method->function->code_target == logical_target_b);
+
+    std::vector<uint8_t> fake_thread(owner_profile.live_vm.thread_isolate_group_offset +
+                                     sizeof(uint64_t));
+    std::array<uint64_t, 16> fake_stack{};
+    DartPlantArm64Context context{};
+    context.x[owner_profile.live_vm.thr_register] = reinterpret_cast<uintptr_t>(fake_thread.data());
+    context.x[15] = reinterpret_cast<uintptr_t>(fake_stack.data() + 8);
+    context.x[29] = context.x[15] + 4 * sizeof(uint64_t);
+    context.x[30] = reinterpret_cast<uintptr_t>(Replacement);
+
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupA,
+                sizeof(kGroupA));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(1, g_callback_order[0]);
+    g_leave_calls = 0;
+    const auto return_a = dartplant_arm64_dispatch_return_from_payload(
+        physical_payload.get(), 5, 0, 0, context.x[30], context.x[15], context.x[29]);
+    EXPECT_TRUE(return_a.context != nullptr);
+    EXPECT_EQ(1, g_leave_calls);
+
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupB,
+                sizeof(kGroupB));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    EXPECT_TRUE(method_b.function->code_target->payload.get() != physical_payload.get());
+    g_leave_calls = 0;
+    EXPECT_EQ(1U, listener_b->record->in_flight.load(std::memory_order_acquire));
+    EXPECT_EQ(1U, hook.in_flight);
+    const auto logical_return_b = dartplant_arm64_dispatch_return_from_payload(
+        logical_payload_b.get(), 5, 0, 0, context.x[30], context.x[15], context.x[29]);
+    EXPECT_TRUE(logical_return_b.context == nullptr);
+    EXPECT_EQ(0, g_leave_calls);
+    EXPECT_EQ(1U, listener_b->record->in_flight.load(std::memory_order_acquire));
+    EXPECT_EQ(1U, hook.in_flight);
+    const auto return_b = dartplant_arm64_dispatch_return_from_payload(
+        physical_payload.get(), 5, 0, 0, context.x[30], context.x[15], context.x[29]);
+    EXPECT_TRUE(return_b.context != nullptr);
+    EXPECT_EQ(1, g_leave_calls);
+    EXPECT_EQ(0U, listener_b->record->in_flight.load(std::memory_order_acquire));
+    EXPECT_EQ(0U, hook.in_flight);
+
+    // Retiring A's logical generation must make only A fail closed. B keeps
+    // using the same physical patch and its own adapter/binding.
+    generation_a->store(12, std::memory_order_release);
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupA,
+                sizeof(kGroupA));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_TRUE(g_callback_order.empty());
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupB,
+                sizeof(kGroupB));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_b));
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+}
+
+TEST_CASE(PhysicalHookRoutesDifferentOwnersToTheirOwnVmAdapters) {
+#if !defined(__aarch64__)
+    return;
+#endif
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    EXPECT_TRUE(dartplant::RuntimeProfileCount() != 0);
+    const auto& owner_profile = dartplant::RuntimeProfiles()[0];
+    EXPECT_TRUE(owner_profile.live_vm.thr_register < 31);
+    EXPECT_TRUE(owner_profile.live_vm.thread_isolate_group_offset != 0);
+
+    FakeVmState state_a{};
+    FakeVmState state_b{};
+    const DartPlantVmAdapterCallbacks callbacks = {
+        .struct_size = sizeof(DartPlantVmAdapterCallbacks),
+        .adapter_version = 1,
+        .enter_isolate = FakeEnter,
+        .leave_isolate = FakeLeave,
+        .enter_scope = FakeEnterScope,
+        .leave_scope = FakeLeaveScope,
+        .retain_object = FakeRetain,
+        .release_object = FakeRelease,
+        .object_kind = FakeKind,
+        .object_to_raw = FakeRaw,
+        .object_is_alive = FakeAlive,
+        .pin_generated_roots = nullptr,
+        .generated_root_get = nullptr,
+        .generated_root_set = nullptr,
+        .unpin_generated_roots = nullptr,
+        .enter_generated_to_native = nullptr,
+        .leave_native_to_generated = nullptr,
+        .read_active_exception = nullptr,
+        .read_active_stacktrace = nullptr,
+        .read_type_arguments_element = nullptr,
+        .prove_capability = nullptr,
+        .begin_live_heap_observation = nullptr,
+        .end_live_heap_observation = nullptr,
+    };
+    DartPlantVmAdapter* adapter_a = nullptr;
+    DartPlantVmAdapter* adapter_b = nullptr;
+    const DartPlantIsolateIdentity isolate_a = {0x101, 0x201, 11};
+    const DartPlantIsolateIdentity isolate_b = {0x102, 0x202, 17};
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state_a, &adapter_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_create(&callbacks, &state_b, &adapter_b));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter_a, &isolate_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_attach_isolate(adapter_b, &isolate_b));
+
+    auto physical_target = std::make_shared<dartplant::DartEntryTarget>();
+    physical_target->entry = reinterpret_cast<uintptr_t>(Replacement);
+    auto generation_a = std::make_shared<std::atomic_uint64_t>(11);
+    auto generation_b = std::make_shared<std::atomic_uint64_t>(17);
+    constexpr uint64_t kGroupA = 0x11111000ULL;
+    constexpr uint64_t kGroupB = 0x22222000ULL;
+
+    const auto make_owner_method = [&](uint64_t group,
+                                       const std::shared_ptr<std::atomic_uint64_t>& generation,
+                                       uint64_t expected_generation) {
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = expected_generation;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kLiveVm;
+        method.function->runtime_profile_version = owner_profile.live_vm.profile_version;
+        method.function->isolate_group_identity = group;
+        method.function->owner.runtime_generation = expected_generation;
+        method.function->thread_jump_to_frame_entry_point_offset = 8;
+        method.function->code_target = physical_target;
+        return method;
+    };
+    DartPlantMethod method_a = make_owner_method(kGroupA, generation_a, 11);
+    DartPlantMethod method_b = make_owner_method(kGroupB, generation_b, 17);
+
+    // Keep the physical representative synthetic: this unit test is about
+    // listener-scoped owner selection and adapter routing, not the real-Dart
+    // generated/native bridge or JumpToFrame installation.
+    DartPlantMethod physical_method{};
+    DartPlantHook hook{};
+    hook.active = true;
+    hook.has_method = true;
+    hook.state = dartplant::HookRecordState::kInstalled;
+    hook.code_target = physical_target;
+    hook.method_storage = std::make_unique<DartPlantMethod>(physical_method);
+    hook.profile = profile;
+    hook.backup = reinterpret_cast<void*>(Replacement);
+    hook.runtime_generation = generation_a;
+    hook.expected_runtime_generation = 11;
+    hook.vm_adapter = adapter_a;
+
+    int callback_a = 1;
+    int callback_b = 2;
+    DartPlantHookOptions options_a = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = 0,
+        .on_enter = OrderedEnter,
+        .on_leave = nullptr,
+        .user_data = &callback_a,
+        .vm_adapter = adapter_a,
+    };
+    DartPlantHookOptions options_b = options_a;
+    options_b.user_data = &callback_b;
+    options_b.vm_adapter = adapter_b;
+    auto call_layout = std::make_shared<dartplant::abi::DartCallLayout>();
+    call_layout->dart_sp_register = 15;
+
+    DartPlantListener* listener_a = nullptr;
+    DartPlantListener* listener_b = nullptr;
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::AddCallbackListener(&hook, &method_a, options_a, 0, &listener_a,
+                                             generation_a, 11, 0, 0, 0, call_layout));
+    EXPECT_EQ(DARTPLANT_OK,
+              dartplant::AddCallbackListener(&hook, &method_b, options_b, 0, &listener_b,
+                                             generation_b, 17, 0, 0, 0, call_layout));
+    EXPECT_EQ(2U, hook.listeners.size());
+
+    std::vector<uint8_t> fake_thread(owner_profile.live_vm.thread_isolate_group_offset +
+                                     sizeof(uint64_t));
+    std::array<uint64_t, 16> fake_stack{};
+    DartPlantArm64Context context{};
+    context.x[owner_profile.live_vm.thr_register] = reinterpret_cast<uintptr_t>(fake_thread.data());
+    context.x[15] = reinterpret_cast<uintptr_t>(fake_stack.data() + 8);
+    context.x[29] = context.x[15] + 4 * sizeof(uint64_t);
+    context.x[30] = reinterpret_cast<uintptr_t>(Replacement);
+
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupA,
+                sizeof(kGroupA));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(1, g_callback_order[0]);
+    EXPECT_EQ(1, state_a.scope_enters);
+    EXPECT_EQ(0, state_b.scope_enters);
+    EXPECT_EQ(1, state_a.generated_enters);
+    EXPECT_EQ(0, state_b.generated_enters);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+    EXPECT_EQ(1, state_a.scope_leaves);
+    EXPECT_EQ(0, state_b.scope_leaves);
+    EXPECT_EQ(1, state_a.generated_leaves);
+    EXPECT_EQ(0, state_b.generated_leaves);
+
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupB,
+                sizeof(kGroupB));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    EXPECT_EQ(1, state_a.scope_enters);
+    EXPECT_EQ(1, state_b.scope_enters);
+    EXPECT_EQ(1, state_a.generated_enters);
+    EXPECT_EQ(1, state_b.generated_enters);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+    EXPECT_EQ(1, state_a.scope_leaves);
+    EXPECT_EQ(1, state_b.scope_leaves);
+    EXPECT_EQ(1, state_a.generated_leaves);
+    EXPECT_EQ(1, state_b.generated_leaves);
+
+    // Retiring A's logical generation must make only A fail closed. B keeps
+    // using the same physical patch and its own adapter/binding.
+    generation_a->store(12, std::memory_order_release);
+    g_callback_order.clear();
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupA,
+                sizeof(kGroupA));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_TRUE(g_callback_order.empty());
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+
+    std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupB,
+                sizeof(kGroupB));
+    EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+    EXPECT_EQ(1U, g_callback_order.size());
+    EXPECT_EQ(2, g_callback_order[0]);
+    EXPECT_EQ(2, state_b.scope_enters);
+    EXPECT_EQ(2, state_b.generated_enters);
+    (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+    EXPECT_EQ(2, state_b.scope_leaves);
+    EXPECT_EQ(2, state_b.generated_leaves);
+
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(listener_b));
+    dartplant_release_listener(listener_a);
+    dartplant_release_listener(listener_b);
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter_a, &isolate_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_detach_isolate(adapter_b, &isolate_b));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter_a));
+    EXPECT_EQ(DARTPLANT_OK, dartplant_vm_adapter_destroy(adapter_b));
 }
 
 TEST_CASE(ListenerOwnerAdmissionRejectsStaleGenerationWithReusedIsolateGroupAddress) {
@@ -6151,6 +7581,9 @@ TEST_CASE(ListenerOwnerAdmissionRemainsStableAcrossForeignGroupAlternation) {
 }
 
 TEST_CASE(ForeignOwnerBypassDoesNotEnterPhysicalHookVmAdapter) {
+#if !defined(__aarch64__)
+    return;
+#endif
     FakeVmState state{};
     const DartPlantVmAdapterCallbacks callbacks = {
         .struct_size = sizeof(DartPlantVmAdapterCallbacks),
@@ -6164,12 +7597,12 @@ TEST_CASE(ForeignOwnerBypassDoesNotEnterPhysicalHookVmAdapter) {
         .object_kind = FakeKind,
         .object_to_raw = FakeRaw,
         .object_is_alive = FakeAlive,
-        .pin_generated_roots = nullptr,
-        .generated_root_get = nullptr,
-        .generated_root_set = nullptr,
-        .unpin_generated_roots = nullptr,
-        .enter_generated_to_native = nullptr,
-        .leave_native_to_generated = nullptr,
+        .pin_generated_roots = FakePinGeneratedRoots,
+        .generated_root_get = FakeGeneratedRootGet,
+        .generated_root_set = FakeGeneratedRootSet,
+        .unpin_generated_roots = FakeUnpinGeneratedRoots,
+        .enter_generated_to_native = FakeEnterGeneratedToNative,
+        .leave_native_to_generated = FakeLeaveNativeToGenerated,
         .read_active_exception = nullptr,
         .read_active_stacktrace = nullptr,
         .read_type_arguments_element = nullptr,
@@ -6230,8 +7663,12 @@ TEST_CASE(ForeignOwnerBypassDoesNotEnterPhysicalHookVmAdapter) {
 
     std::vector<uint8_t> fake_thread(owner_profile.live_vm.thread_isolate_group_offset +
                                      sizeof(uint64_t));
+    std::array<uint64_t, 16> fake_stack{};
     DartPlantArm64Context context{};
     context.x[owner_profile.live_vm.thr_register] = reinterpret_cast<uintptr_t>(fake_thread.data());
+    context.x[15] = reinterpret_cast<uintptr_t>(fake_stack.data() + 8);
+    context.x[29] = context.x[15] + 4 * sizeof(uint64_t);
+    context.x[30] = reinterpret_cast<uintptr_t>(Replacement);
 
     std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupA,
                 sizeof(kGroupA));
@@ -6239,8 +7676,10 @@ TEST_CASE(ForeignOwnerBypassDoesNotEnterPhysicalHookVmAdapter) {
     EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
     EXPECT_EQ(1, g_enter_calls);
     EXPECT_EQ(1, state.scope_enters);
+    EXPECT_EQ(1, state.generated_enters);
     (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
     EXPECT_EQ(1, state.scope_leaves);
+    EXPECT_EQ(1, state.generated_leaves);
 
     std::memcpy(fake_thread.data() + owner_profile.live_vm.thread_isolate_group_offset, &kGroupB,
                 sizeof(kGroupB));

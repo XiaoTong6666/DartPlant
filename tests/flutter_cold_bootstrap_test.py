@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import flutter_cold_bootstrap  # noqa: E402
+import util  # noqa: E402
 
 
 class FlutterColdBootstrapModeTest(unittest.TestCase):
@@ -143,6 +144,27 @@ class FlutterColdBootstrapModeTest(unittest.TestCase):
         self.assertIn("FLUTTER_ENGINE_REVISION=fedcba9876", new_defines)
         self.assertEqual("validate-deferred-components=false", new_defines[-1])
 
+    def test_runtime_event_must_match_requested_toolchain(self) -> None:
+        toolchain = flutter_cold_bootstrap.FlutterToolchain(
+            flutter_version="3.44.1",
+            dart_version="3.12.1",
+            channel="stable",
+            repository_url="https://github.com/flutter/flutter.git",
+            framework_revision="0123456789abcdef",
+            engine_revision="fedcba9876543210",
+            injects_flutter_version_defines=True,
+        )
+        matching = (
+            'I/flutter: DARTPLANT_CI {"event":"runtime","flutter":"3.44.1",'
+            '"dart":"3.12.1","dart_runtime":"3.12.1","abi":"arm64-v8a",'
+            '"dart_ffi_abi":"android_arm64"}\n'
+        )
+        stale = matching.replace('"flutter":"3.44.1"', '"flutter":"3.22.3"').replace(
+            '"dart":"3.12.1"', '"dart":"3.4.4"'
+        ).replace('"dart_runtime":"3.12.1"', '"dart_runtime":"3.4.4"')
+        self.assertTrue(flutter_cold_bootstrap._runtime_matches_toolchain(matching, toolchain))
+        self.assertFalse(flutter_cold_bootstrap._runtime_matches_toolchain(stale, toolchain))
+
     def test_fixture_build_temporarily_binds_and_restores_flutter_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
@@ -222,6 +244,39 @@ class FlutterColdBootstrapModeTest(unittest.TestCase):
         self.assertIn("profile {", feature_gradle)
         self.assertIn("initWith debug", feature_gradle)
         self.assertIn('matchingFallbacks = ["debug"]', feature_gradle)
+
+    def test_arm64_device_gate_accepts_explicit_translation_only_when_requested(self) -> None:
+        def fake_capture(command: list[str], **_: object) -> str:
+            joined = " ".join(command)
+            if "ro.product.cpu.abi" in joined and "abilist" not in joined:
+                return "x86_64"
+            if "ro.product.cpu.abilist" in joined:
+                return "x86_64,arm64-v8a"
+            if "ro.dalvik.vm.isa.arm64" in joined:
+                return "x86_64"
+            raise AssertionError(command)
+
+        with mock.patch.object(util, "capture", side_effect=fake_capture):
+            self.assertFalse(util._supports_arm64_execution("emulator-5554", allow_translated=False))
+            self.assertTrue(util._supports_arm64_execution("emulator-5554", allow_translated=True))
+
+    def test_arm64_device_gate_rejects_abilist_without_translation_mapping(self) -> None:
+        def fake_capture(command: list[str], **_: object) -> str:
+            joined = " ".join(command)
+            if "ro.product.cpu.abi" in joined and "abilist" not in joined:
+                return "x86_64"
+            if "ro.product.cpu.abilist" in joined:
+                return "x86_64,arm64-v8a"
+            if "ro.dalvik.vm.isa.arm64" in joined:
+                return ""
+            raise AssertionError(command)
+
+        with mock.patch.object(util, "capture", side_effect=fake_capture):
+            self.assertFalse(util._supports_arm64_execution("emulator-5554", allow_translated=True))
+
+    def test_arm64_device_gate_keeps_native_arm64_valid_without_translation_opt_in(self) -> None:
+        with mock.patch.object(util, "capture", return_value="arm64-v8a"):
+            self.assertTrue(util._supports_arm64_execution("device", allow_translated=False))
 
 
 if __name__ == "__main__":

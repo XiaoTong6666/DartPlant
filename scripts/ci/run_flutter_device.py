@@ -65,6 +65,21 @@ def _dump_logcat(serial: str, path: Path) -> None:
     path.write_text(text, errors="replace")
 
 
+def _wait_for_package_stopped(serial: str, *, timeout: float) -> None:
+    deadline = time.monotonic() + min(timeout, 10.0)
+    stale_pid = ""
+    while time.monotonic() < deadline:
+        stale_pid = _capture(
+            _adb(serial, "shell", "pidof", PACKAGE),
+            check=False,
+            timeout=min(timeout, 20.0),
+        ).strip()
+        if not stale_pid:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"failed to stop previous runtime: pid={stale_pid}")
+
+
 def _clean_install(serial: str, apks: list[Path], *, timeout: float) -> str:
     """Install one fixture from a clean package state and return uninstall output."""
     # Real devices can reject uninstall with DELETE_FAILED_INTERNAL_ERROR while
@@ -78,23 +93,10 @@ def _clean_install(serial: str, apks: list[Path], *, timeout: float) -> str:
         check=False,
         timeout=timeout,
     )
-    stop_deadline = time.monotonic() + min(timeout, 10.0)
-    stale_pid = ""
-    while time.monotonic() < stop_deadline:
-        stale_pid = _capture(
-            _adb(serial, "shell", "pidof", PACKAGE),
-            check=False,
-            timeout=min(timeout, 20.0),
-        ).strip()
-        if not stale_pid:
-            break
-        time.sleep(0.1)
-    if stale_pid:
-        raise RuntimeError(
-            f"failed to stop previous runtime before install: pid={stale_pid}"
-        )
+    _wait_for_package_stopped(serial, timeout=timeout)
 
     uninstall_attempts: list[str] = []
+    stale_pid = ""
     stale_package = ""
     for _ in range(3):
         uninstall = _capture(
@@ -272,7 +274,16 @@ def main() -> int:
 
         _capture(_adb(serial, "logcat", "-G", "16M"), check=False)
         _capture(_adb(serial, "logcat", "-c"), check=False)
-        _capture(_adb(serial, "shell", "am", "force-stop", PACKAGE), check=False)
+        _capture(
+            _adb(serial, "shell", "am", "force-stop", PACKAGE),
+            check=False,
+            timeout=launch_timeout,
+        )
+        # On translated ARM guests the process restored by PackageManager can
+        # take noticeably longer to die than `am force-stop` takes to return.
+        # If we launch immediately, pidof may still report that stale process
+        # and the runner can mistake its expected SIGKILL for a test crash.
+        _wait_for_package_stopped(serial, timeout=launch_timeout)
         launch = _capture(_launch_command(serial, args.test), timeout=launch_timeout)
         metadata["launch"] = launch.strip()
 

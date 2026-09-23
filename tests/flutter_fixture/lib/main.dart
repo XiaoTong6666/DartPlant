@@ -109,7 +109,14 @@ Future<void> secondaryEngineMain() async {
           'epoch': DartPlantNative.multiOwnerActivate(label),
         };
       case 'hookTarget':
-        return instrumentedAdd(2, 3);
+        final install = DartPlantNative.multiOwnerInstallListener(label);
+        final value = instrumentedAdd(2, 3);
+        final probe = DartPlantNative.multiOwnerListenerProbe(label);
+        return <String, Object?>{
+          'install': install,
+          'value': value,
+          'probe': probe,
+        };
       case 'gc':
         final before = DartPlantNative.multiOwnerActivate(label);
         await _multiOwnerGcPressure();
@@ -313,6 +320,10 @@ Future<bool> _runMultiEngineLifecycleProof() async {
   var aHookWhileB2Active = 0;
   var bHookValue = -1;
   var b2HookValue = -1;
+  var bListenerInstall = 0;
+  var bListenerProbe = 0;
+  var b2ListenerInstall = 0;
+  var b2ListenerProbe = 0;
   var engineIncarnation1 = 0;
   var engineIncarnation2 = 0;
   String? failure;
@@ -334,7 +345,12 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       'multiOwnerCommand',
       <String, Object?>{'command': 'hookTarget', 'label': 2},
     );
-    bHookValue = bHook is int ? bHook : -1;
+    if (bHook is Map) {
+      final values = Map<Object?, Object?>.from(bHook);
+      bHookValue = _mapInt(values, 'value');
+      bListenerInstall = _mapInt(values, 'install');
+      bListenerProbe = _mapInt(values, 'probe');
+    }
     // Keep B as the runtime's active owner, then exercise the interactive
     // rebind path from A. A's method/listener belongs to another still-live
     // owner and must not be torn down merely because the active projection is B.
@@ -373,7 +389,12 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       'multiOwnerCommand',
       <String, Object?>{'command': 'hookTarget', 'label': 3},
     );
-    b2HookValue = b2Hook is int ? b2Hook : -1;
+    if (b2Hook is Map) {
+      final values = Map<Object?, Object?>.from(b2Hook);
+      b2HookValue = _mapInt(values, 'value');
+      b2ListenerInstall = _mapInt(values, 'install');
+      b2ListenerProbe = _mapInt(values, 'probe');
+    }
     DartPlantNative.resetInstrumentedAddProbe();
     aHookWhileB2Active = instrumentedAdd(2, 3);
 
@@ -418,7 +439,11 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       aHookWhileB2Active == 115 &&
       aHookFinal == 115 &&
       bHookValue == 5 &&
-      b2HookValue == 5;
+      b2HookValue == 5 &&
+      bListenerInstall == 1 &&
+      bListenerProbe == 1 &&
+      b2ListenerInstall == 1 &&
+      b2ListenerProbe == 1;
   _ciScenario('multi_engine', passed, <String, Object?>{
     'a_epoch': aEpoch,
     'b_epoch': bEpoch,
@@ -443,6 +468,10 @@ Future<bool> _runMultiEngineLifecycleProof() async {
     'a_hook_final': aHookFinal,
     'b_hook_value': bHookValue,
     'b2_hook_value': b2HookValue,
+    'b_listener_install': bListenerInstall,
+    'b_listener_probe': bListenerProbe,
+    'b2_listener_install': b2ListenerInstall,
+    'b2_listener_probe': b2ListenerProbe,
     if (failure != null) 'error': failure,
   });
   return passed;

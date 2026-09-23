@@ -1,6 +1,7 @@
 #include "runtime/runtime_image_transition.h"
 
 #include <algorithm>
+#include <optional>
 
 #include "runtime/runtime_internal.h"
 
@@ -51,6 +52,15 @@ DartPlantStatus TransitionRuntimeImages(DartPlantRuntime* runtime, RuntimeImageS
             continue;
         }
         affected.push_back(old_image);
+    }
+
+    // An additive image-set refresh (for example dlopen of a deferred
+    // loading-unit .part.so) does not change any already-published physical
+    // owner. Preserve those owners' native semantic receipts so the next
+    // exact VM observation can extend the stable Function directory instead
+    // of throwing it away and rescanning the complete moving heap.
+    if (!invalidate_entire_runtime) {
+        staged_images.PreserveSemanticBindingsFrom(group.image_set);
     }
 
     // Close logical admission before touching physical hooks. Public method
@@ -110,10 +120,48 @@ DartPlantStatus TransitionRuntimeImages(DartPlantRuntime* runtime, RuntimeImageS
         (void) group.image_set.Retire(image.id, image.incarnation_epoch);
     }
 
+    std::optional<SnapshotIndex> pruned_stable_directory;
+    DartPlantLiveVmFunctionIndexInfo pruned_live_info{};
+    if (!invalidate_entire_runtime && !affected.empty() && group.live_snapshot_index.has_value() &&
+        group.live_snapshot_index->stable_live_directory &&
+        std::all_of(affected.begin(), affected.end(), [](const RuntimeImage& image) {
+            return image.kind == RuntimeImageKind::kDeferred;
+        })) {
+        SnapshotIndex candidate = *group.live_snapshot_index;
+        pruned_live_info = group.live_function_index_info;
+        std::string prune_error;
+        if (PruneStableLiveSnapshotIndexForImages(&candidate, affected, &pruned_live_info,
+                                                  &prune_error)) {
+            pruned_stable_directory = std::move(candidate);
+        }
+    }
+
     staged_images.ActivateAll();
+    if (pruned_stable_directory.has_value()) {
+        RuntimeImageSet rebound;
+        std::string bind_error;
+        if (BindStableLiveSnapshotImageSemantics(*pruned_stable_directory, staged_images, &rebound,
+                                                 &bind_error)) {
+            staged_images = std::move(rebound);
+        } else {
+            pruned_stable_directory.reset();
+            pruned_live_info = {};
+        }
+    }
     group.image_set = std::move(staged_images);
-    group.live_snapshot_index.reset();
-    group.live_function_index_info = {};
+    const bool preserve_stable_live_directory =
+        !invalidate_entire_runtime && affected.empty() && group.live_snapshot_index.has_value() &&
+        group.live_snapshot_index->stable_live_directory &&
+        group.live_function_index_info.struct_size >= sizeof(DartPlantLiveVmFunctionIndexInfo) &&
+        group.live_function_index_info.function_count ==
+            group.live_snapshot_index->live_function_infos.size();
+    if (pruned_stable_directory.has_value()) {
+        group.live_snapshot_index = std::move(pruned_stable_directory);
+        group.live_function_index_info = pruned_live_info;
+    } else if (!preserve_stable_live_directory) {
+        group.live_snapshot_index.reset();
+        group.live_function_index_info = {};
+    }
     ClearLastError();
     return DARTPLANT_OK;
 }

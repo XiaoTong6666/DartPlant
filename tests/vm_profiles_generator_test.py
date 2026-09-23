@@ -733,6 +733,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
   V(Object) \
   V(Class) \
   V(LoadingUnit) \
+  V(InstructionsTable) \
   V(Function) \
   V(Library) \
   V(Code) \
@@ -773,6 +774,7 @@ void DartReturnInstr::EmitNativeCode(FlowGraphCompiler* compiler) {
         profile["type_arguments"]["cid"] = actual["TypeArgumentsCid"]
         profile["canonical_bool"]["cid"] = actual["BoolCid"]
         profile["loading_unit"]["cid"] = actual["LoadingUnitCid"]
+        profile["instructions_table"]["cid"] = actual["InstructionsTableCid"]
         type_fields = {
             "cid_type": "TypeCid",
             "cid_function_type": "FunctionTypeCid",

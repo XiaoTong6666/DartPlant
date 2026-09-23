@@ -306,6 +306,24 @@ bool RuntimeImageSet::ReconcileOwnershipFrom(const RuntimeImageSet& previous) {
     return images_.empty() || root_id_ != kInvalidRuntimeImageId;
 }
 
+void RuntimeImageSet::PreserveSemanticBindingsFrom(const RuntimeImageSet& previous) {
+    for (auto& image : images_) {
+        const auto found = std::find_if(
+            previous.images_.begin(), previous.images_.end(), [&image](const RuntimeImage& old) {
+                return image.id == old.id && image.incarnation_epoch == old.incarnation_epoch &&
+                       image.runtime_generation == old.runtime_generation &&
+                       image.engine_incarnation_epoch == old.engine_incarnation_epoch &&
+                       image.isolate_group_incarnation_epoch ==
+                           old.isolate_group_incarnation_epoch &&
+                       SameImageIdentity(image, old);
+            });
+        if (found == previous.images_.end()) continue;
+        image.live_entry_count = found->live_entry_count;
+        image.deferred_program_hash_vm_bound = found->deferred_program_hash_vm_bound;
+        image.deferred_load_state = found->deferred_load_state;
+    }
+}
+
 bool RuntimeImageSet::RemoveById(RuntimeImageId id) {
     const auto found = std::find_if(images_.begin(), images_.end(),
                                     [id](const auto& image) { return image.id == id; });
@@ -358,6 +376,7 @@ void RuntimeImageSet::ResetSemanticBindings() {
     for (auto& image : images_) {
         image.live_entry_count = 0;
         image.deferred_program_hash_vm_bound = false;
+        image.deferred_load_state = RuntimeDeferredLoadState::kUnbound;
     }
 }
 
@@ -397,6 +416,44 @@ bool RuntimeImageSet::BindDeferredProgramHash(uint32_t root_program_hash) {
     for (auto& image : images_) {
         if (image.kind == RuntimeImageKind::kDeferred) {
             image.deferred_program_hash_vm_bound = true;
+        }
+    }
+    return true;
+}
+
+bool RuntimeImageSet::BindDeferredLoadState(RuntimeImageId id, uint32_t loading_unit_id,
+                                            bool loaded) {
+    for (auto& image : images_) {
+        if (image.id != id) continue;
+        if (image.kind != RuntimeImageKind::kDeferred || image.loading_unit_id != loading_unit_id) {
+            return false;
+        }
+        image.deferred_load_state =
+            loaded ? RuntimeDeferredLoadState::kLoaded : RuntimeDeferredLoadState::kNotLoaded;
+        return true;
+    }
+    return false;
+}
+
+bool RuntimeImageSet::SameDeferredLoadStates(const RuntimeImageSet& other) const {
+    if (images_.size() != other.images_.size()) return false;
+    for (const auto& image : images_) {
+        if (image.kind != RuntimeImageKind::kDeferred) continue;
+        const RuntimeImage* candidate = other.FindById(image.id);
+        if (candidate == nullptr || candidate->kind != RuntimeImageKind::kDeferred ||
+            candidate->incarnation_epoch != image.incarnation_epoch ||
+            candidate->loading_unit_id != image.loading_unit_id ||
+            candidate->deferred_load_state != image.deferred_load_state) {
+            return false;
+        }
+    }
+    for (const auto& image : other.images_) {
+        if (image.kind != RuntimeImageKind::kDeferred) continue;
+        const RuntimeImage* candidate = FindById(image.id);
+        if (candidate == nullptr || candidate->kind != RuntimeImageKind::kDeferred ||
+            candidate->incarnation_epoch != image.incarnation_epoch ||
+            candidate->loading_unit_id != image.loading_unit_id) {
+            return false;
         }
     }
     return true;

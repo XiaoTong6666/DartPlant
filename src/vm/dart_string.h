@@ -1,6 +1,8 @@
 #ifndef DARTPLANT_VM_DART_STRING_H_
 #define DARTPLANT_VM_DART_STRING_H_
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -73,11 +75,21 @@ bool ReadDartStringUtf8(const RuntimeProfileRecord& profile, uint64_t tagged,
     };
 
     if (cid == vm.cid_one_byte_string) {
-        for (size_t index = 0; index < length; ++index) {
-            uint8_t byte = 0;
-            if (!read_memory(object + vm.string_data_offset + index, &byte, sizeof(byte)) ||
-                !append(byte)) {
+        // OneByteString payloads are contiguous Latin-1 bytes. Reading one
+        // byte through ProcessMemoryReader for every character dominated
+        // non-PRODUCT live-index traversal (thousands of Function names turn
+        // into hundreds of thousands of reader calls). Keep the same bounded
+        // UTF-8 conversion, but amortize the memory proof over fixed chunks.
+        constexpr size_t kChunkBytes = 256;
+        std::array<uint8_t, kChunkBytes> bytes{};
+        for (size_t chunk_start = 0; chunk_start < length; chunk_start += kChunkBytes) {
+            const size_t chunk_size = std::min(kChunkBytes, length - chunk_start);
+            if (!read_memory(object + vm.string_data_offset + chunk_start, bytes.data(),
+                             chunk_size)) {
                 return false;
+            }
+            for (size_t index = 0; index < chunk_size; ++index) {
+                if (!append(bytes[index])) return false;
             }
         }
     } else {

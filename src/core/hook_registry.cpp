@@ -11,6 +11,24 @@
 #include "vm/runtime_profiles.h"
 
 namespace dartplant {
+
+DartPlantListenerRecord::~DartPlantListenerRecord() {
+    if (vm_adapter_retained.exchange(false, std::memory_order_acq_rel) && vm_adapter != nullptr) {
+        VmAdapterReleaseHook(vm_adapter);
+    }
+}
+
+void ReleaseListenerVmAdapterIfIdle(const std::shared_ptr<DartPlantListenerRecord>& listener) {
+    if (listener == nullptr || listener->vm_adapter == nullptr ||
+        listener->active.load(std::memory_order_acquire) ||
+        listener->in_flight.load(std::memory_order_acquire) != 0) {
+        return;
+    }
+    if (listener->vm_adapter_retained.exchange(false, std::memory_order_acq_rel)) {
+        VmAdapterReleaseHook(listener->vm_adapter);
+    }
+}
+
 namespace {
 
 constexpr uint32_t kSupportedCallbackProfileFlags =
@@ -264,17 +282,39 @@ bool HasSharedCodeEvidence(const DartPlantMethod& method) {
            method.function->code_target->HasAlias(method.function->identity);
 }
 
-std::shared_ptr<DartPlantListenerRecord> MakeListenerLocked(DartPlantHook* hook,
-                                                            const DartPlantMethod* requested_method,
-                                                            const DartPlantHookOptions& options,
-                                                            int32_t priority) {
+std::shared_ptr<DartPlantListenerRecord> MakeListenerLocked(
+    DartPlantHook* hook, const DartPlantMethod* requested_method,
+    const DartPlantHookOptions& options, int32_t priority,
+    const std::shared_ptr<std::atomic_uint64_t>& runtime_generation = {},
+    uint64_t expected_runtime_generation = 0, uint64_t validated_null_value = 0,
+    uint64_t validated_bool_true_value = 0, uint64_t validated_bool_false_value = 0,
+    std::shared_ptr<const abi::DartCallLayout> call_layout = {},
+    DartPlantListenerRecord::ExceptionBridgeBinding exception_bridge_binding = {}) {
     auto listener = std::make_shared<DartPlantListenerRecord>();
     listener->id = hook->next_listener_id++;
     listener->priority = priority;
     listener->registration_order = hook->next_registration_order++;
     listener->options = options;
+    listener->vm_adapter = options.vm_adapter;
+    listener->runtime_generation =
+        runtime_generation != nullptr
+            ? runtime_generation
+            : (requested_method == nullptr ? nullptr : requested_method->runtime_generation);
+    listener->expected_runtime_generation =
+        expected_runtime_generation != 0
+            ? expected_runtime_generation
+            : (requested_method == nullptr ? 0 : requested_method->expected_runtime_generation);
+    listener->validated_null_value = validated_null_value;
+    listener->validated_bool_true_value = validated_bool_true_value;
+    listener->validated_bool_false_value = validated_bool_false_value;
+    listener->call_layout = std::move(call_layout);
+    listener->exception_bridge_binding = std::move(exception_bridge_binding);
     if (requested_method != nullptr) {
         listener->requested_method = std::make_shared<DartPlantMethod>(*requested_method);
+    }
+    if (listener->vm_adapter != nullptr) {
+        VmAdapterRetainHook(listener->vm_adapter);
+        listener->vm_adapter_retained.store(true, std::memory_order_release);
     }
     return listener;
 }
@@ -585,6 +625,7 @@ DartPlantStatus UnhookRecordLocked(DartPlantHook* hook) {
                       hook->backend_installed.load(std::memory_order_acquire);
         for (const auto& listener : hook->listeners) {
             listener->active.store(false, std::memory_order_release);
+            ReleaseListenerVmAdapterIfIdle(listener);
         }
         hook->listeners.clear();
     }
@@ -599,6 +640,22 @@ DartPlantStatus UnhookRecordLocked(DartPlantHook* hook) {
 bool CanDestroyLocked(const DartPlantHook* hook) {
     return hook->state == HookRecordState::kUnhooked && hook->in_flight == 0 &&
            hook->listener_handles == 0;
+}
+
+template <typename Predicate>
+bool RemoveMatchingListenersLocked(DartPlantHook* hook, Predicate&& predicate) {
+    bool matched = false;
+    hook->listeners.erase(
+        std::remove_if(hook->listeners.begin(), hook->listeners.end(),
+                       [&](const std::shared_ptr<DartPlantListenerRecord>& listener) {
+                           if (listener == nullptr || !predicate(*listener)) return false;
+                           matched = true;
+                           listener->active.store(false, std::memory_order_release);
+                           ReleaseListenerVmAdapterIfIdle(listener);
+                           return true;
+                       }),
+        hook->listeners.end());
+    return matched;
 }
 
 }  // namespace
@@ -667,11 +724,27 @@ DartPlantStatus InvalidateRuntimeHooks(
     std::lock_guard lock(State().mutex);
     DartPlantStatus status = DARTPLANT_OK;
     for (const auto& hook : Hooks()) {
-        if (hook->runtime_generation != runtime_generation) continue;
+        bool matched = false;
+        bool empty_after = false;
         {
             std::lock_guard hook_lock(hook->mutex);
             if (hook->state == HookRecordState::kRetired) continue;
+            if (hook->listeners.empty()) {
+                // Compatibility for raw/internal HookRecords that predate
+                // listener-scoped ownership. New callback hooks always carry
+                // at least one listener record, so this fallback cannot make a
+                // process-wide physical hook depend on its historical first
+                // owner again.
+                matched = hook->runtime_generation == runtime_generation;
+            } else {
+                matched = RemoveMatchingListenersLocked(
+                    hook.get(), [&](const DartPlantListenerRecord& listener) {
+                        return listener.runtime_generation == runtime_generation;
+                    });
+            }
+            empty_after = hook->listeners.empty();
         }
+        if (!matched || !empty_after) continue;
         const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
         if (unhook_status != DARTPLANT_OK) status = unhook_status;
     }
@@ -682,14 +755,17 @@ void RetireRuntimeHooks(const std::shared_ptr<std::atomic_uint64_t>& runtime_gen
     if (runtime_generation == nullptr) return;
     std::lock_guard lock(State().mutex);
     for (const auto& hook : Hooks()) {
-        if (hook->runtime_generation != runtime_generation) continue;
         std::lock_guard hook_lock(hook->mutex);
         if (hook->state == HookRecordState::kUnhooked) continue;
+        const bool matched = hook->listeners.empty()
+                                 ? hook->runtime_generation == runtime_generation
+                                 : RemoveMatchingListenersLocked(
+                                       hook.get(), [&](const DartPlantListenerRecord& listener) {
+                                           return listener.runtime_generation == runtime_generation;
+                                       });
+        if (!matched) continue;
+        if (!hook->listeners.empty()) continue;
         hook->active.store(false, std::memory_order_release);
-        for (const auto& listener : hook->listeners) {
-            listener->active.store(false, std::memory_order_release);
-        }
-        hook->listeners.clear();
         hook->state = HookRecordState::kRetired;
         ReleaseArm64ExceptionBridgeConsumer(hook.get());
     }
@@ -702,16 +778,34 @@ DartPlantStatus InvalidateRuntimeImageHooks(
     std::lock_guard lock(State().mutex);
     DartPlantStatus status = DARTPLANT_OK;
     for (const auto& hook : Hooks()) {
-        if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
-            hook->code_target->image_id != image_id ||
-            (image_incarnation_epoch != 0 &&
-             hook->code_target->owner.image_incarnation_epoch != image_incarnation_epoch)) {
-            continue;
-        }
+        bool matched = false;
+        bool empty_after = false;
         {
             std::lock_guard hook_lock(hook->mutex);
             if (hook->state == HookRecordState::kRetired) continue;
+            if (hook->listeners.empty()) {
+                matched =
+                    hook->runtime_generation == runtime_generation &&
+                    hook->code_target != nullptr && hook->code_target->image_id == image_id &&
+                    (image_incarnation_epoch == 0 ||
+                     hook->code_target->owner.image_incarnation_epoch == image_incarnation_epoch);
+            } else {
+                matched = RemoveMatchingListenersLocked(
+                    hook.get(), [&](const DartPlantListenerRecord& listener) {
+                        if (listener.runtime_generation != runtime_generation ||
+                            listener.requested_method == nullptr ||
+                            listener.requested_method->function == nullptr) {
+                            return false;
+                        }
+                        const auto& owner = listener.requested_method->function->owner;
+                        return owner.image_id == image_id &&
+                               (image_incarnation_epoch == 0 ||
+                                owner.image_incarnation_epoch == image_incarnation_epoch);
+                    });
+            }
+            empty_after = hook->listeners.empty();
         }
+        if (!matched || !empty_after) continue;
         const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
         if (unhook_status != DARTPLANT_OK) status = unhook_status;
     }
@@ -723,17 +817,32 @@ void RetireRuntimeImageHooks(const std::shared_ptr<std::atomic_uint64_t>& runtim
     if (runtime_generation == nullptr || image_id == 0) return;
     std::lock_guard lock(State().mutex);
     for (const auto& hook : Hooks()) {
-        if (hook->runtime_generation != runtime_generation || hook->code_target == nullptr ||
-            hook->code_target->image_id != image_id ||
-            (image_incarnation_epoch != 0 &&
-             hook->code_target->owner.image_incarnation_epoch != image_incarnation_epoch)) {
-            continue;
-        }
         std::lock_guard hook_lock(hook->mutex);
         if (hook->state == HookRecordState::kUnhooked) continue;
+        const bool matched =
+            hook->listeners.empty()
+                ? hook->runtime_generation == runtime_generation && hook->code_target != nullptr &&
+                      hook->code_target->image_id == image_id &&
+                      (image_incarnation_epoch == 0 ||
+                       hook->code_target->owner.image_incarnation_epoch == image_incarnation_epoch)
+                : std::any_of(hook->listeners.begin(), hook->listeners.end(),
+                              [&](const std::shared_ptr<DartPlantListenerRecord>& listener) {
+                                  if (listener == nullptr ||
+                                      listener->runtime_generation != runtime_generation ||
+                                      listener->requested_method == nullptr ||
+                                      listener->requested_method->function == nullptr) {
+                                      return false;
+                                  }
+                                  const auto& owner = listener->requested_method->function->owner;
+                                  return owner.image_id == image_id &&
+                                         (image_incarnation_epoch == 0 ||
+                                          owner.image_incarnation_epoch == image_incarnation_epoch);
+                              });
+        if (!matched) continue;
         hook->active.store(false, std::memory_order_release);
         for (const auto& listener : hook->listeners) {
             listener->active.store(false, std::memory_order_release);
+            ReleaseListenerVmAdapterIfIdle(listener);
         }
         hook->listeners.clear();
         hook->state = HookRecordState::kRetired;
@@ -751,16 +860,25 @@ DartPlantStatus QuiesceVmAdapterHooks(DartPlantVmAdapter* adapter) {
     VmAdapterCloseAdmission(adapter);
     DartPlantStatus status = DARTPLANT_OK;
     for (const auto& hook : Hooks()) {
-        bool matches = false;
+        bool matched = false;
+        bool empty_after = false;
         {
             std::lock_guard hook_lock(hook->mutex);
-            matches = hook->vm_adapter == adapter && hook->vm_adapter_retained;
-            if (matches && (hook->state == HookRecordState::kRetired ||
-                            hook->state == HookRecordState::kUnhooked)) {
+            if (hook->state == HookRecordState::kRetired ||
+                hook->state == HookRecordState::kUnhooked) {
                 continue;
             }
+            if (hook->listeners.empty()) {
+                matched = hook->vm_adapter == adapter && hook->vm_adapter_retained;
+            } else {
+                matched = RemoveMatchingListenersLocked(
+                    hook.get(), [&](const DartPlantListenerRecord& listener) {
+                        return listener.vm_adapter == adapter;
+                    });
+            }
+            empty_after = hook->listeners.empty();
         }
-        if (!matches) continue;
+        if (!matched || !empty_after) continue;
         const DartPlantStatus unhook_status = UnhookRecordLocked(hook.get());
         if (unhook_status != DARTPLANT_OK) status = unhook_status;
     }
@@ -933,11 +1051,7 @@ bool BeginInvocation(DartPlantHook* hook,
 
     const bool published_passthrough = hook->published_entry_hook != nullptr &&
                                        hook->backend_installed.load(std::memory_order_acquire);
-    const bool stale_generation = hook->runtime_generation != nullptr &&
-                                  hook->runtime_generation->load(std::memory_order_acquire) !=
-                                      hook->expected_runtime_generation;
-    if ((hook->state == HookRecordState::kFailed || stale_generation) && !published_passthrough) {
-        if (stale_generation) SetLastError("callback hook belongs to a stale runtime generation");
+    if (hook->state == HookRecordState::kFailed && !published_passthrough) {
         return false;
     }
 
@@ -946,43 +1060,53 @@ bool BeginInvocation(DartPlantHook* hook,
     // never reclaim its backup trampoline underneath executing Dart code.
     ++hook->in_flight;
     listeners->clear();
-    const bool adapter_admitted =
-        hook->vm_adapter == nullptr || VmAdapterAdmissionOpen(hook->vm_adapter);
-    bool abi_binding_current = true;
-    if (adapter_admitted && hook->vm_adapter != nullptr && hook->call_layout != nullptr &&
-        hook->call_layout->vm_artifact_generation != 0) {
-        DartPlantVmCapabilityProof call_binding{};
-        DartPlantVmCapabilityProof object_binding{};
-        const RuntimeProfileRecord* call_profile = nullptr;
-        const RuntimeProfileRecord* object_profile = nullptr;
-        call_binding.struct_size = sizeof(call_binding);
-        abi_binding_current =
-            VmAdapterGetCapabilityBinding(hook->vm_adapter, DARTPLANT_VM_CAP_INVOCATION_CALL_ABI,
-                                          &call_binding, &call_profile) == DARTPLANT_OK &&
-            call_profile == hook->call_layout->vm_call_profile &&
-            call_binding.artifact_generation == hook->call_layout->vm_artifact_generation &&
-            call_binding.isolate_generation == hook->call_layout->vm_isolate_generation;
-        if (abi_binding_current && hook->call_layout->closure_signature.has_value()) {
-            object_binding.struct_size = sizeof(object_binding);
-            abi_binding_current =
-                VmAdapterGetCapabilityBinding(hook->vm_adapter,
-                                              DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
-                                              &object_binding, &object_profile) == DARTPLANT_OK &&
-                object_profile == hook->call_layout->vm_object_profile &&
-                object_binding.artifact_generation == hook->call_layout->vm_artifact_generation &&
-                object_binding.isolate_generation == hook->call_layout->vm_isolate_generation;
-        }
+    if (hook->state != HookRecordState::kInstalled ||
+        !hook->active.load(std::memory_order_acquire)) {
+        return true;
     }
-    const bool callbacks_enabled =
-        adapter_admitted && abi_binding_current && hook->state == HookRecordState::kInstalled &&
-        !stale_generation && hook->active.load(std::memory_order_acquire);
-    if (callbacks_enabled) {
-        *listeners = hook->listeners;
-        for (const auto& listener : *listeners) {
-            listener->in_flight.fetch_add(1, std::memory_order_acq_rel);
+
+    for (const auto& listener : hook->listeners) {
+        if (listener == nullptr || !listener->active.load(std::memory_order_acquire)) continue;
+        if (listener->runtime_generation != nullptr &&
+            (listener->expected_runtime_generation == 0 ||
+             listener->runtime_generation->load(std::memory_order_acquire) !=
+                 listener->expected_runtime_generation)) {
+            continue;
         }
-    } else if (stale_generation) {
-        SetLastError("callback hook belongs to a stale runtime generation");
+        if (listener->vm_adapter != nullptr && !VmAdapterAdmissionOpen(listener->vm_adapter)) {
+            continue;
+        }
+        bool abi_binding_current = true;
+        if (listener->vm_adapter != nullptr && listener->call_layout != nullptr &&
+            listener->call_layout->vm_artifact_generation != 0) {
+            DartPlantVmCapabilityProof call_binding{};
+            DartPlantVmCapabilityProof object_binding{};
+            const RuntimeProfileRecord* call_profile = nullptr;
+            const RuntimeProfileRecord* object_profile = nullptr;
+            call_binding.struct_size = sizeof(call_binding);
+            abi_binding_current =
+                VmAdapterGetCapabilityBinding(listener->vm_adapter,
+                                              DARTPLANT_VM_CAP_INVOCATION_CALL_ABI, &call_binding,
+                                              &call_profile) == DARTPLANT_OK &&
+                call_profile == listener->call_layout->vm_call_profile &&
+                call_binding.artifact_generation == listener->call_layout->vm_artifact_generation &&
+                call_binding.isolate_generation == listener->call_layout->vm_isolate_generation;
+            if (abi_binding_current && listener->call_layout->closure_signature.has_value()) {
+                object_binding.struct_size = sizeof(object_binding);
+                abi_binding_current =
+                    VmAdapterGetCapabilityBinding(
+                        listener->vm_adapter, DARTPLANT_VM_CAP_FUNCTION_TYPE_LAYOUT,
+                        &object_binding, &object_profile) == DARTPLANT_OK &&
+                    object_profile == listener->call_layout->vm_object_profile &&
+                    object_binding.artifact_generation ==
+                        listener->call_layout->vm_artifact_generation &&
+                    object_binding.isolate_generation ==
+                        listener->call_layout->vm_isolate_generation;
+            }
+        }
+        if (!abi_binding_current) continue;
+        listeners->push_back(listener);
+        listener->in_flight.fetch_add(1, std::memory_order_acq_rel);
     }
     return true;
 }
@@ -1139,11 +1263,11 @@ DartPlantStatus InstallCallbackHook(
                 *binding.exception_profile, vm_abi::kCapabilityExceptionBridgeLayout),
         };
     } else if (method->function->source != DartFunctionSource::kSynthetic) {
-        hook->exception_bridge_binding = {
-            .verified = method->function->thread_jump_to_frame_entry_point_offset != 0,
-            .thread_offset = method->function->thread_jump_to_frame_entry_point_offset,
-            .abi_domain_key = {},
-        };
+        hook->exception_bridge_binding = {};
+        hook->exception_bridge_binding.verified =
+            method->function->thread_jump_to_frame_entry_point_offset != 0;
+        hook->exception_bridge_binding.thread_offset =
+            method->function->thread_jump_to_frame_entry_point_offset;
     }
     hook->host_binding = host_binding;
     hook->runtime_generation = std::move(runtime_generation);
@@ -1151,7 +1275,11 @@ DartPlantStatus InstallCallbackHook(
     hook->state = HookRecordState::kInstalling;
     hook->entry_published.store(false, std::memory_order_relaxed);
     hook->entry_ready.store(false, std::memory_order_relaxed);
-    auto first_listener = MakeListenerLocked(hook.get(), method, options, priority);
+    auto first_listener =
+        MakeListenerLocked(hook.get(), method, options, priority, hook->runtime_generation,
+                           hook->expected_runtime_generation, hook->validated_null_value,
+                           hook->validated_bool_true_value, hook->validated_bool_false_value,
+                           hook->call_layout, hook->exception_bridge_binding);
     InsertListenerLocked(hook.get(), first_listener);
     std::vector<uint8_t> pristine;
     if (!SnapshotEntryTarget(hook->code_target, &pristine)) {
@@ -1313,8 +1441,10 @@ DartPlantStatus InstallCallbackHook(
     if (real_dart) RegisterArm64ExceptionBridgeConsumer(hook.get());
     hook->state = HookRecordState::kInstalled;
     hook->code_target->BindHookRecord(hook.get());
-    VmAdapterRetainHook(hook->vm_adapter);
-    hook->vm_adapter_retained = hook->vm_adapter != nullptr;
+    // VM adapter ownership is listener-scoped. The physical hook can outlive
+    // any one IsolateGroup while listeners from sibling owners continue to
+    // share the same process-wide AOT entry patch.
+    hook->vm_adapter_retained = false;
     hook->active.store(true, std::memory_order_release);
     if (real_dart) ArmPublishedHostHook(hook->published_entry_hook.get());
     if (out_hook != nullptr) *out_hook = hook.get();
@@ -1330,7 +1460,11 @@ DartPlantStatus AddCallbackListener(DartPlantHook* hook, const DartPlantMethod* 
                                     const DartPlantHookOptions& options, int32_t priority,
                                     DartPlantListener** out_listener,
                                     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
-                                    uint64_t expected_runtime_generation) {
+                                    uint64_t expected_runtime_generation,
+                                    uint64_t validated_null_value,
+                                    uint64_t validated_bool_true_value,
+                                    uint64_t validated_bool_false_value,
+                                    std::shared_ptr<const abi::DartCallLayout> call_layout) {
     if (hook == nullptr || requested_method == nullptr || out_listener == nullptr ||
         !ValidCallbackOptions(options)) {
         SetLastError("listener arguments are invalid");
@@ -1349,28 +1483,87 @@ DartPlantStatus AddCallbackListener(DartPlantHook* hook, const DartPlantMethod* 
             "method listener target is shared by multiple Dart Functions; both the physical hook and listener require explicit shared-code opt-in");
         return DARTPLANT_SHARED_CODE_ENTRY;
     }
+    if (runtime_generation != nullptr &&
+        (expected_runtime_generation == 0 ||
+         runtime_generation->load(std::memory_order_acquire) != expected_runtime_generation)) {
+        SetLastError("listener runtime generation is stale");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+
+    VmMethodBinding binding{};
+    if (requested_method->function != nullptr &&
+        requested_method->function->source != DartFunctionSource::kSynthetic) {
+        // Listener admission must enforce the same generated/native bridge
+        // contract as first-install. A process-wide physical HookRecord can
+        // host listeners from multiple IsolateGroups, but each real-Dart
+        // listener still owns its own VM transition/rooting capability.
+        //
+        // In particular, accepting a new owner merely because the physical
+        // entry is already patched must never downgrade that listener to the
+        // legacy Dart_EnterScope-only path: tagged arguments/results can move
+        // at the safepoint transition and require a verified DartCallLayout
+        // plus the generated-root/generated-transition callbacks.
+        if (options.vm_adapter != nullptr &&
+            (call_layout == nullptr ||
+             !VmAdapterSupportsGeneratedCallbackBridge(options.vm_adapter))) {
+            SetLastError(
+                "VM-adapter listeners on Dart code require a verified DartCallLayout and a GC-safe generated/native bridge");
+            return DARTPLANT_UNSUPPORTED_ABI;
+        }
+    }
     if (options.vm_adapter != nullptr && !VmAdapterAdmissionOpen(options.vm_adapter)) {
         SetLastError("VM adapter is quiescing and rejects new callback listeners");
         return DARTPLANT_VM_ADAPTER_BUSY;
     }
-    std::lock_guard lock(hook->mutex);
-    if (hook->runtime_generation != runtime_generation ||
-        (runtime_generation != nullptr &&
-         (hook->expected_runtime_generation != expected_runtime_generation ||
-          runtime_generation->load(std::memory_order_acquire) != expected_runtime_generation))) {
-        SetLastError("listener runtime generation does not match the active hook");
-        return DARTPLANT_RUNTIME_NOT_READY;
+    if (requested_method->function != nullptr &&
+        requested_method->function->source != DartFunctionSource::kSynthetic) {
+        const DartPlantStatus proof_status =
+            ProveLiveFunctionBinding(*requested_method, options.vm_adapter, call_layout,
+                                     HookTarget(hook), AllowsSharedCode(options), &binding);
+        if (proof_status != DARTPLANT_OK) return proof_status;
+        const DartPlantStatus layout_status =
+            BindCallLayoutProfile(*requested_method, options.vm_adapter, binding, &call_layout);
+        if (layout_status != DARTPLANT_OK) return layout_status;
+        if (requested_method->function->code_target != nullptr &&
+            requested_method->function->code_target->IsShared()) {
+            // A shared physical entry cannot identify one logical Function at
+            // dispatch time. Preserve raw callbacks but suppress typed ABI
+            // interpretation for this listener exactly as first-install does.
+            call_layout.reset();
+        }
     }
+
+    DartPlantListenerRecord::ExceptionBridgeBinding exception_bridge_binding{};
+    if (requested_method->function != nullptr &&
+        requested_method->function->source != DartFunctionSource::kSynthetic) {
+        if (binding.exception_profile != nullptr) {
+            exception_bridge_binding = {
+                .verified = true,
+                .target = binding.exception_bridge.resolved_target,
+                .artifact_generation = binding.exception_bridge.artifact_generation,
+                .isolate_generation = binding.exception_bridge.isolate_generation,
+                .profile_version = binding.exception_bridge.profile_version,
+                .abi_domain_key = vm_abi::BuildCapabilityAbiKey(
+                    *binding.exception_profile, vm_abi::kCapabilityExceptionBridgeLayout),
+            };
+        } else {
+            exception_bridge_binding.verified =
+                requested_method->function->thread_jump_to_frame_entry_point_offset != 0;
+            exception_bridge_binding.thread_offset =
+                requested_method->function->thread_jump_to_frame_entry_point_offset;
+        }
+    }
+
+    std::lock_guard lock(hook->mutex);
     if (hook->state != HookRecordState::kInstalled ||
         !hook->active.load(std::memory_order_acquire)) {
         SetLastError("hook is not active");
         return DARTPLANT_UNHOOK_FAILED;
     }
-    if (options.vm_adapter != hook->vm_adapter) {
-        SetLastError("listener VM adapter does not match the hook adapter");
-        return DARTPLANT_VM_ISOLATE_MISMATCH;
-    }
-    auto record = MakeListenerLocked(hook, requested_method, options, priority);
+    auto record = MakeListenerLocked(hook, requested_method, options, priority, runtime_generation,
+                                     expected_runtime_generation, validated_null_value,
+                                     validated_bool_true_value, validated_bool_false_value,
+                                     std::move(call_layout), std::move(exception_bridge_binding));
     InsertListenerLocked(hook, record);
     auto* listener = new DartPlantListener;
     listener->hook = hook;
@@ -1384,7 +1577,9 @@ DartPlantStatus AddCallbackListenerForMethod(
     const DartPlantMethod* method, const DartPlantHookOptions& options, int32_t priority,
     DartPlantListener** out_listener,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation,
-    uint64_t expected_runtime_generation) {
+    uint64_t expected_runtime_generation, uint64_t validated_null_value,
+    uint64_t validated_bool_true_value, uint64_t validated_bool_false_value,
+    std::shared_ptr<const abi::DartCallLayout> call_layout) {
     if (method == nullptr) {
         SetLastError("listener method is null");
         return DARTPLANT_INVALID_ARGUMENT;
@@ -1397,7 +1592,9 @@ DartPlantStatus AddCallbackListenerForMethod(
         return DARTPLANT_NOT_INITIALIZED;
     }
     return AddCallbackListener(hook, method, options, priority, out_listener, runtime_generation,
-                               expected_runtime_generation);
+                               expected_runtime_generation, validated_null_value,
+                               validated_bool_true_value, validated_bool_false_value,
+                               std::move(call_layout));
 }
 
 }  // namespace dartplant

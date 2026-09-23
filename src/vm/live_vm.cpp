@@ -39,6 +39,16 @@ namespace {
 
 constexpr uint64_t kMaxObjectPoolEntries = 1ULL << 24;
 constexpr uint64_t kMaxClassFunctions = 1ULL << 20;
+// Stable owner ids share one uint32_t namespace. Ordinary Classes use their
+// ClassTable slot id. Top-level Classes are not required to have a ClassTable
+// slot, so reserve bit 31 and encode their ObjectStore.libraries slot.
+// Deferred implicit/synthetic Functions may not occur in Class.functions at
+// all; reserve bit 30 for an InstructionsTable loading-unit identity and pair
+// it with code_objects[index]. Current VM class ids are bounded by
+// class_id_tag_bits (20 in supported profiles), leaving all three namespaces
+// disjoint by construction.
+constexpr uint32_t kTopLevelOwnerIdBit = uint32_t{1} << 31;
+constexpr uint32_t kInstructionsTableOwnerIdBit = uint32_t{1} << 30;
 constexpr uint32_t kVolatileHeapReadAttempts = 3;
 constexpr size_t kLiveVmProfileV1Size =
     offsetof(DartPlantLiveVmProfile, code_unchecked_entry_point_offset);
@@ -63,6 +73,18 @@ bool FailClassCollection(const char** out_stage, const char* stage) {
 bool FailFunctionCollection(const char** out_stage, const char* stage) {
     if (out_stage != nullptr) *out_stage = stage;
     return false;
+}
+
+std::optional<uint32_t> StableTopLevelOwnerId(uint64_t library_index) {
+    if (library_index >= kTopLevelOwnerIdBit - 1) return std::nullopt;
+    return kTopLevelOwnerIdBit | (static_cast<uint32_t>(library_index) + 1u);
+}
+
+std::optional<uint32_t> StableInstructionsTableOwnerId(uint32_t loading_unit_id) {
+    if (loading_unit_id <= 1 || loading_unit_id >= kInstructionsTableOwnerIdBit) {
+        return std::nullopt;
+    }
+    return kInstructionsTableOwnerIdBit | loading_unit_id;
 }
 
 template <typename T>
@@ -243,6 +265,48 @@ private:
     std::vector<MemoryRange> ranges_;
 };
 
+constexpr size_t kMaxObjectFieldWindowBytes = 256;
+
+struct ObjectFieldWindow {
+    uint32_t begin_offset = 0;
+    size_t size = 0;
+    std::array<uint8_t, kMaxObjectFieldWindowBytes> bytes{};
+
+    template <typename T>
+    bool Load(uint32_t field_offset, T* out_value) const {
+        if (out_value == nullptr || field_offset < begin_offset) return false;
+        const size_t relative = static_cast<size_t>(field_offset - begin_offset);
+        if (relative > size || sizeof(T) > size - relative) return false;
+        std::memcpy(out_value, bytes.data() + relative, sizeof(T));
+        return true;
+    }
+};
+
+template <size_t N>
+bool ReadObjectFieldWindow(const ProcessMemoryReader& reader, uintptr_t object_address,
+                           const std::array<std::pair<uint32_t, size_t>, N>& fields,
+                           ObjectFieldWindow* out_window) {
+    if (object_address == 0 || out_window == nullptr || fields.empty()) return false;
+    uint32_t begin = UINT32_MAX;
+    uint64_t end = 0;
+    for (const auto& [offset, width] : fields) {
+        if (width == 0 || width > kMaxObjectFieldWindowBytes) return false;
+        begin = std::min(begin, offset);
+        const uint64_t field_end = static_cast<uint64_t>(offset) + width;
+        if (field_end > UINT32_MAX || field_end > end) end = field_end;
+    }
+    if (begin == UINT32_MAX || end <= begin || end - begin > kMaxObjectFieldWindowBytes ||
+        object_address > std::numeric_limits<uintptr_t>::max() - begin) {
+        return false;
+    }
+    ObjectFieldWindow window;
+    window.begin_offset = begin;
+    window.size = static_cast<size_t>(end - begin);
+    if (!reader.ReadBytes(object_address + begin, window.bytes.data(), window.size)) return false;
+    *out_window = std::move(window);
+    return true;
+}
+
 bool SameString(const char* left, const char* right) {
     return left != nullptr && right != nullptr && std::strcmp(left, right) == 0;
 }
@@ -314,6 +378,22 @@ uintptr_t CanonicalNativePointer(uint64_t pointer) {
 
 uint64_t DecompressObject(uint64_t heap_base, uint32_t compressed) {
     return heap_base + static_cast<uint64_t>(compressed);
+}
+
+bool DecodeCompressedObjectField(const ObjectFieldWindow& window, uint32_t field_offset,
+                                 const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+                                 uint64_t* out_tagged) {
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (out_tagged == nullptr || raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) {
+        return false;
+    }
+    uint32_t compressed = 0;
+    if (!window.Load(field_offset, &compressed) ||
+        (compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
+        return false;
+    }
+    *out_tagged = DecompressObject(heap_base, compressed);
+    return true;
 }
 
 bool ReadCid(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
@@ -420,6 +500,61 @@ bool ReadArrayElement(const ProcessMemoryReader& reader, const DartPlantLiveVmPr
     return true;
 }
 
+enum class ArrayVisitDecision {
+    kContinue,
+    kStop,
+    kFail,
+};
+
+template <typename Visitor>
+bool VisitArrayRawElements(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                           uint64_t tagged_array, uint64_t max_length, Visitor&& visitor,
+                           uint64_t* out_length = nullptr) {
+    uint32_t cid = 0;
+    if (!ReadCid(reader, profile, tagged_array, &cid) ||
+        (cid != profile.cid_array && cid != profile.cid_immutable_array)) {
+        return false;
+    }
+    const uintptr_t array = Untag(profile, tagged_array);
+    uint64_t length = 0;
+    if (!ReadPositiveCompressedSmi(reader, array + profile.array_length_offset, profile, &length) ||
+        length > max_length) {
+        return false;
+    }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) return false;
+    if (out_length != nullptr) *out_length = length;
+
+    // Array payloads are contiguous compressed words. Validate the Array once,
+    // then read the already-bounded payload in fixed chunks. The previous hot
+    // loops called ReadArrayElement() for every slot, redundantly rereading the
+    // same CID and length two extra times per element while holding the exact
+    // moving-GC observation receipt.
+    constexpr size_t kChunkSlots = 1024;
+    std::array<uint32_t, kChunkSlots> slots{};
+    const uintptr_t elements = array + profile.array_elements_offset;
+    for (uint64_t chunk_start = 0; chunk_start < length; chunk_start += kChunkSlots) {
+        const size_t chunk_count =
+            static_cast<size_t>(std::min<uint64_t>(kChunkSlots, length - chunk_start));
+        const uintptr_t chunk_address = elements + chunk_start * raw->compressed_word_size;
+        if (!reader.ReadBytes(chunk_address, slots.data(),
+                              chunk_count * raw->compressed_word_size)) {
+            return false;
+        }
+        for (size_t offset = 0; offset < chunk_count; ++offset) {
+            switch (visitor(chunk_start + offset, slots[offset])) {
+            case ArrayVisitDecision::kContinue:
+                break;
+            case ArrayVisitDecision::kStop:
+                return true;
+            case ArrayVisitDecision::kFail:
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ReadArrayLength(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
                      uint64_t tagged_array, uint64_t* out_length) {
     if (out_length == nullptr) return false;
@@ -522,6 +657,32 @@ bool ReadLibraryUri(const ProcessMemoryReader& reader, const DartPlantLiveVmProf
     return ReadCompressedObject(reader, Untag(profile, tagged_library), profile,
                                 profile.library_url_offset, heap_base, &tagged_url) &&
            ReadDartString(reader, profile, tagged_url, output, capacity);
+}
+
+using LiveLibraryUriCache = std::unordered_map<uint64_t, std::string>;
+
+// Observation-local only. tagged_library is movable and is therefore valid as
+// a cache key only while the exact live-heap observation lease remains held.
+// Keeping this cache inside one traversal avoids rereading the same Library
+// CID, url field, and Dart String for every Class owned by that Library.
+bool ReadCachedLibraryUri(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                          uint64_t heap_base, uint64_t tagged_library, LiveLibraryUriCache* cache,
+                          char* output, size_t capacity) {
+    if (cache == nullptr || output == nullptr || capacity == 0) return false;
+    const auto found = cache->find(tagged_library);
+    if (found != cache->end()) {
+        if (found->second.size() >= capacity) return false;
+        std::memcpy(output, found->second.c_str(), found->second.size() + 1);
+        return true;
+    }
+    char uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
+    if (!ReadLibraryUri(reader, profile, heap_base, tagged_library, uri, sizeof(uri))) {
+        return false;
+    }
+    const auto [inserted, ok] = cache->emplace(tagged_library, uri);
+    if (!ok || inserted->second.size() >= capacity) return false;
+    std::memcpy(output, inserted->second.c_str(), inserted->second.size() + 1);
+    return true;
 }
 
 bool LibraryIdentityMatches(const ProcessMemoryReader& reader,
@@ -817,6 +978,43 @@ uint64_t EntryForKind(const DartPlantLiveVmFunctionInfo& info, DartPlantEntryKin
     return 0;
 }
 
+void FinalizeCollectedLiveFunctionAliases(std::vector<CollectedLiveFunction>* functions,
+                                          uint32_t skipped,
+                                          DartPlantLiveVmFunctionIndexInfo* out_info) {
+    if (functions == nullptr || out_info == nullptr) return;
+    std::array<std::unordered_map<uint64_t, uint32_t>, 4> aliases_by_kind;
+    for (const CollectedLiveFunction& function : *functions) {
+        for (uint32_t kind = 0; kind < 4; ++kind) {
+            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
+            const uint64_t entry =
+                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
+            uint32_t& count = aliases_by_kind[kind][entry];
+            if (count != std::numeric_limits<uint32_t>::max()) ++count;
+        }
+    }
+    for (auto& function : *functions) {
+        for (uint32_t kind = 0; kind < 4; ++kind) {
+            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
+            const uint64_t entry =
+                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
+            function.info.entry_alias_counts[kind] = aliases_by_kind[kind][entry];
+        }
+        function.info.entry_alias_count = function.info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
+        function.info.entry_is_shared = function.info.entry_alias_count > 1 ? 1 : 0;
+    }
+
+    uint32_t shared_targets = 0;
+    const auto& default_aliases = aliases_by_kind[DARTPLANT_ENTRY_DEFAULT];
+    for (const auto& [entry, count] : default_aliases) {
+        (void) entry;
+        if (count > 1) ++shared_targets;
+    }
+    out_info->function_count = static_cast<uint32_t>(functions->size());
+    out_info->code_target_count = static_cast<uint32_t>(default_aliases.size());
+    out_info->shared_code_target_count = shared_targets;
+    out_info->skipped_function_count = skipped;
+}
+
 const LiveVmInstructionImage* ResolveRuntimeInstructionImage(
     std::span<const LiveVmInstructionImage> images, uint64_t entry, uint64_t size,
     uint64_t* out_va) {
@@ -844,16 +1042,23 @@ const LiveVmInstructionImage* ResolveRuntimeInstructionImage(
     return selected;
 }
 
-bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
-                         uint64_t heap_base, uint64_t tagged_function, uint32_t kind,
-                         uint64_t tagged_class, uint64_t library, bool is_top_level,
-                         const char* library_uri, const char* class_name,
-                         const DartPlantFlutterSnapshotInfo& root_snapshot,
-                         std::span<const LiveVmInstructionImage> images,
-                         std::vector<CollectedLiveFunction>* functions, const char** out_stage) {
+// The caller must have already proved tagged_function is a Function under the
+// same observation receipt. Both current callers obtain it from a bounded VM
+// owner container and perform that proof immediately before entering here.
+// Avoiding a second CID read matters on non-PRODUCT heaps with thousands of
+// retained Functions while preserving the exact same proof boundary.
+bool CollectProvenLiveFunction(const ProcessMemoryReader& reader,
+                               const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+                               uint64_t tagged_function, uint32_t kind, uint64_t tagged_class,
+                               uint64_t library, bool is_top_level, uint32_t owner_class_id,
+                               uint32_t owner_function_index, const char* library_uri,
+                               const char* class_name,
+                               const DartPlantFlutterSnapshotInfo& root_snapshot,
+                               std::span<const LiveVmInstructionImage> images,
+                               std::vector<CollectedLiveFunction>* functions,
+                               const char** out_stage) {
     if (out_stage != nullptr) *out_stage = "function-cid";
-    if (functions == nullptr || library_uri == nullptr || class_name == nullptr ||
-        !RequireCid(reader, profile, tagged_function, profile.cid_function)) {
+    if (functions == nullptr || library_uri == nullptr || class_name == nullptr) {
         return FailFunctionCollection(out_stage, "function-cid");
     }
 
@@ -865,25 +1070,36 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
     collected.info.library = library;
     collected.info.owner_is_toplevel_class = is_top_level ? 1 : 0;
     collected.info.function_kind = kind;
+    collected.info.owner_class_id = owner_class_id;
+    collected.info.owner_function_index = owner_function_index;
     std::snprintf(collected.info.library_uri, sizeof(collected.info.library_uri), "%s",
                   library_uri);
     std::snprintf(collected.info.class_name, sizeof(collected.info.class_name), "%s", class_name);
 
     uint64_t tagged_name = 0;
     uint64_t function_owner = 0;
-    if (!reader.Read(function_address + profile.function_entry_point_offset,
-                     &collected.info.function_entry_point) ||
-        !reader.Read(function_address + profile.function_unchecked_entry_point_offset,
-                     &collected.info.function_unchecked_entry_point) ||
-        !ReadCompressedObject(reader, function_address, profile, profile.function_name_offset,
-                              heap_base, &tagged_name) ||
+    ObjectFieldWindow function_fields;
+    const std::array function_field_layout = {
+        std::pair{profile.function_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.function_unchecked_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.function_name_offset, sizeof(uint32_t)},
+        std::pair{profile.function_owner_offset, sizeof(uint32_t)},
+        std::pair{profile.function_code_offset, sizeof(uint32_t)},
+    };
+    if (!ReadObjectFieldWindow(reader, function_address, function_field_layout, &function_fields) ||
+        !function_fields.Load(profile.function_entry_point_offset,
+                              &collected.info.function_entry_point) ||
+        !function_fields.Load(profile.function_unchecked_entry_point_offset,
+                              &collected.info.function_unchecked_entry_point) ||
+        !DecodeCompressedObjectField(function_fields, profile.function_name_offset, profile,
+                                     heap_base, &tagged_name) ||
         !ReadDartString(reader, profile, tagged_name, collected.info.function_name,
                         sizeof(collected.info.function_name)) ||
-        !ReadCompressedObject(reader, function_address, profile, profile.function_owner_offset,
-                              heap_base, &function_owner) ||
+        !DecodeCompressedObjectField(function_fields, profile.function_owner_offset, profile,
+                                     heap_base, &function_owner) ||
         function_owner != tagged_class ||
-        !ReadCompressedObject(reader, function_address, profile, profile.function_code_offset,
-                              heap_base, &collected.info.code) ||
+        !DecodeCompressedObjectField(function_fields, profile.function_code_offset, profile,
+                                     heap_base, &collected.info.code) ||
         !RequireCid(reader, profile, collected.info.code, profile.cid_code)) {
         return FailFunctionCollection(out_stage, "function-fields");
     }
@@ -891,19 +1107,27 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
     const bool closure_call_entry_only = IsClosureFunctionKind(profile.profile_version, kind);
     uint64_t code_owner = 0;
     const uintptr_t code_address = Untag(profile, collected.info.code);
-    if (!reader.Read(code_address + profile.code_entry_point_offset,
-                     &collected.info.code_entry_point) ||
-        !reader.Read(code_address + profile.code_unchecked_entry_point_offset,
-                     &collected.info.code_unchecked_entry_point) ||
-        !reader.Read(code_address + profile.code_monomorphic_entry_point_offset,
-                     &collected.info.code_monomorphic_entry_point) ||
-        !reader.Read(code_address + profile.code_monomorphic_unchecked_entry_point_offset,
-                     &collected.info.code_monomorphic_unchecked_entry_point) ||
-        !reader.Read(code_address + profile.code_object_pool_offset,
-                     &collected.info.code_object_pool) ||
-        !reader.Read(code_address + profile.code_owner_offset, &code_owner) ||
-        !reader.Read(code_address + profile.code_instructions_length_offset,
-                     &collected.info.code_size) ||
+    ObjectFieldWindow code_fields;
+    const std::array code_field_layout = {
+        std::pair{profile.code_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.code_unchecked_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.code_monomorphic_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.code_monomorphic_unchecked_entry_point_offset, sizeof(uint64_t)},
+        std::pair{profile.code_object_pool_offset, sizeof(uint64_t)},
+        std::pair{profile.code_owner_offset, sizeof(uint64_t)},
+        std::pair{profile.code_instructions_length_offset, sizeof(uint64_t)},
+    };
+    if (!ReadObjectFieldWindow(reader, code_address, code_field_layout, &code_fields) ||
+        !code_fields.Load(profile.code_entry_point_offset, &collected.info.code_entry_point) ||
+        !code_fields.Load(profile.code_unchecked_entry_point_offset,
+                          &collected.info.code_unchecked_entry_point) ||
+        !code_fields.Load(profile.code_monomorphic_entry_point_offset,
+                          &collected.info.code_monomorphic_entry_point) ||
+        !code_fields.Load(profile.code_monomorphic_unchecked_entry_point_offset,
+                          &collected.info.code_monomorphic_unchecked_entry_point) ||
+        !code_fields.Load(profile.code_object_pool_offset, &collected.info.code_object_pool) ||
+        !code_fields.Load(profile.code_owner_offset, &code_owner) ||
+        !code_fields.Load(profile.code_instructions_length_offset, &collected.info.code_size) ||
         collected.info.function_entry_point == 0 || collected.info.code_entry_point == 0 ||
         collected.info.code_size == 0) {
         return FailFunctionCollection(out_stage, "code-fields");
@@ -999,20 +1223,27 @@ bool CollectLiveFunction(const ProcessMemoryReader& reader, const DartPlantLiveV
 
 bool CollectFunctionsInClass(
     const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile, uint64_t heap_base,
-    uint64_t tagged_class, bool is_top_level, const DartPlantFlutterSnapshotInfo& root_snapshot,
-    std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
-    std::vector<CollectedLiveFunction>* functions, uint32_t* skipped_function_count,
-    uint32_t* function_rejection_logs, const char** out_stage) {
+    uint64_t tagged_class, uint32_t owner_class_id, bool is_top_level,
+    const DartPlantFlutterSnapshotInfo& root_snapshot,
+    std::span<const LiveVmInstructionImage> images, LiveLibraryUriCache* library_uri_cache,
+    std::unordered_set<uint64_t>* seen_functions, std::vector<CollectedLiveFunction>* functions,
+    uint32_t* skipped_function_count, uint32_t* function_rejection_logs, const char** out_stage) {
     if (out_stage != nullptr) *out_stage = "class-cid";
-    if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr ||
-        function_rejection_logs == nullptr ||
-        !RequireCid(reader, profile, tagged_class, profile.cid_class)) {
+    uint32_t class_object_cid = 0;
+    if (library_uri_cache == nullptr || seen_functions == nullptr || functions == nullptr ||
+        skipped_function_count == nullptr || function_rejection_logs == nullptr ||
+        owner_class_id == 0 || !ReadCid(reader, profile, tagged_class, &class_object_cid) ||
+        class_object_cid != profile.cid_class) {
         return FailClassCollection(out_stage, "class-cid");
     }
 
     uint64_t library = 0;
     uint64_t class_functions = 0;
-    if (!ReadClassLibrary(reader, profile, heap_base, tagged_class, &library) ||
+    // tagged_class was proved above, so do not make ReadClassLibrary repeat
+    // the Class CID check. The observation-local URI cache performs the
+    // Library CID proof exactly once per unique Library below.
+    if (!ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
+                              profile.class_library_offset, heap_base, &library) ||
         !ReadCompressedObject(reader, Untag(profile, tagged_class), profile,
                               profile.class_functions_offset, heap_base, &class_functions)) {
         return FailClassCollection(out_stage, "class-roots");
@@ -1020,7 +1251,8 @@ bool CollectFunctionsInClass(
 
     char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
     char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
-    if (!ReadLibraryUri(reader, profile, heap_base, library, library_uri, sizeof(library_uri))) {
+    if (!ReadCachedLibraryUri(reader, profile, heap_base, library, library_uri_cache, library_uri,
+                              sizeof(library_uri))) {
         return FailClassCollection(out_stage, "library-uri");
     }
     if (is_top_level) {
@@ -1034,69 +1266,110 @@ bool CollectFunctionsInClass(
         }
     }
 
-    uint32_t functions_cid = 0;
-    if (!ReadCid(reader, profile, class_functions, &functions_cid) ||
-        (functions_cid != profile.cid_array && functions_cid != profile.cid_immutable_array)) {
-        return FailClassCollection(out_stage, "functions-cid");
-    }
-    uint64_t length = 0;
-    if (!ReadPositiveCompressedSmi(reader,
-                                   Untag(profile, class_functions) + profile.array_length_offset,
-                                   profile, &length) ||
-        length > kMaxClassFunctions) {
-        return FailClassCollection(out_stage, "functions-length");
-    }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr) return FailClassCollection(out_stage, "functions-layout");
+    if (!VisitArrayRawElements(
+            reader, profile, class_functions, kMaxClassFunctions,
+            [&](uint64_t index, uint32_t compressed) {
+                if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
+                    ++*skipped_function_count;
+                    return ArrayVisitDecision::kContinue;
+                }
+                const uint64_t function = DecompressObject(heap_base, compressed);
+                if (!RequireCid(reader, profile, function, profile.cid_function)) {
+                    ++*skipped_function_count;
+                    return ArrayVisitDecision::kContinue;
+                }
+                if (seen_functions->contains(function)) return ArrayVisitDecision::kContinue;
 
-    for (uint64_t index = 0; index < length; ++index) {
-        uint64_t function = 0;
-        if (!ReadArrayElement(reader, profile, heap_base, class_functions, index, &function) ||
-            !RequireCid(reader, profile, function, profile.cid_function)) {
-            ++*skipped_function_count;
-            continue;
-        }
-        if (seen_functions->contains(function)) continue;
-
-        const uintptr_t function_address = Untag(profile, function);
-        uint32_t kind_tag = 0;
-        if (!reader.Read(function_address + profile.function_kind_tag_offset, &kind_tag)) {
-            ++*skipped_function_count;
-            continue;
-        }
-        uint32_t kind = 0;
-        if (!DecodeFunctionKind(profile, kind_tag, &kind)) {
-            ++*skipped_function_count;
-            continue;
-        }
-        const char* function_stage = "unknown";
-        if (!CollectLiveFunction(reader, profile, heap_base, function, kind, tagged_class, library,
-                                 is_top_level, library_uri, class_name, root_snapshot, images,
-                                 functions, &function_stage)) {
-            ++*skipped_function_count;
-            if (*function_rejection_logs < 20) {
-                ++*function_rejection_logs;
-                LogLiveIndex(
-                    "function rejected class=0x%llx function=0x%llx kind=%u stage=%s "
-                    "function_kind_off=0x%x code_size_off=0x%x",
-                    static_cast<unsigned long long>(tagged_class),
-                    static_cast<unsigned long long>(function), kind, function_stage,
-                    profile.function_kind_tag_offset, profile.code_instructions_length_offset);
-            }
-        } else {
-            seen_functions->insert(function);
-        }
+                const uintptr_t function_address = Untag(profile, function);
+                uint32_t kind_tag = 0;
+                if (!reader.Read(function_address + profile.function_kind_tag_offset, &kind_tag)) {
+                    ++*skipped_function_count;
+                    return ArrayVisitDecision::kContinue;
+                }
+                uint32_t kind = 0;
+                if (!DecodeFunctionKind(profile, kind_tag, &kind)) {
+                    ++*skipped_function_count;
+                    return ArrayVisitDecision::kContinue;
+                }
+                const char* function_stage = "unknown";
+                if (!CollectProvenLiveFunction(
+                        reader, profile, heap_base, function, kind, tagged_class, library,
+                        is_top_level, owner_class_id, static_cast<uint32_t>(index), library_uri,
+                        class_name, root_snapshot, images, functions, &function_stage)) {
+                    ++*skipped_function_count;
+                    if (*function_rejection_logs < 20) {
+                        ++*function_rejection_logs;
+                        LogLiveIndex(
+                            "function rejected class=0x%llx function=0x%llx kind=%u stage=%s "
+                            "function_kind_off=0x%x code_size_off=0x%x",
+                            static_cast<unsigned long long>(tagged_class),
+                            static_cast<unsigned long long>(function), kind, function_stage,
+                            profile.function_kind_tag_offset,
+                            profile.code_instructions_length_offset);
+                    }
+                } else {
+                    seen_functions->insert(function);
+                }
+                return ArrayVisitDecision::kContinue;
+            })) {
+        return FailClassCollection(out_stage, "functions-payload");
     }
     if (out_stage != nullptr) *out_stage = "complete";
     return true;
+}
+
+bool ResolveFunctionOwnerSlot(const ProcessMemoryReader& reader,
+                              const DartPlantLiveVmProfile& profile, uint64_t heap_base,
+                              uint64_t owner_class, uint64_t function,
+                              const std::unordered_map<uint64_t, uint32_t>& class_ids_by_object,
+                              uint32_t* out_class_id, uint32_t* out_function_index) {
+    if (out_class_id == nullptr || out_function_index == nullptr) return false;
+    *out_class_id = 0;
+    *out_function_index = UINT32_MAX;
+
+    const auto owner_id = class_ids_by_object.find(owner_class);
+    if (owner_id == class_ids_by_object.end() || owner_id->second == 0) return false;
+
+    uint32_t class_object_cid = 0;
+    uint64_t class_functions = 0;
+    if (!ReadCid(reader, profile, owner_class, &class_object_cid) ||
+        class_object_cid != profile.cid_class ||
+        !ReadCompressedObject(reader, Untag(profile, owner_class), profile,
+                              profile.class_functions_offset, heap_base, &class_functions)) {
+        return false;
+    }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr) return false;
+    bool found = false;
+    const bool visited =
+        VisitArrayRawElements(reader, profile, class_functions, kMaxClassFunctions,
+                              [&](uint64_t index, uint32_t compressed) {
+                                  if (index > UINT32_MAX) return ArrayVisitDecision::kFail;
+                                  if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag ||
+                                      DecompressObject(heap_base, compressed) != function) {
+                                      return ArrayVisitDecision::kContinue;
+                                  }
+                                  *out_class_id = owner_id->second;
+                                  *out_function_index = static_cast<uint32_t>(index);
+                                  found = true;
+                                  return ArrayVisitDecision::kStop;
+                              });
+    return visited && found;
 }
 
 bool CollectDeferredFunction(
     const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile, uint64_t heap_base,
     uint64_t function, uint64_t expected_code, const LiveVmInstructionImage& target_image,
     const DartPlantFlutterSnapshotInfo& root_snapshot,
-    std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
-    std::vector<CollectedLiveFunction>* functions, const char** out_stage) {
+    std::span<const LiveVmInstructionImage> images,
+    const std::unordered_map<uint64_t, uint32_t>& class_ids_by_object, uint32_t fallback_owner_id,
+    uint32_t fallback_owner_index, LiveLibraryUriCache* library_uri_cache,
+    std::unordered_set<uint64_t>* seen_functions, std::vector<CollectedLiveFunction>* functions,
+    const char** out_stage) {
     if (out_stage != nullptr) *out_stage = "function-cid";
-    if (seen_functions == nullptr || functions == nullptr ||
+    if (library_uri_cache == nullptr || seen_functions == nullptr || functions == nullptr ||
         !RequireCid(reader, profile, function, profile.cid_function)) {
         return false;
     }
@@ -1128,17 +1401,32 @@ bool CollectDeferredFunction(
 
     uint64_t library = 0;
     uint64_t top_level_class = 0;
-    if (!ReadClassLibrary(reader, profile, heap_base, owner_class, &library) ||
+    char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
+    // owner_class was proved immediately above. Validate/cache the Library
+    // once instead of revalidating both Class and Library on every Function.
+    if (!ReadCompressedObject(reader, Untag(profile, owner_class), profile,
+                              profile.class_library_offset, heap_base, &library) ||
+        !ReadCachedLibraryUri(reader, profile, heap_base, library, library_uri_cache, library_uri,
+                              sizeof(library_uri)) ||
         !ReadCompressedObject(reader, Untag(profile, library), profile,
                               profile.library_toplevel_class_offset, heap_base, &top_level_class)) {
         return FailFunctionCollection(out_stage, "function-library");
     }
     const bool is_top_level = owner_class == top_level_class;
-    char library_uri[DARTPLANT_LIVE_VM_LIBRARY_URI_MAX] = {};
-    char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
-    if (!ReadLibraryUri(reader, profile, heap_base, library, library_uri, sizeof(library_uri))) {
-        return FailFunctionCollection(out_stage, "library-uri");
+    uint32_t owner_class_id = 0;
+    uint32_t owner_function_index = UINT32_MAX;
+    // Prefer the semantic Class.functions slot whenever Dart publishes one.
+    // Some deferred implicit/synthetic Functions are Code.owner values but do
+    // not occur in Class.functions. For those, the source-verified
+    // InstructionsTable.code_objects[index] relation is the durable slot:
+    // EndInstructions() appends one table per loaded unit and SetCodeAt()
+    // fills the fixed index while deserializing that image.
+    if (!ResolveFunctionOwnerSlot(reader, profile, heap_base, owner_class, function,
+                                  class_ids_by_object, &owner_class_id, &owner_function_index)) {
+        owner_class_id = fallback_owner_id;
+        owner_function_index = fallback_owner_index;
     }
+    char class_name[DARTPLANT_LIVE_VM_CLASS_NAME_MAX] = {};
     if (is_top_level) {
         std::snprintf(class_name, sizeof(class_name), "%s", "Global");
     } else {
@@ -1151,9 +1439,9 @@ bool CollectDeferredFunction(
     }
 
     const size_t before = functions->size();
-    if (!CollectLiveFunction(reader, profile, heap_base, function, kind, owner_class, library,
-                             is_top_level, library_uri, class_name, root_snapshot, images,
-                             functions, out_stage)) {
+    if (!CollectProvenLiveFunction(reader, profile, heap_base, function, kind, owner_class, library,
+                                   is_top_level, owner_class_id, owner_function_index, library_uri,
+                                   class_name, root_snapshot, images, functions, out_stage)) {
         return false;
     }
     if (functions->size() != before + 1 ||
@@ -1170,12 +1458,16 @@ bool CollectDeferredLoadingUnitFunctions(
     const ProcessMemoryReader& reader, const RuntimeProfileRecord& deferred_profile_record,
     const RuntimeProfileRecord& live_index_profile_record, const DartPlantLiveVmContext& context,
     const DartPlantFlutterSnapshotInfo& root_snapshot,
-    std::span<const LiveVmInstructionImage> images, std::unordered_set<uint64_t>* seen_functions,
-    std::vector<CollectedLiveFunction>* functions, uint32_t* skipped_function_count) {
+    std::span<const LiveVmInstructionImage> images,
+    std::span<const uint64_t> target_runtime_image_ids,
+    const std::unordered_map<uint64_t, uint32_t>& class_ids_by_object,
+    std::unordered_set<uint64_t>* seen_functions, std::vector<CollectedLiveFunction>* functions,
+    uint32_t* skipped_function_count) {
     if (images.size() <= 1) return true;
     if (seen_functions == nullptr || functions == nullptr || skipped_function_count == nullptr) {
         return false;
     }
+    LiveLibraryUriCache library_uri_cache;
     const auto& profile = deferred_profile_record.live_vm;
     const auto& loading_unit = deferred_profile_record.loading_unit;
     if (profile.object_store_loading_units_offset == 0 || loading_unit.cid == 0 ||
@@ -1203,6 +1495,11 @@ bool CollectDeferredLoadingUnitFunctions(
 
     for (const auto& image : images) {
         if (image.loading_unit_id <= 1) continue;
+        if (!target_runtime_image_ids.empty() &&
+            std::find(target_runtime_image_ids.begin(), target_runtime_image_ids.end(),
+                      image.runtime_image_id) == target_runtime_image_ids.end()) {
+            continue;
+        }
         if (image.loading_unit_id >= loading_unit_count) {
             LogLiveIndex("deferred loading unit missing id=%u count=%llu", image.loading_unit_id,
                          static_cast<unsigned long long>(loading_unit_count));
@@ -1241,6 +1538,142 @@ bool CollectDeferredLoadingUnitFunctions(
                          image.loading_unit_id);
             continue;
         }
+
+        // In bare-instructions AOT, Dart publishes one InstructionsTable for
+        // the root image and appends one table for every deserialized deferred
+        // image. Its code_objects array is already the exact VM-maintained Code
+        // set for that instruction image. Prefer it over classifying every
+        // LoadingUnit.base_objects slot by CID; retain the base-object walk as
+        // a conservative fallback if the table cannot be proven uniquely.
+        const auto& instructions_table = deferred_profile_record.instructions_table;
+        bool used_instructions_table = false;
+        if (instructions_table.object_store_offset != 0 && instructions_table.cid != 0 &&
+            instructions_table.code_objects_offset != 0) {
+            uint64_t tables = 0;
+            if (reader.Read(static_cast<uintptr_t>(context.object_store) +
+                                instructions_table.object_store_offset,
+                            &tables) &&
+                RequireCid(reader, profile, tables, profile.cid_growable_object_array)) {
+                const uintptr_t growable = Untag(profile, tables);
+                uint64_t table_count = 0;
+                uint64_t table_data = 0;
+                if (ReadPositiveCompressedSmi(
+                        reader, growable + profile.growable_object_array_length_offset, profile,
+                        &table_count) &&
+                    table_count <= kMaxClassFunctions &&
+                    ReadCompressedObject(reader, growable, profile,
+                                         profile.growable_object_array_data_offset,
+                                         context.heap_base, &table_data)) {
+                    uint64_t matching_table = 0;
+                    uint32_t matching_table_count = 0;
+                    const uint64_t image_start = image.snapshot.isolate_instructions_runtime;
+                    const uint64_t image_end =
+                        image_start + image.snapshot.isolate_instructions_size;
+                    if (image_end >= image_start) {
+                        for (uint64_t table_index = 0; table_index < table_count; ++table_index) {
+                            uint64_t table = 0;
+                            if (!ReadArrayElement(reader, profile, context.heap_base, table_data,
+                                                  table_index, &table) ||
+                                !RequireCid(reader, profile, table, instructions_table.cid)) {
+                                continue;
+                            }
+                            const uintptr_t table_address = Untag(profile, table);
+                            uint64_t start_pc = 0;
+                            uint64_t end_pc = 0;
+                            if (!reader.Read(table_address + instructions_table.start_pc_offset,
+                                             &start_pc) ||
+                                !reader.Read(table_address + instructions_table.end_pc_offset,
+                                             &end_pc) ||
+                                start_pc >= end_pc || start_pc < image_start ||
+                                end_pc > image_end) {
+                                continue;
+                            }
+                            matching_table = table;
+                            ++matching_table_count;
+                        }
+                    }
+
+                    if (matching_table_count == 1) {
+                        const uintptr_t table_address = Untag(profile, matching_table);
+                        const auto table_owner_id =
+                            StableInstructionsTableOwnerId(image.loading_unit_id);
+                        uint64_t code_objects_array = 0;
+                        uint64_t table_length = 0;
+                        uint64_t code_object_count = 0;
+                        if (table_owner_id.has_value() &&
+                            reader.Read(table_address + instructions_table.code_objects_offset,
+                                        &code_objects_array) &&
+                            RequireCid(reader, profile, code_objects_array, profile.cid_array) &&
+                            reader.Read(table_address + instructions_table.length_offset,
+                                        &table_length) &&
+                            table_length <= kMaxClassFunctions &&
+                            ReadArrayLength(reader, profile, code_objects_array,
+                                            &code_object_count) &&
+                            code_object_count == table_length) {
+                            uint32_t accepted = 0;
+                            uint32_t code_objects = 0;
+                            bool table_valid = true;
+                            for (uint64_t code_index = 0; code_index < code_object_count;
+                                 ++code_index) {
+                                uint64_t code = 0;
+                                if (!ReadArrayElement(reader, profile, context.heap_base,
+                                                      code_objects_array, code_index, &code) ||
+                                    !RequireCid(reader, profile, code, profile.cid_code)) {
+                                    table_valid = false;
+                                    break;
+                                }
+                                ++code_objects;
+                                uint64_t entry = 0;
+                                uint64_t entry_va = 0;
+                                if (!reader.Read(
+                                        Untag(profile, code) + profile.code_entry_point_offset,
+                                        &entry) ||
+                                    ResolveRuntimeInstructionImage(images, entry, 4, &entry_va) !=
+                                        &image) {
+                                    table_valid = false;
+                                    break;
+                                }
+                                uint64_t function = 0;
+                                if (!reader.Read(Untag(profile, code) + profile.code_owner_offset,
+                                                 &function) ||
+                                    !RequireCid(reader, profile, function, profile.cid_function)) {
+                                    ++*skipped_function_count;
+                                    continue;
+                                }
+                                const char* stage = "unknown";
+                                if (CollectDeferredFunction(
+                                        reader, live_index_profile_record.live_vm,
+                                        context.heap_base, function, code, image, root_snapshot,
+                                        images, class_ids_by_object, *table_owner_id,
+                                        static_cast<uint32_t>(code_index), &library_uri_cache,
+                                        seen_functions, functions, &stage)) {
+                                    ++accepted;
+                                } else {
+                                    ++*skipped_function_count;
+                                    if (*skipped_function_count <= 20) {
+                                        LogLiveIndex(
+                                            "deferred function rejected unit=%u index=%llu "
+                                            "code=0x%llx function=0x%llx stage=%s",
+                                            image.loading_unit_id,
+                                            static_cast<unsigned long long>(code_index),
+                                            static_cast<unsigned long long>(code),
+                                            static_cast<unsigned long long>(function), stage);
+                                    }
+                                }
+                            }
+                            if (table_valid) {
+                                LogLiveIndex(
+                                    "deferred unit id=%u instructions_table_codes=%u functions=%u",
+                                    image.loading_unit_id, code_objects, accepted);
+                                used_instructions_table = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (used_instructions_table) continue;
+
         uint32_t base_objects_cid = 0;
         uint64_t base_object_count = 0;
         if (!ReadCid(reader, profile, base_objects, &base_objects_cid) ||
@@ -1254,42 +1687,74 @@ bool CollectDeferredLoadingUnitFunctions(
             return false;
         }
 
+        const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+        if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t) ||
+            base_object_count > (std::numeric_limits<size_t>::max() / raw->compressed_word_size)) {
+            LogLiveIndex("deferred base_objects payload layout rejected id=%u",
+                         image.loading_unit_id);
+            return false;
+        }
+
+        // base_objects has already been proven to be one bounded Dart Array.
+        // Do not call ReadArrayElement() for every slot here: that helper
+        // intentionally revalidates the same Array CID and length on each
+        // access, which turns a 100k-slot loading unit into 300k redundant
+        // observation reads. Read the contiguous compressed payload in small
+        // fixed chunks, then keep the per-object CID/Code-owner validation.
+        constexpr size_t kBaseObjectChunkSlots = 1024;
+        std::array<uint32_t, kBaseObjectChunkSlots> compressed_slots{};
+        const uintptr_t base_elements =
+            Untag(profile, base_objects) + profile.array_elements_offset;
+
         uint32_t accepted = 0;
         uint32_t code_objects = 0;
-        for (uint64_t index = 0; index < base_object_count; ++index) {
-            uint64_t code = 0;
-            uint32_t cid = 0;
-            if (!ReadArrayElement(reader, profile, context.heap_base, base_objects, index, &code) ||
-                !ReadCid(reader, profile, code, &cid) || cid != profile.cid_code) {
-                continue;
+        for (uint64_t chunk_start = 0; chunk_start < base_object_count;
+             chunk_start += kBaseObjectChunkSlots) {
+            const size_t chunk_count = static_cast<size_t>(
+                std::min<uint64_t>(kBaseObjectChunkSlots, base_object_count - chunk_start));
+            const uintptr_t chunk_address = base_elements + chunk_start * raw->compressed_word_size;
+            if (!reader.ReadBytes(chunk_address, compressed_slots.data(),
+                                  chunk_count * raw->compressed_word_size)) {
+                LogLiveIndex("deferred base_objects payload read failed id=%u index=%llu",
+                             image.loading_unit_id, static_cast<unsigned long long>(chunk_start));
+                return false;
             }
-            ++code_objects;
-            uint64_t entry = 0;
-            uint64_t entry_va = 0;
-            if (!reader.Read(Untag(profile, code) + profile.code_entry_point_offset, &entry) ||
-                ResolveRuntimeInstructionImage(images, entry, 4, &entry_va) != &image) {
-                continue;
-            }
-            uint64_t function = 0;
-            if (!reader.Read(Untag(profile, code) + profile.code_owner_offset, &function) ||
-                !RequireCid(reader, profile, function, profile.cid_function)) {
-                ++*skipped_function_count;
-                continue;
-            }
-            const char* stage = "unknown";
-            if (CollectDeferredFunction(reader, live_index_profile_record.live_vm,
-                                        context.heap_base, function, code, image, root_snapshot,
-                                        images, seen_functions, functions, &stage)) {
-                ++accepted;
-            } else {
-                ++*skipped_function_count;
-                if (*skipped_function_count <= 20) {
-                    LogLiveIndex(
-                        "deferred function rejected unit=%u index=%llu code=0x%llx function=0x%llx "
-                        "stage=%s",
-                        image.loading_unit_id, static_cast<unsigned long long>(index),
-                        static_cast<unsigned long long>(code),
-                        static_cast<unsigned long long>(function), stage);
+            for (size_t offset = 0; offset < chunk_count; ++offset) {
+                const uint32_t compressed = compressed_slots[offset];
+                if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag) continue;
+                const uint64_t index = chunk_start + offset;
+                const uint64_t code = DecompressObject(context.heap_base, compressed);
+                uint32_t cid = 0;
+                if (!ReadCid(reader, profile, code, &cid) || cid != profile.cid_code) continue;
+                ++code_objects;
+                uint64_t entry = 0;
+                uint64_t entry_va = 0;
+                if (!reader.Read(Untag(profile, code) + profile.code_entry_point_offset, &entry) ||
+                    ResolveRuntimeInstructionImage(images, entry, 4, &entry_va) != &image) {
+                    continue;
+                }
+                uint64_t function = 0;
+                if (!reader.Read(Untag(profile, code) + profile.code_owner_offset, &function) ||
+                    !RequireCid(reader, profile, function, profile.cid_function)) {
+                    ++*skipped_function_count;
+                    continue;
+                }
+                const char* stage = "unknown";
+                if (CollectDeferredFunction(
+                        reader, live_index_profile_record.live_vm, context.heap_base, function,
+                        code, image, root_snapshot, images, class_ids_by_object, 0, UINT32_MAX,
+                        &library_uri_cache, seen_functions, functions, &stage)) {
+                    ++accepted;
+                } else {
+                    ++*skipped_function_count;
+                    if (*skipped_function_count <= 20) {
+                        LogLiveIndex(
+                            "deferred function rejected unit=%u index=%llu code=0x%llx "
+                            "function=0x%llx stage=%s",
+                            image.loading_unit_id, static_cast<unsigned long long>(index),
+                            static_cast<unsigned long long>(code),
+                            static_cast<unsigned long long>(function), stage);
+                    }
                 }
             }
         }
@@ -1354,6 +1819,9 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
     uint32_t rejected_classes = 0;
     uint32_t rejection_logs = 0;
     uint32_t function_rejection_logs = 0;
+    std::unordered_map<uint64_t, uint32_t> class_ids_by_object;
+    class_ids_by_object.reserve(static_cast<size_t>(num_cids));
+    LiveLibraryUriCache library_uri_cache;
     for (uint64_t cid = 1; cid < num_cids; ++cid) {
         uint64_t tagged_class = 0;
         if (!reader.Read(
@@ -1362,11 +1830,19 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
             tagged_class == 0) {
             continue;
         }
+        if (cid > UINT32_MAX ||
+            !class_ids_by_object.emplace(tagged_class, static_cast<uint32_t>(cid)).second) {
+            LogLiveIndex("class-table owner identity is ambiguous cid=%llu tagged=0x%llx",
+                         static_cast<unsigned long long>(cid),
+                         static_cast<unsigned long long>(tagged_class));
+            return false;
+        }
         ++nonzero_class_slots;
         const size_t before = functions->size();
         const char* stage = "unknown";
-        if (CollectFunctionsInClass(reader, profile, context.heap_base, tagged_class, false,
-                                    root_snapshot, images, &seen_functions, functions, &skipped,
+        if (CollectFunctionsInClass(reader, profile, context.heap_base, tagged_class,
+                                    static_cast<uint32_t>(cid), false, root_snapshot, images,
+                                    &library_uri_cache, &seen_functions, functions, &skipped,
                                     &function_rejection_logs, &stage)) {
             ++accepted_classes;
             if (accepted_classes <= 6) {
@@ -1413,87 +1889,90 @@ bool CollectAllLiveFunctions(const ProcessMemoryReader& reader,
     }
     uint32_t accepted_top_levels = 0;
     uint32_t rejected_top_levels = 0;
-    for (uint64_t index = 0; index < library_count; ++index) {
-        uint64_t library = 0;
-        if (!ReadArrayElement(reader, profile, context.heap_base, data, index, &library) ||
-            !RequireCid(reader, profile, library, profile.cid_library)) {
-            continue;
-        }
-        uint64_t top_level_class = 0;
-        if (!ReadCompressedObject(reader, Untag(profile, library), profile,
-                                  profile.library_toplevel_class_offset, context.heap_base,
-                                  &top_level_class)) {
-            continue;
-        }
-        const size_t before = functions->size();
-        const char* stage = "unknown";
-        if (CollectFunctionsInClass(reader, profile, context.heap_base, top_level_class, true,
-                                    root_snapshot, images, &seen_functions, functions, &skipped,
-                                    &function_rejection_logs, &stage)) {
-            ++accepted_top_levels;
-            if (accepted_top_levels <= 6) {
-                LogLiveIndex(
-                    "top-level accepted index=%llu library=0x%llx class=0x%llx added=%llu total=%llu",
-                    static_cast<unsigned long long>(index),
-                    static_cast<unsigned long long>(library),
-                    static_cast<unsigned long long>(top_level_class),
-                    static_cast<unsigned long long>(functions->size() - before),
-                    static_cast<unsigned long long>(functions->size()));
-            }
-        } else {
-            ++rejected_top_levels;
-            if (rejected_top_levels <= 12) {
-                LogLiveIndex("top-level rejected index=%llu library=0x%llx class=0x%llx stage=%s",
-                             static_cast<unsigned long long>(index),
-                             static_cast<unsigned long long>(library),
-                             static_cast<unsigned long long>(top_level_class), stage);
-            }
-        }
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.profile_version);
+    if (raw == nullptr) return false;
+    uint64_t library_data_length = 0;
+    if (!VisitArrayRawElements(
+            reader, profile, data, kMaxClassFunctions,
+            [&](uint64_t index, uint32_t compressed) {
+                if (index >= library_count) return ArrayVisitDecision::kStop;
+                if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                const uint64_t library = DecompressObject(context.heap_base, compressed);
+                if (!RequireCid(reader, profile, library, profile.cid_library)) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                uint64_t top_level_class = 0;
+                if (!ReadCompressedObject(reader, Untag(profile, library), profile,
+                                          profile.library_toplevel_class_offset, context.heap_base,
+                                          &top_level_class)) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                const auto top_level_owner_id = StableTopLevelOwnerId(index);
+                if (!top_level_owner_id.has_value()) {
+                    LogLiveIndex("top-level stable owner id overflow index=%llu",
+                                 static_cast<unsigned long long>(index));
+                    return ArrayVisitDecision::kFail;
+                }
+                const auto [top_level_it, inserted] =
+                    class_ids_by_object.emplace(top_level_class, *top_level_owner_id);
+                if (!inserted && top_level_it->second != *top_level_owner_id) {
+                    LogLiveIndex(
+                        "top-level owner identity is ambiguous index=%llu class=0x%llx existing=0x%x",
+                        static_cast<unsigned long long>(index),
+                        static_cast<unsigned long long>(top_level_class), top_level_it->second);
+                    return ArrayVisitDecision::kFail;
+                }
+                const size_t before = functions->size();
+                const char* stage = "unknown";
+                if (CollectFunctionsInClass(reader, profile, context.heap_base, top_level_class,
+                                            *top_level_owner_id, true, root_snapshot, images,
+                                            &library_uri_cache, &seen_functions, functions,
+                                            &skipped, &function_rejection_logs, &stage)) {
+                    ++accepted_top_levels;
+                    if (accepted_top_levels <= 6) {
+                        LogLiveIndex(
+                            "top-level accepted index=%llu library=0x%llx class=0x%llx added=%llu total=%llu",
+                            static_cast<unsigned long long>(index),
+                            static_cast<unsigned long long>(library),
+                            static_cast<unsigned long long>(top_level_class),
+                            static_cast<unsigned long long>(functions->size() - before),
+                            static_cast<unsigned long long>(functions->size()));
+                    }
+                } else {
+                    ++rejected_top_levels;
+                    if (rejected_top_levels <= 12) {
+                        LogLiveIndex(
+                            "top-level rejected index=%llu library=0x%llx class=0x%llx stage=%s",
+                            static_cast<unsigned long long>(index),
+                            static_cast<unsigned long long>(library),
+                            static_cast<unsigned long long>(top_level_class), stage);
+                    }
+                }
+                return ArrayVisitDecision::kContinue;
+            },
+            &library_data_length) ||
+        library_data_length < library_count) {
+        LogLiveIndex("libraries data payload rejected count=%llu data_length=%llu",
+                     static_cast<unsigned long long>(library_count),
+                     static_cast<unsigned long long>(library_data_length));
+        return false;
     }
 
     const RuntimeProfileRecord& deferred_profile =
         deferred_profile_record == nullptr ? profile_record : *deferred_profile_record;
     if (!CollectDeferredLoadingUnitFunctions(reader, deferred_profile, profile_record, context,
-                                             root_snapshot, images, &seen_functions, functions,
-                                             &skipped)) {
+                                             root_snapshot, images, {}, class_ids_by_object,
+                                             &seen_functions, functions, &skipped)) {
         LogLiveIndex("deferred loading-unit traversal failed profile=%s", profile.name);
         return false;
     }
 
-    std::array<std::unordered_map<uint64_t, uint32_t>, 4> aliases_by_kind;
-    for (const CollectedLiveFunction& function : *functions) {
-        for (uint32_t kind = 0; kind < 4; ++kind) {
-            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
-            const uint64_t entry =
-                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
-            uint32_t& count = aliases_by_kind[kind][entry];
-            if (count != std::numeric_limits<uint32_t>::max()) ++count;
-        }
-    }
-    for (auto& function : *functions) {
-        for (uint32_t kind = 0; kind < 4; ++kind) {
-            if ((function.info.entry_kind_mask & (1u << kind)) == 0) continue;
-            const uint64_t entry =
-                EntryForKind(function.info, static_cast<DartPlantEntryKind>(kind));
-            function.info.entry_alias_counts[kind] = aliases_by_kind[kind][entry];
-        }
-        function.info.entry_alias_count = function.info.entry_alias_counts[DARTPLANT_ENTRY_DEFAULT];
-        function.info.entry_is_shared = function.info.entry_alias_count > 1 ? 1 : 0;
-    }
     // Keep the public aggregate index counters compatible with the original
     // Function-index contract: they describe default Function entries. Exact
     // per-entry-kind multiplicity is exposed on each FunctionInfo above.
-    uint32_t shared_targets = 0;
-    const auto& default_aliases = aliases_by_kind[DARTPLANT_ENTRY_DEFAULT];
-    for (const auto& [entry, count] : default_aliases) {
-        (void) entry;
-        if (count > 1) ++shared_targets;
-    }
-
-    out_info->function_count = static_cast<uint32_t>(functions->size());
-    out_info->code_target_count = static_cast<uint32_t>(default_aliases.size());
-    out_info->shared_code_target_count = shared_targets;
-    out_info->skipped_function_count = skipped;
+    FinalizeCollectedLiveFunctionAliases(functions, skipped, out_info);
     LogLiveIndex(
         "summary profile=%s class_slots=%u classes_ok=%u classes_rejected=%u libraries=%llu "
         "top_levels_ok=%u top_levels_rejected=%u functions=%u code_targets=%u shared=%u skipped=%u",
@@ -1539,6 +2018,18 @@ struct ParsedFunctionSignature {
     uint32_t parent_type_argument_count = 0;
     bool has_named_optional_parameters = false;
     DartPlantDartTypeInfo result_type{};
+};
+
+// Observation-local only. Every key below is a movable Dart heap pointer and
+// therefore must never survive the exact live-heap observation receipt that
+// made it stable. The cached values themselves are immutable semantic copies.
+struct LiveSemanticReadCache {
+    std::unordered_map<uint64_t, ParsedFunctionSignature> function_types;
+    std::unordered_map<uint64_t, DartPlantDartTypeInfo> dart_types;
+    std::unordered_map<uint64_t, std::string> dart_strings;
+    uint64_t function_type_hits = 0;
+    uint64_t dart_type_hits = 0;
+    uint64_t dart_string_hits = 0;
 };
 
 bool DecodeDartNullability(uint32_t flags, const FunctionTypeLayout& layout,
@@ -1629,11 +2120,55 @@ bool DecodeDartType(const ProcessMemoryReader& reader, const DartPlantLiveVmProf
     return true;
 }
 
+bool DecodeDartTypeCached(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                          const FunctionTypeLayout& layout, uint64_t tagged_type,
+                          LiveSemanticReadCache* cache, DartPlantDartTypeInfo* out_type) {
+    if (cache == nullptr) {
+        return DecodeDartType(reader, profile, layout, tagged_type, out_type);
+    }
+    const auto found = cache->dart_types.find(tagged_type);
+    if (found != cache->dart_types.end()) {
+        ++cache->dart_type_hits;
+        *out_type = found->second;
+        return true;
+    }
+    DartPlantDartTypeInfo decoded{};
+    if (!DecodeDartType(reader, profile, layout, tagged_type, &decoded)) return false;
+    cache->dart_types.emplace(tagged_type, decoded);
+    *out_type = decoded;
+    return true;
+}
+
+bool ReadDartStringCached(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                          uint64_t tagged_string, LiveSemanticReadCache* cache, char* output,
+                          size_t capacity) {
+    if (cache == nullptr) {
+        return ReadDartString(reader, profile, tagged_string, output, capacity);
+    }
+    if (output == nullptr || capacity == 0) return false;
+    const auto found = cache->dart_strings.find(tagged_string);
+    if (found != cache->dart_strings.end()) {
+        if (found->second.size() >= capacity) return false;
+        ++cache->dart_string_hits;
+        std::memcpy(output, found->second.c_str(), found->second.size() + 1);
+        return true;
+    }
+    std::array<char, DARTPLANT_DART_PARAMETER_NAME_MAX> value{};
+    if (!ReadDartString(reader, profile, tagged_string, value.data(), value.size())) {
+        return false;
+    }
+    const auto [inserted, ok] = cache->dart_strings.emplace(tagged_string, value.data());
+    if (!ok || inserted->second.size() >= capacity) return false;
+    std::memcpy(output, inserted->second.c_str(), inserted->second.size() + 1);
+    return true;
+}
+
 DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader,
                                                const DartPlantLiveVmProfile& profile,
                                                const FunctionTypeLayout& layout, uint64_t heap_base,
                                                uint64_t tagged_function,
-                                               ParsedFunctionSignature* out_signature) {
+                                               ParsedFunctionSignature* out_signature,
+                                               LiveSemanticReadCache* cache = nullptr) {
     if (out_signature == nullptr || heap_base == 0 ||
         !RequireCid(reader, profile, tagged_function, profile.cid_function)) {
         return FailProbe("live VM Function is stale or has an invalid CID for signature parsing");
@@ -1655,16 +2190,33 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
     if (signature_cid != layout.cid_function_type) {
         return FailProbe("live VM Function.signature has an unexpected CID");
     }
+    if (cache != nullptr) {
+        const auto found = cache->function_types.find(tagged_signature);
+        if (found != cache->function_types.end()) {
+            ++cache->function_type_hits;
+            *out_signature = found->second;
+            return DARTPLANT_OK;
+        }
+    }
 
     const uintptr_t signature_address = Untag(profile, tagged_signature);
     uint32_t packed_counts = 0;
     uint16_t packed_type_counts = 0;
     uint64_t result_type = 0;
-    if (!reader.Read(signature_address + layout.packed_parameter_counts_offset, &packed_counts) ||
-        !reader.Read(signature_address + layout.packed_type_parameter_counts_offset,
-                     &packed_type_counts) ||
-        !ReadCompressedObject(reader, signature_address, profile, layout.result_type_offset,
-                              heap_base, &result_type)) {
+    ObjectFieldWindow signature_fields;
+    const std::array signature_field_layout = {
+        std::pair{layout.packed_parameter_counts_offset, sizeof(uint32_t)},
+        std::pair{layout.packed_type_parameter_counts_offset, sizeof(uint16_t)},
+        std::pair{layout.result_type_offset, sizeof(uint32_t)},
+        std::pair{layout.parameter_types_offset, sizeof(uint32_t)},
+        std::pair{layout.named_parameter_names_offset, sizeof(uint32_t)},
+    };
+    if (!ReadObjectFieldWindow(reader, signature_address, signature_field_layout,
+                               &signature_fields) ||
+        !signature_fields.Load(layout.packed_parameter_counts_offset, &packed_counts) ||
+        !signature_fields.Load(layout.packed_type_parameter_counts_offset, &packed_type_counts) ||
+        !DecodeCompressedObjectField(signature_fields, layout.result_type_offset, profile,
+                                     heap_base, &result_type)) {
         return FailProbe("live VM FunctionType fields are unreadable");
     }
 
@@ -1681,13 +2233,13 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
         (parsed.has_named_optional_parameters && parsed.optional_parameter_count == 0)) {
         return FailProbe("live VM FunctionType parameter counts are inconsistent");
     }
-    if (!DecodeDartType(reader, profile, layout, result_type, &parsed.result_type)) {
+    if (!DecodeDartTypeCached(reader, profile, layout, result_type, cache, &parsed.result_type)) {
         return FailProbe("live VM FunctionType result type is invalid");
     }
 
     if (parsed.parameter_count != 0) {
-        if (!ReadCompressedObject(reader, signature_address, profile, layout.parameter_types_offset,
-                                  heap_base, &parsed.parameter_types)) {
+        if (!DecodeCompressedObjectField(signature_fields, layout.parameter_types_offset, profile,
+                                         heap_base, &parsed.parameter_types)) {
             return FailProbe("live VM FunctionType parameter_types is unreadable");
         }
         uint64_t parameter_type_count = 0;
@@ -1698,9 +2250,8 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
     }
 
     if (parsed.has_named_optional_parameters) {
-        if (!ReadCompressedObject(reader, signature_address, profile,
-                                  layout.named_parameter_names_offset, heap_base,
-                                  &parsed.named_parameter_names)) {
+        if (!DecodeCompressedObjectField(signature_fields, layout.named_parameter_names_offset,
+                                         profile, heap_base, &parsed.named_parameter_names)) {
             return FailProbe("live VM FunctionType named_parameter_names is unreadable");
         }
         uint64_t named_slot_count = 0;
@@ -1716,6 +2267,7 @@ DartPlantStatus ParseRetainedFunctionSignature(const ProcessMemoryReader& reader
         }
     }
 
+    if (cache != nullptr) cache->function_types.emplace(tagged_signature, parsed);
     *out_signature = parsed;
     return DARTPLANT_OK;
 }
@@ -1874,6 +2426,92 @@ DartPlantStatus ProbeLiveVmRootProgramHashForCandidate(const DartPlantLiveVmCont
     return DARTPLANT_OK;
 }
 
+DartPlantStatus ProbeLiveVmDeferredLoadingUnitStatesForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& deferred_profile, uint64_t canonical_null,
+    DartPlantVmAdapter* observation_adapter, const void* observation_lease,
+    std::vector<LiveVmDeferredLoadingUnitState>* out_states) {
+    if (out_states == nullptr || context.object_store == 0 || context.heap_base == 0 ||
+        context.thread == 0 || canonical_null == 0 ||
+        deferred_profile.live_vm.object_store_loading_units_offset == 0 ||
+        deferred_profile.loading_unit.cid == 0 ||
+        deferred_profile.loading_unit.base_objects_offset == 0) {
+        SetLastError("live VM deferred load-state probe arguments/profile are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+
+    auto reader = ProcessMemoryReader::ObservationScopedDirect(observation_adapter, context.thread,
+                                                               observation_lease);
+    if (!reader.has_value()) {
+        SetLastError(
+            "live VM deferred load-state probe requires the current thread's exact "
+            "moving-GC observation receipt");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+    if (!reader->Refresh()) {
+        SetLastError("cannot inspect process mappings for deferred load state");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+
+    const auto& profile = deferred_profile.live_vm;
+    uint64_t loading_units = 0;
+    if (!reader->Read(static_cast<uintptr_t>(context.object_store) +
+                          profile.object_store_loading_units_offset,
+                      &loading_units) ||
+        !RequireCid(*reader, profile, loading_units, profile.cid_array)) {
+        SetLastError("ObjectStore.loading_units is unavailable for deferred load-state proof");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+
+    uint64_t loading_unit_count = 0;
+    if (!ReadArrayLength(*reader, profile, loading_units, &loading_unit_count) ||
+        loading_unit_count > kMaxClassFunctions) {
+        SetLastError("ObjectStore.loading_units length is invalid for deferred load-state proof");
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
+
+    std::vector<LiveVmDeferredLoadingUnitState> states;
+    states.reserve(images.size());
+    for (const auto& image : images) {
+        if (image.loading_unit_id <= 1) continue;
+        if (image.runtime_image_id == 0 || image.loading_unit_id >= loading_unit_count) {
+            SetLastError("deferred RuntimeImage has no matching live LoadingUnit");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+        uint64_t unit = 0;
+        uint64_t base_objects = 0;
+        if (!ReadArrayElement(*reader, profile, context.heap_base, loading_units,
+                              image.loading_unit_id, &unit) ||
+            !RequireCid(*reader, profile, unit, deferred_profile.loading_unit.cid) ||
+            !ReadCompressedObject(*reader, Untag(profile, unit), profile,
+                                  deferred_profile.loading_unit.base_objects_offset,
+                                  context.heap_base, &base_objects)) {
+            SetLastError("deferred LoadingUnit state is unreadable");
+            return DARTPLANT_PROFILE_MISMATCH;
+        }
+
+        const bool loaded = base_objects != canonical_null;
+        if (loaded) {
+            uint32_t base_objects_cid = 0;
+            if (!ReadCid(*reader, profile, base_objects, &base_objects_cid) ||
+                (base_objects_cid != profile.cid_array &&
+                 base_objects_cid != profile.cid_immutable_array)) {
+                SetLastError("loaded deferred LoadingUnit has invalid base_objects");
+                return DARTPLANT_PROFILE_MISMATCH;
+            }
+        }
+        states.push_back({
+            .runtime_image_id = image.runtime_image_id,
+            .loading_unit_id = image.loading_unit_id,
+            .loaded = loaded,
+        });
+    }
+
+    *out_states = std::move(states);
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
 DartPlantStatus ReadLiveVmRootProgramHashForCurrentProfile(const DartPlantLiveVmContext& context,
                                                            const RuntimeProfileRecord& profile,
                                                            uint32_t* out_program_hash) {
@@ -2003,6 +2641,113 @@ void CopyParsedFunctionSignature(const ParsedFunctionSignature& parsed,
     *out_signature = signature;
 }
 
+bool ReadArrayRawSnapshot(const ProcessMemoryReader& reader, const DartPlantLiveVmProfile& profile,
+                          uint64_t tagged_array, uint64_t max_length,
+                          std::vector<uint32_t>* out_slots) {
+    if (out_slots == nullptr) return false;
+    std::vector<uint32_t> slots;
+    uint64_t length = 0;
+    const bool visited = VisitArrayRawElements(
+        reader, profile, tagged_array, max_length,
+        [&slots](uint64_t, uint32_t raw) {
+            slots.push_back(raw);
+            return ArrayVisitDecision::kContinue;
+        },
+        &length);
+    if (!visited || slots.size() != length) return false;
+    *out_slots = std::move(slots);
+    return true;
+}
+
+DartPlantStatus DecodeLiveVmFunctionParametersSnapshot(
+    const ProcessMemoryReader& reader, const RuntimeProfileRecord& profile, uint64_t heap_base,
+    const ParsedFunctionSignature& parsed, LiveSemanticReadCache* cache,
+    std::vector<DartPlantDartParameterInfo>* out_parameters) {
+    if (out_parameters == nullptr) return DARTPLANT_INVALID_ARGUMENT;
+    const RawObjectLayout* raw = FindRawObjectLayout(profile.live_vm.profile_version);
+    if (raw == nullptr || raw->compressed_word_size != sizeof(uint32_t)) {
+        return FailProbe("FunctionType compressed-array layout is unavailable");
+    }
+
+    std::vector<uint32_t> parameter_slots;
+    if (parsed.parameter_count != 0 &&
+        (!ReadArrayRawSnapshot(reader, profile.live_vm, parsed.parameter_types,
+                               parsed.parameter_count, &parameter_slots) ||
+         parameter_slots.size() != parsed.parameter_count)) {
+        return FailProbe("FunctionType parameter type array is inconsistent");
+    }
+
+    std::vector<uint32_t> named_slots;
+    if (parsed.has_named_optional_parameters) {
+        const uint64_t flag_slot_count = (static_cast<uint64_t>(parsed.optional_parameter_count) +
+                                          kNamedParameterFlagsPerSmi - 1) /
+                                         kNamedParameterFlagsPerSmi;
+        const uint64_t maximum_named_slot_count =
+            static_cast<uint64_t>(parsed.optional_parameter_count) + flag_slot_count;
+        if (!ReadArrayRawSnapshot(reader, profile.live_vm, parsed.named_parameter_names,
+                                  maximum_named_slot_count, &named_slots) ||
+            named_slots.size() < parsed.optional_parameter_count) {
+            return FailProbe("FunctionType named parameter array is inconsistent");
+        }
+    }
+
+    std::vector<DartPlantDartParameterInfo> parameters(parsed.parameter_count);
+    for (uint32_t index = 0; index < parsed.parameter_count; ++index) {
+        const uint32_t raw_type = parameter_slots[index];
+        if ((raw_type & raw->smi_tag_mask) != raw->heap_object_tag) {
+            return FailProbe("FunctionType parameter type is unreadable");
+        }
+        const uint64_t tagged_type = DecompressObject(heap_base, raw_type);
+        auto& parameter = parameters[index];
+        parameter.struct_size = sizeof(parameter);
+        parameter.index = index;
+        if (!DecodeDartTypeCached(reader, profile.live_vm, profile.function_type, tagged_type,
+                                  cache, &parameter.type)) {
+            return FailProbe("FunctionType parameter type is invalid");
+        }
+
+        if (index < parsed.implicit_parameter_count) {
+            parameter.kind = DARTPLANT_DART_PARAMETER_IMPLICIT;
+        } else if (index < parsed.fixed_parameter_count) {
+            parameter.kind = DARTPLANT_DART_PARAMETER_REQUIRED_POSITIONAL;
+            parameter.is_required = 1;
+        } else if (!parsed.has_named_optional_parameters) {
+            parameter.kind = DARTPLANT_DART_PARAMETER_OPTIONAL_POSITIONAL;
+        } else {
+            parameter.kind = DARTPLANT_DART_PARAMETER_NAMED;
+            const uint32_t named_index = index - parsed.fixed_parameter_count;
+            if (named_index >= parsed.optional_parameter_count ||
+                named_index >= named_slots.size()) {
+                return FailProbe("FunctionType named parameter name is invalid");
+            }
+            const uint32_t raw_name = named_slots[named_index];
+            if ((raw_name & raw->smi_tag_mask) != raw->heap_object_tag) {
+                return FailProbe("FunctionType named parameter name is invalid");
+            }
+            const uint64_t tagged_name = DecompressObject(heap_base, raw_name);
+            if (!ReadDartStringCached(reader, profile.live_vm, tagged_name, cache, parameter.name,
+                                      sizeof(parameter.name))) {
+                return FailProbe("FunctionType named parameter name is invalid");
+            }
+
+            const uint32_t flag_index =
+                parsed.optional_parameter_count + named_index / kNamedParameterFlagsPerSmi;
+            uint32_t flags = 0;
+            if (flag_index < named_slots.size()) {
+                const uint32_t raw_flags = named_slots[flag_index];
+                if ((raw_flags & raw->smi_tag_mask) != raw->smi_tag) {
+                    return FailProbe("FunctionType required-named flags are invalid");
+                }
+                flags = raw_flags >> raw->smi_tag_shift;
+            }
+            parameter.is_required =
+                (flags & (1U << (named_index % kNamedParameterFlagsPerSmi))) != 0 ? 1 : 0;
+        }
+    }
+    *out_parameters = std::move(parameters);
+    return DARTPLANT_OK;
+}
+
 }  // namespace
 
 DartPlantStatus ReadLiveVmFunctionParameterForProfile(const DartPlantLiveVmContext& context,
@@ -2070,7 +2815,7 @@ DartPlantStatus ReadLiveVmFunctionSemanticsWithReader(
     const ProcessMemoryReader& reader, const DartPlantLiveVmContext& context,
     const RuntimeProfileRecord& profile, uint64_t function,
     DartPlantDartFunctionSignatureInfo* out_signature,
-    std::vector<DartPlantDartParameterInfo>* out_parameters) {
+    std::vector<DartPlantDartParameterInfo>* out_parameters, LiveSemanticReadCache* cache) {
     if (out_signature == nullptr ||
         out_signature->struct_size < sizeof(DartPlantDartFunctionSignatureInfo) ||
         out_parameters == nullptr || context.heap_base == 0 || function == 0) {
@@ -2078,17 +2823,18 @@ DartPlantStatus ReadLiveVmFunctionSemanticsWithReader(
         return DARTPLANT_INVALID_ARGUMENT;
     }
     ParsedFunctionSignature parsed{};
-    DartPlantStatus status = ParseRetainedFunctionSignatureWithRetry(
-        reader, profile.live_vm, profile.function_type, context.heap_base, function, &parsed);
+    DartPlantStatus status =
+        reader.volatile_reads()
+            ? ParseRetainedFunctionSignatureWithRetry(reader, profile.live_vm,
+                                                      profile.function_type, context.heap_base,
+                                                      function, &parsed)
+            : ParseRetainedFunctionSignature(reader, profile.live_vm, profile.function_type,
+                                             context.heap_base, function, &parsed, cache);
     if (status != DARTPLANT_OK) return status;
-
-    std::vector<DartPlantDartParameterInfo> parameters(parsed.parameter_count);
-    for (uint32_t index = 0; index < parsed.parameter_count; ++index) {
-        parameters[index].struct_size = sizeof(DartPlantDartParameterInfo);
-        status = DecodeLiveVmFunctionParameter(reader, profile, context.heap_base, parsed, index,
-                                               &parameters[index]);
-        if (status != DARTPLANT_OK) return status;
-    }
+    std::vector<DartPlantDartParameterInfo> parameters;
+    status = DecodeLiveVmFunctionParametersSnapshot(reader, profile, context.heap_base, parsed,
+                                                    cache, &parameters);
+    if (status != DARTPLANT_OK) return status;
     CopyParsedFunctionSignature(parsed, out_signature);
     *out_parameters = std::move(parameters);
     ClearLastError();
@@ -2339,15 +3085,16 @@ DartPlantStatus CollectLiveVmFunctionSnapshotRecordsForImages(
     const uint64_t semantic_bytes_start = reader->bytes_read();
     const auto semantics_started = std::chrono::steady_clock::now();
     size_t semantic_success = 0;
+    LiveSemanticReadCache semantic_cache;
     std::vector<LiveVmFunctionSnapshotRecord> records;
     records.reserve(functions.size());
     for (const auto& collected : functions) {
         LiveVmFunctionSnapshotRecord record{};
         record.function = collected.info;
         record.signature.struct_size = sizeof(record.signature);
-        if (ReadLiveVmFunctionSemanticsWithReader(*reader, context, function_type_profile,
-                                                  collected.info.function, &record.signature,
-                                                  &record.parameters) == DARTPLANT_OK) {
+        if (ReadLiveVmFunctionSemanticsWithReader(
+                *reader, context, function_type_profile, collected.info.function, &record.signature,
+                &record.parameters, &semantic_cache) == DARTPLANT_OK) {
             record.has_semantics = true;
             ++semantic_success;
         } else {
@@ -2362,15 +3109,224 @@ DartPlantStatus CollectLiveVmFunctionSnapshotRecordsForImages(
                 std::chrono::steady_clock::now() - semantics_started);
             LogLiveIndex(
                 "semantics progress=%zu/%zu success=%zu elapsed_ms=%llu read_calls=%llu "
-                "safe_reads=%llu bytes=%llu",
+                "safe_reads=%llu bytes=%llu cache=function_type:%llu/type:%llu/string:%llu",
                 records.size(), functions.size(), semantic_success,
                 static_cast<unsigned long long>(elapsed.count()),
                 static_cast<unsigned long long>(reader->read_calls() - semantic_reads_start),
                 static_cast<unsigned long long>(reader->safe_read_calls() -
                                                 semantic_safe_reads_start),
-                static_cast<unsigned long long>(reader->bytes_read() - semantic_bytes_start));
+                static_cast<unsigned long long>(reader->bytes_read() - semantic_bytes_start),
+                static_cast<unsigned long long>(semantic_cache.function_type_hits),
+                static_cast<unsigned long long>(semantic_cache.dart_type_hits),
+                static_cast<unsigned long long>(semantic_cache.dart_string_hits));
         }
     }
+
+    *out_records = std::move(records);
+    *out_info = info;
+    ClearLastError();
+    return DARTPLANT_OK;
+}
+
+DartPlantStatus CollectLiveVmDeferredFunctionSnapshotRecordsForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    std::span<const uint64_t> target_runtime_image_ids,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, const RuntimeProfileRecord& deferred_profile,
+    DartPlantVmAdapter* observation_adapter, const void* observation_lease,
+    std::vector<LiveVmFunctionSnapshotRecord>* out_records,
+    DartPlantLiveVmFunctionIndexInfo* out_info) {
+    if (out_records == nullptr || out_info == nullptr || target_runtime_image_ids.empty()) {
+        SetLastError("deferred live VM semantic delta arguments are invalid");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    auto reader = ProcessMemoryReader::ObservationScopedDirect(observation_adapter, context.thread,
+                                                               observation_lease);
+    if (!reader.has_value()) {
+        SetLastError(
+            "deferred live VM semantic delta requires the current thread's exact moving-GC "
+            "observation receipt");
+        return DARTPLANT_VM_BRIDGE_UNAVAILABLE;
+    }
+
+    const LiveVmInstructionImage* root_image = nullptr;
+    std::unordered_set<uint64_t> requested_images;
+    requested_images.reserve(target_runtime_image_ids.size());
+    for (const uint64_t id : target_runtime_image_ids) {
+        if (id == 0 || !requested_images.insert(id).second) {
+            SetLastError("deferred live VM semantic delta contains an invalid image id");
+            return DARTPLANT_INVALID_ARGUMENT;
+        }
+    }
+    std::unordered_set<uint64_t> matched_images;
+    matched_images.reserve(requested_images.size());
+    for (const auto& image : images) {
+        if (image.snapshot.struct_size < sizeof(DartPlantFlutterSnapshotInfo) ||
+            image.snapshot.isolate_instructions_runtime == 0 ||
+            image.snapshot.isolate_instructions_size == 0) {
+            SetLastError("deferred live VM instruction image descriptor is invalid");
+            return DARTPLANT_INVALID_ARGUMENT;
+        }
+        if (image.loading_unit_id == 1) {
+            if (root_image != nullptr) {
+                SetLastError("deferred live VM image set has multiple root loading units");
+                return DARTPLANT_INVALID_ARGUMENT;
+            }
+            root_image = &image;
+        }
+        if (!requested_images.contains(image.runtime_image_id)) continue;
+        if (image.loading_unit_id <= 1 || !matched_images.insert(image.runtime_image_id).second) {
+            SetLastError("deferred live VM semantic delta does not name exact deferred images");
+            return DARTPLANT_INVALID_ARGUMENT;
+        }
+    }
+    if (root_image == nullptr || matched_images.size() != requested_images.size()) {
+        SetLastError("deferred live VM semantic delta references an unknown runtime image");
+        return DARTPLANT_INVALID_ARGUMENT;
+    }
+    if (!reader->Refresh()) {
+        return FailProbe("cannot read /proc/self/maps for deferred live Function delta");
+    }
+
+    const auto& live_profile = live_index_profile.live_vm;
+    const uint64_t max_cids = MaxCidCount(live_profile);
+    uint64_t num_cids = 0;
+    if (max_cids == 0 ||
+        !reader->Read(
+            static_cast<uintptr_t>(context.class_table) + live_profile.class_table_num_cids_offset,
+            &num_cids) ||
+        num_cids == 0 || num_cids > max_cids || num_cids > UINT32_MAX) {
+        return FailProbe("cannot build stable ClassTable identity for deferred Function delta");
+    }
+    std::unordered_map<uint64_t, uint32_t> class_ids_by_object;
+    class_ids_by_object.reserve(static_cast<size_t>(num_cids));
+    for (uint64_t cid = 1; cid < num_cids; ++cid) {
+        uint64_t tagged_class = 0;
+        if (!reader->Read(
+                static_cast<uintptr_t>(context.cached_class_table_table) + cid * sizeof(uint64_t),
+                &tagged_class)) {
+            return FailProbe("cannot read ClassTable owner identity for deferred Function delta");
+        }
+        if (tagged_class == 0) continue;
+        if (!class_ids_by_object.emplace(tagged_class, static_cast<uint32_t>(cid)).second) {
+            return FailProbe("ClassTable owner identity is ambiguous for deferred Function delta");
+        }
+    }
+    uint64_t libraries = 0;
+    if (!reader->Read(static_cast<uintptr_t>(context.object_store) +
+                          live_profile.object_store_libraries_offset,
+                      &libraries) ||
+        !RequireCid(*reader, live_profile, libraries, live_profile.cid_growable_object_array)) {
+        return FailProbe("cannot read library owner identities for deferred Function delta");
+    }
+    const uintptr_t growable = Untag(live_profile, libraries);
+    uint64_t library_count = 0;
+    uint64_t library_data = 0;
+    if (!ReadPositiveCompressedSmi(*reader,
+                                   growable + live_profile.growable_object_array_length_offset,
+                                   live_profile, &library_count) ||
+        library_count > kMaxClassFunctions ||
+        !ReadCompressedObject(*reader, growable, live_profile,
+                              live_profile.growable_object_array_data_offset, context.heap_base,
+                              &library_data)) {
+        return FailProbe("cannot decode library owner identities for deferred Function delta");
+    }
+    class_ids_by_object.reserve(class_ids_by_object.size() + static_cast<size_t>(library_count));
+    const RawObjectLayout* raw = FindRawObjectLayout(live_profile.profile_version);
+    if (raw == nullptr) {
+        return FailProbe("cannot decode library array layout for deferred Function delta");
+    }
+    uint64_t library_data_length = 0;
+    if (!VisitArrayRawElements(
+            *reader, live_profile, library_data, kMaxClassFunctions,
+            [&](uint64_t index, uint32_t compressed) {
+                if (index >= library_count) return ArrayVisitDecision::kStop;
+                if ((compressed & raw->smi_tag_mask) != raw->heap_object_tag) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                const uint64_t library = DecompressObject(context.heap_base, compressed);
+                if (!RequireCid(*reader, live_profile, library, live_profile.cid_library)) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                uint64_t top_level_class = 0;
+                if (!ReadCompressedObject(*reader, Untag(live_profile, library), live_profile,
+                                          live_profile.library_toplevel_class_offset,
+                                          context.heap_base, &top_level_class)) {
+                    return ArrayVisitDecision::kContinue;
+                }
+                const auto stable_owner_id = StableTopLevelOwnerId(index);
+                if (!stable_owner_id.has_value()) {
+                    return ArrayVisitDecision::kFail;
+                }
+                const auto [found, inserted] =
+                    class_ids_by_object.emplace(top_level_class, *stable_owner_id);
+                if (!inserted && found->second != *stable_owner_id) {
+                    return ArrayVisitDecision::kFail;
+                }
+                return ArrayVisitDecision::kContinue;
+            },
+            &library_data_length) ||
+        library_data_length < library_count) {
+        return FailProbe(
+            "library owner identity array is inconsistent for deferred Function delta");
+    }
+
+    std::unordered_set<uint64_t> seen_functions;
+    std::vector<CollectedLiveFunction> functions;
+    uint32_t skipped = 0;
+    const auto started = std::chrono::steady_clock::now();
+    if (!CollectDeferredLoadingUnitFunctions(
+            *reader, deferred_profile, live_index_profile, context, root_image->snapshot, images,
+            target_runtime_image_ids, class_ids_by_object, &seen_functions, &functions, &skipped)) {
+        return FailProbe("failed to enumerate newly-loaded deferred Functions");
+    }
+    // Delta publication has no safe way to infer a missing changed Function.
+    // Any rejected Function therefore makes this optimization ineligible; the
+    // caller will rebuild the complete graph under the same observation.
+    if (skipped != 0) {
+        SetLastError("deferred Function delta was incomplete; full live graph rebuild required");
+        return DARTPLANT_RUNTIME_NOT_READY;
+    }
+    DartPlantLiveVmFunctionIndexInfo info{};
+    info.struct_size = sizeof(info);
+    FinalizeCollectedLiveFunctionAliases(&functions, 0, &info);
+
+    std::vector<LiveVmFunctionSnapshotRecord> records;
+    records.reserve(functions.size());
+    size_t semantic_success = 0;
+    LiveSemanticReadCache semantic_cache;
+    for (const auto& collected : functions) {
+        if (collected.info.owner_class_id == 0 ||
+            collected.info.owner_function_index == UINT32_MAX) {
+            SetLastError("deferred Function delta has no stable owner-slot receipt");
+            return DARTPLANT_RUNTIME_NOT_READY;
+        }
+        LiveVmFunctionSnapshotRecord record{};
+        record.function = collected.info;
+        record.signature.struct_size = sizeof(record.signature);
+        if (ReadLiveVmFunctionSemanticsWithReader(
+                *reader, context, function_type_profile, collected.info.function, &record.signature,
+                &record.parameters, &semantic_cache) == DARTPLANT_OK) {
+            record.has_semantics = true;
+            ++semantic_success;
+        } else {
+            ClearLastError();
+        }
+        records.push_back(std::move(record));
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    LogLiveIndex(
+        "deferred delta images=%zu functions=%zu semantics=%zu elapsed_ms=%llu read_calls=%llu "
+        "safe_reads=%llu bytes=%llu cache=function_type:%llu/type:%llu/string:%llu",
+        target_runtime_image_ids.size(), records.size(), semantic_success,
+        static_cast<unsigned long long>(elapsed.count()),
+        static_cast<unsigned long long>(reader->read_calls()),
+        static_cast<unsigned long long>(reader->safe_read_calls()),
+        static_cast<unsigned long long>(reader->bytes_read()),
+        static_cast<unsigned long long>(semantic_cache.function_type_hits),
+        static_cast<unsigned long long>(semantic_cache.dart_type_hits),
+        static_cast<unsigned long long>(semantic_cache.dart_string_hits));
 
     *out_records = std::move(records);
     *out_info = info;

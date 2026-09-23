@@ -384,17 +384,20 @@ def _verify_object_store_offsets_contract(
     try:
         libraries_index = fields.index("libraries")
         loading_units_index = fields.index("loading_units")
+        instructions_tables_index = fields.index("instructions_tables")
     except ValueError as exc:
         raise ValueError(
-            f"{source_name}: ObjectStore libraries/loading_units fields are unavailable"
+            f"{source_name}: ObjectStore libraries/loading_units/instructions_tables fields are unavailable"
         ) from exc
     if loading_units_index <= libraries_index:
         raise ValueError(f"{source_name}: ObjectStore loading_units field order changed")
 
     expected_libraries = libraries_index * pointer_size
     expected_loading_units = loading_units_index * pointer_size
+    expected_instructions_tables = instructions_tables_index * pointer_size
     manifest_libraries = int(profile["object_store"]["libraries"])
     manifest_loading_units = int(profile["object_store"]["loading_units"])
+    manifest_instructions_tables = int(profile["object_store"]["instructions_tables"])
     if manifest_libraries != expected_libraries:
         raise ValueError(
             f"{profile['name']}: manifest object_store.libraries=0x{manifest_libraries:x} "
@@ -404,6 +407,12 @@ def _verify_object_store_offsets_contract(
         raise ValueError(
             f"{profile['name']}: manifest object_store.loading_units=0x{manifest_loading_units:x} "
             f"disagrees with source-proven {source_name} layout=0x{expected_loading_units:x}"
+        )
+    if manifest_instructions_tables != expected_instructions_tables:
+        raise ValueError(
+            f"{profile['name']}: manifest object_store.instructions_tables="
+            f"0x{manifest_instructions_tables:x} disagrees with source-proven "
+            f"{source_name} layout=0x{expected_instructions_tables:x}"
         )
 
 
@@ -489,6 +498,62 @@ def _verify_loading_unit_layout_contract(
     if minimum_size > instance_size:
         raise ValueError(
             f"{source_name}: LoadingUnit fields exceed source instance size"
+        )
+
+
+def _verify_instructions_table_layout_contract(
+    profile: dict[str, object],
+    runtime_offsets: str,
+    raw_object_header: str,
+    *,
+    source_name: str,
+) -> None:
+    """Verify the AOT InstructionsTable fields used by deferred live indexing."""
+
+    pointer_size = int(profile["machine"]["pointer_size"])
+    if pointer_size != 8:
+        raise ValueError(
+            f"{source_name}: unsupported InstructionsTable pointer size: {pointer_size}"
+        )
+
+    normalized = " ".join(raw_object_header.split())
+    declaration = (
+        "class UntaggedInstructionsTable : public UntaggedObject { "
+        "RAW_HEAP_OBJECT_IMPLEMENTATION(InstructionsTable); "
+        "POINTER_FIELD(ArrayPtr, code_objects) VISIT_FROM(code_objects) VISIT_TO(code_objects)"
+    )
+    if declaration not in normalized:
+        raise ValueError(f"{source_name}: UntaggedInstructionsTable field order changed")
+
+    block = _arm64_compressed_aot_block(
+        runtime_offsets, product=bool(profile["machine"]["product"])
+    )
+    object_size = _parse_aot_offset(block, "AOT_Object_InstanceSize")
+    instance_size = _parse_aot_offset(block, "AOT_InstructionsTable_InstanceSize")
+    code_objects_offset = object_size
+    length_offset = code_objects_offset + pointer_size
+    rodata_offset = length_offset + pointer_size
+    start_pc_offset = rodata_offset + pointer_size
+    end_pc_offset = start_pc_offset + pointer_size
+
+    layout = profile["instructions_table"]
+    expected = {
+        "code_objects": code_objects_offset,
+        "length": length_offset,
+        "start_pc": start_pc_offset,
+        "end_pc": end_pc_offset,
+        "instance_size": instance_size,
+    }
+    for field, value in expected.items():
+        actual = int(layout[field])
+        if actual != value:
+            raise ValueError(
+                f"{profile['name']}: manifest instructions_table.{field}=0x{actual:x} "
+                f"disagrees with source-proven {source_name} layout=0x{value:x}"
+            )
+    if end_pc_offset + pointer_size > instance_size:
+        raise ValueError(
+            f"{source_name}: InstructionsTable fields exceed source instance size"
         )
 
 
@@ -725,6 +790,7 @@ ABI_PROFILE_SECTIONS = (
     "type_arguments",
     "closure",
     "loading_unit",
+    "instructions_table",
     "transition",
 )
 
@@ -735,7 +801,7 @@ ABI_DOMAIN_FIELDS = {
         "thread.global_object_pool", "thread.isolate", "thread.isolate_group",
         "isolate_group.class_table", "isolate_group.cached_class_table_table",
         "isolate_group.object_store", "class_table.num_cids", "object_store.libraries",
-        "object_store.loading_units",
+        "object_store.loading_units", "object_store.instructions_tables",
         "code.object_pool", "code.owner", "code.instructions_length", "function.name",
         "function.owner", "function.code", "class.name", "class.functions",
         "class.library", "library.url", "library.toplevel_class",
@@ -780,6 +846,9 @@ ABI_DOMAIN_FIELDS = {
         "type_arguments.types", "closure.function", "loading_unit.cid", "loading_unit.parent",
         "loading_unit.base_objects", "loading_unit.instructions_image",
         "loading_unit.packed_fields", "loading_unit.instance_size",
+        "instructions_table.cid", "instructions_table.code_objects",
+        "instructions_table.length", "instructions_table.start_pc",
+        "instructions_table.end_pc", "instructions_table.instance_size",
     ),
     "transition": (
         "thread.enter_safepoint_stub", "thread.exit_safepoint_stub",
@@ -932,6 +1001,7 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("raw_object.class_id_tag_bits", "profile.raw_object.class_id_tag_bits"),
         ("raw_object.compressed_word_size", "profile.raw_object.compressed_word_size"),
         ("object_store.loading_units", "profile.live_vm.object_store_loading_units_offset"),
+        ("object_store.instructions_tables", "profile.instructions_table.object_store_offset"),
         ("array.length", "profile.live_vm.array_length_offset"),
         ("array.elements", "profile.live_vm.array_elements_offset"),
         ("loading_unit.cid", "profile.loading_unit.cid"),
@@ -940,6 +1010,12 @@ CAPABILITY_FINGERPRINT_FIELDS = {
         ("loading_unit.instructions_image", "profile.loading_unit.instructions_image_offset"),
         ("loading_unit.packed_fields", "profile.loading_unit.packed_fields_offset"),
         ("loading_unit.instance_size", "profile.loading_unit.instance_size"),
+        ("instructions_table.cid", "profile.instructions_table.cid"),
+        ("instructions_table.code_objects", "profile.instructions_table.code_objects_offset"),
+        ("instructions_table.length", "profile.instructions_table.length_offset"),
+        ("instructions_table.start_pc", "profile.instructions_table.start_pc_offset"),
+        ("instructions_table.end_pc", "profile.instructions_table.end_pc_offset"),
+        ("instructions_table.instance_size", "profile.instructions_table.instance_size"),
         ("cids.class", "profile.live_vm.cid_class"),
         ("cids.function", "profile.live_vm.cid_function"),
         ("cids.library", "profile.live_vm.cid_library"),
@@ -1236,6 +1312,7 @@ def _verify_class_ids(profile: dict[str, object], class_id_text: str) -> None:
         "TwoByteStringCid": int(cids["two_byte_string"]),
         "TypeArgumentsCid": int(profile["type_arguments"]["cid"]),
         "LoadingUnitCid": int(profile["loading_unit"]["cid"]),
+        "InstructionsTableCid": int(profile["instructions_table"]["cid"]),
         "BoolCid": int(profile["canonical_bool"]["cid"]),
         "TypeCid": int(function_type["cid_type"]),
         "FunctionTypeCid": int(function_type["cid_function_type"]),
@@ -1916,6 +1993,12 @@ def verify_historical_profiles(sdk_root: Path, profiles: list[dict[str, object]]
             raw_object,
             source_name=f"Dart SDK {version}",
         )
+        _verify_instructions_table_layout_contract(
+            profile,
+            runtime_offsets,
+            raw_object,
+            source_name=f"Dart SDK {version}",
+        )
         _verify_class_raw_layout_contract(
             profile, raw_object, source_name=f"Dart SDK {version}"
         )
@@ -2361,6 +2444,7 @@ def _render_profile(profile: dict[str, object]) -> str:
     type_arguments = profile["type_arguments"]
     closure = profile["closure"]
     loading_unit = profile["loading_unit"]
+    instructions_table = profile["instructions_table"]
     transition = profile["transition"]
     gp_args = ", ".join(str(value) for value in r["dart_gp_args"])
     fpu_args = ", ".join(str(value) for value in r["dart_fpu_args"])
@@ -2529,6 +2613,15 @@ def _render_profile(profile: dict[str, object]) -> str:
             .instructions_image_offset = {_u(int(loading_unit['instructions_image']))},
             .packed_fields_offset = {_u(int(loading_unit['packed_fields']))},
             .instance_size = {_u(int(loading_unit['instance_size']))},
+        }},
+        .instructions_table = {{
+            .object_store_offset = {_u(int(profile['object_store']['instructions_tables']))},
+            .cid = {instructions_table['cid']}u,
+            .code_objects_offset = {_u(int(instructions_table['code_objects']))},
+            .length_offset = {_u(int(instructions_table['length']))},
+            .start_pc_offset = {_u(int(instructions_table['start_pc']))},
+            .end_pc_offset = {_u(int(instructions_table['end_pc']))},
+            .instance_size = {_u(int(instructions_table['instance_size']))},
         }},
         .transition = {{
             .vm_tag_dart = {transition['vm_tag_dart']}u,

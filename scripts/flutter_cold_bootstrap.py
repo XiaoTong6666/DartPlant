@@ -169,6 +169,7 @@ def _assemble_deferred_fixture_apks(
     run(
         [
             str(FIXTURE_DIR / "android" / "gradlew"),
+            "--no-build-cache",
             "-q",
             "-Ptarget-platform=android-arm64",
             "-Ptarget=lib/main.dart",
@@ -322,7 +323,8 @@ def _build_fixture(
     # Dart AOT or APK contents.
     gradle_opts = build_env.get("GRADLE_OPTS", "").strip()
     deterministic_gradle_opts = (
-        "-Dorg.gradle.vfs.watch=false -Dorg.gradle.daemon=false"
+        "-Dorg.gradle.vfs.watch=false -Dorg.gradle.daemon=false "
+        "-Dorg.gradle.caching=false"
     )
     build_env["GRADLE_OPTS"] = " ".join(
         part for part in (gradle_opts, deterministic_gradle_opts) if part
@@ -580,6 +582,7 @@ def _build_fixture(
     # intermediates to be regenerated; Dart source/app.dill stay untouched and
     # deterministic libapp.so remains the exact artifact to which the sidecars
     # above were bound.
+    expected_libapp = libapp.read_bytes()
     shutil.rmtree(FIXTURE_DIR / "android" / "app" / ".cxx", ignore_errors=True)
     shutil.rmtree(FIXTURE_DIR / "build" / "app" / "intermediates" / "cxx", ignore_errors=True)
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
@@ -596,7 +599,7 @@ def _build_fixture(
             build_mode=build_mode,
             aab_path=aab_path,
         )
-    if rebuilt_libapp != libapp.read_bytes():
+    if rebuilt_libapp != expected_libapp:
         raise RuntimeError(
             "second-stage native fixture rebuild changed libapp.so; generated sidecar is stale"
         )
@@ -729,6 +732,20 @@ def _structured_events(logs: str, event_name: str) -> list[dict[str, object]]:
     return events
 
 
+def _runtime_matches_toolchain(logs: str, toolchain: FlutterToolchain) -> bool:
+    runtime_events = _structured_events(logs, "runtime")
+    if not runtime_events:
+        return False
+    runtime = runtime_events[-1]
+    return (
+        runtime.get("flutter") == toolchain.flutter_version
+        and runtime.get("dart") == toolchain.dart_version
+        and runtime.get("dart_runtime") == toolchain.dart_version
+        and runtime.get("abi") == "arm64-v8a"
+        and runtime.get("dart_ffi_abi") == "android_arm64"
+    )
+
+
 def _log_line_contains_markers(logs: str, prefix: str, markers: tuple[str, ...]) -> bool:
     for line in logs.splitlines():
         if prefix in line:
@@ -764,7 +781,11 @@ def _required_ordinary_source_markers(build_mode: str) -> tuple[str, ...]:
 
 
 def _validate_round(
-    serial: str, round_index: int, timeout_seconds: float, build_mode: str
+    serial: str,
+    round_index: int,
+    timeout_seconds: float,
+    build_mode: str,
+    toolchain: FlutterToolchain,
 ) -> ColdStartResult:
     run(adb_cmd(["logcat", "-c"], device=serial))
     run(adb_cmd(["shell", "am", "force-stop", PACKAGE], device=serial))
@@ -789,6 +810,12 @@ def _validate_round(
     if not pid:
         raise RuntimeError(f"cold start {round_index}: fixture process is not running")
     logs = _wait_for_logs(serial, pid, timeout_seconds)
+
+    if not _runtime_matches_toolchain(logs, toolchain):
+        raise RuntimeError(
+            f"cold start {round_index}: installed AOT runtime does not match requested "
+            f"Flutter {toolchain.flutter_version} / Dart {toolchain.dart_version}\n{logs}"
+        )
 
     bootstrap_match = _BOOTSTRAP_RE.search(logs)
     if bootstrap_match is None:
@@ -1179,10 +1206,14 @@ def run_flutter_cold_bootstrap_test(
         raise ValueError("timeout must be greater than zero")
     build_mode = _normalize_flutter_mode(build_mode)
 
+    flutter_bin = _resolve_flutter(flutter)
+    toolchain = _detect_flutter_toolchain(flutter_bin)
     if build:
-        build_flutter_fixture(
+        built_toolchain = build_flutter_fixture(
             flutter=flutter, dobby_root=dobby_root, build_mode=build_mode
         )
+        if built_toolchain != toolchain:
+            raise RuntimeError("Flutter toolchain changed while building the fixture")
     apk_path = flutter_fixture_apk_path(build_mode)
     deferred_apk_path = flutter_fixture_deferred_apk_path(build_mode)
     if not apk_path.is_file():
@@ -1194,7 +1225,11 @@ def run_flutter_cold_bootstrap_test(
     _assert_no_packaged_runtime_metadata(apk_path)
     _assert_no_packaged_runtime_metadata(deferred_apk_path)
 
-    serial = find_arm64_device(device)
+    # Cold-bootstrap validates the ARM64 Dart/Flutter runtime itself. An x86_64
+    # Android guest is therefore usable when Android explicitly advertises
+    # arm64-v8a in ro.product.cpu.abilist and supplies native translation. Keep
+    # the stricter native-only gate for device/core tests in util.test_device().
+    serial = find_arm64_device(device, allow_translated=True)
     sp.run(
         adb_cmd(["uninstall", PACKAGE], device=serial),
         check=False,
@@ -1210,7 +1245,7 @@ def run_flutter_cold_bootstrap_test(
     )
 
     results = [
-        _validate_round(serial, index, timeout_seconds, build_mode)
+        _validate_round(serial, index, timeout_seconds, build_mode, toolchain)
         for index in range(1, rounds + 1)
     ]
     sampled = [result.sampled for result in results]

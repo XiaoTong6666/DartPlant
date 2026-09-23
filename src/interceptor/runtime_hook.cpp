@@ -216,11 +216,14 @@ extern "C" DartPlantStatus dartplant_runtime_add_listener(DartPlantRuntime* runt
                           "method belongs to a stale or different runtime generation");
     }
     const uint64_t generation = runtime->generation->load(std::memory_order_acquire);
+    const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
 
     DartPlantStatus status = dartplant::AddCallbackListenerForMethod(
-        method, *options, priority, out_listener, runtime->generation, generation);
+        method, *options, priority, out_listener, runtime->generation, generation,
+        dartplant::RuntimeIsolateGroup(runtime).live_vm_null_value,
+        dartplant::RuntimeIsolateGroup(runtime).live_vm_bool_true_value,
+        dartplant::RuntimeIsolateGroup(runtime).live_vm_bool_false_value, call_layout);
     if (status == DARTPLANT_NOT_INITIALIZED) {
-        const auto call_layout = dartplant::FindRuntimeCallLayoutLocked(runtime, method);
         status = dartplant::InstallCallbackHook(
             method, runtime->profile.profile, *options, priority, nullptr, out_listener,
             dartplant::RuntimeIsolateGroup(runtime).live_vm_null_value, runtime->generation,
@@ -248,6 +251,7 @@ extern "C" DartPlantStatus dartplant_remove_listener(DartPlantListener* listener
         remove_hook =
             hook->listeners.empty() && hook->state == dartplant::HookRecordState::kInstalled;
     }
+    dartplant::ReleaseListenerVmAdapterIfIdle(listener->record);
     return remove_hook ? dartplant::RemoveHook(hook) : DARTPLANT_OK;
 }
 

@@ -190,6 +190,11 @@ typedef struct DartPlantLiveVmFunctionInfo {
     uint32_t struct_size;
     uint32_t entry_alias_count;
 
+    // Raw GC-managed heap receipts. Direct live-enumeration visitors may see
+    // these while their observation window is valid. A runtime-published
+    // cached Function index deliberately returns zero here after converting
+    // the record into an immutable semantic/RuntimeImage receipt; callers must
+    // not use these addresses as persistent Function/Code identity.
     uint64_t function;
     uint64_t code;
     uint64_t code_object_pool;
@@ -246,6 +251,17 @@ typedef struct DartPlantLiveVmFunctionInfo {
     uint64_t engine_incarnation_epoch;
     uint64_t isolate_group_incarnation_epoch;
     uint64_t runtime_generation;
+
+    // V5 append-only stable owner slot. Ordinary Classes use their ClassTable
+    // slot id; top-level Classes use a disjoint encoded ObjectStore.libraries
+    // slot because they are not required to appear in ClassTable. Deferred
+    // implicit/synthetic Functions that are absent from Class.functions use a
+    // second disjoint encoded loading-unit owner id plus the source-verified
+    // InstructionsTable.code_objects[] index. This is not the Class object's
+    // header CID. The pair is an immutable semantic slot receipt and survives
+    // moving GC without retaining a raw FunctionPtr/CodePtr.
+    uint32_t owner_class_id;
+    uint32_t owner_function_index;
 } DartPlantLiveVmFunctionInfo;
 
 typedef struct DartPlantLiveVmFunctionIndexInfo {

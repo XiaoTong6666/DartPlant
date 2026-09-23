@@ -239,12 +239,11 @@ bool ResultIsTagged(const DartPlantInvocation* invocation) {
 }
 
 uint64_t ActiveValidatedNullValue(const DartPlantInvocation* invocation) {
-    if (invocation == nullptr || invocation->hook == nullptr ||
-        invocation->hook->runtime_generation == nullptr) {
+    if (invocation == nullptr || invocation->runtime_generation == nullptr) {
         return invocation == nullptr ? 0 : invocation->validated_null_value;
     }
-    return invocation->hook->runtime_generation->load(std::memory_order_acquire) ==
-                   invocation->hook->expected_runtime_generation
+    return invocation->runtime_generation->load(std::memory_order_acquire) ==
+                   invocation->expected_runtime_generation
                ? invocation->validated_null_value
                : 0;
 }
@@ -252,9 +251,9 @@ uint64_t ActiveValidatedNullValue(const DartPlantInvocation* invocation) {
 bool ActiveValidatedBoolValues(const DartPlantInvocation* invocation, uint64_t* out_true,
                                uint64_t* out_false) {
     if (invocation == nullptr || out_true == nullptr || out_false == nullptr) return false;
-    if (invocation->hook != nullptr && invocation->hook->runtime_generation != nullptr &&
-        invocation->hook->runtime_generation->load(std::memory_order_acquire) !=
-            invocation->hook->expected_runtime_generation) {
+    if (invocation->runtime_generation != nullptr &&
+        invocation->runtime_generation->load(std::memory_order_acquire) !=
+            invocation->expected_runtime_generation) {
         return false;
     }
     const uint64_t bool_true = invocation->validated_bool_true_value;

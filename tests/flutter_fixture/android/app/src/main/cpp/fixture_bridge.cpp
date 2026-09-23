@@ -135,6 +135,11 @@ struct MultiOwnerObservation {
 std::mutex g_multi_owner_mutex;
 std::array<MultiOwnerObservation, 4> g_multi_owner_observations{};
 DartPlantMethod* g_multi_owner_retained_b_method = nullptr;
+DartPlantListener* g_multi_owner_listener = nullptr;
+std::atomic<uint32_t> g_multi_owner_listener_label{0};
+std::atomic<uint64_t> g_multi_owner_listener_enter{0};
+std::atomic<uint64_t> g_multi_owner_listener_leave{0};
+std::atomic_bool g_multi_owner_listener_logical_target_ok{false};
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
@@ -554,6 +559,26 @@ void OnInstrumentedAddLeave(DartPlantInvocation* invocation, void*) {
     }
     g_instrumented_add_last_result.store(result.raw, std::memory_order_relaxed);
     g_instrumented_add_leave.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnMultiOwnerListenerEnter(DartPlantInvocation* invocation, void*) {
+    const DartPlantMethod* requested = dartplant_invocation_requested_method(invocation);
+    const auto* logical_target = requested == nullptr || requested->function == nullptr
+                                     ? nullptr
+                                     : requested->function->code_target.get();
+    const auto* physical_target =
+        g_instrumented_add_hook == nullptr ? nullptr : g_instrumented_add_hook->code_target.get();
+    const bool logical_target_ok =
+        logical_target != nullptr && physical_target != nullptr &&
+        logical_target != physical_target && logical_target->entry == physical_target->entry &&
+        logical_target->payload != nullptr && physical_target->payload != nullptr &&
+        logical_target->payload.get() != physical_target->payload.get();
+    g_multi_owner_listener_logical_target_ok.store(logical_target_ok, std::memory_order_release);
+    g_multi_owner_listener_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnMultiOwnerListenerLeave(DartPlantInvocation*, void*) {
+    g_multi_owner_listener_leave.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnEchoObjectEnter(DartPlantInvocation* invocation, void*) {
@@ -1534,11 +1559,11 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
     bool indexed_echo_object = false;
     bool indexed_closure_entry_proof = false;
     uint64_t indexed_entry_va = 0;
-    uint64_t instrumented_function_object = 0;
-    uint64_t instrumented_code_object = 0;
+    uint32_t instrumented_owner_class_id = 0;
+    uint32_t instrumented_owner_function_index = UINT32_MAX;
     uint64_t instrumented_runtime_entry = 0;
-    uint64_t add_int_function_object = 0;
-    uint64_t add_int_code_object = 0;
+    uint32_t add_int_owner_class_id = 0;
+    uint32_t add_int_owner_function_index = UINT32_MAX;
     uint64_t add_int_runtime_entry = 0;
     for (uint32_t position = 0; position < function_index.function_count; ++position) {
         DartPlantLiveVmFunctionInfo function{};
@@ -1565,7 +1590,9 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
                 static_cast<unsigned long long>(function.code_monomorphic_entry_point),
                 static_cast<unsigned long long>(function.code_monomorphic_unchecked_entry_point));
             indexed_instrumented_add =
-                function.function != 0 && function.code != 0 && function.code_size != 0 &&
+                function.function == 0 && function.code == 0 && function.code_object_pool == 0 &&
+                function.owner_class == 0 && function.library == 0 && function.code_size != 0 &&
+                function.owner_class_id != 0 && function.owner_function_index != UINT32_MAX &&
                 function.entry_alias_count == expected_instrumented_aliases &&
                 function.entry_va + g_snapshot_info.load_bias == function.function_entry_point &&
                 function.entry_kind_mask == 0x0f &&
@@ -1574,34 +1601,38 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
                 function.code_monomorphic_entry_point != 0 &&
                 function.code_monomorphic_unchecked_entry_point != 0;
             indexed_entry_va = function.entry_va;
-            instrumented_function_object = function.function;
-            instrumented_code_object = function.code;
+            instrumented_owner_class_id = function.owner_class_id;
+            instrumented_owner_function_index = function.owner_function_index;
             instrumented_runtime_entry = function.function_entry_point;
         }
         if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
             std::strcmp(function.class_name, "DartPlantFixture") == 0 &&
             std::strcmp(function.function_name, "addInt") == 0) {
-            indexed_add_int = function.function != 0 && function.code != 0 &&
-                              function.code_size != 0 &&
-                              function.entry_alias_count == expected_instrumented_aliases &&
-                              function.function_entry_point == function.code_entry_point;
-            add_int_function_object = function.function;
-            add_int_code_object = function.code;
+            indexed_add_int =
+                function.function == 0 && function.code == 0 && function.code_object_pool == 0 &&
+                function.owner_class == 0 && function.library == 0 && function.code_size != 0 &&
+                function.owner_class_id != 0 && function.owner_function_index != UINT32_MAX &&
+                function.entry_alias_count == expected_instrumented_aliases &&
+                function.function_entry_point == function.code_entry_point;
+            add_int_owner_class_id = function.owner_class_id;
+            add_int_owner_function_index = function.owner_function_index;
             add_int_runtime_entry = function.function_entry_point;
             __android_log_print(
                 ANDROID_LOG_INFO, kTag,
-                "entry-family addInt aliases=%u expected=%u dedup=%u function=0x%llx code=0x%llx entry=0x%llx",
+                "entry-family addInt aliases=%u expected=%u dedup=%u owner_slot=%u/%u entry=0x%llx",
                 function.entry_alias_count, expected_instrumented_aliases,
-                static_cast<unsigned>(dedup_instructions),
-                static_cast<unsigned long long>(function.function),
-                static_cast<unsigned long long>(function.code),
+                static_cast<unsigned>(dedup_instructions), function.owner_class_id,
+                function.owner_function_index,
                 static_cast<unsigned long long>(function.function_entry_point));
         }
         if (std::strcmp(function.library_uri, "package:dartplant_fixture/main.dart") == 0 &&
             std::strcmp(function.class_name, "Global") == 0 &&
             std::strcmp(function.function_name, "nullableEchoObject") == 0) {
-            indexed_echo_object = function.function != 0 && function.code != 0 &&
-                                  function.code_size != 0 && function.entry_alias_count == 1;
+            indexed_echo_object =
+                function.function == 0 && function.code == 0 && function.code_object_pool == 0 &&
+                function.owner_class == 0 && function.library == 0 && function.code_size != 0 &&
+                function.owner_class_id != 0 && function.owner_function_index != UINT32_MAX &&
+                function.entry_alias_count == 1;
         }
         if (function.function_kind == 1 || function.function_kind == 2) {
             __android_log_print(
@@ -1669,23 +1700,21 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         }
         ++decoded_pool_entries;
     }
+    const bool distinct_stable_owner_slots =
+        instrumented_owner_class_id != add_int_owner_class_id ||
+        instrumented_owner_function_index != add_int_owner_function_index;
     const bool producer_identity_ok =
-        indexed_add_int && instrumented_function_object != add_int_function_object &&
-        (dedup_instructions ? (instrumented_code_object == add_int_code_object &&
-                               instrumented_runtime_entry == add_int_runtime_entry)
-                            : (instrumented_code_object != add_int_code_object &&
-                               instrumented_runtime_entry != add_int_runtime_entry));
+        indexed_add_int && distinct_stable_owner_slots &&
+        (dedup_instructions ? instrumented_runtime_entry == add_int_runtime_entry
+                            : instrumented_runtime_entry != add_int_runtime_entry);
     if (!indexed_instrumented_add || !indexed_echo_object || !producer_identity_ok) {
         __android_log_print(
             ANDROID_LOG_ERROR, kTag,
-            "live FunctionInfo producer verification instrumented=%u add_int=%u echo=%u identity=%u dedup=%u instrumented_fn=0x%llx add_int_fn=0x%llx instrumented_code=0x%llx add_int_code=0x%llx instrumented_entry=0x%llx add_int_entry=0x%llx",
+            "live FunctionInfo producer verification instrumented=%u add_int=%u echo=%u identity=%u dedup=%u instrumented_slot=%u/%u add_int_slot=%u/%u instrumented_entry=0x%llx add_int_entry=0x%llx",
             static_cast<unsigned>(indexed_instrumented_add), static_cast<unsigned>(indexed_add_int),
             static_cast<unsigned>(indexed_echo_object), static_cast<unsigned>(producer_identity_ok),
-            static_cast<unsigned>(dedup_instructions),
-            static_cast<unsigned long long>(instrumented_function_object),
-            static_cast<unsigned long long>(add_int_function_object),
-            static_cast<unsigned long long>(instrumented_code_object),
-            static_cast<unsigned long long>(add_int_code_object),
+            static_cast<unsigned>(dedup_instructions), instrumented_owner_class_id,
+            instrumented_owner_function_index, add_int_owner_class_id, add_int_owner_function_index,
             static_cast<unsigned long long>(instrumented_runtime_entry),
             static_cast<unsigned long long>(add_int_runtime_entry));
         LogFailure("live FunctionInfo entry verification");
@@ -1780,13 +1809,15 @@ void CompleteBootstrap(DartPlantStatus bootstrap_status, DartPlantLiveVmBootstra
         add_int_status == DARTPLANT_OK && g_add_int != nullptr && g_add_int->function != nullptr &&
         g_add_int->function->code_target != nullptr && g_instrumented_add->function != nullptr &&
         g_instrumented_add->function->code_target != nullptr &&
-        g_add_int->function->function_object != g_instrumented_add->function->function_object &&
+        g_add_int->function->function_object == 0 && g_add_int->function->code_object == 0 &&
+        g_instrumented_add->function->function_object == 0 &&
+        g_instrumented_add->function->code_object == 0 &&
+        !dartplant::SameLogicalFunctionIdentity(g_add_int->function->identity,
+                                                g_instrumented_add->function->identity) &&
         (dedup_instructions
-             ? (g_add_int->function->code_object == g_instrumented_add->function->code_object &&
-                g_add_int->function->code_target == g_instrumented_add->function->code_target &&
+             ? (g_add_int->function->code_target == g_instrumented_add->function->code_target &&
                 g_add_int->function->code_target->IsShared())
-             : (g_add_int->function->code_object != g_instrumented_add->function->code_object &&
-                g_add_int->function->code_target != g_instrumented_add->function->code_target &&
+             : (g_add_int->function->code_target != g_instrumented_add->function->code_target &&
                 !g_add_int->function->code_target->IsShared() &&
                 !g_instrumented_add->function->code_target->IsShared()));
     if (!add_int_model_ok) {
@@ -2171,6 +2202,13 @@ uint64_t ActivateMultiOwnerForRegisters(uint32_t label, uint64_t null_value, uin
     return passed ? observation.group_epoch : 0;
 }
 
+void ReleaseMultiOwnerListener() {
+    if (g_multi_owner_listener == nullptr) return;
+    (void) dartplant_remove_listener(g_multi_owner_listener);
+    dartplant_release_listener(g_multi_owner_listener);
+    g_multi_owner_listener = nullptr;
+}
+
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) void dartplant_fixture_begin_object_probe() {
@@ -2202,6 +2240,81 @@ dartplant_fixture_reset_instrumented_add_probe() {
     g_shared_identity_ambiguous_seen.store(false, std::memory_order_release);
     g_add_int_listener_enter.store(0, std::memory_order_relaxed);
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_install_listener(uint32_t label) {
+    if (g_runtime == nullptr || g_instrumented_add_hook == nullptr || label == 0 ||
+        label >= g_multi_owner_observations.size()) {
+        return 0;
+    }
+    ReleaseMultiOwnerListener();
+    g_multi_owner_listener_label.store(label, std::memory_order_release);
+    g_multi_owner_listener_enter.store(0, std::memory_order_relaxed);
+    g_multi_owner_listener_leave.store(0, std::memory_order_relaxed);
+    g_multi_owner_listener_logical_target_ok.store(false, std::memory_order_release);
+
+    DartPlantMethod* method = nullptr;
+    if (!FindLiveTopLevelMethod("instrumentedAdd", &method) || method == nullptr ||
+        method->function == nullptr || method->function->code_target == nullptr ||
+        method->function->code_target->payload == nullptr ||
+        g_instrumented_add_hook->code_target == nullptr ||
+        g_instrumented_add_hook->code_target->payload == nullptr) {
+        if (method != nullptr) dartplant_release_method(method);
+        return 0;
+    }
+    const bool distinct_logical_target =
+        method->function->code_target.get() != g_instrumented_add_hook->code_target.get() &&
+        method->function->code_target->entry == g_instrumented_add_hook->code_target->entry &&
+        method->function->code_target->payload.get() !=
+            g_instrumented_add_hook->code_target->payload.get();
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
+        .on_enter = OnMultiOwnerListenerEnter,
+        .on_leave = OnMultiOwnerListenerLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    const DartPlantStatus status =
+        distinct_logical_target ? dartplant_runtime_add_listener(g_runtime, method, &options, 100,
+                                                                 &g_multi_owner_listener)
+                                : DARTPLANT_RUNTIME_NOT_READY;
+    const uint64_t group_epoch = method->function->owner.isolate_group_incarnation_epoch;
+    dartplant_release_method(method);
+    const bool installed = status == DARTPLANT_OK && g_multi_owner_listener != nullptr;
+    if (!installed) ReleaseMultiOwnerListener();
+    __android_log_print(installed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"multi_owner_listener_install\",\"state\":\"%s\","
+                        "\"label\":%u,\"status\":%d,\"group_epoch\":%llu,\"distinct_target\":%u}",
+                        installed ? "pass" : "fail", label, status,
+                        static_cast<unsigned long long>(group_epoch),
+                        static_cast<unsigned>(distinct_logical_target));
+    return installed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_listener_probe(uint32_t label) {
+    const uint64_t enter = g_multi_owner_listener_enter.load(std::memory_order_relaxed);
+    const uint64_t leave = g_multi_owner_listener_leave.load(std::memory_order_relaxed);
+    const bool target_ok = g_multi_owner_listener_logical_target_ok.load(std::memory_order_acquire);
+    const bool label_ok = g_multi_owner_listener_label.load(std::memory_order_acquire) == label;
+    const bool listener_idle =
+        g_multi_owner_listener != nullptr && g_multi_owner_listener->record != nullptr &&
+        g_multi_owner_listener->record->in_flight.load(std::memory_order_acquire) == 0;
+    const bool hook_idle =
+        g_instrumented_add_hook != nullptr && g_instrumented_add_hook->in_flight == 0;
+    const bool passed =
+        label_ok && enter == 1 && leave == 1 && target_ok && listener_idle && hook_idle;
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"multi_owner_listener_return\",\"state\":\"%s\","
+                        "\"label\":%u,\"enter\":%llu,\"leave\":%llu,\"distinct_target\":%u,"
+                        "\"listener_idle\":%u,\"hook_idle\":%u}",
+                        passed ? "pass" : "fail", label, static_cast<unsigned long long>(enter),
+                        static_cast<unsigned long long>(leave), static_cast<unsigned>(target_ok),
+                        static_cast<unsigned>(listener_idle), static_cast<unsigned>(hook_idle));
+    ReleaseMultiOwnerListener();
+    return passed ? 1 : 0;
 }
 
 extern "C" __attribute__((visibility("default"))) void
@@ -2398,21 +2511,20 @@ dartplant_fixture_instrumented_add_probe() {
     const bool common_model_ok =
         lookup_ok && bootstrap_function != nullptr && add_int_function != nullptr &&
         bootstrap_target != nullptr && add_int_target != nullptr &&
-        bootstrap_function->function_object != 0 && add_int_function->function_object != 0 &&
-        bootstrap_function->function_object != add_int_function->function_object &&
-        bootstrap_function->code_object != 0 && add_int_function->code_object != 0 &&
+        bootstrap_function->function_object == 0 && add_int_function->function_object == 0 &&
+        bootstrap_function->code_object == 0 && add_int_function->code_object == 0 &&
+        !dartplant::SameLogicalFunctionIdentity(bootstrap_function->identity,
+                                                add_int_function->identity) &&
         shared_policy_ok && g_instrumented_add_hook != nullptr &&
         g_instrumented_add_hook->code_target == bootstrap_target &&
         bootstrap_target->HookRecord() == g_instrumented_add_hook;
     const bool model_ok =
         common_model_ok &&
         (expect_dedup
-             ? (bootstrap_function->code_object == add_int_function->code_object &&
-                bootstrap_target == add_int_target && bootstrap_target->IsShared() &&
+             ? (bootstrap_target == add_int_target && bootstrap_target->IsShared() &&
                 bootstrap_target->AliasCount() == 2 && bootstrap_target->KnownAliasCount() == 2 &&
                 ambiguous_seen && add_int_listener_enter == enter && add_int_listener_identity_ok)
-             : (bootstrap_function->code_object != add_int_function->code_object &&
-                bootstrap_target != add_int_target && !bootstrap_target->IsShared() &&
+             : (bootstrap_target != add_int_target && !bootstrap_target->IsShared() &&
                 !add_int_target->IsShared() && bootstrap_target->AliasCount() == 1 &&
                 add_int_target->AliasCount() == 1 && bootstrap_target->KnownAliasCount() == 1 &&
                 add_int_target->KnownAliasCount() == 1 && !ambiguous_seen &&
@@ -3358,6 +3470,11 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_add_int_listener_identity_ok.store(false, std::memory_order_release);
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
     g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
+    ReleaseMultiOwnerListener();
+    g_multi_owner_listener_label.store(0, std::memory_order_release);
+    g_multi_owner_listener_enter.store(0, std::memory_order_relaxed);
+    g_multi_owner_listener_leave.store(0, std::memory_order_relaxed);
+    g_multi_owner_listener_logical_target_ok.store(false, std::memory_order_release);
     {
         std::lock_guard lock(g_multi_owner_mutex);
         g_multi_owner_observations = {};
@@ -3452,6 +3569,7 @@ extern "C" __attribute__((visibility("default"))) int dartplant_fixture_initiali
 
 extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdown() {
     if (g_cold_bootstrap_thread.joinable()) g_cold_bootstrap_thread.join();
+    ReleaseMultiOwnerListener();
     if (g_weak_object_handle != nullptr) {
         dartplant_object_release(g_weak_object_handle);
         g_weak_object_handle = nullptr;

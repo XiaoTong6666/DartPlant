@@ -176,6 +176,16 @@ final class DartPlantNative {
         'dartplant_fixture_multi_owner_deferred',
       )
       .asFunction();
+  static final _MultiOwnerDart _multiOwnerInstallListener = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_install_listener',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerListenerProbe = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_listener_probe',
+      )
+      .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
       _exceptionBridgeLifetimeInstall = _library
           .lookup<NativeFunction<_ExceptionBridgeLifetimeInstallNative>>(
@@ -343,6 +353,12 @@ final class DartPlantNative {
   static int multiOwnerActivate(int label) => _multiOwnerActivate(label);
 
   static int multiOwnerDeferred(int label) => _multiOwnerDeferred(label);
+
+  static int multiOwnerInstallListener(int label) =>
+      _multiOwnerInstallListener(label);
+
+  static int multiOwnerListenerProbe(int label) =>
+      _multiOwnerListenerProbe(label);
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

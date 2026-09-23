@@ -195,6 +195,7 @@ inline void AppendDeferredLoadingUnitLayoutFields(std::string& key, const Runtim
     AppendCapabilityValue(key, profile.raw_object.class_id_tag_bits);  // raw_object.class_id_tag_bits
     AppendCapabilityValue(key, profile.raw_object.compressed_word_size);  // raw_object.compressed_word_size
     AppendCapabilityValue(key, profile.live_vm.object_store_loading_units_offset);  // object_store.loading_units
+    AppendCapabilityValue(key, profile.instructions_table.object_store_offset);  // object_store.instructions_tables
     AppendCapabilityValue(key, profile.live_vm.array_length_offset);  // array.length
     AppendCapabilityValue(key, profile.live_vm.array_elements_offset);  // array.elements
     AppendCapabilityValue(key, profile.loading_unit.cid);  // loading_unit.cid
@@ -203,6 +204,12 @@ inline void AppendDeferredLoadingUnitLayoutFields(std::string& key, const Runtim
     AppendCapabilityValue(key, profile.loading_unit.instructions_image_offset);  // loading_unit.instructions_image
     AppendCapabilityValue(key, profile.loading_unit.packed_fields_offset);  // loading_unit.packed_fields
     AppendCapabilityValue(key, profile.loading_unit.instance_size);  // loading_unit.instance_size
+    AppendCapabilityValue(key, profile.instructions_table.cid);  // instructions_table.cid
+    AppendCapabilityValue(key, profile.instructions_table.code_objects_offset);  // instructions_table.code_objects
+    AppendCapabilityValue(key, profile.instructions_table.length_offset);  // instructions_table.length
+    AppendCapabilityValue(key, profile.instructions_table.start_pc_offset);  // instructions_table.start_pc
+    AppendCapabilityValue(key, profile.instructions_table.end_pc_offset);  // instructions_table.end_pc
+    AppendCapabilityValue(key, profile.instructions_table.instance_size);  // instructions_table.instance_size
     AppendCapabilityValue(key, profile.live_vm.cid_class);  // cids.class
     AppendCapabilityValue(key, profile.live_vm.cid_function);  // cids.function
     AppendCapabilityValue(key, profile.live_vm.cid_library);  // cids.library

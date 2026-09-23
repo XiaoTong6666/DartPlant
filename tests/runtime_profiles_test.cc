@@ -172,16 +172,16 @@ TEST_CASE(RuntimeProfileCandidatesDistinguishProductAndNonProductWithSameSnapsho
 
 TEST_CASE(RuntimeProfileAbiIdentityTracksPrivateLayoutNotArtifactIdentity) {
     const auto* profiles = dartplant::RuntimeProfiles();
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-2432db822658411fcc790446",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-3d4873fd60ab8c3cb14dcc80",
               std::string_view(profiles[0].abi_identity.full));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[1].abi_id));
     EXPECT_TRUE(std::string_view(profiles[0].abi_id) != std::string_view(profiles[2].abi_id));
     EXPECT_TRUE(std::string_view(profiles[1].abi_id) != std::string_view(profiles[2].abi_id));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-core-e1061561f58d7c038f469012",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-core-945ec13e0fa0bf5ceab275eb",
               std::string_view(profiles[0].abi_identity.core));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-call-273aebdc747bafdd341f2e18",
               std::string_view(profiles[0].abi_identity.call));
-    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-f0a0a6dd762c88ff15f4fe96",
+    EXPECT_EQ("dart-vm-arm64-product-compressed/abi-object-47eafc42d1ca14df28d8ec52",
               std::string_view(profiles[0].abi_identity.object));
     EXPECT_EQ("dart-vm-arm64-product-compressed/abi-transition-13e6a36c40f82036520fe423",
               std::string_view(profiles[0].abi_identity.transition));
@@ -222,6 +222,23 @@ TEST_CASE(RuntimeProfilesTrackVersionedLoadingUnitLayoutsExactly) {
     EXPECT_EQ(profiles[0].loading_unit.cid, profiles[3].loading_unit.cid);
     EXPECT_EQ(profiles[1].loading_unit.cid, profiles[4].loading_unit.cid);
     EXPECT_EQ(profiles[2].loading_unit.cid, profiles[5].loading_unit.cid);
+
+    EXPECT_EQ(0x7B8U, profiles[0].instructions_table.object_store_offset);
+    EXPECT_EQ(21U, profiles[0].instructions_table.cid);
+    EXPECT_EQ(8U, profiles[0].instructions_table.code_objects_offset);
+    EXPECT_EQ(16U, profiles[0].instructions_table.length_offset);
+    EXPECT_EQ(32U, profiles[0].instructions_table.start_pc_offset);
+    EXPECT_EQ(40U, profiles[0].instructions_table.end_pc_offset);
+    EXPECT_EQ(48U, profiles[0].instructions_table.instance_size);
+
+    EXPECT_EQ(0x7A0U, profiles[1].instructions_table.object_store_offset);
+    EXPECT_EQ(21U, profiles[1].instructions_table.cid);
+    EXPECT_EQ(0x810U, profiles[2].instructions_table.object_store_offset);
+    EXPECT_EQ(22U, profiles[2].instructions_table.cid);
+
+    EXPECT_EQ(profiles[0].instructions_table.cid, profiles[3].instructions_table.cid);
+    EXPECT_EQ(profiles[1].instructions_table.cid, profiles[4].instructions_table.cid);
+    EXPECT_EQ(profiles[2].instructions_table.cid, profiles[5].instructions_table.cid);
 }
 
 TEST_CASE(RuntimeProfileDomainCandidateSelectionIsIndependent) {
@@ -448,6 +465,13 @@ TEST_CASE(DeferredLoadingUnitCapabilityOwnsLoadingUnitPrivateLayout) {
         candidates, dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, {true, true});
     EXPECT_TRUE(deferred.ambiguous());
     EXPECT_EQ(2U, deferred.distinct_domain_sets);
+
+    profiles[1] = profiles[0];
+    profiles[1].instructions_table.code_objects_offset += sizeof(uint64_t);
+    const auto instructions_table = dartplant::vm_abi::SelectCapabilityAbiSet(
+        candidates, dartplant::vm_abi::kCapabilityDeferredLoadingUnitLayout, {true, true});
+    EXPECT_TRUE(instructions_table.ambiguous());
+    EXPECT_EQ(2U, instructions_table.distinct_domain_sets);
 }
 
 TEST_CASE(VmCapabilitySelectionRetainsEveryRowForTheSelectedKey) {

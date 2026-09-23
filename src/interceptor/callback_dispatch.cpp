@@ -30,6 +30,8 @@ uint64_t CanonicalNativePointer(uint64_t value) {
 #endif
 }
 
+void RefreshIdentityState(DartPlantInvocation* invocation);
+
 bool MethodOwnerMatchesCurrentIsolateGroup(const DartPlantMethod* method,
                                            const DartPlantArm64Context& context) {
     if (method == nullptr || method->function == nullptr) {
@@ -86,9 +88,85 @@ void FilterListenersForCurrentIsolateGroup(DartPlantInvocation* invocation,
         }
         if (listener != nullptr) {
             listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            dartplant::ReleaseListenerVmAdapterIfIdle(listener);
         }
     }
     listeners.erase(out, listeners.end());
+}
+
+bool SameExecutionBinding(const dartplant::DartPlantListenerRecord& left,
+                          const dartplant::DartPlantListenerRecord& right) {
+    if (left.vm_adapter != right.vm_adapter ||
+        left.runtime_generation != right.runtime_generation ||
+        left.expected_runtime_generation != right.expected_runtime_generation ||
+        left.validated_null_value != right.validated_null_value ||
+        left.validated_bool_true_value != right.validated_bool_true_value ||
+        left.validated_bool_false_value != right.validated_bool_false_value) {
+        return false;
+    }
+    if (left.exception_bridge_binding.verified != right.exception_bridge_binding.verified ||
+        left.exception_bridge_binding.target != right.exception_bridge_binding.target ||
+        left.exception_bridge_binding.thread_offset !=
+            right.exception_bridge_binding.thread_offset ||
+        left.exception_bridge_binding.artifact_generation !=
+            right.exception_bridge_binding.artifact_generation ||
+        left.exception_bridge_binding.isolate_generation !=
+            right.exception_bridge_binding.isolate_generation ||
+        left.exception_bridge_binding.profile_version !=
+            right.exception_bridge_binding.profile_version ||
+        left.exception_bridge_binding.abi_domain_key !=
+            right.exception_bridge_binding.abi_domain_key) {
+        return false;
+    }
+    if (left.call_layout == nullptr || right.call_layout == nullptr) {
+        return left.call_layout == nullptr && right.call_layout == nullptr;
+    }
+    return left.call_layout->vm_artifact_generation == right.call_layout->vm_artifact_generation &&
+           left.call_layout->vm_isolate_generation == right.call_layout->vm_isolate_generation &&
+           left.call_layout->vm_call_profile == right.call_layout->vm_call_profile &&
+           left.call_layout->vm_object_profile == right.call_layout->vm_object_profile;
+}
+
+std::shared_ptr<dartplant::DartPlantListenerRecord> BindInvocationToCurrentOwner(
+    DartPlantInvocation* invocation) {
+    if (invocation == nullptr || invocation->entered_listeners.empty()) return {};
+    const auto execution_listener = invocation->entered_listeners.front();
+    if (execution_listener == nullptr) return {};
+
+    auto& listeners = invocation->entered_listeners;
+    auto out = listeners.begin();
+    for (auto it = listeners.begin(); it != listeners.end(); ++it) {
+        const auto& listener = *it;
+        if (listener != nullptr && SameExecutionBinding(*execution_listener, *listener)) {
+            *out++ = listener;
+            continue;
+        }
+        if (listener != nullptr) {
+            listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            dartplant::ReleaseListenerVmAdapterIfIdle(listener);
+        }
+    }
+    listeners.erase(out, listeners.end());
+    if (listeners.empty()) return {};
+
+    invocation->requested_method = execution_listener->requested_method == nullptr
+                                       ? nullptr
+                                       : execution_listener->requested_method.get();
+    if (invocation->requested_method != nullptr &&
+        invocation->requested_method->function != nullptr &&
+        invocation->requested_method->function->code_target != nullptr) {
+        invocation->code_target = invocation->requested_method->function->code_target;
+        invocation->code_alias_snapshot = invocation->code_target->AliasSnapshot();
+    }
+    invocation->vm_adapter = execution_listener->vm_adapter;
+    invocation->runtime_generation = execution_listener->runtime_generation;
+    invocation->expected_runtime_generation = execution_listener->expected_runtime_generation;
+    invocation->call_layout = execution_listener->call_layout.get();
+    invocation->validated_null_value = execution_listener->validated_null_value;
+    invocation->validated_bool_true_value = execution_listener->validated_bool_true_value;
+    invocation->validated_bool_false_value = execution_listener->validated_bool_false_value;
+    RefreshIdentityState(invocation);
+    return execution_listener;
 }
 
 enum class GeneratedRootRole : uint8_t {
@@ -106,6 +184,12 @@ struct GeneratedRootBinding {
 struct DispatchFrame {
     DartPlantArm64Context context{};
     DartPlantInvocation invocation{};
+    // Physical RET interception belongs to the HookRecord/payload that owns
+    // the patched executable body. BindInvocationToCurrentOwner() is allowed
+    // to replace invocation.code_target with the selected listener's logical
+    // owner target, so the return veneer cookie must not be validated through
+    // that mutable semantic view.
+    dartplant::DartCodePayload* physical_return_payload = nullptr;
     uintptr_t entry_spreg = 0;
     uintptr_t entry_caller_fp = 0;
     uintptr_t invoke_original_native_frame = 0;
@@ -667,6 +751,7 @@ void ClearEnteredListeners(DartPlantInvocation* invocation) {
     if (invocation == nullptr) return;
     for (const auto& listener : invocation->entered_listeners) {
         listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        dartplant::ReleaseListenerVmAdapterIfIdle(listener);
     }
     invocation->entered_listeners.clear();
 }
@@ -814,6 +899,10 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     DispatchFrame& frame = stack->frames[stack->depth++];
     frame.context = *context;
     frame.invocation = {};
+    frame.physical_return_payload =
+        hook->code_target == nullptr || hook->code_target->payload == nullptr
+            ? nullptr
+            : hook->code_target->payload.get();
     frame.entry_spreg = static_cast<uintptr_t>(context->x[15]);
     frame.entry_caller_fp = static_cast<uintptr_t>(context->x[29]);
     frame.invoke_original_native_frame = 0;
@@ -861,11 +950,12 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
     // return bookkeeping; retaining the entrant then conservatively prevents
     // physical backend teardown for process life.
 
-    // BeginInvocation is the entry-stub quiescence pin. Reset cannot detach
-    // this hook or its VM adapter after this point until FinishFrame retires it.
-    frame.invocation.vm_adapter = hook->vm_adapter;
+    // BeginInvocation is the entry-stub quiescence pin. Physical hook
+    // lifetime is process-wide; owner-specific VM state is selected only
+    // after THR identifies the current IsolateGroup.
     const size_t listener_count_before_owner_filter = frame.invocation.entered_listeners.size();
     FilterListenersForCurrentIsolateGroup(&frame.invocation, frame.context);
+    const auto execution_listener = BindInvocationToCurrentOwner(&frame.invocation);
     if (listener_count_before_owner_filter != 0 && frame.invocation.entered_listeners.empty()) {
         // Direct FlutterEngine instances share the process-wide AOT text
         // mapping. Keep the physical hook/return bookkeeping process-wide, but
@@ -911,7 +1001,8 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         frame.invocation.vm_scope_entered = true;
     }
 
-    if (real_dart && !dartplant::EnsureArm64ExceptionBridge(hook, frame.context)) {
+    if (real_dart &&
+        !dartplant::EnsureArm64ExceptionBridge(hook, frame.context, execution_listener)) {
         // The physical entry/RET patches remain safe passthrough instrumentation,
         // but callbacks must not start unless Dart non-local unwinds can retire
         // their pending invocation state. A generated VM bridge is already in
@@ -961,8 +1052,9 @@ extern "C" DartPlantArm64DispatchResult dartplant_arm64_dispatch_enter(
         if (frame.invocation.skip_original) break;
     }
     for (size_t index = entered_count; index < frame.invocation.entered_listeners.size(); ++index) {
-        frame.invocation.entered_listeners[index]->in_flight.fetch_sub(1,
-                                                                       std::memory_order_acq_rel);
+        const auto& listener = frame.invocation.entered_listeners[index];
+        listener->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        dartplant::ReleaseListenerVmAdapterIfIdle(listener);
     }
     frame.invocation.entered_listeners.resize(entered_count);
 
@@ -1011,8 +1103,7 @@ extern "C" DartPlantArm64ReturnDispatchResult dartplant_arm64_dispatch_return_fr
     DartPlantArm64ReturnDispatchResult output{};
     DispatchFrame* frame = CurrentFrame();
     if (frame == nullptr || frame->invocation.context == nullptr ||
-        frame->invocation.code_target == nullptr ||
-        frame->invocation.code_target->payload.get() != payload ||
+        frame->physical_return_payload == nullptr || frame->physical_return_payload != payload ||
         frame->invocation.context->x[30] != return_lr || frame->entry_spreg != return_spreg ||
         frame->entry_caller_fp != return_fp) {
         return output;

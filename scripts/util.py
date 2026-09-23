@@ -276,11 +276,37 @@ def adb_cmd(args: list[str], *, device: str | None = None) -> list[str]:
     return command + args
 
 
-def find_arm64_device(device: str | None = None) -> str:
+def _supports_arm64_execution(serial: str, *, allow_translated: bool) -> bool:
+    abi = capture(adb_cmd(["shell", "getprop", "ro.product.cpu.abi"], device=serial))
+    if abi == "arm64-v8a":
+        return True
+    if not allow_translated:
+        return False
+    abilist = capture(adb_cmd(["shell", "getprop", "ro.product.cpu.abilist"], device=serial))
+    if "arm64-v8a" not in {entry.strip() for entry in abilist.split(",") if entry.strip()}:
+        return False
+    # On x86_64 Android guests, advertising arm64-v8a in abilist is only
+    # meaningful for this test when ART also publishes the ISA remap used by
+    # native translation (for example arm64 -> x86_64 on the 16K AVD). This
+    # avoids treating a broad/incorrect product abilist as proof that an ARM64
+    # AOT process can actually execute.
+    translated_isa = capture(
+        adb_cmd(["shell", "getprop", "ro.dalvik.vm.isa.arm64"], device=serial)
+    )
+    return bool(translated_isa) and translated_isa != "arm64"
+
+
+def find_arm64_device(device: str | None = None, *, allow_translated: bool = False) -> str:
     if device:
-        abi = capture(adb_cmd(["shell", "getprop", "ro.product.cpu.abi"], device=device))
-        if abi != "arm64-v8a":
-            raise ValueError(f"device {device} is not arm64-v8a: {abi}")
+        if not _supports_arm64_execution(device, allow_translated=allow_translated):
+            abi = capture(adb_cmd(["shell", "getprop", "ro.product.cpu.abi"], device=device))
+            abilist = capture(
+                adb_cmd(["shell", "getprop", "ro.product.cpu.abilist"], device=device)
+            )
+            expectation = "arm64-v8a execution support" if allow_translated else "arm64-v8a"
+            raise ValueError(
+                f"device {device} does not provide {expectation}: abi={abi} abilist={abilist}"
+            )
         return device
     output = capture(["adb", "devices"])
     for line in output.splitlines()[1:]:
@@ -288,10 +314,10 @@ def find_arm64_device(device: str | None = None) -> str:
         if len(fields) != 2 or fields[1] != "device":
             continue
         serial = fields[0]
-        abi = capture(adb_cmd(["shell", "getprop", "ro.product.cpu.abi"], device=serial))
-        if abi == "arm64-v8a":
+        if _supports_arm64_execution(serial, allow_translated=allow_translated):
             return serial
-    raise RuntimeError("no attached arm64-v8a device found")
+    expectation = "arm64-v8a capable device" if allow_translated else "arm64-v8a device"
+    raise RuntimeError(f"no attached {expectation} found")
 
 
 def test_device(

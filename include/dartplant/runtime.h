@@ -165,8 +165,12 @@ dartplant_runtime_bootstrap_live_vm_from_arm64_registers_with_adapter(
     DartPlantVmAdapter* adapter, DartPlantLiveVmBootstrapInfo* out_info);
 
 // Returns the automatically generated runtime Function index. The index is
-// rebuilt from live Class.functions/Library.toplevel_class when a LiveVmContext
-// is captured or bootstrapped; no metadata or offline SnapshotIndex is required.
+// built from live Class.functions/Library.toplevel_class under an exact heap
+// observation and then published as an immutable, owner-bound directory. A
+// later bootstrap of the same owner/image/capability incarnation may reuse the
+// directory without rescanning the moving heap. Raw GC-managed Function/Code
+// receipt fields in DartPlantLiveVmFunctionInfo are zero in this cached view.
+// No metadata or offline SnapshotIndex is required.
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_index_info(
     const DartPlantRuntime* runtime, DartPlantLiveVmFunctionIndexInfo* out_info);
 DARTPLANT_EXPORT DartPlantStatus dartplant_runtime_get_function_info(

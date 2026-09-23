@@ -35,6 +35,12 @@ struct LiveVmFunctionSnapshotRecord {
     std::vector<DartPlantDartParameterInfo> parameters;
 };
 
+struct LiveVmDeferredLoadingUnitState {
+    uint64_t runtime_image_id = 0;
+    uint32_t loading_unit_id = 0;
+    bool loaded = false;
+};
+
 DartPlantStatus ResolveLiveVmCandidateForArm64Context(const DartPlantFlutterSnapshotInfo& snapshot,
                                                       const DartPlantArm64Context& context,
                                                       LiveVmCandidateResolution* out_resolution);
@@ -69,6 +75,18 @@ DartPlantStatus CollectLiveVmFunctionSnapshotRecordsForImages(
     const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
     const RuntimeProfileRecord& live_index_profile,
     const RuntimeProfileRecord& function_type_profile, const RuntimeProfileRecord* deferred_profile,
+    DartPlantVmAdapter* observation_adapter, const void* observation_lease,
+    std::vector<LiveVmFunctionSnapshotRecord>* out_records,
+    DartPlantLiveVmFunctionIndexInfo* out_info);
+
+// Deferred-load delta collector. It scans only the requested RuntimeImages'
+// LoadingUnit roots, then snapshots complete immutable FunctionType semantics
+// for the affected Functions under the current observation receipt.
+DartPlantStatus CollectLiveVmDeferredFunctionSnapshotRecordsForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    std::span<const uint64_t> target_runtime_image_ids,
+    const RuntimeProfileRecord& live_index_profile,
+    const RuntimeProfileRecord& function_type_profile, const RuntimeProfileRecord& deferred_profile,
     DartPlantVmAdapter* observation_adapter, const void* observation_lease,
     std::vector<LiveVmFunctionSnapshotRecord>* out_records,
     DartPlantLiveVmFunctionIndexInfo* out_info);
@@ -114,6 +132,17 @@ DartPlantStatus ReadLiveVmRootProgramHashForCurrentProfile(const DartPlantLiveVm
 DartPlantStatus ProbeLiveVmRootProgramHashForCandidate(const DartPlantLiveVmContext& context,
                                                        const RuntimeProfileRecord& candidate,
                                                        uint32_t* out_program_hash);
+
+// Cheap observation-scoped semantic receipt for deferred loading completion.
+// Dart's UnitDeserializationRoots updates Function entry-point caches before
+// PostLoad publishes LoadingUnit.base_objects, so base_objects null/non-null is
+// sufficient to detect a Function-directory mutation without rescanning every
+// retained Function. Raw LoadingUnit/base_objects pointers are never retained.
+DartPlantStatus ProbeLiveVmDeferredLoadingUnitStatesForImages(
+    const DartPlantLiveVmContext& context, std::span<const LiveVmInstructionImage> images,
+    const RuntimeProfileRecord& deferred_profile, uint64_t canonical_null,
+    DartPlantVmAdapter* observation_adapter, const void* observation_lease,
+    std::vector<LiveVmDeferredLoadingUnitState>* out_states);
 
 }  // namespace dartplant
 

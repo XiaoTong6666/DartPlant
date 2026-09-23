@@ -186,12 +186,32 @@ struct DartPlantListenerRecord {
     uint64_t registration_order = 0;
     DartPlantHookOptions options{};
     DartPlantVmAdapter* vm_adapter = nullptr;
+    std::shared_ptr<std::atomic_uint64_t> runtime_generation;
+    uint64_t expected_runtime_generation = 0;
+    uint64_t validated_null_value = 0;
+    uint64_t validated_bool_true_value = 0;
+    uint64_t validated_bool_false_value = 0;
+    std::shared_ptr<const abi::DartCallLayout> call_layout;
+    struct ExceptionBridgeBinding {
+        bool verified = false;
+        uintptr_t target = 0;
+        uint32_t thread_offset = 0;
+        uint64_t artifact_generation = 0;
+        uint64_t isolate_generation = 0;
+        uint32_t profile_version = 0;
+        std::string abi_domain_key;
+    } exception_bridge_binding;
+    std::atomic_bool vm_adapter_retained{false};
     std::shared_ptr<DartPlantMethod> requested_method;
     std::atomic_bool active{true};
     std::atomic_uint64_t in_flight{0};
     std::atomic<DartPlantExceptionCallback> on_exception{nullptr};
     std::atomic<void*> exception_user_data{nullptr};
+
+    ~DartPlantListenerRecord();
 };
+
+void ReleaseListenerVmAdapterIfIdle(const std::shared_ptr<DartPlantListenerRecord>& listener);
 
 struct RuntimeState {
     std::mutex mutex;
@@ -246,12 +266,16 @@ DartPlantStatus AddCallbackListener(
     DartPlantHook* hook, const DartPlantMethod* requested_method,
     const DartPlantHookOptions& options, int32_t priority, DartPlantListener** out_listener,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation = {},
-    uint64_t expected_runtime_generation = 0);
+    uint64_t expected_runtime_generation = 0, uint64_t validated_null_value = 0,
+    uint64_t validated_bool_true_value = 0, uint64_t validated_bool_false_value = 0,
+    std::shared_ptr<const abi::DartCallLayout> call_layout = {});
 DartPlantStatus AddCallbackListenerForMethod(
     const DartPlantMethod* method, const DartPlantHookOptions& options, int32_t priority,
     DartPlantListener** out_listener,
     const std::shared_ptr<std::atomic_uint64_t>& runtime_generation = {},
-    uint64_t expected_runtime_generation = 0);
+    uint64_t expected_runtime_generation = 0, uint64_t validated_null_value = 0,
+    uint64_t validated_bool_true_value = 0, uint64_t validated_bool_false_value = 0,
+    std::shared_ptr<const abi::DartCallLayout> call_layout = {});
 bool BeginInvocation(DartPlantHook* hook,
                      std::vector<std::shared_ptr<DartPlantListenerRecord>>* listeners);
 void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out_size);
@@ -263,7 +287,8 @@ DartPlantStatus InstallArm64ReturnInterception(DartPlantHook* hook);
 bool RestoreArm64ReturnInterception(DartPlantHook* hook);
 void RegisterArm64ExceptionBridgeConsumer(DartPlantHook* hook);
 void ReleaseArm64ExceptionBridgeConsumer(DartPlantHook* hook);
-bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context& context);
+bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context& context,
+                                const std::shared_ptr<DartPlantListenerRecord>& execution_listener);
 DartPlantStatus RemoveHook(DartPlantHook* hook);
 bool IsTargetHooked(uintptr_t target);
 void ResetHooks();
@@ -371,15 +396,7 @@ struct DartPlantHook {
     std::vector<uintptr_t> payload_return_sites;
     std::vector<dartplant::ManagedCodePatch> managed_backend_patches;
     bool exception_bridge_consumer = false;
-    struct ExceptionBridgeBinding {
-        bool verified = false;
-        uintptr_t target = 0;
-        uint32_t thread_offset = 0;
-        uint64_t artifact_generation = 0;
-        uint64_t isolate_generation = 0;
-        uint32_t profile_version = 0;
-        std::string abi_domain_key;
-    } exception_bridge_binding;
+    dartplant::DartPlantListenerRecord::ExceptionBridgeBinding exception_bridge_binding;
     bool vm_adapter_retained = false;
 };
 

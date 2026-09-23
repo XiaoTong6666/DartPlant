@@ -317,33 +317,57 @@ void ReleaseArm64ExceptionBridgeConsumer(DartPlantHook* hook) {
 #endif
 }
 
-bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context& context) {
+bool EnsureArm64ExceptionBridge(
+    DartPlantHook* hook, const DartPlantArm64Context& context,
+    const std::shared_ptr<DartPlantListenerRecord>& execution_listener) {
 #if defined(__aarch64__)
-    if (hook == nullptr || hook->method_storage == nullptr ||
-        hook->method_storage->function == nullptr ||
-        hook->method_storage->function->source == DartFunctionSource::kSynthetic) {
+    const DartPlantMethod* method =
+        execution_listener != nullptr && execution_listener->requested_method != nullptr
+            ? execution_listener->requested_method.get()
+            : (hook == nullptr ? nullptr : hook->method_storage.get());
+    if (hook == nullptr || method == nullptr || method->function == nullptr ||
+        method->function->source == DartFunctionSource::kSynthetic) {
         return true;
     }
+    if (execution_listener == nullptr) {
+        // No listener owns this IsolateGroup. Do not dereference the
+        // HookRecord's historical first-owner adapter: that owner may already
+        // have retired while the process-wide entry patch remains shared by
+        // sibling owners. A previously installed JumpToFrame bridge is
+        // process-global and sufficient for passthrough bookkeeping; otherwise
+        // fail closed and retain the publication entrant.
+        auto& state = ExceptionBridge();
+        std::lock_guard lock(state.mutex);
+        return state.target != 0 && state.backup != nullptr && state.published_hook != nullptr;
+    }
     const uintptr_t thread = static_cast<uintptr_t>(context.x[26]);
-    const auto& binding = hook->exception_bridge_binding;
+    const auto& binding = execution_listener != nullptr
+                              ? execution_listener->exception_bridge_binding
+                              : hook->exception_bridge_binding;
+    DartPlantVmAdapter* vm_adapter =
+        execution_listener != nullptr ? execution_listener->vm_adapter : hook->vm_adapter;
+    const auto& runtime_generation = execution_listener != nullptr
+                                         ? execution_listener->runtime_generation
+                                         : hook->runtime_generation;
+    const uint64_t expected_runtime_generation =
+        execution_listener != nullptr ? execution_listener->expected_runtime_generation
+                                      : hook->expected_runtime_generation;
     const bool adapter_bound_live =
-        hook->method_storage->function->source == DartFunctionSource::kLiveVm &&
-        hook->vm_adapter != nullptr;
+        method->function->source == DartFunctionSource::kLiveVm && vm_adapter != nullptr;
     if (thread == 0 || !binding.verified ||
-        ((adapter_bound_live && (binding.target == 0 || hook->runtime_generation == nullptr ||
-                                 hook->runtime_generation->load(std::memory_order_acquire) !=
-                                     hook->expected_runtime_generation)) ||
+        ((adapter_bound_live &&
+          (binding.target == 0 || runtime_generation == nullptr ||
+           runtime_generation->load(std::memory_order_acquire) != expected_runtime_generation)) ||
          (!adapter_bound_live && binding.target == 0 && binding.thread_offset == 0))) {
         SetLastError("Dart JumpToFrame capability binding is unavailable or stale");
         return false;
     }
-    if (hook->vm_adapter != nullptr) {
+    if (vm_adapter != nullptr) {
         DartPlantVmCapabilityProof proof{};
         proof.struct_size = sizeof(proof);
         const RuntimeProfileRecord* profile = nullptr;
-        if (VmAdapterGetCapabilityBinding(hook->vm_adapter,
-                                          DARTPLANT_VM_CAP_EXCEPTION_BRIDGE_LAYOUT, &proof,
-                                          &profile) != DARTPLANT_OK ||
+        if (VmAdapterGetCapabilityBinding(vm_adapter, DARTPLANT_VM_CAP_EXCEPTION_BRIDGE_LAYOUT,
+                                          &proof, &profile) != DARTPLANT_OK ||
             profile == nullptr || proof.resolved_target != binding.target ||
             proof.artifact_generation != binding.artifact_generation ||
             proof.isolate_generation != binding.isolate_generation ||
@@ -361,7 +385,7 @@ bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context
             return false;
         }
     }
-    if (hook->method_storage->function->source == DartFunctionSource::kLiveVm &&
+    if (method->function->source == DartFunctionSource::kLiveVm &&
         !IsKnownExecutableAddress(target)) {
         SetLastError("verified Dart JumpToFrame target is no longer executable");
         return false;
@@ -412,6 +436,7 @@ bool EnsureArm64ExceptionBridge(DartPlantHook* hook, const DartPlantArm64Context
 #else
     (void) hook;
     (void) context;
+    (void) execution_listener;
     return false;
 #endif
 }

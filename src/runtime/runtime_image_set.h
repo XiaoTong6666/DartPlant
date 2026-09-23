@@ -34,6 +34,12 @@ enum class RuntimeImageLifecycleState : uint8_t {
     kRetired,
 };
 
+enum class RuntimeDeferredLoadState : uint8_t {
+    kUnbound = 0,
+    kNotLoaded,
+    kLoaded,
+};
+
 // One independently mapped Dart AOT instruction namespace. A runtime image is
 // deliberately stronger than ModuleImage: it binds the ELF artifact identity
 // to the exact Dart isolate-instructions symbol that defines the entry-VA
@@ -60,6 +66,14 @@ struct RuntimeImage {
     // serialized unit hash has been compared with the current isolate group's
     // ObjectStore.loading_units[0] root program hash.
     bool deferred_program_hash_vm_bound = false;
+    // Deferred loading completion mutates Function entry-point caches without
+    // changing the mapped RuntimeImage set. Cache reuse therefore needs one
+    // cheap VM-semantic receipt in addition to image identity. This state is
+    // derived from LoadingUnit.base_objects under the exact moving-GC
+    // observation lease: null means the unit snapshot has not completed,
+    // non-null means UnitDeserializationRoots::PostLoad has published the
+    // deserialized reference set after entry points were updated.
+    RuntimeDeferredLoadState deferred_load_state = RuntimeDeferredLoadState::kUnbound;
     ModuleImage module;
     FlutterSnapshotSource snapshot;
 
@@ -117,6 +131,11 @@ public:
     // id and a new epoch. Allocators are monotonic across refreshes so a stale
     // owner token can never become current again through numeric reuse.
     bool ReconcileOwnershipFrom(const RuntimeImageSet& previous);
+    // Carries VM-semantic receipts only for physical RuntimeImage owners that
+    // survive an in-generation image-set transition unchanged. Newly-added or
+    // replaced images remain unbound and must be proven by the next live VM
+    // observation before they can inherit any Function-directory semantics.
+    void PreserveSemanticBindingsFrom(const RuntimeImageSet& previous);
     bool ContainsIdentity(const RuntimeImage& image) const;
     bool RemoveById(RuntimeImageId id);
     void BindGeneration(uint64_t runtime_generation);
@@ -137,6 +156,14 @@ public:
     // root program hash. The operation is transactional and never publishes a
     // partial set of proven units.
     bool BindDeferredProgramHash(uint32_t root_program_hash);
+    // Binds one observation-scoped deferred load-state receipt to the exact
+    // RuntimeImage/loading-unit owner. Callers normally apply these to a copy
+    // of the image set and publish that copy only after every unit succeeds.
+    bool BindDeferredLoadState(RuntimeImageId id, uint32_t loading_unit_id, bool loaded);
+    // Compares only the deferred VM load-state receipts for otherwise exact
+    // image owners. A change means the stable Function directory may be stale
+    // even though the mapped image set itself did not change.
+    bool SameDeferredLoadStates(const RuntimeImageSet& other) const;
 
 private:
     RuntimeImageId AllocateId();

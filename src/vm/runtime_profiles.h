@@ -67,6 +67,21 @@ struct VmLoadingUnitLayout {
     uint32_t instance_size;
 };
 
+// Source-verified AOT InstructionsTable layout. Dart keeps one table for the
+// root image and appends one for each loaded deferred instruction image. The
+// table's code_objects array is the VM-maintained exact Code set for that
+// image, so deferred indexing can avoid classifying every LoadingUnit base
+// object by CID.
+struct VmInstructionsTableLayout {
+    uint32_t object_store_offset;
+    uint32_t cid;
+    uint32_t code_objects_offset;
+    uint32_t length_offset;
+    uint32_t start_pc_offset;
+    uint32_t end_pc_offset;
+    uint32_t instance_size;
+};
+
 struct VmTransitionLayout {
     uint64_t vm_tag_dart;
     uint64_t execution_vm;
@@ -168,6 +183,7 @@ struct RuntimeProfileRecord {
     VmTypeArgumentsLayout type_arguments;
     VmClosureLayout closure;
     VmLoadingUnitLayout loading_unit;
+    VmInstructionsTableLayout instructions_table;
     VmTransitionLayout transition;
 };
 

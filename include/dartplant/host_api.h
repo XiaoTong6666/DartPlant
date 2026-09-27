@@ -32,6 +32,9 @@ extern "C" {
 enum DartPlantHostHookResult {
     DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED = -1,
     DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED = -2,
+    // Physical replacement may still be installed. The host retains its
+    // recovery ticket and must not allow the published gate to be freed.
+    DARTPLANT_HOST_HOOK_FAILED_RECOVERY_REQUIRED = -3,
 };
 
 typedef void (*DartPlantHostBackupReadyCallback)(void* user_data, void* backup);

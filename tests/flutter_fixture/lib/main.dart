@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'dartplant_native.dart';
+import 'external_module_native.dart';
 import 'deferred_probe.dart' deferred as deferred_probe;
 import 'package:flutter/services.dart';
 
@@ -106,6 +107,11 @@ Future<void> secondaryEngineMain() async {
         ? arguments['label'] as int
         : 2;
     switch (call.method) {
+      case 'externalOwnerCall':
+        // A's external Hook is installed in the original Engine owner.
+        // This call runs in B/B2's real Dart mutator and must not be routed
+        // into A's logical listener simply because AOT code is shared.
+        return <String, Object?>{'value': instrumentedAdd(2, 3)};
       case 'activate':
         return <String, Object?>{
           'epoch': DartPlantNative.multiOwnerActivate(label),
@@ -182,6 +188,23 @@ Future<void> secondaryEngineMain() async {
 int instrumentedAdd(int left, int right) {
   final result = left + right;
   return result;
+}
+
+// Kept as a separate external exception entry. The unannotated P6 throwing
+// callee retains its optimized compiler ABI and independent test contract.
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+int externalThrowingProbe(int value) {
+  if (value == 99) throw StateError('dartplant-external-throw');
+  return value + 1;
+}
+
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+FixtureObject externalObjectRootProbe(int seed) {
+  // A fresh heap object, not a canonical const; the caller only retains its
+  // scalar value, leaving the external strong VM handle as its durable root.
+  return FixtureObject(seed + 31);
 }
 
 @pragma('vm:entry-point')
@@ -309,6 +332,49 @@ String _runTypeArgumentsProof(
       'result_ok': resultOk,
     });
     return summary;
+  } finally {
+    pressurePort.close();
+  }
+}
+
+Map<String, Object?> _runExternalTypeArgumentsProof(
+  int prepareEntry,
+  int probeEntry, {
+  required bool requireRelocation,
+}) {
+  final callback = _bootstrapRetainedGenericClosure ?? retainedGenericClosure;
+  final pressurePort = ReceivePort();
+  try {
+    final prepare = ExternalModuleNative.typeArgsPrepare(
+      prepareEntry,
+      callback,
+      pressurePort.sendPort,
+      requireRelocation: requireRelocation,
+    );
+    if (prepare != 0) {
+      return <String, Object?>{
+        'passed': false,
+        'prepare': prepare,
+        'native': 0,
+        'result_ok': false,
+        'require_relocation': requireRelocation,
+      };
+    }
+    final value = invokeRetainedGenericClosure<TypeArgumentsProofValue>(
+      callback,
+      const TypeArgumentsProofValue(37),
+    );
+    final native = ExternalModuleNative.typeArgsProbe(probeEntry);
+    final resultOk = value.length == 1 &&
+        value.single.value == 37 &&
+        value.runtimeType.toString().contains('TypeArgumentsProofValue');
+    return <String, Object?>{
+      'passed': native == 1 && resultOk,
+      'prepare': prepare,
+      'native': native,
+      'result_ok': resultOk,
+      'require_relocation': requireRelocation,
+    };
   } finally {
     pressurePort.close();
   }
@@ -673,6 +739,528 @@ int verifiedAbiImmediateCatchProbe() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (const bool.fromEnvironment('DARTPLANT_EXTERNAL_MODULE')) {
+    _bootstrapRetainedGenericClosure = retainedGenericClosure;
+    runApp(const DartPlantFixtureApp());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final report = await externalModuleChannel
+          .invokeMapMethod<String, Object?>('externalModuleProbe');
+      final value = report?['value'] as int? ?? 0;
+      final entry = report?['entry'] as int? ?? 0;
+      final counters = report?['counters'] as int? ?? 0;
+      final retireEntry = report?['retire'] as int? ?? 0;
+      final mappingEntry = report?['mapping'] as int? ?? 0;
+      final exceptionEntry = report?['exception'] as int? ?? 0;
+      final objectRootEntry = report?['objectRoot'] as int? ?? 0;
+      final loaderDrainEntry = report?['loaderDrain'] as int? ?? 0;
+      final typeArgsPrepareEntry = report?['typeArgsPrepare'] as int? ?? 0;
+      final typeArgsProbeEntry = report?['typeArgsProbe'] as int? ?? 0;
+      final p6InstallEntry = report?['p6Install'] as int? ?? 0;
+      final p6ProbeEntry = report?['p6Probe'] as int? ?? 0;
+      final closureInstallEntry = report?['closureInstall'] as int? ?? 0;
+      final closureProbeEntry = report?['closureProbe'] as int? ?? 0;
+      final ordinaryInstallEntry = report?['ordinaryInstall'] as int? ?? 0;
+      final ordinaryMarkSharedEntry =
+          report?['ordinaryMarkShared'] as int? ?? 0;
+      final ordinaryProbeEntry = report?['ordinaryProbe'] as int? ?? 0;
+      final externalExceptionBaseline =
+          entry != 0 ? externalThrowingProbe(1) : -1;
+      final bootstrap = entry == 0 ? 0 : ExternalModuleNative.bootstrap(entry);
+      final hookedResult = bootstrap == 1 ? instrumentedAdd(2, 3) : 0;
+      final counts = counters != 0 && bootstrap == 1
+          ? ExternalModuleNative.counters(counters)
+          : 0;
+      // These hooks are owned and installed by libdartplant.so in the
+      // injected module. Do not import the embedded fixture's test runtime.
+      final externalCanonicalNull =
+          bootstrap == 1 ? nullableEchoObject(null) : const FixtureObject(-2);
+      final externalRewrittenNull = bootstrap == 1
+          ? nullableEchoObject(const FixtureObject(11))
+          : const FixtureObject(-2);
+      final externalBoolSeed = Platform.numberOfProcessors > 0;
+      final externalBoolFirstInput = !externalBoolSeed;
+      final externalBoolSecondInput = externalBoolSeed;
+      final externalBoolFirst = bootstrap == 1
+          ? negateBool(externalBoolFirstInput)
+          : !externalBoolFirstInput;
+      final externalBoolSecond = bootstrap == 1
+          ? negateBool(externalBoolSecondInput)
+          : !externalBoolSecondInput;
+      _ciScenario(
+          'external_null_semantics',
+          bootstrap == 1 &&
+              externalCanonicalNull == null &&
+              externalRewrittenNull == null,
+          {
+            'canonical_null': externalCanonicalNull == null,
+            'rewritten_null': externalRewrittenNull == null,
+          });
+      _ciScenario(
+          'external_bool_semantics',
+          bootstrap == 1 &&
+              externalBoolFirst == externalBoolFirstInput &&
+              externalBoolSecond == externalBoolSecondInput,
+          {
+            'first_input': externalBoolFirstInput,
+            'first_result': externalBoolFirst,
+            'second_input': externalBoolSecondInput,
+            'second_result': externalBoolSecond,
+          });
+      var externalExceptionCaught = 0;
+      if (bootstrap == 1) {
+        try {
+          externalThrowingProbe(99);
+          externalExceptionCaught = 1;
+        } on StateError catch (error) {
+          externalExceptionCaught =
+              error.message == 'dartplant-external-throw' ? 2 : 3;
+        } catch (_) {
+          externalExceptionCaught = 3;
+        }
+      }
+      final externalExceptionProbe = bootstrap == 1 && exceptionEntry != 0
+          ? ExternalModuleNative.exception(exceptionEntry)
+          : 0;
+      _ciScenario(
+          'external_exception',
+          externalExceptionBaseline == 2 &&
+              externalExceptionCaught == 2 &&
+              externalExceptionProbe == 1,
+          {
+            'baseline': externalExceptionBaseline,
+            'caught': externalExceptionCaught,
+            'native': externalExceptionProbe,
+            'object_api_available': false,
+          });
+      var externalRootFirst = -1;
+      var externalRootSecond = -1;
+      var externalRootProbe = 0;
+      String? externalRootError;
+      if (bootstrap == 1 && objectRootEntry != 0) {
+        try {
+          // Keep only the scalar here; the first returned object must stay
+          // alive through the independent module's strong VM root.
+          externalRootFirst = externalObjectRootProbe(7).value;
+          await _multiOwnerGcPressure();
+          externalRootSecond = externalObjectRootProbe(8).value;
+          externalRootProbe = ExternalModuleNative.objectRoot(objectRootEntry);
+        } catch (error) {
+          externalRootError = '$error';
+        }
+      }
+      _ciScenario(
+          'external_object_root_gc',
+          externalRootError == null &&
+              externalRootFirst == 38 &&
+              externalRootSecond == 39 &&
+              (externalRootProbe & 1) != 0,
+          {
+            'first_value': externalRootFirst,
+            'second_value': externalRootSecond,
+            'strong_root_alive': (externalRootProbe & 1) != 0,
+            'root_address_changed': (externalRootProbe & 2) != 0,
+            'generic_typearguments_proven': false,
+            'error': externalRootError ?? '',
+          });
+      final externalGenericClosure =
+          bootstrap == 1 && typeArgsPrepareEntry != 0 && typeArgsProbeEntry != 0
+              ? _runExternalTypeArgumentsProof(
+                  typeArgsPrepareEntry,
+                  typeArgsProbeEntry,
+                  requireRelocation: false,
+                )
+              : <String, Object?>{'passed': false};
+      _ciScenario(
+        'external_generic_closure',
+        externalGenericClosure['passed'] == true,
+        externalGenericClosure,
+      );
+      final externalGenericGc =
+          bootstrap == 1 && typeArgsPrepareEntry != 0 && typeArgsProbeEntry != 0
+              ? _runExternalTypeArgumentsProof(
+                  typeArgsPrepareEntry,
+                  typeArgsProbeEntry,
+                  requireRelocation: true,
+                )
+              : <String, Object?>{'passed': false};
+      _ciScenario(
+        'external_generic_gc',
+        externalGenericGc['passed'] == true,
+        externalGenericGc,
+      );
+      final externalClosureInstall = bootstrap == 1 && closureInstallEntry != 0
+          ? ExternalModuleNative.closureInstall(closureInstallEntry)
+          : -1;
+      const externalForcedStackTearOff = verifiedAbiForcedStack;
+      final externalClosureValue = externalClosureInstall == 0
+          ? invokeForcedStackClosure(externalForcedStackTearOff, 7, 8)
+          : 0;
+      final externalClosureProbe =
+          externalClosureInstall == 0 && closureProbeEntry != 0
+              ? ExternalModuleNative.closureProbe(closureProbeEntry)
+              : 0;
+      _ciScenario(
+          'external_closure_receiver',
+          externalClosureInstall == 0 &&
+              externalClosureValue == 78 &&
+              externalClosureProbe == 1,
+          {
+            'install': externalClosureInstall,
+            'value': externalClosureValue,
+            'probe': externalClosureProbe,
+          });
+
+      final externalOrdinaryInstall =
+          bootstrap == 1 && ordinaryInstallEntry != 0
+              ? ExternalModuleNative.ordinaryInstall(ordinaryInstallEntry)
+              : -1;
+      final externalOrdinaryDirect =
+          externalOrdinaryInstall == 0 ? verifiedAbiDouble(1.25, 2.5) : 0.0;
+      final externalOrdinaryShared =
+          externalOrdinaryInstall == 0 && ordinaryMarkSharedEntry != 0
+              ? ExternalModuleNative.ordinaryMarkShared(ordinaryMarkSharedEntry)
+              : 0;
+      final externalOrdinaryAfterShared =
+          externalOrdinaryShared == 1 ? verifiedAbiDouble(2.0, 3.0) : 0.0;
+      final externalOrdinaryProbe =
+          externalOrdinaryShared == 1 && ordinaryProbeEntry != 0
+              ? ExternalModuleNative.ordinaryProbe(ordinaryProbeEntry)
+              : 0;
+      final externalOrdinaryPassed = externalOrdinaryInstall == 0 &&
+          externalOrdinaryDirect == 16.125 &&
+          externalOrdinaryShared == 1 &&
+          externalOrdinaryAfterShared == 6.25 &&
+          externalOrdinaryProbe == 1;
+      _ciScenario('external_ordinary_aot', externalOrdinaryPassed, {
+        'install': externalOrdinaryInstall,
+        'direct': externalOrdinaryDirect,
+        'shared_transition': externalOrdinaryShared,
+        'after_shared': externalOrdinaryAfterShared,
+        'probe': externalOrdinaryProbe,
+      });
+      _ciScenario('external_late_shared', externalOrdinaryPassed, {
+        'transition': externalOrdinaryShared,
+        'typed_after_shared': externalOrdinaryAfterShared,
+      });
+      final p6BaselineInt64 =
+          bootstrap == 1 ? verifiedAbiInt64(100000000, 7) : 0;
+      final p6BaselineStack =
+          bootstrap == 1 ? verifiedAbiEntryStack(1, 2, 3, 4, 5, 6, 7, 8) : 0.0;
+      final p6BaselineOdd =
+          bootstrap == 1 ? verifiedAbiOddStack(1, 2, 3, 4, 5, 6, 7) : 0.0;
+      final p6BaselineThrow = bootstrap == 1
+          ? verifiedAbiThrowingStack(1, 2, 3, 4, 5, 6, 7, 8)
+          : 0.0;
+      final p6BaselineForced =
+          bootstrap == 1 ? verifiedAbiForcedStack(3, 4) : 0;
+      final p6BaselinePair = bootstrap == 1 ? verifiedAbiPair(21, 22) : (0, 0);
+      final externalP6Install = bootstrap == 1 && p6InstallEntry != 0
+          ? ExternalModuleNative.p6Install(p6InstallEntry)
+          : -1;
+      final p6HookedInt64 =
+          externalP6Install == 0 ? verifiedAbiInt64(300000000, 13) : 0;
+      final p6HookedStack = externalP6Install == 0
+          ? verifiedAbiEntryStack(2, 3, 4, 5, 6, 7, 8, 9)
+          : 0.0;
+      final p6HookedOdd = externalP6Install == 0
+          ? verifiedAbiOddStack(2, 3, 4, 5, 6, 7, 8)
+          : 0.0;
+      var externalP6ThrowPath = 0;
+      if (externalP6Install == 0) {
+        try {
+          externalP6ThrowPath = verifiedAbiImmediateCatchProbe();
+        } catch (_) {
+          externalP6ThrowPath = 3;
+        }
+      }
+      final p6HookedThrow = externalP6Install == 0
+          ? verifiedAbiThrowingStack(2, 3, 4, 5, 6, 7, 8, 9)
+          : 0.0;
+      final p6HookedForced =
+          externalP6Install == 0 ? verifiedAbiForcedStack(5, 6) : 0;
+      final p6HookedPair =
+          externalP6Install == 0 ? verifiedAbiPair(31, 32) : (0, 0);
+      (Object?, Object?) p6HookedObjectPair = (null, null);
+      if (externalP6Install == 0) {
+        final gcPort = ReceivePort();
+        await Isolate.spawn(movingGcPressure, gcPort.sendPort);
+        final gcEvents = StreamIterator<Object?>(gcPort);
+        await gcEvents.moveNext();
+        p6HookedObjectPair = verifiedAbiPair(
+          const FixtureObject(31),
+          const FixtureObject(32),
+        );
+        await gcEvents.moveNext();
+        await gcEvents.cancel();
+        gcPort.close();
+      }
+      final externalP6Probe = externalP6Install == 0 && p6ProbeEntry != 0
+          ? ExternalModuleNative.p6Probe(p6ProbeEntry)
+          : 0;
+      final externalP6Passed = externalP6Install == 0 &&
+          externalP6Probe == 1 &&
+          p6BaselineInt64 == 1000000000000000007 &&
+          p6HookedInt64 == 3000000010000000113 &&
+          p6BaselineStack == 108.0 &&
+          p6HookedStack == 1146.0 &&
+          p6BaselineOdd == 91.0 &&
+          p6HookedOdd == 217.0 &&
+          externalP6ThrowPath == 2 &&
+          p6BaselineThrow == 108.0 &&
+          p6HookedThrow == 125.0 &&
+          p6BaselineForced == 34 &&
+          p6HookedForced == 65 &&
+          p6BaselinePair.$1 == 21 &&
+          p6BaselinePair.$2 == 22 &&
+          p6HookedPair.$1 == 32 &&
+          p6HookedPair.$2 == 31 &&
+          p6HookedObjectPair.$1 == const FixtureObject(32) &&
+          p6HookedObjectPair.$2 == const FixtureObject(31);
+      _ciScenario('external_p6_abi', externalP6Passed, {
+        'install': externalP6Install,
+        'probe': externalP6Probe,
+        'int64_before': p6BaselineInt64,
+        'int64_after': p6HookedInt64,
+        'stack_before': p6BaselineStack,
+        'stack_after': p6HookedStack,
+        'odd_before': p6BaselineOdd,
+        'odd_after': p6HookedOdd,
+        'throw_path': externalP6ThrowPath,
+        'throw_before': p6BaselineThrow,
+        'throw_after': p6HookedThrow,
+        'forced_before': p6BaselineForced,
+        'forced_after': p6HookedForced,
+        'pair_before_first': p6BaselinePair.$1,
+        'pair_before_second': p6BaselinePair.$2,
+        'pair_after_first': p6HookedPair.$1,
+        'pair_after_second': p6HookedPair.$2,
+        'object_pair_first': p6HookedObjectPair.$1 == const FixtureObject(32),
+        'object_pair_second': p6HookedObjectPair.$2 == const FixtureObject(31),
+      });
+      var externalDeferredRefresh = 0;
+      var externalDeferredValue = -1;
+      var externalDeferredHookValue = -1;
+      String? externalDeferredError;
+      if (bootstrap == 1) {
+        try {
+          await deferred_probe.loadLibrary();
+          // Re-enter the same owner-thread bridge. Once the root owner is
+          // already hooked, the module interprets this as deferred image
+          // refresh/rebootstrap rather than a second initial bootstrap.
+          externalDeferredRefresh = ExternalModuleNative.bootstrap(entry);
+          externalDeferredValue = deferred_probe.deferredAdd(1);
+          externalDeferredHookValue = instrumentedAdd(2, 3);
+        } catch (error) {
+          externalDeferredError = '$error';
+        }
+      }
+      _ciScenario(
+          'external_deferred_lifecycle',
+          externalDeferredError == null &&
+              externalDeferredRefresh == 1 &&
+              externalDeferredValue == 42 &&
+              externalDeferredHookValue == 115,
+          {
+            'refresh': externalDeferredRefresh,
+            'value': externalDeferredValue,
+            'post_refresh_hook': externalDeferredHookValue,
+            'mapping_retained': true,
+            'error': externalDeferredError ?? '',
+          });
+      final countsBeforeRetire =
+          counters != 0 ? ExternalModuleNative.counters(counters) : 0;
+      final retired = bootstrap == 1 && retireEntry != 0
+          ? ExternalModuleNative.retire(retireEntry)
+          : 0;
+      final unhookedResult = retired == 1 ? instrumentedAdd(2, 3) : 0;
+      final idleCounts =
+          counters != 0 ? ExternalModuleNative.counters(counters) : 0;
+      final mappingControl = retired == 1 && mappingEntry != 0
+          ? ExternalModuleNative.mapping(mappingEntry)
+          : 0;
+      final rebound = retired == 1 ? ExternalModuleNative.bootstrap(entry) : 0;
+      final reboundResult = rebound == 1 ? instrumentedAdd(2, 3) : 0;
+      final reboundCounts =
+          counters != 0 ? ExternalModuleNative.counters(counters) : 0;
+      var firstEngineIncarnation = 0;
+      var secondEngineIncarnation = 0;
+      var bValue = -1;
+      var b2Value = -1;
+      var aAfterBValue = -1;
+      var aAfterB2Value = -1;
+      var bCounts = 0;
+      var b2Counts = 0;
+      var aAfterBCounts = 0;
+      var aAfterB2Counts = 0;
+      String? externalOwnerError;
+      if (rebound == 1 && counters != 0) {
+        try {
+          final start =
+              await _launchChannel.invokeMethod<Object?>('multiOwnerStart');
+          if (start is Map && start['incarnation'] is int) {
+            firstEngineIncarnation = start['incarnation'] as int;
+          }
+          final b = await _multiOwnerCommand('externalOwnerCall', 2);
+          bValue = _mapInt(b, 'value');
+          bCounts = ExternalModuleNative.counters(counters);
+          await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          aAfterBValue = instrumentedAdd(2, 3);
+          aAfterBCounts = ExternalModuleNative.counters(counters);
+          final recreate =
+              await _launchChannel.invokeMethod<Object?>('multiOwnerRecreate');
+          if (recreate is Map && recreate['incarnation'] is int) {
+            secondEngineIncarnation = recreate['incarnation'] as int;
+          }
+          final b2 = await _multiOwnerCommand('externalOwnerCall', 3);
+          b2Value = _mapInt(b2, 'value');
+          b2Counts = ExternalModuleNative.counters(counters);
+          await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          aAfterB2Value = instrumentedAdd(2, 3);
+          aAfterB2Counts = ExternalModuleNative.counters(counters);
+        } catch (error, stackTrace) {
+          externalOwnerError = '$error';
+          debugPrint(
+              'DartPlant external owner lifecycle error: $error\n$stackTrace');
+        } finally {
+          try {
+            await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          } catch (_) {
+            // A previously destroyed Engine has no remaining owner.
+          }
+        }
+      }
+      _ciScenario(
+          'external_owner_lifecycle',
+          externalOwnerError == null &&
+              firstEngineIncarnation != 0 &&
+              secondEngineIncarnation > firstEngineIncarnation &&
+              bValue == 5 &&
+              bCounts == reboundCounts &&
+              aAfterBValue == 115 &&
+              aAfterBCounts == reboundCounts + 0x100000001 &&
+              b2Value == 5 &&
+              b2Counts == aAfterBCounts &&
+              aAfterB2Value == 115 &&
+              aAfterB2Counts == aAfterBCounts + 0x100000001,
+          {
+            'first_engine': firstEngineIncarnation,
+            'second_engine': secondEngineIncarnation,
+            'b_value': bValue,
+            'b_counts': bCounts,
+            'a_after_b': aAfterBValue,
+            'a_after_b_counts': aAfterBCounts,
+            'b2_value': b2Value,
+            'b2_counts': b2Counts,
+            'a_after_b2': aAfterB2Value,
+            'a_after_b2_counts': aAfterB2Counts,
+            'error': externalOwnerError ?? '',
+          });
+      var gcBefore = 0;
+      var gcAfter = 0;
+      var gcCountersBefore = 0;
+      var gcCountersAfter = 0;
+      String? gcError;
+      if (rebound == 1 && counters != 0) {
+        try {
+          gcCountersBefore = ExternalModuleNative.counters(counters);
+          gcBefore = instrumentedAdd(2, 3);
+          // The allocations run on A's own mutator. This proves callback
+          // survival across allocation pressure, not object-root relocation.
+          await _multiOwnerGcPressure();
+          gcAfter = instrumentedAdd(2, 3);
+          gcCountersAfter = ExternalModuleNative.counters(counters);
+        } catch (error) {
+          gcError = '$error';
+        }
+      }
+      _ciScenario(
+          'external_gc_pressure',
+          gcError == null &&
+              gcBefore == 115 &&
+              gcAfter == 115 &&
+              (gcCountersAfter >> 32) == (gcCountersBefore >> 32) + 2 &&
+              (gcCountersAfter & 0xffffffff) ==
+                  (gcCountersBefore & 0xffffffff) + 2,
+          {
+            'before': gcBefore,
+            'after': gcAfter,
+            'enter_before': gcCountersBefore >> 32,
+            'enter_after': gcCountersAfter >> 32,
+            'leave_before': gcCountersBefore & 0xffffffff,
+            'leave_after': gcCountersAfter & 0xffffffff,
+            'object_root_relocation_proven': false,
+            'error': gcError ?? '',
+          });
+
+      // Retire the rebound runtime first, then close the independent
+      // Vector/LSPosed loader callback. Native API v2 has no unregister, so
+      // libdartplant.so remains NODELETE even after the logical drain.
+      final finalRetired = rebound == 1 && retireEntry != 0
+          ? ExternalModuleNative.retire(retireEntry)
+          : 0;
+      final loaderDrained = finalRetired == 1 && loaderDrainEntry != 0
+          ? ExternalModuleNative.retire(loaderDrainEntry)
+          : 0;
+      _ciScenario(
+          'external_callback_drain', finalRetired == 1 && loaderDrained == 1, {
+        'runtime_retired': finalRetired,
+        'loader_callback_drained': loaderDrained,
+        'nodelete_required': true,
+      });
+      _ciScenario(
+          'external_module',
+          value == 107 &&
+              bootstrap == 1 &&
+              hookedResult == 115 &&
+              counts == 0x100000001 &&
+              retired == 1 &&
+              unhookedResult == 5 &&
+              idleCounts == countsBeforeRetire &&
+              mappingControl == 1 &&
+              rebound == 1 &&
+              reboundResult == 115 &&
+              reboundCounts == countsBeforeRetire + 0x100000001,
+          {
+            'java_value': value,
+            'entry_present': entry != 0,
+            'bootstrap': bootstrap,
+            'dart_result': hookedResult,
+            'dart_enter': counts >> 32,
+            'dart_leave': counts & 0xffffffff,
+            'retired': retired,
+            'unhooked_result': unhookedResult,
+            'counts_before_retire': countsBeforeRetire,
+            'idle_counts': idleCounts,
+            'physical_mapping_control': mappingControl,
+            'rebound': rebound,
+            'rebound_result': reboundResult,
+            'rebound_enter': reboundCounts >> 32,
+            'rebound_leave': reboundCounts & 0xffffffff,
+          });
+      _ciEvent('suite', {
+        'state': _ciScenarioResults['external_module'] == true &&
+                _ciScenarioResults['external_owner_lifecycle'] == true &&
+                _ciScenarioResults['external_null_semantics'] == true &&
+                _ciScenarioResults['external_bool_semantics'] == true &&
+                _ciScenarioResults['external_exception'] == true &&
+                _ciScenarioResults['external_object_root_gc'] == true &&
+                _ciScenarioResults['external_generic_closure'] == true &&
+                _ciScenarioResults['external_generic_gc'] == true &&
+                _ciScenarioResults['external_closure_receiver'] == true &&
+                _ciScenarioResults['external_ordinary_aot'] == true &&
+                _ciScenarioResults['external_late_shared'] == true &&
+                _ciScenarioResults['external_p6_abi'] == true &&
+                _ciScenarioResults['external_deferred_lifecycle'] == true &&
+                _ciScenarioResults['external_gc_pressure'] == true &&
+                _ciScenarioResults['external_callback_drain'] == true
+            ? 'pass'
+            : 'fail',
+        'mode': 'external_module_subset',
+        'dobby_parity_complete': false,
+      });
+    });
+    return;
+  }
   _ciEvent('runtime', <String, Object?>{
     'flutter': _ciFlutterVersion,
     'dart': _ciDartVersion,

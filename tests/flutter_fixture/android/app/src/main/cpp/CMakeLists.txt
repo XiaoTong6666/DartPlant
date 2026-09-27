@@ -75,3 +75,9 @@ target_link_options(
     PRIVATE
     -Wl,-z,max-page-size=16384
 )
+
+# Does not link DartPlant: the external libxposed module alone owns core,
+# physical HookRecords and the exact VM adapter in this test mode.
+add_library(dartplant_external_bridge SHARED external_bridge.cpp)
+target_compile_options(dartplant_external_bridge PRIVATE -Wall -Wextra -Werror)
+target_link_options(dartplant_external_bridge PRIVATE -Wl,-z,max-page-size=16384)

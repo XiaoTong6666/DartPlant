@@ -114,7 +114,19 @@ DartPlantStatus InstallPublishedHostHook(PublishedHostHook* published, void** ou
 
     if (status != 0) {
         if (binding->publication_policy == HostPublicationPolicy::kStrict &&
-            status == DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED) {
+            status == DARTPLANT_HOST_HOOK_FAILED_RECOVERY_REQUIRED) {
+            // Dobby's rollback did not synchronize the original stream. Its
+            // replacement may STILL be reachable. Keep the gate/record and
+            // recover through this exact host binding later; in the meantime
+            // stale fetches must use the prepared original, not Dart callbacks.
+            published->ever_published = true;
+            published->backend_installed = true;
+            if (backup != nullptr)
+                StoreGateState(&published->gate, HostPublicationGateState::kBypassBackup);
+            // Without a backup, INSTALLING deliberately blocks stale entrants
+            // while the exact host owner retries physical recovery.
+        } else if (binding->publication_policy == HostPublicationPolicy::kStrict &&
+                   status == DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED) {
             published->ever_published = true;
             published->backend_installed = false;
             StoreGateState(&published->gate, HostPublicationGateState::kBypassTarget);
@@ -126,7 +138,12 @@ DartPlantStatus InstallPublishedHostHook(PublishedHostHook* published, void** ou
     }
     if (backup == nullptr) {
         SetLastError("host hook succeeded without an original trampoline");
-        __builtin_trap();
+        // The backend may already have published replacement. Do not trap or
+        // free a gate naming this owner. Leave entrants blocked in INSTALLING,
+        // and let the retained host binding perform explicit unhook/recovery.
+        published->backend_installed = true;
+        published->ever_published = true;
+        return DARTPLANT_HOOK_FAILED;
     }
     published->gate.backup = backup;
     published->backend_installed = true;
@@ -175,7 +192,8 @@ bool ClosePublishedHostHook(PublishedHostHook* published) {
         // directly: the legacy backend can already own target, but kInstalling
         // has never permitted a CPU to cross the gate.
         if (state != HostPublicationGateState::kDraining &&
-            state != HostPublicationGateState::kInstalling) {
+            state != HostPublicationGateState::kInstalling &&
+            state != HostPublicationGateState::kBypassBackup) {
             return false;
         }
         if ((current >> 32) != 0) return false;

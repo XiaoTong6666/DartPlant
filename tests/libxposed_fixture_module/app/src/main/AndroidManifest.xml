@@ -1,0 +1,4 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="DartPlant LibXposed Fixture" android:allowBackup="false"
+        android:hasCode="true" />
+</manifest>

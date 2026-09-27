@@ -13,3 +13,6 @@ __pycache__/
 /tests/dart/.dart_tool/
 /tests/dart/.packages
 /tests/dart/pubspec.lock
+/tests/libxposed_fixture_module/app/build/
+/tests/libxposed_fixture_module/app/.cxx/
+/tests/libxposed_fixture_module/.gradle/

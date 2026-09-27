@@ -553,6 +553,26 @@ int StrictFailureAfterPublicationHook(void*, void* target, void*,
     return DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED;
 }
 
+int StrictRecoveryRequiredHook(void*, void* target, void*,
+                               DartPlantHostHookTransaction* transaction) {
+    if (target == nullptr || transaction == nullptr ||
+        transaction->struct_size < sizeof(DartPlantHostHookTransaction) ||
+        transaction->backup_ready == nullptr) {
+        return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
+    }
+    // The physical backend has committed a branch, failed both synchronization
+    // and rollback, and retained its recovery ticket. Its replacement can
+    // still be fetched; preserve the publication gate until host unhook.
+    transaction->backup_ready(transaction->user_data, target);
+    return DARTPLANT_HOST_HOOK_FAILED_RECOVERY_REQUIRED;
+}
+
+int StrictBrokenSuccessWithoutBackupHook(void*, void*, void*, DartPlantHostHookTransaction*) {
+    // A faulty backend already returned success but did not provide a callable
+    // original. The core must not trap or free a possibly published stub.
+    return 0;
+}
+
 int StrictNeverPublishedHook(void*, void*, void*, DartPlantHostHookTransaction*) {
     return DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED;
 }
@@ -2179,6 +2199,69 @@ TEST_CASE(StrictNeverPublishedFailureLeavesNoBackendOwnership) {
     EXPECT_TRUE(!published.backend_installed);
     EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
     EXPECT_EQ(0, host.unhook_calls.load(std::memory_order_acquire));
+}
+
+TEST_CASE(StrictRecoveryRequiredKeepsPhysicalBackendAndBypassesDartCallback) {
+    StrictPublicationHostState host;
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.unhook = StrictPublicationUnhook;
+    binding.hook_with_publication = StrictRecoveryRequiredHook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kStrict;
+
+    dartplant::PublishedHostHook published;
+    void* const target = reinterpret_cast<void*>(Replacement);
+    void* const callback = reinterpret_cast<void*>(RetiredReplacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                &published, &binding, reinterpret_cast<uintptr_t>(target), callback,
+                                false, reinterpret_cast<void*>(uintptr_t{0x5679})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED, dartplant::InstallPublishedHostHook(&published, &backup));
+    EXPECT_TRUE(backup == nullptr);
+    EXPECT_TRUE(published.ever_published);
+    EXPECT_TRUE(published.backend_installed);
+    EXPECT_TRUE(published.gate.backup == target);
+
+    bool callback_pin = false;
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(&published, &callback_pin) ==
+                target);
+    EXPECT_TRUE(!callback_pin);
+    EXPECT_EQ(0U, dartplant::PublishedHostHookEntrantCount(&published));
+    // A failed installation can be explicitly closed and recovered by its
+    // ORIGINAL immutable binding. The gate stays allocated for stale fetches.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
+    EXPECT_TRUE(!published.backend_installed);
+    EXPECT_TRUE(published.ever_published);
+    EXPECT_TRUE(dartplant::AcquirePublishedHostHookRouteForTesting(&published, &callback_pin) ==
+                target);
+    EXPECT_TRUE(!callback_pin);
+}
+
+TEST_CASE(StrictMissingBackupRetainsPhysicalOwnershipInsteadOfTrapping) {
+    StrictPublicationHostState host;
+    dartplant::HostApiBinding binding{};
+    binding.user_data = &host;
+    binding.unhook = StrictPublicationUnhook;
+    binding.hook_with_publication = StrictBrokenSuccessWithoutBackupHook;
+    binding.publication_policy = dartplant::HostPublicationPolicy::kStrict;
+
+    dartplant::PublishedHostHook published;
+    void* const target = reinterpret_cast<void*>(Replacement);
+    EXPECT_EQ(DARTPLANT_OK, dartplant::PreparePublishedHostHook(
+                                &published, &binding, reinterpret_cast<uintptr_t>(target),
+                                reinterpret_cast<void*>(RetiredReplacement), false,
+                                reinterpret_cast<void*>(uintptr_t{0x5680})));
+    void* backup = nullptr;
+    EXPECT_EQ(DARTPLANT_HOOK_FAILED, dartplant::InstallPublishedHostHook(&published, &backup));
+    EXPECT_TRUE(backup == nullptr);
+    EXPECT_TRUE(published.ever_published);
+    EXPECT_TRUE(published.backend_installed);
+    EXPECT_TRUE(published.gate.backup == nullptr);
+    // No replacement call can cross INSTALLING while there is no backup.
+    EXPECT_EQ(DARTPLANT_OK, dartplant::UninstallPublishedHostHook(&published));
+    EXPECT_TRUE(!published.backend_installed);
+    EXPECT_EQ(1, host.unhook_calls.load(std::memory_order_acquire));
 }
 
 TEST_CASE(StrictSuccessfulPublicationPublishesBackupBeforeReplacement) {

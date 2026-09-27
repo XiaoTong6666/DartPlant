@@ -32,6 +32,13 @@ typedef struct DartPlantNativeApiEntries {
 typedef DartPlantNativeOnModuleLoaded (*DartPlantNativeInit)(
     const DartPlantNativeApiEntries* entries);
 
+// Native API v2 has no callback-unregister operation. These retire only
+// DartPlant's logical loader-callback admission. The Android module remains
+// NODELETE because Vector may retain the callback pointer for process lifetime.
+DARTPLANT_EXPORT void dartplant_lsposed_native_close_callback_admission(void);
+DARTPLANT_EXPORT uint8_t dartplant_lsposed_native_finish_callback_drain(void);
+DARTPLANT_EXPORT uint32_t dartplant_lsposed_native_callback_in_flight(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

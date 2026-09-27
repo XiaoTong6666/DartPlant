@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(dartplant_libxposed_fixture LANGUAGES C CXX ASM)
+get_filename_component(DARTPLANT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
+set(DARTPLANT_BUILD_ANDROID_MODULE ON CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_DOBBY_ADAPTER ON CACHE BOOL "" FORCE)
+set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(DARTPLANT_BUILD_ANDROID_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${DARTPLANT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/dartplant")
+target_include_directories(dartplant PRIVATE
+    "${DARTPLANT_ROOT}/tests/flutter_fixture/.dart_tool/dartplant/generated"
+    "${DARTPLANT_DART_SDK_ROOT}/runtime/include")

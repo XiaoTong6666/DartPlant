@@ -144,6 +144,21 @@ class FlutterColdBootstrapModeTest(unittest.TestCase):
         self.assertIn("FLUTTER_ENGINE_REVISION=fedcba9876", new_defines)
         self.assertEqual("validate-deferred-components=false", new_defines[-1])
 
+    def test_external_module_define_is_shared_by_aab_and_split_builds(self) -> None:
+        self.assertEqual([], flutter_cold_bootstrap._external_module_dart_defines({}))
+        self.assertEqual(
+            [],
+            flutter_cold_bootstrap._external_module_dart_defines(
+                {"DARTPLANT_EXTERNAL_MODULE": "0"}
+            ),
+        )
+        self.assertEqual(
+            ["DARTPLANT_EXTERNAL_MODULE=true"],
+            flutter_cold_bootstrap._external_module_dart_defines(
+                {"DARTPLANT_EXTERNAL_MODULE": "1"}
+            ),
+        )
+
     def test_runtime_event_must_match_requested_toolchain(self) -> None:
         toolchain = flutter_cold_bootstrap.FlutterToolchain(
             flutter_version="3.44.1",

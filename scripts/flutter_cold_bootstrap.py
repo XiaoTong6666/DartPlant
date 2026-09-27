@@ -23,6 +23,7 @@ SIDECAR_HEADER = GENERATED_DIR / "ordinary_aot_sidecar.h"
 ABI_ORACLE_JSON = GENERATED_DIR / "abi_oracle.json"
 CLOSURE_SIDECAR_HEADER = GENERATED_DIR / "p6_forced_stack_closure_sidecar.h"
 TYPE_ARGUMENTS_CLOSURE_SIDECAR_HEADER = GENERATED_DIR / "type_arguments_closure_sidecar.h"
+EXTERNAL_ROOT_SIDECAR_HEADER = GENERATED_DIR / "external_root_sidecar.h"
 P6_SIDECARS = (
     ("verifiedAbiInt64", "DartPlantP6Int64", GENERATED_DIR / "p6_int64_sidecar.h"),
     (
@@ -134,6 +135,10 @@ def _read_required_aab_entry(
 def _encode_gradle_dart_defines(defines: list[str]) -> str:
     return ",".join(base64.b64encode(value.encode()).decode() for value in defines)
 
+def _external_module_dart_defines(env: dict[str, str]) -> list[str]:
+    # AAB and split APK must compile the identical external AOT program.
+    return ["DARTPLANT_EXTERNAL_MODULE=true"] if env.get("DARTPLANT_EXTERNAL_MODULE") == "1" else []
+
 
 def _gradle_dart_defines(toolchain: FlutterToolchain) -> str:
     # Reproduce the exact BuildInfo.dartDefines sequence of the active Flutter
@@ -166,6 +171,10 @@ def _assemble_deferred_fixture_apks(
 ) -> tuple[Path, Path]:
     build_mode = _normalize_flutter_mode(build_mode)
     task = f"assemble{build_mode.capitalize()}"
+    dart_defines = _gradle_dart_defines(toolchain)
+    extra_defines = _external_module_dart_defines(env)
+    if extra_defines:
+        dart_defines += "," + _encode_gradle_dart_defines(extra_defines)
     run(
         [
             str(FIXTURE_DIR / "android" / "gradlew"),
@@ -181,7 +190,7 @@ def _assemble_deferred_fixture_apks(
             "-Pdart-obfuscation=false",
             "-Ptrack-widget-creation=true",
             "-Ptree-shake-icons=true",
-            f"-Pdart-defines={_gradle_dart_defines(toolchain)}",
+            f"-Pdart-defines={dart_defines}",
             task,
         ],
         cwd=FIXTURE_DIR / "android",
@@ -375,6 +384,11 @@ def _build_fixture(
         "// Generated placeholder; replaced after the first AOT build.\n"
         "#pragma once\n"
     )
+    EXTERNAL_ROOT_SIDECAR_HEADER.write_text(
+        "// External root hook requires an exact app-bound compiler sidecar.\n"
+        "#pragma once\n"
+        "#define DARTPLANT_EXTERNAL_ROOT_SIDECAR_AVAILABLE 0\n"
+    )
     run([flutter, "pub", "get"], cwd=FIXTURE_DIR, env=build_env)
     build_command = [
         flutter,
@@ -388,6 +402,9 @@ def _build_fixture(
         f"--dart-define=DARTPLANT_CI_DART_VERSION={toolchain.dart_version}",
         "--dart-define=DARTPLANT_CI_TARGET_ABI=arm64-v8a",
     ]
+    build_command.extend(
+        f"--dart-define={define}" for define in _external_module_dart_defines(build_env)
+    )
     run(build_command, cwd=FIXTURE_DIR, env=build_env)
     aab_path = flutter_fixture_aab_path(build_mode)
     if not aab_path.is_file():
@@ -420,6 +437,53 @@ def _build_fixture(
             build_mode=build_mode,
             aab_path=aab_path,
         )
+
+    if build_env.get("DARTPLANT_EXTERNAL_MODULE") == "1":
+        # The external module owns its VM adapter and must independently prove
+        # the exact object-return ABI before entering a GC-safe callback. A
+        # legacy result-location guess must never be passed off as a VM root.
+        # Unlike internal P6 targets, externalObjectRootProbe is deliberately
+        # retained in this distinct AOT program and has its own sidecar.
+        flutter_root = Path(flutter).resolve().parent.parent
+        gen_snapshot = flutter_gen_snapshot_path(flutter, build_mode)
+        dart = flutter_root / "bin" / "cache" / "dart-sdk" / "bin" / "dart"
+        sdk_repo = ROOT_DIR.parent / "sdk"
+        run(
+            [
+                sys.executable,
+                str(ROOT_DIR / "tools" / "compiler-oracle" / "run_abi_oracle.py"),
+                "--dart", str(dart),
+                "--sdk-repo", str(sdk_repo),
+                "--app-package-config", str(FIXTURE_DIR / ".dart_tool" / "package_config.json"),
+                "--dill", str(dill),
+                "--output", str(ABI_ORACLE_JSON),
+            ],
+            cwd=ROOT_DIR,
+            env=build_env,
+        )
+        run(
+            [
+                sys.executable,
+                str(ROOT_DIR / "tools" / "compiler-oracle" / "build_snapshot_sidecar.py"),
+                "--gen-snapshot", str(gen_snapshot),
+                "--dill", str(dill),
+                "--libapp", str(libapp),
+                "--library-uri", "package:dartplant_fixture/main.dart",
+                "--class-name", "Global",
+                "--function-name", "externalObjectRootProbe",
+                "--abi-oracle-json", str(ABI_ORACLE_JSON),
+                "--aot-analyzer", str(aot_analyzer),
+                "--symbol-prefix", "DartPlantExternalRoot",
+                "--output-header", str(EXTERNAL_ROOT_SIDECAR_HEADER),
+            ],
+            cwd=ROOT_DIR,
+            env=build_env,
+        )
+        # No second-stage app build: the sidecar is embedded in the separately
+        # built libxposed module, not in the Flutter fixture's internal bridge.
+        # Both split APKs still match their corresponding AAB bytes.
+        _assemble_deferred_fixture_apks(toolchain, build_mode=build_mode, env=build_env)
+        return toolchain
 
     flutter_root = Path(flutter).resolve().parent.parent
     gen_snapshot = flutter_gen_snapshot_path(flutter, build_mode)

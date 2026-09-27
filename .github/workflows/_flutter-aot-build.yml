@@ -121,6 +121,59 @@ jobs:
               --out "build/ci/flutter/${{ inputs.family }}/$mode"
           done
 
+      - name: Build and verify exact-family libxposed fixture module
+        shell: bash
+        env:
+          DARTPLANT_DART_SDK_ROOT: ${{ github.workspace }}/../sdk
+        run: |
+          set -euo pipefail
+          cd tests/libxposed_fixture_module
+          ./gradlew :app:assembleRelease -PdartplantFamily="${{ inputs.dart_version }}"
+          cd ../..
+          for mode in release profile; do
+            out="build/ci/flutter/${{ inputs.family }}/$mode"
+            cp tests/libxposed_fixture_module/app/build/outputs/apk/release/app-release.apk \
+              "$out/libxposed-module.apk"
+            python3 scripts/ci/check_libxposed_module.py \
+              --apk "$out/libxposed-module.apk" \
+              --family "${{ inputs.dart_version }}" \
+              --manifest "$out/manifest.json"
+          done
+
+      - name: Build external-module Flutter release fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a second, test-only AOT program with the built-in DartPlant
+          # runtime disabled. It must never replace the ordinary matrix APK.
+          external="build/ci/external/${{ inputs.family }}/release"
+          DARTPLANT_EXTERNAL_MODULE=1 python3 scripts/ci/build_flutter_fixture.py \
+            --flutter "$(command -v flutter)" \
+            --expected-flutter "${{ inputs.flutter_version }}" \
+            --expected-dart "${{ inputs.dart_version }}" \
+            --family "${{ inputs.family }}" \
+            --mode release \
+            --out "$external"
+          regular="build/ci/flutter/${{ inputs.family }}/release"
+          cp "$external/app-release.apk" "$regular/external-app-release.apk"
+          cp "$external/deferred_probe-release.apk" \
+            "$regular/external-deferred_probe-release.apk"
+          python3 - "$regular" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          manifest = root / 'manifest.json'
+          data = json.loads(manifest.read_text())
+          names = ('external-app-release.apk', 'external-deferred_probe-release.apk')
+          data['external_module_fixture'] = {
+              name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+              for name in names
+          }
+          manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+          PY
+
       - name: Upload release/profile AOT fixtures
         uses: actions/upload-artifact@v4
         with:

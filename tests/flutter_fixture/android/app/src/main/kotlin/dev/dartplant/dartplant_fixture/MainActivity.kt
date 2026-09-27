@@ -26,6 +26,19 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "launchProbe" -> result.success(launchProbe)
                 "launchTest" -> result.success(launchTest)
+                "externalModuleProbe" ->
+                    result.success(
+                        mapOf(
+                            "value" to ExternalModuleProbe.value(),
+                            "entry" to ExternalModuleProbe.bootstrapEntry(),
+                            "counters" to ExternalModuleProbe.countersEntry(),
+                            "retire" to ExternalModuleProbe.retireEntry(),
+                            "mapping" to ExternalModuleProbe.mappingEntry(),
+                            "exception" to ExternalModuleProbe.exceptionEntry(),
+                            "objectRoot" to ExternalModuleProbe.objectRootEntry(),
+                            "loaderDrain" to ExternalModuleProbe.loaderDrainEntry(),
+                        ),
+                    )
                 "multiOwnerStart" -> startSecondaryEngine(result)
                 "multiOwnerCommand" -> {
                     val command = call.argument<String>("command")

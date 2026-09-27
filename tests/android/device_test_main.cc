@@ -3,6 +3,9 @@
 
 #include <dlfcn.h>
 #include <dobby.h>
+#if defined(DARTPLANT_DEVICE_HAVE_DOBBY_ADAPTER)
+#include "dartplant/adapters/dobby.h"
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -108,6 +111,111 @@ int Fail(const char* message);
 uint64_t DobbyX17Replacement(uint64_t argument) {
     return g_dobby_x17_original == nullptr ? UINT64_MAX : g_dobby_x17_original(argument) + 1000;
 }
+
+#if defined(DARTPLANT_DEVICE_HAVE_DOBBY_ADAPTER)
+std::atomic_bool g_strict_backup_published{false};
+void PublishStrictDobbyBackup(void*, void* original) {
+    g_dobby_x17_original = reinterpret_cast<UnaryWord>(original);
+    g_strict_backup_published.store(original != nullptr, std::memory_order_release);
+}
+
+struct MutationDuringPrepare {
+    uint32_t* target = nullptr;
+    bool mutate = false;
+    void* original = nullptr;
+};
+
+void PublishAndMaybeMutate(void* user_data, void* original) {
+    auto* ctx = static_cast<MutationDuringPrepare*>(user_data);
+    ctx->original = original;
+    g_dobby_x17_original = reinterpret_cast<UnaryWord>(original);
+    if (ctx->mutate) {
+        // Simulate an independent writer between Prepare and Commit. The
+        // adapter must Abort its still-prepared ticket without overwriting the
+        // foreign bytes, then permit a new attempt on the same target.
+        __atomic_store_n(ctx->target, 0xd2800120U, __ATOMIC_RELEASE); // mov x0, #9
+        __builtin___clear_cache(reinterpret_cast<char*>(ctx->target),
+                                reinterpret_cast<char*>(ctx->target + 1));
+    }
+}
+
+int ExerciseStrictDobbyChangedTargetAbort() {
+    const auto* host = dartplant_dobby_host_api();
+    if (host == nullptr || host->hook_with_publication == nullptr)
+        return Fail("strict Dobby changed-target adapter unavailable");
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) return Fail("strict Dobby changed-target page size");
+    const size_t page_size = static_cast<size_t>(raw_page_size);
+    void* page = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return Fail("strict Dobby changed-target mapping");
+    auto* code = static_cast<uint32_t*>(page);
+    code[0] = 0xd28000e0U; // mov x0, #7
+    code[1] = 0xd65f03c0U; // ret
+    for (size_t i = 2; i < 16; ++i) code[i] = 0xd503201fU; // nop
+    __builtin___clear_cache(reinterpret_cast<char*>(page),
+                            reinterpret_cast<char*>(page) + 64);
+    using Target = uint64_t (*)(uint64_t);
+    const auto target = reinterpret_cast<Target>(page);
+    MutationDuringPrepare ctx{code, true, nullptr};
+    DartPlantHostHookTransaction tx{
+        .struct_size = sizeof(DartPlantHostHookTransaction),
+        .user_data = &ctx,
+        .backup_ready = PublishAndMaybeMutate,
+    };
+    const int first = host->hook_with_publication(
+        host->user_data, page, reinterpret_cast<void*>(DobbyX17Replacement), &tx);
+    const bool rejected = first == DARTPLANT_HOST_HOOK_FAILED_NEVER_PUBLISHED &&
+                          code[0] == 0xd2800120U && target(5) == 9 &&
+                          host->unhook(host->user_data, page) != RS_SUCCESS;
+    ctx.mutate = false;
+    ctx.original = nullptr;
+    const int retried = rejected ? host->hook_with_publication(
+        host->user_data, page, reinterpret_cast<void*>(DobbyX17Replacement), &tx) : RS_FAILED;
+    const bool installed = retried == RS_SUCCESS && ctx.original != nullptr &&
+                           target(5) == 1009 && reinterpret_cast<Target>(ctx.original)(5) == 9;
+    const int unhooked = installed ? host->unhook(host->user_data, page) : RS_FAILED;
+    const bool restored = unhooked == RS_SUCCESS && target(5) == 9;
+    g_dobby_x17_original = nullptr;
+    munmap(page, page_size);
+    if (!rejected || !installed || !restored)
+        return Fail("strict Dobby changed-target abort and reprepare");
+    std::puts("[PASS] ARM64 strict Dobby target-change abort and reprepare");
+    return 0;
+}
+
+int ExerciseStrictDobbyTransactionAdapter() {
+    const auto* host = dartplant_dobby_host_api();
+    if (host == nullptr || host->hook_with_publication == nullptr || host->unhook == nullptr)
+        return Fail("strict Dobby adapter unavailable");
+    g_dobby_x17_original = nullptr;
+    g_strict_backup_published.store(false, std::memory_order_release);
+    DartPlantHostHookTransaction transaction{
+        .struct_size = sizeof(DartPlantHostHookTransaction),
+        .user_data = nullptr,
+        .backup_ready = PublishStrictDobbyBackup,
+    };
+    void* target = reinterpret_cast<void*>(DartPlantDeviceDobbyX17Target);
+    const int installed =
+        host->hook_with_publication(host->user_data, target,
+                                    reinterpret_cast<void*>(DobbyX17Replacement), &transaction);
+    if (installed != RS_SUCCESS || !g_strict_backup_published.load(std::memory_order_acquire) ||
+        g_dobby_x17_original == nullptr) {
+        return Fail("strict Dobby original publication before commit");
+    }
+    const uint64_t hooked = DartPlantDeviceDobbyX17Target(5);
+    const uint64_t original = g_dobby_x17_original(5);
+    const int removed = host->unhook(host->user_data, target);
+    const uint64_t restored = DartPlantDeviceDobbyX17Target(5);
+    if (hooked != 1012 || original != 12 || removed != RS_SUCCESS || restored != 12 ||
+        host->unhook(host->user_data, target) == RS_SUCCESS) {
+        return Fail("strict Dobby physical owner/backup roundtrip");
+    }
+    g_dobby_x17_original = nullptr;
+    std::puts("[PASS] ARM64 strict Dobby two-phase publication and owned unhook");
+    return 0;
+}
+#endif
 
 int DobbyFailClosedReplacement() { return 99; }
 
@@ -810,6 +918,10 @@ int main() {
     if (ExerciseDobbyInstrumentRelocationFailClosed() != 0) return 1;
     if (ExerciseDobbyRelocationFailClosed() != 0) return 1;
     if (ExerciseDobbyX17OriginalTrampoline() != 0) return 1;
+#if defined(DARTPLANT_DEVICE_HAVE_DOBBY_ADAPTER)
+    if (ExerciseStrictDobbyTransactionAdapter() != 0) return 1;
+    if (ExerciseStrictDobbyChangedTargetAbort() != 0) return 1;
+#endif
 
     const DartPlantHostApi legacy_dobby_host = {
         .struct_size = sizeof(DartPlantHostApi),

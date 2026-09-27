@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'dartplant_native.dart';
+import 'external_module_native.dart';
 import 'deferred_probe.dart' deferred as deferred_probe;
 import 'package:flutter/services.dart';
 
@@ -106,6 +107,11 @@ Future<void> secondaryEngineMain() async {
         ? arguments['label'] as int
         : 2;
     switch (call.method) {
+      case 'externalOwnerCall':
+        // A's external Hook is installed in the original Engine owner.
+        // This call runs in B/B2's real Dart mutator and must not be routed
+        // into A's logical listener simply because AOT code is shared.
+        return <String, Object?>{'value': instrumentedAdd(2, 3)};
       case 'activate':
         return <String, Object?>{
           'epoch': DartPlantNative.multiOwnerActivate(label),
@@ -182,6 +188,23 @@ Future<void> secondaryEngineMain() async {
 int instrumentedAdd(int left, int right) {
   final result = left + right;
   return result;
+}
+
+// Kept as a separate external exception entry. The unannotated P6 throwing
+// callee retains its optimized compiler ABI and independent test contract.
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+int externalThrowingProbe(int value) {
+  if (value == 99) throw StateError('dartplant-external-throw');
+  return value + 1;
+}
+
+@pragma('vm:entry-point')
+@pragma('vm:never-inline')
+FixtureObject externalObjectRootProbe(int seed) {
+  // A fresh heap object, not a canonical const; the caller only retains its
+  // scalar value, leaving the external strong VM handle as its durable root.
+  return FixtureObject(seed + 31);
 }
 
 @pragma('vm:entry-point')
@@ -673,6 +696,304 @@ int verifiedAbiImmediateCatchProbe() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (const bool.fromEnvironment('DARTPLANT_EXTERNAL_MODULE')) {
+    runApp(const DartPlantFixtureApp());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final report = await externalModuleChannel
+          .invokeMapMethod<String, Object?>('externalModuleProbe');
+      final value = report?['value'] as int? ?? 0;
+      final entry = report?['entry'] as int? ?? 0;
+      final counters = report?['counters'] as int? ?? 0;
+      final retireEntry = report?['retire'] as int? ?? 0;
+      final mappingEntry = report?['mapping'] as int? ?? 0;
+      final exceptionEntry = report?['exception'] as int? ?? 0;
+      final objectRootEntry = report?['objectRoot'] as int? ?? 0;
+      final loaderDrainEntry = report?['loaderDrain'] as int? ?? 0;
+      final externalExceptionBaseline =
+          entry != 0 ? externalThrowingProbe(1) : -1;
+      final bootstrap = entry == 0 ? 0 : ExternalModuleNative.bootstrap(entry);
+      final hookedResult = bootstrap == 1 ? instrumentedAdd(2, 3) : 0;
+      final counts = counters != 0 && bootstrap == 1
+          ? ExternalModuleNative.counters(counters)
+          : 0;
+      // These hooks are owned and installed by libdartplant.so in the
+      // injected module. Do not import the embedded fixture's test runtime.
+      final externalCanonicalNull =
+          bootstrap == 1 ? nullableEchoObject(null) : const FixtureObject(-2);
+      final externalRewrittenNull = bootstrap == 1
+          ? nullableEchoObject(const FixtureObject(11))
+          : const FixtureObject(-2);
+      final externalBoolSeed = Platform.numberOfProcessors > 0;
+      final externalBoolFirstInput = !externalBoolSeed;
+      final externalBoolSecondInput = externalBoolSeed;
+      final externalBoolFirst = bootstrap == 1
+          ? negateBool(externalBoolFirstInput)
+          : !externalBoolFirstInput;
+      final externalBoolSecond = bootstrap == 1
+          ? negateBool(externalBoolSecondInput)
+          : !externalBoolSecondInput;
+      _ciScenario(
+          'external_null_semantics',
+          bootstrap == 1 &&
+              externalCanonicalNull == null &&
+              externalRewrittenNull == null,
+          {
+            'canonical_null': externalCanonicalNull == null,
+            'rewritten_null': externalRewrittenNull == null,
+          });
+      _ciScenario(
+          'external_bool_semantics',
+          bootstrap == 1 &&
+              externalBoolFirst == externalBoolFirstInput &&
+              externalBoolSecond == externalBoolSecondInput,
+          {
+            'first_input': externalBoolFirstInput,
+            'first_result': externalBoolFirst,
+            'second_input': externalBoolSecondInput,
+            'second_result': externalBoolSecond,
+          });
+      var externalExceptionCaught = 0;
+      if (bootstrap == 1) {
+        try {
+          externalThrowingProbe(99);
+          externalExceptionCaught = 1;
+        } on StateError catch (error) {
+          externalExceptionCaught =
+              error.message == 'dartplant-external-throw' ? 2 : 3;
+        } catch (_) {
+          externalExceptionCaught = 3;
+        }
+      }
+      final externalExceptionProbe = bootstrap == 1 && exceptionEntry != 0
+          ? ExternalModuleNative.exception(exceptionEntry)
+          : 0;
+      _ciScenario(
+          'external_exception',
+          externalExceptionBaseline == 2 &&
+              externalExceptionCaught == 2 &&
+              externalExceptionProbe == 1,
+          {
+            'baseline': externalExceptionBaseline,
+            'caught': externalExceptionCaught,
+            'native': externalExceptionProbe,
+            'object_api_available': false,
+          });
+      var externalRootFirst = -1;
+      var externalRootSecond = -1;
+      var externalRootProbe = 0;
+      String? externalRootError;
+      if (bootstrap == 1 && objectRootEntry != 0) {
+        try {
+          // Keep only the scalar here; the first returned object must stay
+          // alive through the independent module's strong VM root.
+          externalRootFirst = externalObjectRootProbe(7).value;
+          await _multiOwnerGcPressure();
+          externalRootSecond = externalObjectRootProbe(8).value;
+          externalRootProbe = ExternalModuleNative.objectRoot(objectRootEntry);
+        } catch (error) {
+          externalRootError = '$error';
+        }
+      }
+      _ciScenario(
+          'external_object_root_gc',
+          externalRootError == null &&
+              externalRootFirst == 38 &&
+              externalRootSecond == 39 &&
+              (externalRootProbe & 1) != 0,
+          {
+            'first_value': externalRootFirst,
+            'second_value': externalRootSecond,
+            'strong_root_alive': (externalRootProbe & 1) != 0,
+            'root_address_changed': (externalRootProbe & 2) != 0,
+            'generic_typearguments_proven': false,
+            'error': externalRootError ?? '',
+          });
+      final retired = bootstrap == 1 && retireEntry != 0
+          ? ExternalModuleNative.retire(retireEntry)
+          : 0;
+      final unhookedResult = retired == 1 ? instrumentedAdd(2, 3) : 0;
+      final idleCounts =
+          counters != 0 ? ExternalModuleNative.counters(counters) : 0;
+      final mappingControl = retired == 1 && mappingEntry != 0
+          ? ExternalModuleNative.mapping(mappingEntry)
+          : 0;
+      final rebound = retired == 1 ? ExternalModuleNative.bootstrap(entry) : 0;
+      final reboundResult = rebound == 1 ? instrumentedAdd(2, 3) : 0;
+      final reboundCounts =
+          counters != 0 ? ExternalModuleNative.counters(counters) : 0;
+      var firstEngineIncarnation = 0;
+      var secondEngineIncarnation = 0;
+      var bValue = -1;
+      var b2Value = -1;
+      var aAfterBValue = -1;
+      var aAfterB2Value = -1;
+      var bCounts = 0;
+      var b2Counts = 0;
+      var aAfterBCounts = 0;
+      var aAfterB2Counts = 0;
+      String? externalOwnerError;
+      if (rebound == 1 && counters != 0) {
+        try {
+          final start =
+              await _launchChannel.invokeMethod<Object?>('multiOwnerStart');
+          if (start is Map && start['incarnation'] is int) {
+            firstEngineIncarnation = start['incarnation'] as int;
+          }
+          final b = await _multiOwnerCommand('externalOwnerCall', 2);
+          bValue = _mapInt(b, 'value');
+          bCounts = ExternalModuleNative.counters(counters);
+          await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          aAfterBValue = instrumentedAdd(2, 3);
+          aAfterBCounts = ExternalModuleNative.counters(counters);
+          final recreate =
+              await _launchChannel.invokeMethod<Object?>('multiOwnerRecreate');
+          if (recreate is Map && recreate['incarnation'] is int) {
+            secondEngineIncarnation = recreate['incarnation'] as int;
+          }
+          final b2 = await _multiOwnerCommand('externalOwnerCall', 3);
+          b2Value = _mapInt(b2, 'value');
+          b2Counts = ExternalModuleNative.counters(counters);
+          await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          aAfterB2Value = instrumentedAdd(2, 3);
+          aAfterB2Counts = ExternalModuleNative.counters(counters);
+        } catch (error, stackTrace) {
+          externalOwnerError = '$error';
+          debugPrint(
+              'DartPlant external owner lifecycle error: $error\n$stackTrace');
+        } finally {
+          try {
+            await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
+          } catch (_) {
+            // A previously destroyed Engine has no remaining owner.
+          }
+        }
+      }
+      _ciScenario(
+          'external_owner_lifecycle',
+          externalOwnerError == null &&
+              firstEngineIncarnation != 0 &&
+              secondEngineIncarnation > firstEngineIncarnation &&
+              bValue == 5 &&
+              bCounts == reboundCounts &&
+              aAfterBValue == 115 &&
+              aAfterBCounts == 0x300000003 &&
+              b2Value == 5 &&
+              b2Counts == aAfterBCounts &&
+              aAfterB2Value == 115 &&
+              aAfterB2Counts == 0x400000004,
+          {
+            'first_engine': firstEngineIncarnation,
+            'second_engine': secondEngineIncarnation,
+            'b_value': bValue,
+            'b_counts': bCounts,
+            'a_after_b': aAfterBValue,
+            'a_after_b_counts': aAfterBCounts,
+            'b2_value': b2Value,
+            'b2_counts': b2Counts,
+            'a_after_b2': aAfterB2Value,
+            'a_after_b2_counts': aAfterB2Counts,
+            'error': externalOwnerError ?? '',
+          });
+      var gcBefore = 0;
+      var gcAfter = 0;
+      var gcCountersBefore = 0;
+      var gcCountersAfter = 0;
+      String? gcError;
+      if (rebound == 1 && counters != 0) {
+        try {
+          gcCountersBefore = ExternalModuleNative.counters(counters);
+          gcBefore = instrumentedAdd(2, 3);
+          // The allocations run on A's own mutator. This proves callback
+          // survival across allocation pressure, not object-root relocation.
+          await _multiOwnerGcPressure();
+          gcAfter = instrumentedAdd(2, 3);
+          gcCountersAfter = ExternalModuleNative.counters(counters);
+        } catch (error) {
+          gcError = '$error';
+        }
+      }
+      _ciScenario(
+          'external_gc_pressure',
+          gcError == null &&
+              gcBefore == 115 &&
+              gcAfter == 115 &&
+              (gcCountersAfter >> 32) == (gcCountersBefore >> 32) + 2 &&
+              (gcCountersAfter & 0xffffffff) ==
+                  (gcCountersBefore & 0xffffffff) + 2,
+          {
+            'before': gcBefore,
+            'after': gcAfter,
+            'enter_before': gcCountersBefore >> 32,
+            'enter_after': gcCountersAfter >> 32,
+            'leave_before': gcCountersBefore & 0xffffffff,
+            'leave_after': gcCountersAfter & 0xffffffff,
+            'object_root_relocation_proven': false,
+            'error': gcError ?? '',
+          });
+
+      // Retire the rebound runtime first, then close the independent
+      // Vector/LSPosed loader callback. Native API v2 has no unregister, so
+      // libdartplant.so remains NODELETE even after the logical drain.
+      final finalRetired = rebound == 1 && retireEntry != 0
+          ? ExternalModuleNative.retire(retireEntry)
+          : 0;
+      final loaderDrained = finalRetired == 1 && loaderDrainEntry != 0
+          ? ExternalModuleNative.retire(loaderDrainEntry)
+          : 0;
+      _ciScenario(
+          'external_callback_drain',
+          finalRetired == 1 && loaderDrained == 1,
+          {
+            'runtime_retired': finalRetired,
+            'loader_callback_drained': loaderDrained,
+            'nodelete_required': true,
+          });
+      _ciScenario(
+          'external_module',
+          value == 107 &&
+              bootstrap == 1 &&
+              hookedResult == 115 &&
+              counts == 0x100000001 &&
+              retired == 1 &&
+              unhookedResult == 5 &&
+              idleCounts == counts &&
+              mappingControl == 1 &&
+              rebound == 1 &&
+              reboundResult == 115 &&
+              reboundCounts == 0x200000002,
+          {
+            'java_value': value,
+            'entry_present': entry != 0,
+            'bootstrap': bootstrap,
+            'dart_result': hookedResult,
+            'dart_enter': counts >> 32,
+            'dart_leave': counts & 0xffffffff,
+            'retired': retired,
+            'unhooked_result': unhookedResult,
+            'idle_counts': idleCounts,
+            'physical_mapping_control': mappingControl,
+            'rebound': rebound,
+            'rebound_result': reboundResult,
+            'rebound_enter': reboundCounts >> 32,
+            'rebound_leave': reboundCounts & 0xffffffff,
+          });
+      _ciEvent('suite', {
+        'state': _ciScenarioResults['external_module'] == true &&
+                _ciScenarioResults['external_owner_lifecycle'] == true &&
+                _ciScenarioResults['external_null_semantics'] == true &&
+                _ciScenarioResults['external_bool_semantics'] == true &&
+                _ciScenarioResults['external_exception'] == true &&
+                _ciScenarioResults['external_object_root_gc'] == true &&
+                _ciScenarioResults['external_gc_pressure'] == true &&
+                _ciScenarioResults['external_callback_drain'] == true
+            ? 'pass'
+            : 'fail',
+        'mode': 'external_module_subset',
+        'dobby_parity_complete': false,
+      });
+    });
+    return;
+  }
   _ciEvent('runtime', <String, Object?>{
     'flutter': _ciFlutterVersion,
     'dart': _ciDartVersion,

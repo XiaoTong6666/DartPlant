@@ -104,16 +104,37 @@ struct FlutterVmAdapterImpl {
 };
 
 constexpr DescriptorMetadata kDescriptorMetadata[] = {
+#if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
     {1, "3.22.3", "flutter-3.22.3-dart-3.4.4-android-arm64-product"},
-#if !defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
+    {4, "3.22.3", "flutter-3.22.3-dart-3.4.4-android-arm64-profile"},
+#elif defined(DARTPLANT_FLUTTER_VM_PROFILE_3_5_0)
+    {2, "3.24.0", "flutter-3.24.0-dart-3.5.0-android-arm64-product"},
+    {5, "3.24.0", "flutter-3.24.0-dart-3.5.0-android-arm64-profile"},
+#elif defined(DARTPLANT_FLUTTER_VM_PROFILE_3_12_1)
+    {3, "3.44.1", "flutter-3.44.1-dart-3.12.1-android-arm64-product"},
+    {6, "3.44.1", "flutter-3.44.1-dart-3.12.1-android-arm64-profile"},
+#else
+    // Preserve the generic adapter's existing three-descriptor public ABI.
+    {1, "3.22.3", "flutter-3.22.3-dart-3.4.4-android-arm64-product"},
     {2, "3.24.0", "flutter-3.24.0-dart-3.5.0-android-arm64-product"},
     {3, "3.44.1", "flutter-3.44.1-dart-3.12.1-android-arm64-product"},
 #endif
 };
 
+#if (defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4) + defined(DARTPLANT_FLUTTER_VM_PROFILE_3_5_0) +   \
+     defined(DARTPLANT_FLUTTER_VM_PROFILE_3_12_1)) > 1
+#error "Flutter VM fixed adapter families are mutually exclusive"
+#endif
 #if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
-static_assert(std::size(kDescriptorMetadata) == 1,
-              "the version-specific Flutter VM adapter must expose only Dart 3.4.4");
+static_assert(std::size(kDescriptorMetadata) == 2 && kDescriptorMetadata[0].profile_version == 1 &&
+                  kDescriptorMetadata[1].profile_version == 4,
+              "the fixed Dart 3.4.4 family must expose only its product/profile rows");
+#elif defined(DARTPLANT_FLUTTER_VM_PROFILE_3_5_0)
+static_assert(std::size(kDescriptorMetadata) == 2 && kDescriptorMetadata[0].profile_version == 2 &&
+              kDescriptorMetadata[1].profile_version == 5);
+#elif defined(DARTPLANT_FLUTTER_VM_PROFILE_3_12_1)
+static_assert(std::size(kDescriptorMetadata) == 2 && kDescriptorMetadata[0].profile_version == 3 &&
+              kDescriptorMetadata[1].profile_version == 6);
 #endif
 
 constexpr char kTag[] = "DartPlantFlutterVm";
@@ -428,10 +449,24 @@ bool BeginSourceVerifiedLiveHeapObservation(const dartplant::VmRuntimeFacts& fac
             selected = candidate;
         }
     }
-    if (selected == nullptr) return false;
+    if (selected == nullptr) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag,
+                            "startup observation has no exact source profile hash=%.*s version=%u",
+                            static_cast<int>(facts.snapshot_hash.size()),
+                            facts.snapshot_hash.data(), only_profile_version);
+        return false;
+    }
     const auto safepoints = dartplant::vm_abi::ProbeSafepoints(*selected, thread, modules);
-    return safepoints.passed && safepoints.code_module != nullptr &&
-           BeginLiveHeapObservationForProfile(thread, current_isolate, *selected,
+    if (!safepoints.passed || safepoints.code_module == nullptr) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "startup safepoint proof failed profile=%s stage=%s thread=0x%llx modules=%zu",
+            selected->live_vm.name,
+            dartplant::vm_abi::CandidateProbeStageName(safepoints.stage, {}),
+            static_cast<unsigned long long>(thread), modules.size());
+        return false;
+    }
+    return BeginLiveHeapObservationForProfile(thread, current_isolate, *selected,
                                               safepoints.code_module->executable_ranges, out);
 }
 
@@ -2306,8 +2341,33 @@ DartPlantStatus dartplant_flutter_vm_adapter_create(const DartPlantFlutterVmAdap
     resolver_input.canonical_null = canonical_null;
     resolver_input.modules = &modules;
     resolver_input.engine_anchor = reinterpret_cast<uintptr_t>(Dart_CurrentIsolate_DL);
-#if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4)
-    resolver_input.only_profile_version = 1;
+#if defined(DARTPLANT_FLUTTER_VM_PROFILE_3_4_4) || defined(DARTPLANT_FLUTTER_VM_PROFILE_3_5_0) ||  \
+    defined(DARTPLANT_FLUTTER_VM_PROFILE_3_12_1)
+    // One fixed Dart family contains two *source-verified* machine modes:
+    // PRODUCT and non-product/profile. The actual snapshot features select
+    // the row; a matching hash alone cannot merge their transition ABIs.
+    for (const auto* candidate : dartplant::ResolveRuntimeProfileCandidates(facts)) {
+        if (candidate->live_vm.snapshot_hash == nullptr ||
+            facts.snapshot_hash != candidate->live_vm.snapshot_hash) {
+            continue;
+        }
+        for (const auto& metadata : kDescriptorMetadata) {
+            if (metadata.profile_version != candidate->live_vm.profile_version) continue;
+            if (resolver_input.only_profile_version != 0) {
+                __android_log_print(ANDROID_LOG_ERROR, kTag,
+                                    "fixed family has ambiguous product/profile source rows");
+                return DARTPLANT_PROFILE_MISMATCH;
+            }
+            resolver_input.only_profile_version = metadata.profile_version;
+        }
+    }
+    if (resolver_input.only_profile_version == 0) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kTag,
+            "fixed adapter has no exact family/mode source row hash=%s features=%s", snapshot_hash,
+            options->snapshot_features == nullptr ? "" : options->snapshot_features);
+        return DARTPLANT_PROFILE_MISMATCH;
+    }
 #endif
     LiveHeapObservation startup_observation{};
     if (!BeginSourceVerifiedLiveHeapObservation(facts, resolver_input.only_profile_version, modules,

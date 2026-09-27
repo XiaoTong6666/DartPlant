@@ -13,6 +13,20 @@ option(
     "Build the exact Flutter 3.22.3 / Dart 3.4.4 VM V3 adapter"
     OFF
 )
+option(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_5_0
+    "Build the exact Flutter 3.24.0 / Dart 3.5.0 VM adapter" OFF)
+option(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_12_1
+    "Build the exact Flutter 3.44.1 / Dart 3.12.1 VM adapter" OFF)
+set(DARTPLANT_MODULE_VM_ADAPTER_FAMILY "" CACHE STRING
+    "Fixed adapter embedded in the optional native module: 3.4.4, 3.5.0, or 3.12.1")
+set_property(CACHE DARTPLANT_MODULE_VM_ADAPTER_FAMILY PROPERTY STRINGS "" "3.4.4" "3.5.0" "3.12.1")
+if(DARTPLANT_MODULE_VM_ADAPTER_FAMILY)
+    if(NOT DARTPLANT_MODULE_VM_ADAPTER_FAMILY MATCHES "^(3\\.4\\.4|3\\.5\\.0|3\\.12\\.1)$")
+        message(FATAL_ERROR "Unsupported fixed VM adapter family: ${DARTPLANT_MODULE_VM_ADAPTER_FAMILY}")
+    endif()
+    string(REPLACE "." "_" DARTPLANT_MODULE_VM_ADAPTER_SUFFIX "${DARTPLANT_MODULE_VM_ADAPTER_FAMILY}")
+    set(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_${DARTPLANT_MODULE_VM_ADAPTER_SUFFIX} ON)
+endif()
 option(
     DARTPLANT_REQUIRE_MINIMAL_LINKER_COMPAT
     "Use pthread TLS and audit the final Android shared module for minimal/custom loader compatibility"
@@ -179,7 +193,10 @@ if(ANDROID)
         message(FATAL_ERROR "DartPlant currently supports Android arm64-v8a only")
     endif()
 
-    if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER OR DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4)
+    if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER OR
+       DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_4_4 OR
+       DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_5_0 OR
+       DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_12_1)
         if(NOT EXISTS "${DARTPLANT_DART_SDK_ROOT}/runtime/include/dart_api_dl.c")
             message(FATAL_ERROR "DARTPLANT_DART_SDK_ROOT must point to a Dart SDK source tree")
         endif()
@@ -217,6 +234,16 @@ if(ANDROID)
                 PRIVATE DARTPLANT_FLUTTER_VM_PROFILE_3_4_4=1
             )
         endif()
+        if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_5_0)
+            dartplant_add_flutter_vm_adapter(dartplant_adapter_flutter_vm_3_5_0)
+            target_compile_definitions(dartplant_adapter_flutter_vm_3_5_0
+                PRIVATE DARTPLANT_FLUTTER_VM_PROFILE_3_5_0=1)
+        endif()
+        if(DARTPLANT_BUILD_FLUTTER_VM_ADAPTER_3_12_1)
+            dartplant_add_flutter_vm_adapter(dartplant_adapter_flutter_vm_3_12_1)
+            target_compile_definitions(dartplant_adapter_flutter_vm_3_12_1
+                PRIVATE DARTPLANT_FLUTTER_VM_PROFILE_3_12_1=1)
+        endif()
     endif()
 
     if(DARTPLANT_BUILD_ANDROID_MODULE)
@@ -252,6 +279,24 @@ if(ANDROID)
             log
             dl
         )
+        if(DARTPLANT_MODULE_VM_ADAPTER_FAMILY)
+            target_compile_definitions(dartplant PRIVATE
+                DARTPLANT_FIXED_VM_FAMILY="${DARTPLANT_MODULE_VM_ADAPTER_FAMILY}")
+            target_link_libraries(dartplant PRIVATE
+                dartplant_adapter_flutter_vm_${DARTPLANT_MODULE_VM_ADAPTER_SUFFIX}
+                dartplant_adapter_dobby)
+            target_sources(dartplant PRIVATE
+                tests/libxposed_fixture_module/app/src/main/cpp/module_probe.cpp
+                tests/libxposed_fixture_module/app/src/main/cpp/physical_mapping_probe.cpp)
+            # Native API v2 hooks run in the framework's own Dobby registry.
+            # This module also embeds a private Dobby fallback for translated
+            # guests. Exporting DobbyHook/DobbyDestroy from our .so lets the
+            # dynamic linker bind a lazily-resolved framework unhook PLT to
+            # our *different* registry after the module is loaded.
+            # Keep the backend callable within this .so but never interpose
+            # the framework's global Dobby symbols.
+            target_link_options(dartplant PRIVATE -Wl,--exclude-libs,libdobby.a)
+        endif()
         # Vector stores NativeOnModuleLoaded without an unregister API. Keep the
         # callback and its refresh worker code resident for process lifetime.
         target_link_options(dartplant PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,nodelete)
@@ -333,6 +378,11 @@ if(ANDROID)
             log
             dl
         )
+        if(DARTPLANT_BUILD_DOBBY_ADAPTER)
+            target_link_libraries(dartplant_device_tests PRIVATE dartplant_adapter_dobby)
+            target_compile_definitions(dartplant_device_tests PRIVATE
+                DARTPLANT_DEVICE_HAVE_DOBBY_ADAPTER=1)
+        endif()
         set_target_properties(
             dartplant_device_tests
             PROPERTIES

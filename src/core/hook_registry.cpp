@@ -1372,6 +1372,10 @@ DartPlantStatus InstallCallbackHook(
                                     std::memory_order_release);
         if (published_status != DARTPLANT_OK) {
             hook->active.store(false, std::memory_order_release);
+            if (hook->published_entry_hook->ever_published) {
+                hook->backup.store(hook->published_entry_hook->gate.backup,
+                                   std::memory_order_release);
+            }
             const bool returns_restored = RestoreArm64ReturnInterception(hook.get());
             if (hook->published_entry_hook->ever_published || !returns_restored) {
                 hook->state = hook->published_entry_hook->ever_published
@@ -1388,12 +1392,30 @@ DartPlantStatus InstallCallbackHook(
             return published_status;
         }
     } else {
-        if (host_binding->hook(host_binding->user_data, reinterpret_cast<void*>(target),
-                               hook->replacement_entry, &original) != 0 ||
-            original == nullptr) {
-            DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
-            hook->replacement_entry = nullptr;
-            hook->replacement_entry_size = 0;
+        const int host_status = host_binding->hook(
+            host_binding->user_data, reinterpret_cast<void*>(target),
+            hook->replacement_entry, &original);
+        if (host_status != 0 || original == nullptr) {
+            const bool ever_published =
+                host_status == DARTPLANT_HOST_HOOK_FAILED_AFTER_PUBLISHED ||
+                host_status == DARTPLANT_HOST_HOOK_FAILED_RECOVERY_REQUIRED ||
+                (host_status == 0 && original == nullptr);
+            if (ever_published) {
+                hook->backup.store(original, std::memory_order_release);
+                hook->host_binding = host_binding;
+                hook->backend_installed.store(
+                    host_status == DARTPLANT_HOST_HOOK_FAILED_RECOVERY_REQUIRED ||
+                    host_status == 0, std::memory_order_release);
+                hook->entry_published.store(true, std::memory_order_release);
+                hook->state = HookRecordState::kFailedAfterPublished;
+                hook->active.store(false, std::memory_order_release);
+                hook->listeners.clear();
+                Hooks().push_back(std::move(hook));
+            } else {
+                DestroyArm64CallbackStub(hook->replacement_entry, hook->replacement_entry_size);
+                hook->replacement_entry = nullptr;
+                hook->replacement_entry_size = 0;
+            }
             SetLastError("host hook function failed");
             return DARTPLANT_HOOK_FAILED;
         }

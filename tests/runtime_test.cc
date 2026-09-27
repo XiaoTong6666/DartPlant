@@ -7234,6 +7234,155 @@ TEST_CASE(PhysicalReturnCookieRemainsPhysicalAcrossLogicalOwnerTargetSwitch) {
     dartplant_release_listener(listener_b);
 }
 
+TEST_CASE(ExecutionBindingRequiresEquivalentCompleteCallLayout) {
+    using Layout = dartplant::abi::DartCallLayout;
+    using LocationKind = dartplant::abi::DartAbiLocationKind;
+    using Representation = dartplant::abi::DartAbiRepresentation;
+    using FormalKind = dartplant::abi::DartClosureFormalKind;
+
+    Layout base{};
+    base.vm_artifact_generation = 7;
+    base.vm_isolate_generation = 11;
+    base.vm_semantic_observation_receipt = true;
+    base.dart_sp_register = 15;
+    base.stack_words = 1;
+    base.parameters.resize(2);
+    base.parameters[0].representation = Representation::kTagged;
+    base.parameters[0].location.count = 1;
+    base.parameters[0].location.locations[0] = {.kind = LocationKind::kGpRegister,
+                                                .register_index = 1};
+    base.parameters[1].representation = Representation::kUnboxedDouble;
+    base.parameters[1].location.count = 1;
+    base.parameters[1].location.locations[0] = {.kind = LocationKind::kEntryStack,
+                                                .stack_offset = 0};
+    base.result.representation = Representation::kTagged;
+    base.result.location.count = 1;
+    base.result.location.locations[0] = {.kind = LocationKind::kGpRegister, .register_index = 0};
+    base.has_closure_receiver = true;
+    base.closure_receiver_location = {.kind = LocationKind::kGpRegister, .register_index = 0};
+    base.has_arguments_descriptor = true;
+    base.arguments_descriptor_location = {.kind = LocationKind::kGpRegister, .register_index = 4};
+    base.closure_signature = dartplant::abi::DartClosureSignatureLayout{};
+    base.closure_signature->implicit_parameter_count = 1;
+    base.closure_signature->fixed_parameter_count = 2;
+    base.closure_signature->optional_parameter_count = 1;
+    base.closure_signature->type_parameter_count = 1;
+    base.closure_signature->parent_type_argument_count = 1;
+    base.closure_signature->has_named_optional_parameters = true;
+    base.closure_signature->formals.push_back(
+        {.signature_index = 1, .kind = FormalKind::kNamed, .is_required = true, .name = "value"});
+
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    profile.flags = DARTPLANT_PROFILE_RAW_GP_ARGUMENTS | DARTPLANT_PROFILE_RAW_GP_RESULT;
+    profile.result_location = {DARTPLANT_ABI_GP_REGISTER, 0, {0, 0}};
+
+    const auto run_case = [&](const Layout& second_layout, bool equivalent) {
+        auto target = std::make_shared<dartplant::DartEntryTarget>();
+        target->entry = reinterpret_cast<uintptr_t>(Replacement);
+        auto generation = std::make_shared<std::atomic_uint64_t>(11);
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = 11;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = target;
+
+        DartPlantHook hook{};
+        hook.active = true;
+        hook.has_method = true;
+        hook.state = dartplant::HookRecordState::kInstalled;
+        hook.code_target = target;
+        hook.method_storage = std::make_unique<DartPlantMethod>(method);
+        hook.profile = profile;
+        hook.backup = reinterpret_cast<void*>(Replacement);
+
+        int first_label = 1;
+        int second_label = 2;
+        DartPlantHookOptions options = {
+            .struct_size = sizeof(DartPlantHookOptions),
+            .flags = 0,
+            .on_enter = OrderedEnter,
+            .on_leave = OnLeave,
+            .user_data = &first_label,
+            .vm_adapter = nullptr,
+        };
+        DartPlantListener* first = nullptr;
+        DartPlantListener* second = nullptr;
+        const auto first_layout = std::make_shared<const Layout>(base);
+        const auto second_binding = std::make_shared<const Layout>(second_layout);
+        EXPECT_TRUE(first_layout.get() != second_binding.get());
+        EXPECT_EQ(DARTPLANT_OK,
+                  dartplant::AddCallbackListener(&hook, &method, options, 0, &first, generation, 11,
+                                                 0, 0, 0, first_layout));
+        options.user_data = &second_label;
+        EXPECT_EQ(DARTPLANT_OK,
+                  dartplant::AddCallbackListener(&hook, &method, options, 0, &second, generation,
+                                                 11, 0, 0, 0, second_binding));
+
+        g_callback_order.clear();
+        g_leave_calls = 0;
+        DartPlantArm64Context context{};
+        EXPECT_TRUE(dartplant_arm64_dispatch_enter(&context, &hook).original != nullptr);
+        EXPECT_EQ(equivalent ? 2U : 1U, g_callback_order.size());
+        EXPECT_EQ(1, g_callback_order[0]);
+        if (equivalent) EXPECT_EQ(2, g_callback_order[1]);
+        EXPECT_EQ(1U, first->record->in_flight.load(std::memory_order_acquire));
+        EXPECT_EQ(equivalent ? 1U : 0U, second->record->in_flight.load(std::memory_order_acquire));
+        (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+        EXPECT_EQ(equivalent ? 2 : 1, g_leave_calls);
+        EXPECT_EQ(0U, first->record->in_flight.load(std::memory_order_acquire));
+        EXPECT_EQ(0U, second->record->in_flight.load(std::memory_order_acquire));
+        EXPECT_EQ(0U, hook.in_flight);
+        EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(first));
+        EXPECT_EQ(DARTPLANT_OK, dartplant_remove_listener(second));
+        dartplant_release_listener(first);
+        dartplant_release_listener(second);
+    };
+
+    // Separate immutable layout instances with the same complete structure
+    // may share the execution binding; pointer equality is not required.
+    run_case(base, true);
+    const std::vector<void (*)(Layout&)> mutations = {
+        [](Layout& value) { ++value.vm_artifact_generation; },
+        [](Layout& value) { ++value.vm_isolate_generation; },
+        [](Layout& value) { value.vm_semantic_observation_receipt = false; },
+        [](Layout& value) { value.parameters.pop_back(); },
+        [](Layout& value) { value.parameters[0].representation = Representation::kUnboxedInt64; },
+        [](Layout& value) { value.parameters[0].location.count = 0; },
+        [](Layout& value) { value.parameters[0].location.locations[0].register_index = 2; },
+        [](Layout& value) { value.parameters[1].location.locations[0].stack_offset = 8; },
+        [](Layout& value) { value.result.representation = Representation::kUnboxedInt64; },
+        [](Layout& value) { value.result.location.count = 0; },
+        [](Layout& value) { value.result.location.locations[0].register_index = 1; },
+        [](Layout& value) { ++value.stack_words; },
+        [](Layout& value) { value.dart_sp_register = 14; },
+        [](Layout& value) { value.has_closure_receiver = false; },
+        [](Layout& value) { value.closure_receiver_location.register_index = 1; },
+        [](Layout& value) { value.has_arguments_descriptor = false; },
+        [](Layout& value) { value.arguments_descriptor_location.register_index = 5; },
+        [](Layout& value) { value.closure_signature.reset(); },
+        [](Layout& value) { ++value.closure_signature->implicit_parameter_count; },
+        [](Layout& value) { ++value.closure_signature->fixed_parameter_count; },
+        [](Layout& value) { ++value.closure_signature->optional_parameter_count; },
+        [](Layout& value) { ++value.closure_signature->type_parameter_count; },
+        [](Layout& value) { ++value.closure_signature->parent_type_argument_count; },
+        [](Layout& value) { value.closure_signature->has_named_optional_parameters = false; },
+        [](Layout& value) { value.closure_signature->formals.clear(); },
+        [](Layout& value) { ++value.closure_signature->formals[0].signature_index; },
+        [](Layout& value) {
+            value.closure_signature->formals[0].kind = FormalKind::kOptionalPositional;
+        },
+        [](Layout& value) { value.closure_signature->formals[0].is_required = false; },
+        [](Layout& value) { value.closure_signature->formals[0].name = "other"; },
+    };
+    for (auto mutate : mutations) {
+        Layout mismatched = base;
+        mutate(mismatched);
+        run_case(mismatched, false);
+    }
+}
+
 TEST_CASE(PhysicalHookRoutesDifferentOwnersToTheirOwnVmAdapters) {
 #if !defined(__aarch64__)
     return;

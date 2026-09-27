@@ -94,6 +94,73 @@ void FilterListenersForCurrentIsolateGroup(DartPlantInvocation* invocation,
     listeners.erase(out, listeners.end());
 }
 
+bool SameAbiValueLocation(const dartplant::abi::DartAbiValueLocation& left,
+                          const dartplant::abi::DartAbiValueLocation& right) {
+    if (left.count != right.count || left.count > left.locations.size()) return false;
+    for (size_t index = 0; index < left.count; ++index) {
+        if (left.locations[index] != right.locations[index]) return false;
+    }
+    return true;
+}
+
+bool SameParameterLayout(const dartplant::abi::DartParameterLayout& left,
+                         const dartplant::abi::DartParameterLayout& right) {
+    return left.representation == right.representation &&
+           SameAbiValueLocation(left.location, right.location);
+}
+
+bool SameCallLayout(const dartplant::abi::DartCallLayout& left,
+                    const dartplant::abi::DartCallLayout& right) {
+    if (left.vm_artifact_generation != right.vm_artifact_generation ||
+        left.vm_isolate_generation != right.vm_isolate_generation ||
+        left.vm_call_profile != right.vm_call_profile ||
+        left.vm_object_profile != right.vm_object_profile ||
+        left.vm_semantic_observation_receipt != right.vm_semantic_observation_receipt ||
+        left.parameters.size() != right.parameters.size() ||
+        left.stack_words != right.stack_words || left.dart_sp_register != right.dart_sp_register ||
+        left.has_closure_receiver != right.has_closure_receiver ||
+        left.has_arguments_descriptor != right.has_arguments_descriptor ||
+        left.closure_signature.has_value() != right.closure_signature.has_value() ||
+        !SameParameterLayout(left.result, right.result)) {
+        return false;
+    }
+    for (size_t index = 0; index < left.parameters.size(); ++index) {
+        if (!SameParameterLayout(left.parameters[index], right.parameters[index])) return false;
+    }
+    if (left.has_closure_receiver &&
+        left.closure_receiver_location != right.closure_receiver_location) {
+        return false;
+    }
+    if (left.has_arguments_descriptor &&
+        left.arguments_descriptor_location != right.arguments_descriptor_location) {
+        return false;
+    }
+    if (!left.closure_signature.has_value()) return true;
+
+    const auto& first = *left.closure_signature;
+    const auto& second = *right.closure_signature;
+    if (first.implicit_parameter_count != second.implicit_parameter_count ||
+        first.fixed_parameter_count != second.fixed_parameter_count ||
+        first.optional_parameter_count != second.optional_parameter_count ||
+        first.type_parameter_count != second.type_parameter_count ||
+        first.parent_type_argument_count != second.parent_type_argument_count ||
+        first.has_named_optional_parameters != second.has_named_optional_parameters ||
+        first.formals.size() != second.formals.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < first.formals.size(); ++index) {
+        const auto& first_formal = first.formals[index];
+        const auto& second_formal = second.formals[index];
+        if (first_formal.signature_index != second_formal.signature_index ||
+            first_formal.kind != second_formal.kind ||
+            first_formal.is_required != second_formal.is_required ||
+            first_formal.name != second_formal.name) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool SameExecutionBinding(const dartplant::DartPlantListenerRecord& left,
                           const dartplant::DartPlantListenerRecord& right) {
     if (left.vm_adapter != right.vm_adapter ||
@@ -121,10 +188,11 @@ bool SameExecutionBinding(const dartplant::DartPlantListenerRecord& left,
     if (left.call_layout == nullptr || right.call_layout == nullptr) {
         return left.call_layout == nullptr && right.call_layout == nullptr;
     }
-    return left.call_layout->vm_artifact_generation == right.call_layout->vm_artifact_generation &&
-           left.call_layout->vm_isolate_generation == right.call_layout->vm_isolate_generation &&
-           left.call_layout->vm_call_profile == right.call_layout->vm_call_profile &&
-           left.call_layout->vm_object_profile == right.call_layout->vm_object_profile;
+    // Listener identity may change during enter/leave, but invocation.call_layout
+    // remains the first admitted listener's layout for the whole physical frame.
+    // Matching VM proof pointers alone does not prove compatible argument/result
+    // transport or closure descriptor semantics.
+    return SameCallLayout(*left.call_layout, *right.call_layout);
 }
 
 std::shared_ptr<dartplant::DartPlantListenerRecord> BindInvocationToCurrentOwner(

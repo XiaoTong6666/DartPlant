@@ -7,12 +7,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <vector>
 
+#include "android_logging.h"
 #include "core/internal.h"
 #include "vm/abi/resolver.h"
 
@@ -151,46 +154,321 @@ uintptr_t Distance(uintptr_t left, uintptr_t right) {
     return left > right ? left - right : right - left;
 }
 
+struct NearStubPages {
+    uintptr_t base = 0;
+    size_t page_size = 0;
+    uint32_t page_count = 0;
+    uint32_t used_pages = 0;
+};
+
+std::mutex& NearStubPagesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<NearStubPages>& NearStubPagePools() {
+    // Published callback and RET veneers can still be reached by a stale
+    // instruction fetch after logical unhook. Never reuse a consumed page.
+    static auto* pools = new std::vector<NearStubPages>();
+    return *pools;
+}
+
+bool IsPooledNearStubPage(const void* entry) {
+    if (entry == nullptr) return false;
+    const uintptr_t address = reinterpret_cast<uintptr_t>(entry);
+    std::lock_guard lock(NearStubPagesMutex());
+    for (const auto& pool : NearStubPagePools()) {
+        const size_t span = pool.page_size * pool.page_count;
+        if (address >= pool.base && address - pool.base < span &&
+            (address - pool.base) % pool.page_size == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool NearSpanFits(uintptr_t start, size_t span, uintptr_t target, uintptr_t reach) {
+    if (span == 0 || start > UINTPTR_MAX - (span - 1)) return false;
+    return Distance(start, target) < reach && Distance(start + span - 1, target) < reach;
+}
+
+void* ReserveNearStubPages(uintptr_t target_page, uintptr_t target, uintptr_t reach,
+                           size_t page_size, uint32_t page_count) {
+    const size_t span = page_size * page_count;
+    uint32_t hint_failed = 0;
+    uint32_t hint_out_of_reach = 0;
+    uintptr_t last_hint_mapping = 0;
+    uint32_t fixed_failed = 0;
+    uint32_t fixed_exists = 0;
+    uint32_t fixed_invalid = 0;
+    uint32_t fixed_nomem = 0;
+    uint32_t fixed_other = 0;
+    int last_fixed_errno = 0;
+    const auto accept = [&](void* mapped) -> void* {
+        if (mapped == MAP_FAILED) return nullptr;
+        if (NearSpanFits(reinterpret_cast<uintptr_t>(mapped), span, target, reach)) return mapped;
+        munmap(mapped, span);
+        return nullptr;
+    };
+
+    // A non-fixed address is only a hint, never permission to overwrite an
+    // image. Accept the returned address only after proving the *whole* pool
+    // is in direct-B reach. This also works on native-translation runtimes
+    // that do not honor a particular MAP_FIXED_NOREPLACE candidate.
+    constexpr uintptr_t kHintStep = uintptr_t{8} << 20;
+    for (uintptr_t delta = kHintStep; delta < reach; delta += kHintStep) {
+        const uintptr_t hints[2] = {
+            target_page <= UINTPTR_MAX - delta ? target_page + delta : 0,
+            target_page >= delta ? target_page - delta : 0,
+        };
+        for (uintptr_t hint : hints) {
+            if (hint == 0) continue;
+            void* requested = mmap(reinterpret_cast<void*>(hint), span, PROT_NONE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (requested == MAP_FAILED) {
+                ++hint_failed;
+                continue;
+            }
+            if (!NearSpanFits(reinterpret_cast<uintptr_t>(requested), span, target, reach)) {
+                ++hint_out_of_reach;
+                last_hint_mapping = reinterpret_cast<uintptr_t>(requested);
+            }
+            if (void* mapped = accept(requested); mapped != nullptr) {
+                return mapped;
+            }
+        }
+    }
+
+    // Search exact holes if non-fixed hints were redirected. A large pool is
+    // scanned at its own span first; the one-page fallback scans every page.
+    const uintptr_t step = span;
+    for (uintptr_t delta = page_size; delta < reach; delta += step) {
+        const uintptr_t candidates[2] = {
+            target_page <= UINTPTR_MAX - delta ? target_page + delta : 0,
+            target_page >= delta + span - page_size ? target_page - delta - (span - page_size) : 0,
+        };
+        for (uintptr_t candidate : candidates) {
+            if (candidate == 0 || !NearSpanFits(candidate, span, target, reach)) continue;
+            void* requested = mmap(reinterpret_cast<void*>(candidate), span, PROT_NONE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (requested == MAP_FAILED) {
+                ++fixed_failed;
+                last_fixed_errno = errno;
+                switch (errno) {
+                case EEXIST:
+                    ++fixed_exists;
+                    break;
+                case EINVAL:
+                    ++fixed_invalid;
+                    break;
+                case ENOMEM:
+                    ++fixed_nomem;
+                    break;
+                default:
+                    ++fixed_other;
+                    break;
+                }
+                continue;
+            }
+            if (void* mapped = accept(requested); mapped != nullptr) {
+                return mapped;
+            }
+        }
+    }
+#if defined(__ANDROID__)
+    AndroidLogPrint(ANDROID_LOG_ERROR, "CallbackStub",
+                    "near mmap failed target=0x%llx pages=%u hint_fail=%u hint_far=%u "
+                    "last_hint=0x%llx fixed_fail=%u exists=%u invalid=%u nomem=%u other=%u "
+                    "last_errno=%d",
+                    static_cast<unsigned long long>(target), page_count, hint_failed,
+                    hint_out_of_reach, static_cast<unsigned long long>(last_hint_mapping),
+                    fixed_failed, fixed_exists, fixed_invalid, fixed_nomem, fixed_other,
+                    last_fixed_errno);
+#endif
+    return nullptr;
+}
+
+void* AllocateNearStubPage(uintptr_t target, uintptr_t reach, size_t page_size) {
+    std::lock_guard lock(NearStubPagesMutex());
+    auto& pools = NearStubPagePools();
+    for (auto& pool : pools) {
+        if (pool.page_size != page_size) continue;
+        for (uint32_t index = 0; index < pool.page_count; ++index) {
+            const uint32_t bit = uint32_t{1} << index;
+            if ((pool.used_pages & bit) != 0) continue;
+            const uintptr_t page = pool.base + static_cast<uintptr_t>(index) * page_size;
+            if (!NearSpanFits(page, page_size, target, reach)) continue;
+            pool.used_pages |= bit;
+            if (mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ | PROT_WRITE) == 0) {
+                return reinterpret_cast<void*>(page);
+            }
+            // The failed page is never reused. Do not release another page
+            // that a future instruction-fetch continuation may have named.
+            munmap(reinterpret_cast<void*>(page), page_size);
+        }
+    }
+
+    try {
+        pools.reserve(pools.size() + 1);
+    } catch (...) {
+        return nullptr;
+    }
+    const uintptr_t target_page = target & ~(static_cast<uintptr_t>(page_size) - 1);
+    for (uint32_t page_count : {32U, 8U, 1U}) {
+        void* mapped = ReserveNearStubPages(target_page, target, reach, page_size, page_count);
+        if (mapped == nullptr) continue;
+        pools.push_back({reinterpret_cast<uintptr_t>(mapped), page_size, page_count, 1});
+        if (mprotect(mapped, page_size, PROT_READ | PROT_WRITE) == 0) return mapped;
+        munmap(mapped, page_size);
+        return nullptr;
+    }
+#if defined(__ANDROID__)
+    AndroidLogPrint(ANDROID_LOG_ERROR, "CallbackStub",
+                    "no direct-branch-reachable page for target=0x%llx reach=0x%llx page=%zu",
+                    static_cast<unsigned long long>(target), static_cast<unsigned long long>(reach),
+                    page_size);
+#endif
+    return nullptr;
+}
+
+enum class SharedVeneerKind : uint8_t { kCallback, kReturn, kGeneratedGate };
+
+struct SharedVeneerSlot {
+    std::atomic<void*> cookie{nullptr};
+    bool issued = false;
+};
+
+struct SharedVeneerPage {
+    uintptr_t base = 0;
+    size_t page_size = 0;
+    size_t slot_count = 0;
+    std::unique_ptr<SharedVeneerSlot[]> slots;
+};
+
+std::mutex& SharedVeneerPagesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<std::unique_ptr<SharedVeneerPage>>& SharedVeneerPages() {
+    // Executable slots and the separate atomic cookie cells outlive all
+    // published HookRecords/CodePayloads. A slot is issued at most once.
+    static auto* pages = new std::vector<std::unique_ptr<SharedVeneerPage>>();
+    return *pages;
+}
+
+std::pair<size_t, size_t> SharedVeneerRange(SharedVeneerKind kind, size_t count) {
+    const size_t third = count / 3;
+    switch (kind) {
+    case SharedVeneerKind::kCallback:
+        return {0, third};
+    case SharedVeneerKind::kReturn:
+        return {third, 2 * third};
+    case SharedVeneerKind::kGeneratedGate:
+        return {2 * third, count};
+    }
+    return {0, 0};
+}
+
+void* SharedVeneerDispatcher(SharedVeneerKind kind) {
+    switch (kind) {
+    case SharedVeneerKind::kCallback:
+        return reinterpret_cast<void*>(&dartplant_arm64_callback_entry);
+    case SharedVeneerKind::kReturn:
+        return reinterpret_cast<void*>(&dartplant_arm64_return_entry);
+    case SharedVeneerKind::kGeneratedGate:
+        return reinterpret_cast<void*>(&dartplant_arm64_generated_publication_gate_entry);
+    }
+    return nullptr;
+}
+
+void* AllocateSharedVeneer(SharedVeneerKind kind, void* cookie, uintptr_t target,
+                           size_t* out_size) {
+    if (cookie == nullptr || target == 0 || out_size == nullptr) return nullptr;
+    constexpr size_t kSlotSize = 32;
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) return nullptr;
+    const size_t page_size = static_cast<size_t>(raw_page_size);
+    if (page_size < 3 * kSlotSize || page_size % kSlotSize != 0) return nullptr;
+
+    std::lock_guard lock(SharedVeneerPagesMutex());
+    auto& pages = SharedVeneerPages();
+    const auto issue = [&](SharedVeneerPage& page) -> void* {
+        if (page.page_size != page_size) return nullptr;
+        const auto [begin, end] = SharedVeneerRange(kind, page.slot_count);
+        for (size_t index = begin; index < end; ++index) {
+            SharedVeneerSlot& slot = page.slots[index];
+            const uintptr_t entry = page.base + index * kSlotSize;
+            if (slot.issued || !NearSpanFits(entry, kSlotSize, target, kArm64BranchReach)) {
+                continue;
+            }
+            // The page is already RX and must never be patched again. The
+            // release-store publishes the complete immutable cookie to LDAR
+            // before the caller can publish a branch to this slot.
+            slot.issued = true;
+            slot.cookie.store(cookie, std::memory_order_release);
+            *out_size = 0;  // Shared page has no per-veneer munmap ownership.
+            return reinterpret_cast<void*>(entry);
+        }
+        return nullptr;
+    };
+    for (const auto& page : pages) {
+        if (void* entry = issue(*page); entry != nullptr) return entry;
+    }
+
+    std::unique_ptr<SharedVeneerPage> page;
+    try {
+        pages.reserve(pages.size() + 1);
+        page = std::make_unique<SharedVeneerPage>();
+        page->page_size = page_size;
+        page->slot_count = page_size / kSlotSize;
+        page->slots = std::make_unique<SharedVeneerSlot[]>(page->slot_count);
+    } catch (...) {
+        return nullptr;
+    }
+    void* mapped = AllocateNearStubPage(target, kArm64BranchReach, page_size);
+    if (mapped == nullptr) return nullptr;
+    page->base = reinterpret_cast<uintptr_t>(mapped);
+    for (size_t index = 0; index < page->slot_count; ++index) {
+        SharedVeneerKind slot_kind = SharedVeneerKind::kGeneratedGate;
+        if (index < page->slot_count / 3) {
+            slot_kind = SharedVeneerKind::kCallback;
+        } else if (index < 2 * (page->slot_count / 3)) {
+            slot_kind = SharedVeneerKind::kReturn;
+        }
+        auto* code = reinterpret_cast<uint32_t*>(page->base + index * kSlotSize);
+        code[0] = 0x58000091;  // ldr x17, +16 (atomic cookie cell address).
+        code[1] = 0xc8dffe31;  // ldar x17, [x17] (acquire published cookie).
+        code[2] = 0x58000090;  // ldr x16, +16 (common dispatcher at +24).
+        code[3] = 0xd61f0200;  // br x16.
+        auto* cell = &page->slots[index].cookie;
+        std::memcpy(reinterpret_cast<uint8_t*>(code) + 16, &cell, sizeof(cell));
+        void* dispatcher = SharedVeneerDispatcher(slot_kind);
+        std::memcpy(reinterpret_cast<uint8_t*>(code) + 24, &dispatcher, sizeof(dispatcher));
+    }
+    __builtin___clear_cache(reinterpret_cast<char*>(mapped),
+                            reinterpret_cast<char*>(mapped) + page_size);
+    if (mprotect(mapped, page_size, PROT_READ | PROT_EXEC) != 0) {
+        // The unused near page remains owned by the process pool; no veneer
+        // was issued and no instruction branch could have been published.
+        return nullptr;
+    }
+    pages.push_back(std::move(page));
+    return issue(*pages.back());
+}
+
 void* AllocateCallbackStub(size_t allocation_size, uintptr_t target, uintptr_t required_reach) {
     if (target != 0) {
         const long page_size_value = sysconf(_SC_PAGESIZE);
         if (page_size_value <= 0) return nullptr;
         const uintptr_t page_size = static_cast<uintptr_t>(page_size_value);
-        const uintptr_t target_page = target & ~(page_size - 1);
 
-        // A patched RET has only B +/-128 MiB of reach. mmap(address) is merely
-        // a hint and Android may return a distant page, so for this stricter
-        // case search exact free pages with MAP_FIXED_NOREPLACE. This never
-        // replaces an existing Dart/Flutter mapping.
+        // A patched RET has only B +/-128 MiB of reach. Reuse an unconsumed
+        // page from a verified near pool, or reserve a new pool without
+        // replacing existing Dart/Flutter mappings.
         if (required_reach != 0 && required_reach <= kArm64BranchReach) {
-            // A direct B can reach any instruction within +/-128 MiB, but the
-            // free mapping need not share a particular 1-MiB residue with the
-            // Dart target. Walk at the real page granularity so every possible
-            // page-aligned hole in range is considered. MAP_FIXED_NOREPLACE is
-            // essential here: it may claim only an actually free page and can
-            // never replace Dart/Flutter code or data.
-            const uintptr_t near_step = page_size;
-            const uint32_t attempts =
-                static_cast<uint32_t>((required_reach - page_size) / near_step);
-            for (uint32_t attempt = 1; attempt <= attempts; ++attempt) {
-                const uintptr_t delta = near_step * attempt;
-                const uintptr_t candidates[2] = {
-                    target_page <= UINTPTR_MAX - delta ? target_page + delta : 0,
-                    target_page >= delta ? target_page - delta : 0,
-                };
-                for (uintptr_t candidate : candidates) {
-                    if (candidate == 0) continue;
-                    void* mapped = mmap(reinterpret_cast<void*>(candidate), allocation_size,
-                                        PROT_READ | PROT_WRITE,
-                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-                    if (mapped == MAP_FAILED) continue;
-                    if (Distance(reinterpret_cast<uintptr_t>(mapped), target) < required_reach) {
-                        return mapped;
-                    }
-                    munmap(mapped, allocation_size);
-                }
-            }
-            return nullptr;
+            if (allocation_size != page_size) return nullptr;
+            return AllocateNearStubPage(target, required_reach, page_size);
         }
 
         // A non-null mmap address is a hint, not MAP_FIXED: it cannot replace
@@ -445,6 +723,9 @@ void* CreateArm64HostPublicationGateStub(HostPublicationGate* gate, uintptr_t ta
                                          bool track_generated_entrants, size_t* out_size) {
 #if defined(__aarch64__)
     if (gate == nullptr || target == 0 || out_size == nullptr) return nullptr;
+    if (track_generated_entrants) {
+        return AllocateSharedVeneer(SharedVeneerKind::kGeneratedGate, gate, target, out_size);
+    }
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return nullptr;
     const size_t allocation_size = static_cast<size_t>(page_size);
@@ -489,6 +770,11 @@ void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out
     const bool synthetic_native =
         hook->method_storage != nullptr && hook->method_storage->function != nullptr &&
         hook->method_storage->function->source == DartFunctionSource::kSynthetic;
+    if (!synthetic_native) {
+        // All executable instructions were frozen while the shared page was
+        // still private RW. This slot publishes only a one-time cookie.
+        return AllocateSharedVeneer(SharedVeneerKind::kCallback, hook, target, out_size);
+    }
     // Real Dart hooks also patch each RET to a per-hook return veneer. AArch64
     // B has a +/-128 MiB range, which is stricter than ADRP and therefore also
     // avoids the backend's far absolute-literal entry trampoline. Synthetic
@@ -532,26 +818,7 @@ void* CreateArm64CallbackStub(DartPlantHook* hook, uintptr_t target, size_t* out
 void* CreateArm64PayloadReturnStub(DartCodePayload* payload, uintptr_t target, size_t* out_size) {
 #if defined(__aarch64__)
     if (payload == nullptr || out_size == nullptr || target == 0) return nullptr;
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) return nullptr;
-    const size_t allocation_size = static_cast<size_t>(page_size);
-    auto* code =
-        static_cast<uint32_t*>(AllocateCallbackStub(allocation_size, target, kArm64BranchReach));
-    if (code == nullptr) return nullptr;
-    code[0] = 0x58000091;  // ldr x17, +16 (DartCodePayload*).
-    code[1] = 0x580000b0;  // ldr x16, +20 (common dispatcher).
-    code[2] = 0xd61f0200;  // br x16.
-    code[3] = 0xd503201f;  // nop.
-    std::memcpy(reinterpret_cast<uint8_t*>(code) + 16, &payload, sizeof(payload));
-    void* common = reinterpret_cast<void*>(&dartplant_arm64_return_entry);
-    std::memcpy(reinterpret_cast<uint8_t*>(code) + 24, &common, sizeof(common));
-    __builtin___clear_cache(reinterpret_cast<char*>(code), reinterpret_cast<char*>(code) + 32);
-    if (mprotect(code, allocation_size, PROT_READ | PROT_EXEC) != 0) {
-        munmap(code, allocation_size);
-        return nullptr;
-    }
-    *out_size = allocation_size;
-    return code;
+    return AllocateSharedVeneer(SharedVeneerKind::kReturn, payload, target, out_size);
 #else
     (void) payload;
     (void) target;
@@ -853,7 +1120,11 @@ bool RestoreArm64ReturnInterception(DartPlantHook* hook) {
 
 void DestroyArm64CallbackStub(void* entry, size_t size) {
 #if defined(__aarch64__)
-    if (entry != nullptr && size != 0) munmap(entry, size);
+    // A callback page may also host a payload-level RET veneer. RET patches
+    // can have stale instruction fetches after rollback even when the entry
+    // hook itself was never published. Keep all consumed near-pool pages
+    // reserved; unused pages stay PROT_NONE and are never reused after issue.
+    if (entry != nullptr && size != 0 && !IsPooledNearStubPage(entry)) munmap(entry, size);
 #else
     (void) entry;
     (void) size;

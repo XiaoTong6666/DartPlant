@@ -38,6 +38,14 @@ typedef _DeferredLifecycleProofNative = Uint64 Function();
 typedef _DeferredLifecycleProofDart = int Function();
 typedef _MultiOwnerNative = Uint64 Function(Uint32);
 typedef _MultiOwnerDart = int Function(int);
+typedef _ChangedSlotlessNative = Uint64 Function();
+typedef _ChangedSlotlessDart = int Function();
+typedef _MultiOwnerExceptionPrepareNative = Uint64 Function();
+typedef _MultiOwnerExceptionPrepareDart = int Function();
+typedef _MultiOwnerExceptionCleanupNative = Void Function();
+typedef _MultiOwnerExceptionCleanupDart = void Function();
+typedef _CallLayoutBindingProbeNative = Uint64 Function();
+typedef _CallLayoutBindingProbeDart = int Function();
 typedef _ExceptionBridgeLifetimeInstallNative = Int32 Function();
 typedef _ExceptionBridgeLifetimeInstallDart = int Function();
 typedef _ExceptionBridgeLifetimeProbeNative = Uint64 Function();
@@ -184,6 +192,48 @@ final class DartPlantNative {
   static final _MultiOwnerDart _multiOwnerListenerProbe = _library
       .lookup<NativeFunction<_MultiOwnerNative>>(
         'dartplant_fixture_multi_owner_listener_probe',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerRetireRaceStart = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_retire_race_start',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerRetireRaceProbe = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_retire_race_probe',
+      )
+      .asFunction();
+  static final _ChangedSlotlessDart _changedSlotlessRejectProbe = _library
+      .lookup<NativeFunction<_ChangedSlotlessNative>>(
+        'dartplant_fixture_changed_slotless_reject_probe',
+      )
+      .asFunction();
+  static final _MultiOwnerExceptionPrepareDart _multiOwnerExceptionPrepare =
+      _library
+          .lookup<NativeFunction<_MultiOwnerExceptionPrepareNative>>(
+            'dartplant_fixture_multi_owner_exception_prepare',
+          )
+          .asFunction();
+  static final _MultiOwnerDart _multiOwnerExceptionInstall = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_exception_install',
+      )
+      .asFunction();
+  static final _MultiOwnerDart _multiOwnerExceptionProbe = _library
+      .lookup<NativeFunction<_MultiOwnerNative>>(
+        'dartplant_fixture_multi_owner_exception_probe',
+      )
+      .asFunction();
+  static final _MultiOwnerExceptionCleanupDart _multiOwnerExceptionCleanup =
+      _library
+          .lookup<NativeFunction<_MultiOwnerExceptionCleanupNative>>(
+            'dartplant_fixture_multi_owner_exception_cleanup',
+          )
+          .asFunction();
+  static final _CallLayoutBindingProbeDart _callLayoutBindingProbe = _library
+      .lookup<NativeFunction<_CallLayoutBindingProbeNative>>(
+        'dartplant_fixture_call_layout_binding_probe',
       )
       .asFunction();
   static final _ExceptionBridgeLifetimeInstallDart
@@ -359,6 +409,26 @@ final class DartPlantNative {
 
   static int multiOwnerListenerProbe(int label) =>
       _multiOwnerListenerProbe(label);
+
+  static int multiOwnerRetireRaceStart(int label) =>
+      _multiOwnerRetireRaceStart(label);
+
+  static int multiOwnerRetireRaceProbe(int label) =>
+      _multiOwnerRetireRaceProbe(label);
+
+  static int changedSlotlessRejectProbe() => _changedSlotlessRejectProbe();
+
+  static int multiOwnerExceptionPrepare() => _multiOwnerExceptionPrepare();
+
+  static int multiOwnerExceptionInstall(int label) =>
+      _multiOwnerExceptionInstall(label);
+
+  static int multiOwnerExceptionProbe(int label) =>
+      _multiOwnerExceptionProbe(label);
+
+  static void multiOwnerExceptionCleanup() => _multiOwnerExceptionCleanup();
+
+  static int callLayoutBindingProbe() => _callLayoutBindingProbe();
 
   static int exceptionBridgeLifetimeInstall() =>
       _exceptionBridgeLifetimeInstall();

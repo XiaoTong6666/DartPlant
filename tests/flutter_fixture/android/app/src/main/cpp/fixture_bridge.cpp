@@ -1,5 +1,6 @@
 #include <android/log.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -21,6 +22,7 @@
 #include "fixture_host.h"
 #include "runtime/flutter_snapshot_internal.h"
 #include "runtime/runtime_internal.h"
+#include "runtime/snapshot_index.h"
 #include "simple_facade_consumer.h"
 #include "vm/abi/resolver.h"
 #include "vm/live_vm_internal.h"
@@ -58,9 +60,11 @@ DartPlantMethod* g_echo_object = nullptr;
 DartPlantMethod* g_negate_bool = nullptr;
 DartPlantMethod* g_signature_probe = nullptr;
 DartPlantMethod* g_verified_abi_double = nullptr;
+DartPlantMethod* g_multi_owner_exception_method = nullptr;
 DartPlantMethod* g_forced_stack_closure = nullptr;
 DartPlantMethod* g_type_arguments_closure = nullptr;
 DartPlantHook* g_instrumented_add_hook = nullptr;
+DartPlantHook* g_multi_owner_exception_hook = nullptr;
 DartPlantHook* g_forced_stack_closure_hook = nullptr;
 DartPlantHook* g_type_arguments_closure_hook = nullptr;
 DartPlantHook* g_echo_object_hook = nullptr;
@@ -136,10 +140,29 @@ std::mutex g_multi_owner_mutex;
 std::array<MultiOwnerObservation, 4> g_multi_owner_observations{};
 DartPlantMethod* g_multi_owner_retained_b_method = nullptr;
 DartPlantListener* g_multi_owner_listener = nullptr;
+DartPlantListener* g_multi_owner_exception_listener = nullptr;
 std::atomic<uint32_t> g_multi_owner_listener_label{0};
 std::atomic<uint64_t> g_multi_owner_listener_enter{0};
 std::atomic<uint64_t> g_multi_owner_listener_leave{0};
 std::atomic_bool g_multi_owner_listener_logical_target_ok{false};
+std::thread g_multi_owner_retire_worker;
+std::atomic_bool g_multi_owner_retire_enabled{false};
+std::atomic_bool g_multi_owner_retire_entered{false};
+std::atomic_bool g_multi_owner_retire_finished{false};
+std::atomic_bool g_multi_owner_retire_overlap_ok{false};
+std::atomic_bool g_multi_owner_retire_owner_ok{false};
+std::atomic_bool g_multi_owner_retire_timeout{false};
+std::atomic<uint64_t> g_multi_owner_retire_status{0};
+std::atomic<uint32_t> g_multi_owner_exception_label{0};
+std::atomic<uint64_t> g_multi_owner_exception_enter{0};
+std::atomic<uint64_t> g_multi_owner_exception_leave{0};
+std::atomic<uint64_t> g_multi_owner_exception_unwind{0};
+std::atomic_bool g_multi_owner_exception_owner_ok{false};
+std::atomic_bool g_multi_owner_exception_objects_ok{false};
+std::atomic_bool g_multi_owner_exception_objects_available{false};
+std::atomic_bool g_multi_owner_exception_phase_ok{false};
+
+void ReleaseMultiOwnerExceptionHook();
 
 void LogFailure(const char* operation) {
     __android_log_print(ANDROID_LOG_ERROR, kTag, "%s: %s", operation, dartplant_last_error());
@@ -575,10 +598,103 @@ void OnMultiOwnerListenerEnter(DartPlantInvocation* invocation, void*) {
         logical_target->payload.get() != physical_target->payload.get();
     g_multi_owner_listener_logical_target_ok.store(logical_target_ok, std::memory_order_release);
     g_multi_owner_listener_enter.fetch_add(1, std::memory_order_relaxed);
+    if (g_multi_owner_retire_enabled.load(std::memory_order_acquire)) {
+        const auto record = g_multi_owner_listener == nullptr
+                                ? std::shared_ptr<dartplant::DartPlantListenerRecord>{}
+                                : g_multi_owner_listener->record;
+        bool hook_in_flight = false;
+        if (g_instrumented_add_hook != nullptr) {
+            std::lock_guard lock(g_instrumented_add_hook->mutex);
+            hook_in_flight = g_instrumented_add_hook->in_flight != 0;
+        }
+        g_multi_owner_retire_overlap_ok.store(
+            record != nullptr && record->in_flight.load(std::memory_order_acquire) != 0 &&
+                hook_in_flight,
+            std::memory_order_release);
+        g_multi_owner_retire_entered.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!g_multi_owner_retire_finished.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        if (!g_multi_owner_retire_finished.load(std::memory_order_acquire)) {
+            g_multi_owner_retire_timeout.store(true, std::memory_order_release);
+        }
+    }
 }
 
 void OnMultiOwnerListenerLeave(DartPlantInvocation*, void*) {
     g_multi_owner_listener_leave.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnMultiOwnerExceptionPhysicalEnter(DartPlantInvocation*, void*) {}
+
+void OnMultiOwnerExceptionEnter(DartPlantInvocation* invocation, void*) {
+    const DartPlantMethod* method = dartplant_invocation_requested_method(invocation);
+    const auto* logical = method == nullptr || method->function == nullptr
+                              ? nullptr
+                              : method->function->code_target.get();
+    const auto* physical = g_multi_owner_exception_hook == nullptr
+                               ? nullptr
+                               : g_multi_owner_exception_hook->code_target.get();
+    const uint32_t label = g_multi_owner_exception_label.load(std::memory_order_acquire);
+    uint64_t expected_group = 0;
+    {
+        std::lock_guard lock(g_multi_owner_mutex);
+        if (label < g_multi_owner_observations.size()) {
+            expected_group = g_multi_owner_observations[label].isolate_group;
+        }
+    }
+    const bool owner_ok = method != nullptr && method->function != nullptr &&
+                          method->function->isolate_group_identity == expected_group &&
+                          expected_group != 0 && logical != nullptr && physical != nullptr &&
+                          logical != physical && logical->entry == physical->entry &&
+                          logical->payload.get() != physical->payload.get();
+    g_multi_owner_exception_owner_ok.store(owner_ok, std::memory_order_release);
+    g_multi_owner_exception_enter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnMultiOwnerExceptionLeave(DartPlantInvocation*, void*) {
+    g_multi_owner_exception_leave.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnMultiOwnerExceptionUnwind(DartPlantInvocation* invocation, void*) {
+    DartPlantValue exception{};
+    DartPlantValue stacktrace{};
+    DartPlantValue invalid_argument{};
+    const bool phase_ok = dartplant_invocation_phase(invocation) == DARTPLANT_INVOCATION_EXCEPTION;
+    const DartPlantStatus exception_status =
+        dartplant_invocation_get_exception(invocation, &exception);
+    const DartPlantStatus stacktrace_status =
+        dartplant_invocation_get_stacktrace(invocation, &stacktrace);
+    const DartPlantStatus argument_status =
+        dartplant_invocation_get_argument(invocation, 0, &invalid_argument);
+    const bool phase_safe = phase_ok && argument_status == DARTPLANT_INVALID_INVOCATION_PHASE;
+    const bool objects_available =
+        invocation->vm_adapter != nullptr && exception_status == DARTPLANT_OK &&
+        stacktrace_status == DARTPLANT_OK && exception.kind == DARTPLANT_VALUE_HEAP_OBJECT &&
+        stacktrace.kind == DARTPLANT_VALUE_HEAP_OBJECT;
+    // A listener without an exact owner-bound V4 adapter can observe the
+    // non-local unwind and its phase-safe identity, but cannot manufacture
+    // VM object roots from a different IsolateGroup. The existing P6 fixture
+    // separately proves object/stacktrace reads with a real V4 adapter.
+    const bool objects_unavailable = invocation->vm_adapter == nullptr &&
+                                     exception_status == DARTPLANT_INVALID_INVOCATION_PHASE &&
+                                     stacktrace_status == DARTPLANT_INVALID_INVOCATION_PHASE;
+    const bool objects_ok = objects_available || objects_unavailable;
+    g_multi_owner_exception_phase_ok.store(phase_safe, std::memory_order_release);
+    g_multi_owner_exception_objects_ok.store(objects_ok, std::memory_order_release);
+    g_multi_owner_exception_objects_available.store(objects_available, std::memory_order_release);
+    g_multi_owner_exception_unwind.fetch_add(1, std::memory_order_relaxed);
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "multi-owner exception object phase=%u exception_status=%d "
+                        "stacktrace_status=%d argument_status=%d exception_kind=%u "
+                        "stacktrace_kind=%u adapter=%p object_api_available=%u "
+                        "object_api_contract=%u error=%s",
+                        static_cast<unsigned>(phase_safe), exception_status, stacktrace_status,
+                        argument_status, exception.kind, stacktrace.kind, invocation->vm_adapter,
+                        static_cast<unsigned>(objects_available), static_cast<unsigned>(objects_ok),
+                        dartplant_last_error());
 }
 
 void OnEchoObjectEnter(DartPlantInvocation* invocation, void*) {
@@ -1056,6 +1172,7 @@ void ReleaseStaleFixtureGenerationBindings() {
     if (probe == nullptr || dartplant::IsRuntimeMethodOwnerAlive(g_runtime, probe)) return;
 
     ReleaseInstrumentedAddBindings();
+    ReleaseMultiOwnerExceptionHook();
     ReleaseHookBinding(&g_echo_object_hook);
     ReleaseHookBinding(&g_negate_bool_hook);
     ReleaseHookBinding(&g_forced_stack_closure_hook);
@@ -2209,7 +2326,387 @@ void ReleaseMultiOwnerListener() {
     g_multi_owner_listener = nullptr;
 }
 
+void ReleaseMultiOwnerExceptionListener() {
+    if (g_multi_owner_exception_listener == nullptr) return;
+    (void) dartplant_remove_listener(g_multi_owner_exception_listener);
+    dartplant_release_listener(g_multi_owner_exception_listener);
+    g_multi_owner_exception_listener = nullptr;
+}
+
+void ReleaseMultiOwnerExceptionHook() {
+    ReleaseMultiOwnerExceptionListener();
+    ReleaseHookBinding(&g_multi_owner_exception_hook);
+    ReleaseMethodBinding(&g_multi_owner_exception_method);
+}
+
+struct LayoutProbeCounts {
+    uint32_t enter = 0;
+    uint32_t leave = 0;
+};
+
+void OnLayoutProbeEnter(DartPlantInvocation*, void* user_data) {
+    ++static_cast<LayoutProbeCounts*>(user_data)->enter;
+}
+
+void OnLayoutProbeLeave(DartPlantInvocation*, void* user_data) {
+    ++static_cast<LayoutProbeCounts*>(user_data)->leave;
+}
+
 }  // namespace
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_exception_prepare() {
+    if (g_runtime == nullptr) return 0;
+    ReleaseMultiOwnerExceptionHook();
+    if (!FindLiveTopLevelMethod("verifiedAbiThrowingStack", &g_multi_owner_exception_method) ||
+        g_multi_owner_exception_method == nullptr) {
+        LogFailure("multi-owner exception physical lookup");
+        return 0;
+    }
+    DartPlantRuntimeProfile profile{};
+    dartplant_runtime_profile_init_arm64_aot(&profile);
+    const DartPlantStatus status = InstallMethodHook(
+        g_multi_owner_exception_method, profile, nullptr, &g_multi_owner_exception_hook,
+        OnMultiOwnerExceptionPhysicalEnter, DARTPLANT_HOOK_ALLOW_SHARED_CODE);
+    const bool installed = status == DARTPLANT_OK && g_multi_owner_exception_hook != nullptr &&
+                           g_multi_owner_exception_hook->code_target != nullptr &&
+                           g_multi_owner_exception_hook->code_target->payload != nullptr;
+    __android_log_print(installed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"multi_owner_exception_prepare\","
+                        "\"state\":\"%s\",\"status\":%d}",
+                        installed ? "pass" : "fail", status);
+    if (!installed) ReleaseMultiOwnerExceptionHook();
+    return installed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_exception_install(uint32_t label) {
+    if (g_runtime == nullptr || g_multi_owner_exception_hook == nullptr || label == 0 ||
+        label >= g_multi_owner_observations.size()) {
+        return 0;
+    }
+    ReleaseMultiOwnerExceptionListener();
+    g_multi_owner_exception_label.store(label, std::memory_order_release);
+    g_multi_owner_exception_enter.store(0, std::memory_order_relaxed);
+    g_multi_owner_exception_leave.store(0, std::memory_order_relaxed);
+    g_multi_owner_exception_unwind.store(0, std::memory_order_relaxed);
+    g_multi_owner_exception_owner_ok.store(false, std::memory_order_release);
+    g_multi_owner_exception_objects_ok.store(false, std::memory_order_release);
+    g_multi_owner_exception_objects_available.store(false, std::memory_order_release);
+    g_multi_owner_exception_phase_ok.store(false, std::memory_order_release);
+
+    DartPlantMethod* method = nullptr;
+    if (!FindLiveTopLevelMethod("verifiedAbiThrowingStack", &method) || method == nullptr ||
+        method->function == nullptr || method->function->code_target == nullptr ||
+        method->function->code_target->payload == nullptr) {
+        if (method != nullptr) dartplant_release_method(method);
+        return 0;
+    }
+    const bool distinct =
+        method->function->code_target.get() != g_multi_owner_exception_hook->code_target.get() &&
+        method->function->code_target->entry == g_multi_owner_exception_hook->code_target->entry &&
+        method->function->code_target->payload.get() !=
+            g_multi_owner_exception_hook->code_target->payload.get();
+    const DartPlantHookOptions options = {
+        .struct_size = sizeof(DartPlantHookOptions),
+        .flags = DARTPLANT_HOOK_ALLOW_SHARED_CODE,
+        .on_enter = OnMultiOwnerExceptionEnter,
+        .on_leave = OnMultiOwnerExceptionLeave,
+        .user_data = nullptr,
+        .vm_adapter = nullptr,
+    };
+    const DartPlantStatus status =
+        distinct ? dartplant_runtime_add_listener(g_runtime, method, &options, 100,
+                                                  &g_multi_owner_exception_listener)
+                 : DARTPLANT_RUNTIME_NOT_READY;
+    dartplant_release_method(method);
+    const bool installed = status == DARTPLANT_OK && g_multi_owner_exception_listener != nullptr &&
+                           g_multi_owner_exception_listener->record != nullptr;
+    if (installed) {
+        g_multi_owner_exception_listener->record->on_exception.store(OnMultiOwnerExceptionUnwind,
+                                                                     std::memory_order_release);
+    } else {
+        ReleaseMultiOwnerExceptionListener();
+    }
+    __android_log_print(installed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"multi_owner_exception_install\","
+                        "\"state\":\"%s\",\"label\":%u,\"status\":%d,\"distinct\":%u}",
+                        installed ? "pass" : "fail", label, status,
+                        static_cast<unsigned>(distinct));
+    return installed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_exception_probe(uint32_t label) {
+    const uint64_t enter = g_multi_owner_exception_enter.load(std::memory_order_relaxed);
+    const uint64_t leave = g_multi_owner_exception_leave.load(std::memory_order_relaxed);
+    const uint64_t unwind = g_multi_owner_exception_unwind.load(std::memory_order_relaxed);
+    const bool owner = g_multi_owner_exception_owner_ok.load(std::memory_order_acquire);
+    const bool objects = g_multi_owner_exception_objects_ok.load(std::memory_order_acquire);
+    const bool objects_available =
+        g_multi_owner_exception_objects_available.load(std::memory_order_acquire);
+    const bool phase = g_multi_owner_exception_phase_ok.load(std::memory_order_acquire);
+    const bool listener_idle =
+        g_multi_owner_exception_listener != nullptr &&
+        g_multi_owner_exception_listener->record != nullptr &&
+        g_multi_owner_exception_listener->record->in_flight.load(std::memory_order_acquire) == 0;
+    const bool hook_idle =
+        g_multi_owner_exception_hook != nullptr && g_multi_owner_exception_hook->in_flight == 0;
+    const bool passed = g_multi_owner_exception_label.load(std::memory_order_acquire) == label &&
+                        enter == 1 && leave == 0 && unwind == 1 && owner && phase && objects &&
+                        listener_idle && hook_idle;
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"multi_owner_exception_unwind\","
+                        "\"state\":\"%s\",\"label\":%u,\"enter\":%llu,\"leave\":%llu,"
+                        "\"exception\":%llu,\"owner\":%u,\"phase\":%u,\"object_contract\":%u,"
+                        "\"object_api_available\":%u,"
+                        "\"listener_idle\":%u,\"hook_idle\":%u}",
+                        passed ? "pass" : "fail", label, static_cast<unsigned long long>(enter),
+                        static_cast<unsigned long long>(leave),
+                        static_cast<unsigned long long>(unwind), static_cast<unsigned>(owner),
+                        static_cast<unsigned>(phase), static_cast<unsigned>(objects),
+                        static_cast<unsigned>(objects_available),
+                        static_cast<unsigned>(listener_idle), static_cast<unsigned>(hook_idle));
+    ReleaseMultiOwnerExceptionListener();
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+dartplant_fixture_multi_owner_exception_cleanup() {
+    ReleaseMultiOwnerExceptionHook();
+}
+
+// Construct a deliberately corrupted *copy* of the live stable directory for
+// the actual loaded deferred RuntimeImage. The production VM/index state and
+// the heap are untouched. The incremental builder must reject this before
+// trying to observe moving Function objects.
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_changed_slotless_reject_probe() {
+    if (g_runtime == nullptr) return 0;
+    dartplant::SnapshotIndex base;
+    DartPlantLiveVmFunctionIndexInfo base_info{};
+    dartplant::RuntimeImage deferred{};
+    bool real_image = false;
+    bool stable = false;
+    const dartplant::RuntimeProfileRecord* vm_profile = nullptr;
+    {
+        std::lock_guard lock(g_runtime->mutex);
+        const auto& group = dartplant::RuntimeIsolateGroup(g_runtime);
+        const auto* image = group.image_set.FindByLoadingUnitId(2);
+        if (image != nullptr && group.live_snapshot_index.has_value()) {
+            deferred = *image;
+            base = *group.live_snapshot_index;
+            base_info = group.live_function_index_info;
+            vm_profile = dartplant::FindRuntimeProfileByVersion(base.vm_profile_version);
+            real_image =
+                image->IsActive() &&
+                image->deferred_load_state == dartplant::RuntimeDeferredLoadState::kLoaded &&
+                image->live_entry_count != 0;
+            stable = base.stable_live_directory && base_info.struct_size >= sizeof(base_info) &&
+                     base_info.function_count == base.live_function_infos.size() &&
+                     !base.live_function_infos.empty();
+        }
+    }
+    bool rejected = false;
+    bool unchanged = false;
+    std::string rejection;
+    if (real_image && stable && vm_profile != nullptr) {
+        auto bad_base = base;
+        auto record = base.live_function_infos.front();
+        record.runtime_image_id = deferred.id;
+        record.runtime_image_incarnation_epoch = deferred.incarnation_epoch;
+        record.engine_incarnation_epoch = deferred.engine_incarnation_epoch;
+        record.isolate_group_incarnation_epoch = deferred.isolate_group_incarnation_epoch;
+        record.runtime_generation = deferred.runtime_generation;
+        record.loading_unit_id = deferred.loading_unit_id;
+        record.owner_class_id = 0;
+        record.owner_function_index = UINT32_MAX;
+        bad_base.live_function_infos.push_back(record);
+        auto corrupt_info = base_info;
+        corrupt_info.function_count = static_cast<uint32_t>(bad_base.live_function_infos.size());
+        DartPlantLiveVmFunctionIndexInfo out_info{};
+        out_info.struct_size = sizeof(out_info);
+        DartPlantLiveVmContext context{};
+        context.struct_size = sizeof(context);
+        const std::array<uint64_t, 1> changed = {deferred.id};
+        const auto result = dartplant::BuildDeferredLiveSnapshotIndexIncrement(
+            bad_base, context, {}, changed, *vm_profile, *vm_profile, *vm_profile, nullptr, nullptr,
+            corrupt_info, &out_info, &rejection);
+        rejected =
+            !result.has_value() &&
+            rejection == "changed deferred image contains a slotless stable-directory record";
+        // No partial directory publication or output from the rejected
+        // incremental attempt, including on the original live owner.
+        unchanged = base.stable_live_directory &&
+                    base.live_function_infos.size() + 1 == bad_base.live_function_infos.size() &&
+                    out_info.function_count == 0;
+        {
+            std::lock_guard lock(g_runtime->mutex);
+            const auto& current = dartplant::RuntimeIsolateGroup(g_runtime);
+            const auto* live = current.image_set.FindById(deferred.id);
+            unchanged = unchanged && current.live_snapshot_index.has_value() &&
+                        current.live_snapshot_index->stable_live_directory &&
+                        current.live_snapshot_index->live_function_infos.size() ==
+                            base.live_function_infos.size() &&
+                        live != nullptr && live->incarnation_epoch == deferred.incarnation_epoch &&
+                        live->live_entry_count == deferred.live_entry_count;
+        }
+    }
+    const bool passed = real_image && stable && vm_profile != nullptr && rejected && unchanged;
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"changed_slotless_reject\","
+                        "\"state\":\"%s\",\"loaded_image\":%u,\"stable_base\":%u,"
+                        "\"rejected\":%u,\"unchanged\":%u,\"loading_unit\":%u,"
+                        "\"error\":\"%s\"}",
+                        passed ? "pass" : "fail", static_cast<unsigned>(real_image),
+                        static_cast<unsigned>(stable), static_cast<unsigned>(rejected),
+                        static_cast<unsigned>(unchanged), deferred.loading_unit_id,
+                        rejection.c_str());
+    return passed ? 1 : 0;
+}
+
+// Exercise the production ARM64 dispatcher from inside a release Flutter
+// process, without forging a real Dart Function's compiler-proven ABI. Real
+// AOT calls keep their own exact call layout; only these synthetic listeners
+// deliberately supply incompatible layouts to test fail-closed admission.
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_call_layout_binding_probe() {
+    using Layout = dartplant::abi::DartCallLayout;
+    using Kind = dartplant::abi::DartAbiLocationKind;
+    using Representation = dartplant::abi::DartAbiRepresentation;
+    Layout base{};
+    base.vm_artifact_generation = 7;
+    base.vm_isolate_generation = 11;
+    base.vm_semantic_observation_receipt = true;
+    base.dart_sp_register = 15;
+    base.parameters.resize(1);
+    base.parameters[0].representation = Representation::kTagged;
+    base.parameters[0].location.count = 1;
+    base.parameters[0].location.locations[0] = {.kind = Kind::kGpRegister, .register_index = 1};
+    base.result.representation = Representation::kTagged;
+    base.result.location.count = 1;
+    base.result.location.locations[0] = {.kind = Kind::kGpRegister, .register_index = 0};
+    base.has_closure_receiver = true;
+    base.closure_receiver_location = {.kind = Kind::kGpRegister, .register_index = 0};
+    base.has_arguments_descriptor = true;
+    base.arguments_descriptor_location = {.kind = Kind::kGpRegister, .register_index = 4};
+    base.closure_signature = dartplant::abi::DartClosureSignatureLayout{};
+    base.closure_signature->fixed_parameter_count = 1;
+    base.closure_signature->formals.push_back(
+        {.signature_index = 0,
+         .kind = dartplant::abi::DartClosureFormalKind::kNamed,
+         .is_required = true,
+         .name = "value"});
+
+    const auto run_case = [&](const Layout& second_layout, bool equivalent) {
+        auto generation = std::make_shared<std::atomic_uint64_t>(11);
+        auto target = std::make_shared<dartplant::DartEntryTarget>();
+        target->entry = 0x1234;
+        DartPlantMethod method{};
+        method.runtime_generation = generation;
+        method.expected_runtime_generation = 11;
+        method.function = std::make_shared<dartplant::DartFunctionHandle>();
+        method.function->source = dartplant::DartFunctionSource::kSynthetic;
+        method.function->code_target = target;
+
+        DartPlantHook hook{};
+        hook.active = true;
+        hook.has_method = true;
+        hook.state = dartplant::HookRecordState::kInstalled;
+        hook.code_target = target;
+        hook.method_storage = std::make_unique<DartPlantMethod>(method);
+        dartplant_runtime_profile_init_arm64_aot(&hook.profile);
+        hook.backup = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234));
+
+        LayoutProbeCounts first_counts{};
+        LayoutProbeCounts second_counts{};
+        DartPlantHookOptions options = {
+            .struct_size = sizeof(DartPlantHookOptions),
+            .flags = 0,
+            .on_enter = OnLayoutProbeEnter,
+            .on_leave = OnLayoutProbeLeave,
+            .user_data = &first_counts,
+            .vm_adapter = nullptr,
+        };
+        DartPlantListener* first = nullptr;
+        DartPlantListener* second = nullptr;
+        const bool first_ok =
+            dartplant::AddCallbackListener(&hook, &method, options, 0, &first, generation, 11, 0, 0,
+                                           0, std::make_shared<const Layout>(base)) == DARTPLANT_OK;
+        options.user_data = &second_counts;
+        const bool second_ok =
+            first_ok && dartplant::AddCallbackListener(
+                            &hook, &method, options, 0, &second, generation, 11, 0, 0, 0,
+                            std::make_shared<const Layout>(second_layout)) == DARTPLANT_OK;
+        bool passed = false;
+        if (second_ok) {
+            DartPlantArm64Context context{};
+            const auto enter = dartplant_arm64_dispatch_enter(&context, &hook);
+            const bool admitted =
+                enter.original != nullptr && first_counts.enter == 1 &&
+                second_counts.enter == (equivalent ? 1U : 0U) &&
+                second->record->in_flight.load(std::memory_order_acquire) == (equivalent ? 1U : 0U);
+            (void) dartplant_arm64_dispatch_leave_from_tls(5, 0, 0);
+            passed = admitted && first_counts.leave == 1 &&
+                     second_counts.leave == (equivalent ? 1U : 0U) &&
+                     first->record->in_flight.load(std::memory_order_acquire) == 0 &&
+                     second->record->in_flight.load(std::memory_order_acquire) == 0 &&
+                     hook.in_flight == 0;
+        }
+        if (first != nullptr) {
+            (void) dartplant_remove_listener(first);
+            dartplant_release_listener(first);
+        }
+        if (second != nullptr) {
+            (void) dartplant_remove_listener(second);
+            dartplant_release_listener(second);
+        }
+        return passed;
+    };
+
+    bool passed = run_case(base, true);
+    uint32_t rejected = 0;
+    for (uint32_t index = 0; index < 8; ++index) {
+        Layout mismatched = base;
+        switch (index) {
+        case 0:
+            mismatched.parameters[0].location.locations[0].register_index = 2;
+            break;
+        case 1:
+            mismatched.result.location.locations[0].register_index = 1;
+            break;
+        case 2:
+            mismatched.stack_words = 1;
+            break;
+        case 3:
+            mismatched.dart_sp_register = 14;
+            break;
+        case 4:
+            mismatched.closure_receiver_location.register_index = 1;
+            break;
+        case 5:
+            mismatched.arguments_descriptor_location.register_index = 5;
+            break;
+        case 6:
+            mismatched.closure_signature->formals[0].name = "other";
+            break;
+        case 7:
+            mismatched.vm_semantic_observation_receipt = false;
+            break;
+        }
+        if (run_case(mismatched, false)) {
+            ++rejected;
+        } else {
+            passed = false;
+        }
+    }
+    __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+                        "DARTPLANT_CI {\"event\":\"call_layout_binding\",\"state\":\"%s\","
+                        "\"mode\":\"native_dispatch_in_flutter_process\",\"positive\":%u,"
+                        "\"rejected\":%u}",
+                        passed ? "pass" : "fail", 1U, rejected);
+    return passed ? 1 : 0;
+}
 
 extern "C" __attribute__((visibility("default"))) void dartplant_fixture_begin_object_probe() {
     __android_log_print(ANDROID_LOG_WARN, kTag,
@@ -2302,8 +2799,11 @@ dartplant_fixture_multi_owner_listener_probe(uint32_t label) {
     const bool listener_idle =
         g_multi_owner_listener != nullptr && g_multi_owner_listener->record != nullptr &&
         g_multi_owner_listener->record->in_flight.load(std::memory_order_acquire) == 0;
-    const bool hook_idle =
-        g_instrumented_add_hook != nullptr && g_instrumented_add_hook->in_flight == 0;
+    bool hook_idle = false;
+    if (g_instrumented_add_hook != nullptr) {
+        std::lock_guard lock(g_instrumented_add_hook->mutex);
+        hook_idle = g_instrumented_add_hook->in_flight == 0;
+    }
     const bool passed =
         label_ok && enter == 1 && leave == 1 && target_ok && listener_idle && hook_idle;
     __android_log_print(passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
@@ -2313,6 +2813,104 @@ dartplant_fixture_multi_owner_listener_probe(uint32_t label) {
                         passed ? "pass" : "fail", label, static_cast<unsigned long long>(enter),
                         static_cast<unsigned long long>(leave), static_cast<unsigned>(target_ok),
                         static_cast<unsigned>(listener_idle), static_cast<unsigned>(hook_idle));
+    ReleaseMultiOwnerListener();
+    return passed ? 1 : 0;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_retire_race_start(uint32_t label) {
+    if (g_multi_owner_retire_worker.joinable() || g_multi_owner_listener == nullptr ||
+        g_multi_owner_listener->record == nullptr || g_instrumented_add_hook == nullptr ||
+        g_multi_owner_listener_label.load(std::memory_order_acquire) != label) {
+        return 0;
+    }
+    const auto record = g_multi_owner_listener->record;
+    const auto generation = record->runtime_generation;
+    const bool distinct_owner =
+        generation != nullptr && generation != g_instrumented_add_hook->runtime_generation;
+    if (!distinct_owner) return 0;
+    g_multi_owner_retire_enabled.store(true, std::memory_order_release);
+    g_multi_owner_retire_entered.store(false, std::memory_order_release);
+    g_multi_owner_retire_finished.store(false, std::memory_order_release);
+    g_multi_owner_retire_overlap_ok.store(false, std::memory_order_release);
+    g_multi_owner_retire_owner_ok.store(false, std::memory_order_release);
+    g_multi_owner_retire_timeout.store(false, std::memory_order_release);
+    g_multi_owner_retire_status.store(0, std::memory_order_release);
+    g_multi_owner_retire_worker = std::thread([record, generation] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!g_multi_owner_retire_entered.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        if (g_multi_owner_retire_entered.load(std::memory_order_acquire)) {
+            // Same production owner-unload path as runtime owner retirement.
+            // The physical hook and A listener must remain installed while
+            // this B invocation is still in flight.
+            dartplant::RetireRuntimeHooks(generation);
+            bool survived = false;
+            {
+                std::lock_guard lock(g_instrumented_add_hook->mutex);
+                survived =
+                    g_instrumented_add_hook->active.load(std::memory_order_acquire) &&
+                    g_instrumented_add_hook->state == dartplant::HookRecordState::kInstalled &&
+                    !g_instrumented_add_hook->listeners.empty() &&
+                    std::none_of(
+                        g_instrumented_add_hook->listeners.begin(),
+                        g_instrumented_add_hook->listeners.end(),
+                        [&](const auto& listener) { return listener.get() == record.get(); }) &&
+                    g_instrumented_add_hook->in_flight != 0;
+            }
+            const bool retired = !record->active.load(std::memory_order_acquire) &&
+                                 record->in_flight.load(std::memory_order_acquire) != 0;
+            g_multi_owner_retire_owner_ok.store(survived && retired, std::memory_order_release);
+            g_multi_owner_retire_status.store(survived && retired ? 1 : 0,
+                                              std::memory_order_release);
+        } else {
+            g_multi_owner_retire_timeout.store(true, std::memory_order_release);
+        }
+        g_multi_owner_retire_finished.store(true, std::memory_order_release);
+    });
+    return 1;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+dartplant_fixture_multi_owner_retire_race_probe(uint32_t label) {
+    if (g_multi_owner_retire_worker.joinable()) g_multi_owner_retire_worker.join();
+    g_multi_owner_retire_enabled.store(false, std::memory_order_release);
+    const auto record = g_multi_owner_listener == nullptr
+                            ? std::shared_ptr<dartplant::DartPlantListenerRecord>{}
+                            : g_multi_owner_listener->record;
+    const uint64_t enter = g_multi_owner_listener_enter.load(std::memory_order_relaxed);
+    const uint64_t leave = g_multi_owner_listener_leave.load(std::memory_order_relaxed);
+    const bool listener_idle =
+        record != nullptr && record->in_flight.load(std::memory_order_acquire) == 0;
+    bool hook_idle = false;
+    if (g_instrumented_add_hook != nullptr) {
+        std::lock_guard lock(g_instrumented_add_hook->mutex);
+        hook_idle = g_instrumented_add_hook->in_flight == 0;
+    }
+    const bool passed = g_multi_owner_listener_label.load(std::memory_order_acquire) == label &&
+                        g_multi_owner_retire_overlap_ok.load(std::memory_order_acquire) &&
+                        g_multi_owner_retire_owner_ok.load(std::memory_order_acquire) &&
+                        !g_multi_owner_retire_timeout.load(std::memory_order_acquire) &&
+                        g_multi_owner_retire_status.load(std::memory_order_acquire) == 1 &&
+                        enter == 1 &&
+                        // Pine-style pairing preserves the leave callback for
+                        // listeners already admitted before concurrent removal.
+                        // Retirement prevents *new* enters, not an in-flight leave.
+                        leave == 1 && listener_idle && hook_idle;
+    __android_log_print(
+        passed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, kTag,
+        "DARTPLANT_CI {\"event\":\"multi_owner_concurrent_retire\","
+        "\"state\":\"%s\",\"label\":%u,\"enter\":%llu,\"leave\":%llu,"
+        "\"overlap\":%u,\"owner_retired\":%u,\"timeout\":%u,"
+        "\"listener_idle\":%u,\"hook_idle\":%u}",
+        passed ? "pass" : "fail", label, static_cast<unsigned long long>(enter),
+        static_cast<unsigned long long>(leave),
+        static_cast<unsigned>(g_multi_owner_retire_overlap_ok.load(std::memory_order_acquire)),
+        static_cast<unsigned>(g_multi_owner_retire_owner_ok.load(std::memory_order_acquire)),
+        static_cast<unsigned>(g_multi_owner_retire_timeout.load(std::memory_order_acquire)),
+        static_cast<unsigned>(listener_idle), static_cast<unsigned>(hook_idle));
     ReleaseMultiOwnerListener();
     return passed ? 1 : 0;
 }
@@ -3471,6 +4069,7 @@ extern "C" __attribute__((visibility("hidden"))) int dartplant_fixture_initializ
     g_forced_stack_closure_enter.store(0, std::memory_order_relaxed);
     g_forced_stack_closure_failures.store(0, std::memory_order_relaxed);
     ReleaseMultiOwnerListener();
+    ReleaseMultiOwnerExceptionHook();
     g_multi_owner_listener_label.store(0, std::memory_order_release);
     g_multi_owner_listener_enter.store(0, std::memory_order_relaxed);
     g_multi_owner_listener_leave.store(0, std::memory_order_relaxed);
@@ -3570,6 +4169,7 @@ extern "C" __attribute__((visibility("default"))) int dartplant_fixture_initiali
 extern "C" __attribute__((visibility("default"))) void dartplant_fixture_shutdown() {
     if (g_cold_bootstrap_thread.joinable()) g_cold_bootstrap_thread.join();
     ReleaseMultiOwnerListener();
+    ReleaseMultiOwnerExceptionHook();
     if (g_weak_object_handle != nullptr) {
         dartplant_object_release(g_weak_object_handle);
         g_weak_object_handle = nullptr;

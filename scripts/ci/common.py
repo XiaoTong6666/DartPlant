@@ -21,9 +21,11 @@ RUNTIME_SCENARIOS = (
     "artifact_revalidate",
     "deferred_lifecycle",
     "multi_engine",
+    "changed_slotless_reject",
 )
 COMMON_RUNTIME_SCENARIOS = (
     "initialization",
+    "layout_binding",
     "local_gate",
     "simple_facade",
     "p6_abi",

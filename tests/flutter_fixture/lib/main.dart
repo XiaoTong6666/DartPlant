@@ -35,9 +35,11 @@ const _ciRuntimeTests = <String>{
   'artifact_revalidate',
   'deferred_lifecycle',
   'multi_engine',
+  'changed_slotless_reject',
 };
 const _ciCommonScenarios = <String>{
   'initialization',
+  'layout_binding',
   'local_gate',
   'simple_facade',
   'p6_abi',
@@ -115,6 +117,36 @@ Future<void> secondaryEngineMain() async {
         return <String, Object?>{
           'install': install,
           'value': value,
+          'probe': probe,
+        };
+      case 'hookUnloadRace':
+        final install = DartPlantNative.multiOwnerInstallListener(label);
+        final started =
+            install == 1 ? DartPlantNative.multiOwnerRetireRaceStart(label) : 0;
+        final value = started == 1 ? instrumentedAdd(2, 3) : -1;
+        final probe =
+            started == 1 ? DartPlantNative.multiOwnerRetireRaceProbe(label) : 0;
+        return <String, Object?>{
+          'install': install,
+          'started': started,
+          'value': value,
+          'probe': probe,
+        };
+      case 'hookThrow':
+        final install = DartPlantNative.multiOwnerExceptionInstall(label);
+        var caught = 0;
+        if (install == 1) {
+          try {
+            verifiedAbiThrowingStack(99, 2, 3, 4, 5, 6, 7, 8);
+          } on StateError catch (error) {
+            caught = error.message == 'dartplant-p6-throw' ? 1 : 0;
+          }
+        }
+        final probe =
+            install == 1 ? DartPlantNative.multiOwnerExceptionProbe(label) : 0;
+        return <String, Object?>{
+          'install': install,
+          'caught': caught,
           'probe': probe,
         };
       case 'gc':
@@ -324,6 +356,20 @@ Future<bool> _runMultiEngineLifecycleProof() async {
   var bListenerProbe = 0;
   var b2ListenerInstall = 0;
   var b2ListenerProbe = 0;
+  var aExceptionInstall = 0;
+  var aExceptionBaseline = 0.0;
+  var bExceptionInstall = 0;
+  var bExceptionCatch = 0;
+  var bExceptionProbe = 0;
+  var b2ExceptionInstall = 0;
+  var b2ExceptionCatch = 0;
+  var b2ExceptionProbe = 0;
+  var bRetireEpoch = 0;
+  var bRetireInstall = 0;
+  var bRetireStart = 0;
+  var bRetireValue = -1;
+  var bRetireProbe = 0;
+  var aAfterBRetire = 0;
   var engineIncarnation1 = 0;
   var engineIncarnation2 = 0;
   String? failure;
@@ -332,6 +378,10 @@ Future<bool> _runMultiEngineLifecycleProof() async {
     DartPlantNative.resetInstrumentedAddProbe();
     aEpoch = DartPlantNative.multiOwnerActivate(1);
     aHookBefore = instrumentedAdd(2, 3);
+    aExceptionInstall = DartPlantNative.multiOwnerExceptionPrepare();
+    if (aExceptionInstall == 1) {
+      aExceptionBaseline = verifiedAbiThrowingStack(1, 2, 3, 4, 5, 6, 7, 8);
+    }
 
     final start = await _launchChannel.invokeMethod<Object?>('multiOwnerStart');
     if (start is Map) {
@@ -351,6 +401,10 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       bListenerInstall = _mapInt(values, 'install');
       bListenerProbe = _mapInt(values, 'probe');
     }
+    final bThrow = await _multiOwnerCommand('hookThrow', 2);
+    bExceptionInstall = _mapInt(bThrow, 'install');
+    bExceptionCatch = _mapInt(bThrow, 'caught');
+    bExceptionProbe = _mapInt(bThrow, 'probe');
     // Keep B as the runtime's active owner, then exercise the interactive
     // rebind path from A. A's method/listener belongs to another still-live
     // owner and must not be torn down merely because the active projection is B.
@@ -374,6 +428,18 @@ Future<bool> _runMultiEngineLifecycleProof() async {
     aPostDeferredEpoch = DartPlantNative.multiOwnerActivate(1);
     aHookAfterDeferred = instrumentedAdd(2, 3);
 
+    // B is the active VM owner during this call. A background native thread
+    // executes production owner retirement while B's Dart enter callback is
+    // held in-flight; B then finishes through the original physical RET.
+    final bRetireActivation = await _multiOwnerCommand('activate', 2);
+    bRetireEpoch = _mapInt(bRetireActivation, 'epoch');
+    final bRace = await _multiOwnerCommand('hookUnloadRace', 2);
+    bRetireInstall = _mapInt(bRace, 'install');
+    bRetireStart = _mapInt(bRace, 'started');
+    bRetireValue = _mapInt(bRace, 'value');
+    bRetireProbe = _mapInt(bRace, 'probe');
+    aAfterBRetire = instrumentedAdd(2, 3);
+
     await _launchChannel.invokeMethod<void>('multiOwnerDestroy');
     aPostDestroyEpoch = DartPlantNative.multiOwnerActivate(1);
 
@@ -395,6 +461,10 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       b2ListenerInstall = _mapInt(values, 'install');
       b2ListenerProbe = _mapInt(values, 'probe');
     }
+    final b2Throw = await _multiOwnerCommand('hookThrow', 3);
+    b2ExceptionInstall = _mapInt(b2Throw, 'install');
+    b2ExceptionCatch = _mapInt(b2Throw, 'caught');
+    b2ExceptionProbe = _mapInt(b2Throw, 'probe');
     DartPlantNative.resetInstrumentedAddProbe();
     aHookWhileB2Active = instrumentedAdd(2, 3);
 
@@ -411,6 +481,7 @@ Future<bool> _runMultiEngineLifecycleProof() async {
     } catch (_) {
       // The engine may already be gone after a successful lifecycle run.
     }
+    DartPlantNative.multiOwnerExceptionCleanup();
   }
 
   final passed = failure == null &&
@@ -436,6 +507,12 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       aHookAfterB == 115 &&
       aHookWhileBAfterDeferred == 115 &&
       aHookAfterDeferred == 115 &&
+      bRetireEpoch == bEpoch &&
+      bRetireInstall == 1 &&
+      bRetireStart == 1 &&
+      bRetireValue == 5 &&
+      bRetireProbe == 1 &&
+      aAfterBRetire == 115 &&
       aHookWhileB2Active == 115 &&
       aHookFinal == 115 &&
       bHookValue == 5 &&
@@ -443,7 +520,15 @@ Future<bool> _runMultiEngineLifecycleProof() async {
       bListenerInstall == 1 &&
       bListenerProbe == 1 &&
       b2ListenerInstall == 1 &&
-      b2ListenerProbe == 1;
+      b2ListenerProbe == 1 &&
+      aExceptionInstall == 1 &&
+      aExceptionBaseline == 108.0 &&
+      bExceptionInstall == 1 &&
+      bExceptionCatch == 1 &&
+      bExceptionProbe == 1 &&
+      b2ExceptionInstall == 1 &&
+      b2ExceptionCatch == 1 &&
+      b2ExceptionProbe == 1;
   _ciScenario('multi_engine', passed, <String, Object?>{
     'a_epoch': aEpoch,
     'b_epoch': bEpoch,
@@ -472,6 +557,20 @@ Future<bool> _runMultiEngineLifecycleProof() async {
     'b_listener_probe': bListenerProbe,
     'b2_listener_install': b2ListenerInstall,
     'b2_listener_probe': b2ListenerProbe,
+    'a_exception_install': aExceptionInstall,
+    'a_exception_baseline': aExceptionBaseline,
+    'b_exception_install': bExceptionInstall,
+    'b_exception_catch': bExceptionCatch,
+    'b_exception_probe': bExceptionProbe,
+    'b_retire_epoch': bRetireEpoch,
+    'b_retire_install': bRetireInstall,
+    'b_retire_start': bRetireStart,
+    'b_retire_value': bRetireValue,
+    'b_retire_probe': bRetireProbe,
+    'a_after_b_retire': aAfterBRetire,
+    'b2_exception_install': b2ExceptionInstall,
+    'b2_exception_catch': b2ExceptionCatch,
+    'b2_exception_probe': b2ExceptionProbe,
     if (failure != null) 'error': failure,
   });
   return passed;
@@ -639,6 +738,15 @@ Future<void> main() async {
     debugPrint('DartPlant initialize status: $initializeStatus');
     _ciScenario('initialization', initializeStatus == 0, <String, Object?>{
       'status': initializeStatus,
+    });
+
+    // A synthetic native dispatch in the release Flutter process validates
+    // that identical VM proof receipts do not merge incompatible per-listener
+    // call layouts. This is separate from the real-AOT multi-engine fixture:
+    // production method layouts are never deliberately falsified.
+    final layoutBindingProbe = DartPlantNative.callLayoutBindingProbe();
+    _ciScenario('layout_binding', layoutBindingProbe == 1, <String, Object?>{
+      'native': layoutBindingProbe,
     });
 
     // The advanced runtime is intentionally initialized with DartPlant's local
@@ -951,11 +1059,16 @@ Future<void> main() async {
       });
     }
 
-    if (wants('deferred_lifecycle')) {
+    if (wants('deferred_lifecycle') || wants('changed_slotless_reject')) {
       final beforeLoad = DartPlantNative.deferredBeforeLoad();
       await deferred_probe.loadLibrary();
       final afterLoad = DartPlantNative.deferredAfterLoad();
       final value = deferred_probe.deferredAdd(1);
+      final changedSlotlessReject =
+          DartPlantNative.changedSlotlessRejectProbe();
+      _ciScenario('changed_slotless_reject', changedSlotlessReject == 1, {
+        'native': changedSlotlessReject,
+      });
       DartPlantNative.resetInstrumentedAddProbe();
       var postDeferredInstrumented = 0;
       for (var index = 0; index < 5; ++index) {
